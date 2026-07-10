@@ -81,9 +81,6 @@ pre-acknowledgement and ABA reuse.
   per-launch private named pipes, and kill-on-close Job Objects. It currently
   returns incomplete.
 
-No backend may substitute a globally named object, System V IPC, executable
-mapping, or cooperative-only permission convention.
-
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

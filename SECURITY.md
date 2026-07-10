@@ -15,10 +15,9 @@ days; remediation timelines depend on impact and reproducibility.
 
 ## Security scope
 
-Memory-safety failures reachable from safe Rust, unintended writable or
-executable shared mappings, schema/generation/sequence bypasses, unchecked
-hostile lengths or offsets, cross-process aliasing violations, and capability
-leaks are in scope. Process separation alone is not claimed as a sandbox.
+Memory-safety failures reachable from safe Rust, unintended writable mappings,
+schema/generation/sequence bypasses, unchecked hostile lengths or offsets,
+cross-process aliasing violations, and capability leaks are in scope.
 Incorrect use of explicitly unsafe APIs, kernel compromise, and platforms the
 crate explicitly reports as incomplete are not production security guarantees,
 but clear documentation or fail-closed regressions are still welcome.

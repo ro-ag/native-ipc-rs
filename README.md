@@ -31,11 +31,6 @@ The workspace contains:
   layouts validated as writable. Read-only layouts grant acquire-only types.
 - Runtime mappings never expose ordinary Rust slices. Slice access exists only
   in a consuming, pre-transfer quiescent macOS typestate.
-- Shared mappings are never executable and are never globally named.
-
-These properties reduce shared-memory authority; they do not sandbox a peer
-process. Process launch, identity authentication, sandboxing, and application
-policy remain the embedding application's responsibility.
 
 ## Current status
 
@@ -63,16 +58,6 @@ Incomplete:
 
 Until those items are complete, this repository must not be described as a
 production-ready isolation transport.
-
-## Non-goals
-
-- mapping arbitrary Rust values or native object graphs between processes;
-- VST3, COM, audio plug-in, or other application-domain semantics;
-- Serde, bincode, postcard, or ABI-dependent foundational wire layouts;
-- network or cross-machine transport;
-- globally discoverable shared-memory names or System V IPC;
-- executable shared mappings; and
-- claiming that process separation alone is a security sandbox.
 
 ## Toolchain and validation
 

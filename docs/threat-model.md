@@ -8,9 +8,8 @@ least authority when one authenticated peer is buggy or malicious. Primary
 runtime surfaces are the explicit wire decoder, checked region layout parser,
 atomic slot/acknowledgement state machine, and native OS mapping layer.
 
-The library is not a sandbox, process launcher, or authentication policy. A
-complete embedding must separately establish peer identity, private bootstrap
-channels, lifecycle containment, and platform sandbox policy.
+A complete embedding establishes peer identity, private bootstrap channels,
+lifecycle containment, and platform policy.
 
 ## Threat Model, Trust Boundaries, and Assumptions
 
@@ -63,10 +62,7 @@ typestates, and live kernel permission probes.
 
 The Linux and Windows native transports, native capability transfer, peer
 authentication, lifecycle containment, and cleanup ledger are not implemented.
-Their APIs fail closed rather than claiming weaker functionality. Network
-attack classes, web authentication bugs, injection into databases or shells,
-and confidentiality against a peer explicitly granted read access are outside
-this library's direct surface.
+Their APIs fail closed rather than claiming weaker functionality.
 
 ## Severity Calibration (Critical, High, Medium, Low)
 
