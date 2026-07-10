@@ -1,11 +1,11 @@
 //! Generation-bound, role-bound slot and acknowledgement capabilities.
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
-use crate::layout::RoleId;
+use crate::layout::{AcknowledgementRoute, RoleId};
 
 #[cfg(not(target_has_atomic = "64"))]
 compile_error!("native-ipc-core requires lock-free 64-bit atomic support");
@@ -24,9 +24,9 @@ pub const ACKNOWLEDGEMENT_CELL_SIZE: u64 = 64;
 pub struct SlotMetadata {
     generation: AtomicU64,
     payload_len: AtomicU32,
-    reserved_word: u32,
+    reserved_word: UnsafeCell<u32>,
     published_sequence: AtomicU64,
-    reserved: [u8; 40],
+    reserved: UnsafeCell<[u8; 40]>,
 }
 
 impl SlotMetadata {
@@ -35,9 +35,9 @@ impl SlotMetadata {
         Self {
             generation: AtomicU64::new(generation),
             payload_len: AtomicU32::new(0),
-            reserved_word: 0,
+            reserved_word: UnsafeCell::new(0),
             published_sequence: AtomicU64::new(0),
-            reserved: [0; 40],
+            reserved: UnsafeCell::new([0; 40]),
         }
     }
 
@@ -53,18 +53,26 @@ impl SlotMetadata {
         }
         *self.generation.get_mut() = generation;
         *self.payload_len.get_mut() = 0;
-        self.reserved_word = 0;
+        // SAFETY: `&mut self` and the function contract exclude all aliases.
+        unsafe { *self.reserved_word.get() = 0 };
         *self.published_sequence.get_mut() = 0;
-        self.reserved = [0; 40];
+        // SAFETY: `&mut self` and the function contract exclude all aliases.
+        unsafe { *self.reserved.get() = [0; 40] };
         Ok(())
     }
 }
+
+// SAFETY: live fields are accessed only through atomics. `UnsafeCell` makes
+// peer mutation of padding explicit; protocol code never reads that padding
+// after quiescent validation. Peers must use compatible aligned atomics for
+// atomic fields.
+unsafe impl Sync for SlotMetadata {}
 
 /// A single writer-owned atomic acknowledgement sequence.
 #[repr(C, align(64))]
 pub struct AcknowledgementCell {
     sequence: AtomicU64,
-    reserved: [u8; 56],
+    reserved: UnsafeCell<[u8; 56]>,
 }
 
 impl AcknowledgementCell {
@@ -72,7 +80,7 @@ impl AcknowledgementCell {
     pub const fn new() -> Self {
         Self {
             sequence: AtomicU64::new(0),
-            reserved: [0; 56],
+            reserved: UnsafeCell::new([0; 56]),
         }
     }
 
@@ -83,9 +91,14 @@ impl AcknowledgementCell {
     /// No peer process or concurrent thread may access this cell.
     pub unsafe fn initialize(&mut self) {
         *self.sequence.get_mut() = 0;
-        self.reserved = [0; 56];
+        // SAFETY: `&mut self` and the function contract exclude all aliases.
+        unsafe { *self.reserved.get() = [0; 56] };
     }
 }
+
+// SAFETY: `sequence` is atomic and externally mutable padding is never read
+// after quiescent validation.
+unsafe impl Sync for AcknowledgementCell {}
 
 impl Default for AcknowledgementCell {
     fn default() -> Self {
@@ -105,6 +118,7 @@ impl WriterSlotBinding {
         slot_index: u32,
         slot_count: u32,
         acknowledgement_owner: RoleId,
+        acknowledgement_cell_index: u32,
     ) -> Self {
         Self(SlotBinding {
             role,
@@ -113,6 +127,7 @@ impl WriterSlotBinding {
             slot_index,
             slot_count,
             acknowledgement_owner: Some(acknowledgement_owner),
+            acknowledgement_cell_index: Some(acknowledgement_cell_index),
         })
     }
 }
@@ -136,6 +151,7 @@ impl ReaderSlotBinding {
             slot_index,
             slot_count,
             acknowledgement_owner: None,
+            acknowledgement_cell_index: None,
         })
     }
 }
@@ -148,6 +164,7 @@ struct SlotBinding {
     slot_index: u32,
     slot_count: u32,
     acknowledgement_owner: Option<RoleId>,
+    acknowledgement_cell_index: Option<u32>,
 }
 
 /// Sole-writer capability bound to a validated writable mapping.
@@ -212,6 +229,12 @@ impl<'a> WriterSlot<'a> {
             }
             if acknowledgement.owner != self.binding.acknowledgement_owner.unwrap() {
                 return Err(SlotError::WrongAcknowledgementOwner);
+            }
+            if acknowledgement.slot_index != self.binding.slot_index {
+                return Err(SlotError::WrongAcknowledgementSlot);
+            }
+            if acknowledgement.cell_index != self.binding.acknowledgement_cell_index.unwrap() {
+                return Err(SlotError::WrongAcknowledgementCell);
             }
             if acknowledgement.generation != self.binding.generation {
                 return Err(SlotError::StaleAcknowledgementGeneration);
@@ -283,13 +306,18 @@ impl<'a> ReaderSlot<'a> {
         }
         Ok(SlotObservation {
             role: self.binding.role,
+            slot_index: self.binding.slot_index,
             generation: self.binding.generation,
             sequence,
             payload_len,
         })
     }
 
-    /// Acquire-rechecks identity after copying payload bytes to owned storage.
+    /// Rechecks metadata stability after copying hostile bytes to owned storage.
+    ///
+    /// This detects metadata changes, not payload integrity. A malicious writer
+    /// can mutate bytes without changing metadata; callers must parse every
+    /// owned payload copy as hostile input.
     pub fn recheck(&self, observation: SlotObservation) -> Result<(), SlotError> {
         if observation.role != self.binding.role {
             return Err(SlotError::WrongObservationRole);
@@ -300,6 +328,9 @@ impl<'a> ReaderSlot<'a> {
                 actual: observation.generation,
             });
         }
+        // Keep preceding payload reads before the final metadata loads on
+        // weakly ordered hardware.
+        fence(Ordering::SeqCst);
         let sequence = self.header.published_sequence.load(Ordering::Acquire);
         if sequence != observation.sequence {
             return Err(SlotError::StaleSequence {
@@ -307,7 +338,15 @@ impl<'a> ReaderSlot<'a> {
                 actual: sequence,
             });
         }
-        validate_bound_generation(self.header, observation.generation)
+        validate_bound_generation(self.header, observation.generation)?;
+        let payload_len = self.header.payload_len.load(Ordering::Relaxed);
+        if payload_len != observation.payload_len {
+            return Err(SlotError::ChangedPayloadLength {
+                expected: observation.payload_len,
+                actual: payload_len,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -344,6 +383,7 @@ impl PublishReservation<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlotObservation {
     role: RoleId,
+    slot_index: u32,
     generation: u64,
     sequence: u64,
     payload_len: u32,
@@ -353,6 +393,10 @@ impl SlotObservation {
     /// Returns the producer region role.
     pub const fn role(self) -> RoleId {
         self.role
+    }
+    /// Returns the exact observed slot index.
+    pub const fn slot_index(self) -> u32 {
+        self.slot_index
     }
     /// Returns the connection generation.
     pub const fn generation(self) -> u64 {
@@ -373,10 +417,12 @@ impl SlotObservation {
 pub struct AcknowledgementWriterBinding(AcknowledgementBinding);
 
 impl AcknowledgementWriterBinding {
-    pub(crate) const fn validated(owner: RoleId, target: RoleId, generation: u64) -> Self {
+    pub(crate) const fn validated(route: AcknowledgementRoute, generation: u64) -> Self {
         Self(AcknowledgementBinding {
-            owner,
-            target,
+            owner: route.owner(),
+            target: route.target(),
+            slot_index: route.slot_index(),
+            cell_index: route.cell_index(),
             generation,
         })
     }
@@ -387,10 +433,12 @@ impl AcknowledgementWriterBinding {
 pub struct AcknowledgementReaderBinding(AcknowledgementBinding);
 
 impl AcknowledgementReaderBinding {
-    pub(crate) const fn validated(owner: RoleId, target: RoleId, generation: u64) -> Self {
+    pub(crate) const fn validated(route: AcknowledgementRoute, generation: u64) -> Self {
         Self(AcknowledgementBinding {
-            owner,
-            target,
+            owner: route.owner(),
+            target: route.target(),
+            slot_index: route.slot_index(),
+            cell_index: route.cell_index(),
             generation,
         })
     }
@@ -400,6 +448,8 @@ impl AcknowledgementReaderBinding {
 struct AcknowledgementBinding {
     owner: RoleId,
     target: RoleId,
+    slot_index: u32,
+    cell_index: u32,
     generation: u64,
 }
 
@@ -440,18 +490,21 @@ impl<'a> AcknowledgementWriter<'a> {
         if observation.generation != self.binding.generation {
             return Err(AcknowledgementError::StaleGeneration);
         }
+        if observation.slot_index != self.binding.slot_index {
+            return Err(AcknowledgementError::WrongSlot);
+        }
         if observation.sequence == 0 {
             return Err(AcknowledgementError::UnpublishedSequence);
         }
         let current = self.cell.sequence.load(Ordering::Relaxed);
-        if current == u64::MAX {
-            return Err(AcknowledgementError::SequenceWrap);
-        }
         if observation.sequence < current {
             return Err(AcknowledgementError::NonMonotonic {
                 current,
                 next: observation.sequence,
             });
+        }
+        if observation.sequence == current {
+            return Ok(());
         }
         self.cell
             .sequence
@@ -490,6 +543,8 @@ impl<'a> AcknowledgementReader<'a> {
             owner: self.binding.owner,
             target: self.binding.target,
             generation: self.binding.generation,
+            slot_index: self.binding.slot_index,
+            cell_index: self.binding.cell_index,
             sequence: self.cell.sequence.load(Ordering::Acquire),
         }
     }
@@ -501,6 +556,8 @@ pub struct AcknowledgementObservation {
     owner: RoleId,
     target: RoleId,
     generation: u64,
+    slot_index: u32,
+    cell_index: u32,
     sequence: u64,
 }
 
@@ -516,6 +573,14 @@ impl AcknowledgementObservation {
     /// Returns the acknowledged generation.
     pub const fn generation(self) -> u64 {
         self.generation
+    }
+    /// Returns the acknowledged producer slot.
+    pub const fn slot_index(self) -> u32 {
+        self.slot_index
+    }
+    /// Returns the exact acknowledgement cell.
+    pub const fn cell_index(self) -> u32 {
+        self.cell_index
     }
     /// Returns the acknowledged sequence.
     pub const fn sequence(self) -> u64 {
@@ -547,6 +612,10 @@ pub enum SlotError {
     WrongAcknowledgementTarget,
     /// Acknowledgement came from another routed owner.
     WrongAcknowledgementOwner,
+    /// Acknowledgement belongs to another producer slot.
+    WrongAcknowledgementSlot,
+    /// Acknowledgement came from another cell.
+    WrongAcknowledgementCell,
     /// Acknowledgement came from another generation.
     StaleAcknowledgementGeneration,
     /// Acknowledgement lags the exact prior publication.
@@ -557,6 +626,8 @@ pub enum SlotError {
     StaleSequence { expected: u64, actual: u64 },
     /// Peer-declared payload exceeds fixed capacity.
     PayloadTooLarge { length: u32, capacity: u32 },
+    /// Payload length changed during the copy window.
+    ChangedPayloadLength { expected: u32, actual: u32 },
     /// Observation belongs to another role.
     WrongObservationRole,
 }
@@ -569,10 +640,10 @@ pub enum AcknowledgementError {
     WrongTarget,
     /// Slot observation belongs to another generation.
     StaleGeneration,
+    /// Slot observation belongs to another routed slot.
+    WrongSlot,
     /// Sequence zero is unpublished.
     UnpublishedSequence,
-    /// Stored acknowledgement is terminal at `u64::MAX`.
-    SequenceWrap,
     /// Acknowledgement moved backwards.
     NonMonotonic { current: u64, next: u64 },
 }
@@ -622,8 +693,15 @@ fn validate_sequence_slot(binding: SlotBinding, sequence: u64) -> Result<(), Slo
 
 const _: () = assert!(core::mem::size_of::<SlotMetadata>() == SLOT_HEADER_SIZE as usize);
 const _: () = assert!(core::mem::align_of::<SlotMetadata>() == 64);
+const _: () = assert!(core::mem::offset_of!(SlotMetadata, generation) == 0);
+const _: () = assert!(core::mem::offset_of!(SlotMetadata, payload_len) == 8);
+const _: () = assert!(core::mem::offset_of!(SlotMetadata, reserved_word) == 12);
+const _: () = assert!(core::mem::offset_of!(SlotMetadata, published_sequence) == 16);
+const _: () = assert!(core::mem::offset_of!(SlotMetadata, reserved) == 24);
 const _: () = assert!(core::mem::size_of::<AcknowledgementCell>() == 64);
 const _: () = assert!(core::mem::align_of::<AcknowledgementCell>() == 64);
+const _: () = assert!(core::mem::offset_of!(AcknowledgementCell, sequence) == 0);
+const _: () = assert!(core::mem::offset_of!(AcknowledgementCell, reserved) == 8);
 
 #[cfg(test)]
 mod tests {
@@ -634,7 +712,11 @@ mod tests {
     const GENERATION: u64 = 9;
 
     fn writer_binding(slot: u32) -> WriterSlotBinding {
-        WriterSlotBinding::validated(PRODUCER, GENERATION, 8, slot, 2, ACK_OWNER)
+        WriterSlotBinding::validated(PRODUCER, GENERATION, 8, slot, 2, ACK_OWNER, slot)
+    }
+
+    const fn route(slot: u32) -> AcknowledgementRoute {
+        AcknowledgementRoute::validated(ACK_OWNER, PRODUCER, slot, slot)
     }
 
     fn reader_binding(slot: u32) -> ReaderSlotBinding {
@@ -644,6 +726,11 @@ mod tests {
     fn observation(sequence: u64) -> SlotObservation {
         SlotObservation {
             role: PRODUCER,
+            slot_index: if sequence == 0 {
+                0
+            } else {
+                ((sequence - 1) % 2) as u32
+            },
             generation: GENERATION,
             sequence,
             payload_len: 4,
@@ -680,6 +767,8 @@ mod tests {
             owner: ACK_OWNER,
             target: PRODUCER,
             generation: GENERATION,
+            slot_index: 0,
+            cell_index: 0,
             sequence: 1,
         };
         writer
@@ -736,26 +825,141 @@ mod tests {
     #[test]
     fn acknowledgement_capabilities_are_split_and_monotonic() {
         let cell = AcknowledgementCell::new();
-        let writer_binding =
-            AcknowledgementWriterBinding::validated(ACK_OWNER, PRODUCER, GENERATION);
+        let writer_binding = AcknowledgementWriterBinding::validated(route(0), GENERATION);
         {
             // SAFETY: local test storage has one simulated acknowledgement writer.
             let mut writer = unsafe { AcknowledgementWriter::bind(&cell, writer_binding) };
             writer.acknowledge(observation(1)).unwrap();
+            writer.acknowledge(observation(1)).unwrap();
+            writer.acknowledge(observation(3)).unwrap();
+            assert_eq!(
+                writer.acknowledge(observation(1)).unwrap_err(),
+                AcknowledgementError::NonMonotonic {
+                    current: 3,
+                    next: 1
+                }
+            );
             assert!(matches!(
                 writer.acknowledge(observation(0)),
                 Err(AcknowledgementError::UnpublishedSequence)
             ));
         }
-        let reader_binding =
-            AcknowledgementReaderBinding::validated(ACK_OWNER, PRODUCER, GENERATION);
+        let reader_binding = AcknowledgementReaderBinding::validated(route(0), GENERATION);
         // SAFETY: simulated writer was dropped; storage is immutable here.
         let reader = unsafe { AcknowledgementReader::bind(&cell, reader_binding) };
         let observed = reader.observe();
         assert_eq!(observed.owner(), ACK_OWNER);
         assert_eq!(observed.target(), PRODUCER);
         assert_eq!(observed.generation(), GENERATION);
-        assert_eq!(observed.sequence(), 1);
+        assert_eq!(observed.sequence(), 3);
+
+        let mut terminal = AcknowledgementCell::new();
+        *terminal.sequence.get_mut() = u64::MAX;
+        let mut writer = unsafe {
+            AcknowledgementWriter::bind(
+                &terminal,
+                AcknowledgementWriterBinding::validated(route(0), GENERATION),
+            )
+        };
+        let maximum = SlotObservation {
+            sequence: u64::MAX,
+            slot_index: 0,
+            ..observation(1)
+        };
+        writer.acknowledge(maximum).unwrap();
+    }
+
+    #[test]
+    fn two_slot_routes_complete_multiple_rotations() {
+        let headers = [SlotMetadata::new(GENERATION), SlotMetadata::new(GENERATION)];
+        let cells = [AcknowledgementCell::new(), AcknowledgementCell::new()];
+        let mut acknowledgements = [None, None];
+
+        for sequence in 1..=6 {
+            let slot = ((sequence - 1) % 2) as usize;
+            let mut writer =
+                unsafe { WriterSlot::bind(&headers[slot], writer_binding(slot as u32)) }.unwrap();
+            writer
+                .prepare_publish(sequence, acknowledgements[slot])
+                .unwrap()
+                .publish(4)
+                .unwrap();
+            let reader =
+                unsafe { ReaderSlot::bind(&headers[slot], reader_binding(slot as u32)) }.unwrap();
+            let observed = reader.observe(sequence).unwrap();
+            reader.recheck(observed).unwrap();
+            let binding = AcknowledgementWriterBinding::validated(route(slot as u32), GENERATION);
+            let mut acknowledgement_writer =
+                unsafe { AcknowledgementWriter::bind(&cells[slot], binding) };
+            acknowledgement_writer.acknowledge(observed).unwrap();
+            let binding = AcknowledgementReaderBinding::validated(route(slot as u32), GENERATION);
+            let acknowledgement_reader =
+                unsafe { AcknowledgementReader::bind(&cells[slot], binding) };
+            acknowledgements[slot] = Some(acknowledgement_reader.observe());
+        }
+
+        let mut slot_zero = unsafe { WriterSlot::bind(&headers[0], writer_binding(0)) }.unwrap();
+        let wrong_cell = AcknowledgementObservation {
+            cell_index: 1,
+            sequence: 5,
+            ..acknowledgements[0].unwrap()
+        };
+        assert_eq!(
+            slot_zero.prepare_publish(7, Some(wrong_cell)).unwrap_err(),
+            SlotError::WrongAcknowledgementCell
+        );
+        let wrong_slot = AcknowledgementObservation {
+            slot_index: 1,
+            cell_index: 0,
+            sequence: 5,
+            ..acknowledgements[0].unwrap()
+        };
+        assert_eq!(
+            slot_zero.prepare_publish(7, Some(wrong_slot)).unwrap_err(),
+            SlotError::WrongAcknowledgementSlot
+        );
+    }
+
+    #[test]
+    fn production_interleaving_model_accepts_only_exact_prior_ack() {
+        for current in [1_u64, 3, 5] {
+            for acknowledged in 0..=current + 1 {
+                let mut header = SlotMetadata::new(GENERATION);
+                *header.published_sequence.get_mut() = current;
+                let mut writer = unsafe { WriterSlot::bind(&header, writer_binding(0)) }.unwrap();
+                let result = writer.prepare_publish(
+                    current + 2,
+                    Some(AcknowledgementObservation {
+                        owner: ACK_OWNER,
+                        target: PRODUCER,
+                        generation: GENERATION,
+                        slot_index: 0,
+                        cell_index: 0,
+                        sequence: acknowledged,
+                    }),
+                );
+                assert_eq!(result.is_ok(), acknowledged == current);
+            }
+        }
+    }
+
+    #[test]
+    fn recheck_detects_length_change_but_does_not_claim_payload_integrity() {
+        let header = SlotMetadata::new(GENERATION);
+        {
+            let mut writer = unsafe { WriterSlot::bind(&header, writer_binding(0)) }.unwrap();
+            writer.prepare_publish(1, None).unwrap().publish(4).unwrap();
+        }
+        let reader = unsafe { ReaderSlot::bind(&header, reader_binding(0)) }.unwrap();
+        let observed = reader.observe(1).unwrap();
+        header.payload_len.store(5, Ordering::Relaxed);
+        assert_eq!(
+            reader.recheck(observed).unwrap_err(),
+            SlotError::ChangedPayloadLength {
+                expected: 4,
+                actual: 5
+            }
+        );
     }
 
     #[test]
@@ -788,6 +992,8 @@ mod tests {
                         owner: ACK_OWNER,
                         target: PRODUCER,
                         generation: GENERATION,
+                        slot_index: 0,
+                        cell_index: 0,
                         sequence: u64::MAX,
                     })
                 )

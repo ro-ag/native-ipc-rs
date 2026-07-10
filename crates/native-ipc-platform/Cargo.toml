@@ -12,6 +12,9 @@ documentation = "https://docs.rs/native-ipc-platform"
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+native-ipc-core = { path = "../native-ipc-core", version = "0.1.0" }
+
 [features]
 default = []
 

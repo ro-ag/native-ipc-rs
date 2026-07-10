@@ -17,6 +17,9 @@ version = "0.1.0"
 [[package]]
 name = "native-ipc-platform"
 version = "0.1.0"
+dependencies = [
+ "native-ipc-core",
+]
 
 [[package]]
 name = "native-ipc-testkit"
