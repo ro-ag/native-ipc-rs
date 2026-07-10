@@ -1,0 +1,20 @@
+[package]
+name = "native-ipc-core"
+description = "Platform-neutral, pointer-free protocol and sequencing primitives for native-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/native-ipc-core"
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = []
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "native-ipc"
+description = "Secure-by-construction foundations for native cross-process IPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+native-ipc-core = { path = "../native-ipc-core", version = "0.1.0" }
+native-ipc-platform = { path = "../native-ipc-platform", version = "0.1.0" }
+
+[features]
+default = ["std"]
+std = ["native-ipc-core/std"]
+
+[lints]
+workspace = true

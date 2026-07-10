@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/native-ipc",
+    "crates/native-ipc-core",
+    "crates/native-ipc-platform",
+    "crates/native-ipc-testkit",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+authors = ["Rodrigo Agurto"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ro-ag/native-ipc-rs"
+homepage = "https://github.com/ro-ag/native-ipc-rs"
+documentation = "https://docs.rs/native-ipc"
+keywords = ["ipc", "shared-memory", "process", "capability", "security"]
+categories = ["os", "memory-management"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

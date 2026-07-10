@@ -1,0 +1,22 @@
+[package]
+name = "native-ipc-testkit"
+description = "Adversarial helpers and cross-process conformance fixtures for native-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/native-ipc-testkit"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+native-ipc-core = { path = "../native-ipc-core", version = "0.1.0" }
+
+[features]
+default = []
+
+[lints]
+workspace = true
