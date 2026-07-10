@@ -3,7 +3,7 @@
 use native_ipc_core::codec::{
     DecodeContext, DecodeError, EncodeError, Envelope, Limits, Protocol, decode_message,
 };
-use native_ipc_testkit::{every_truncation, golden_message};
+use native_ipc_testkit::{bounded_bit_mutations, every_truncation, golden_message};
 
 struct U32Protocol;
 
@@ -65,5 +65,16 @@ fn every_truncated_golden_vector_is_rejected_without_panic() {
     let limits = Limits::new(1024, 512, 8, 512);
     for truncation in every_truncation(&vector).take(vector.len()) {
         assert!(decode_message::<U32Protocol>(truncation, &limits).is_err());
+    }
+}
+
+#[test]
+fn bounded_hostile_envelope_corpus_is_panic_free() {
+    let vector = decode_hex(include_str!("vectors/u32-message.hex"));
+    let limits = Limits::new(1024, 512, 8, 512);
+    let corpus = bounded_bit_mutations(&vector, 72);
+    assert_eq!(corpus.len(), 72);
+    for hostile in corpus {
+        let _ = decode_message::<U32Protocol>(&hostile, &limits);
     }
 }

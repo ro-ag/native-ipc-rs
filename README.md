@@ -22,13 +22,14 @@ The workspace contains:
   numeric roles, fixed capacity, and checked relative ranges.
 - Each mapping has exactly one writer. A peer reader receives only a read-only
   native capability; no shared page is writable by both processes.
-- Writers publish a nonzero sequence with Release ordering. Readers Acquire,
-  validate, copy to owned memory, and recheck without modifying producer data.
-- Ring reuse requires an acknowledgement with the exact target, generation,
-  and prior sequence. Missing, stale, lagging, future, wrong-target, and wrapped
-  acknowledgements fail closed.
-- Store-capable slot and acknowledgement types can be created only from
-  layouts validated as writable. Read-only layouts grant acquire-only types.
+- Writers publish with Release ordering. Readers Acquire, copy hostile bytes to
+  owned memory, fence, and recheck generation, sequence, and length. This does
+  not prove payload integrity or detect malicious same-sequence mutation.
+- Ring reuse requires a unique per-slot route with exact owner, target, slot,
+  cell, generation, and prior sequence. Equal re-acknowledgement is
+  intentionally idempotent for retransmission.
+- Store capabilities require a consumed platform sole-writer witness;
+  OS-enforced read-only witnesses grant only acquire capabilities.
 - Runtime mappings never expose ordinary Rust slices. Slice access exists only
   in a consuming, pre-transfer quiescent macOS typestate.
 
@@ -53,8 +54,9 @@ Incomplete:
 - Linux sealed `memfd`, `SCM_RIGHTS`, `SO_PEERCRED`, and `pidfd` transport;
 - Windows least-rights unnamed sections, private named pipes, and kill-on-close
   Job Objects;
-- cross-process helper lifecycle, peer authentication, guard pages, fuzzing,
-  and production cleanup orchestration.
+- received Mach capability import/transfer, cross-process helper lifecycle,
+  peer authentication, guard pages, coverage-guided fuzzing, and production
+  cleanup orchestration.
 
 Until those items are complete, this repository must not be described as a
 production-ready isolation transport.
@@ -67,6 +69,7 @@ The MSRV is Rust 1.97 with edition 2024. Before submitting a change, run:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features --all-targets
+cargo test --workspace --no-default-features --all-targets --locked
 cargo check --workspace --no-default-features --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo deny check

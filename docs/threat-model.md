@@ -55,10 +55,17 @@ hangs during peer failure.
 
 Current mitigations are manual fixed-width little-endian codecs, exact schema
 identity, explicit record/allocation limits, checked ranges and layout
-arithmetic, nonzero generations and sequences, exact slot/acknowledgement state
-transitions, Release/Acquire publication with post-copy recheck, separate safe
-reader/writer capability types, slice-free runtime APIs, consuming macOS
-typestates, and live kernel permission probes.
+arithmetic, nonzero generations and sequences, unique per-slot acknowledgement
+routes, exact state transitions, Release publication with a fenced
+generation/sequence/length recheck, platform-minted reader/writer mapping
+witnesses, slice-free runtime APIs, consuming macOS typestates, validated zero
+page padding, and live kernel permission probes.
+
+Copied payload bytes remain hostile and may be torn or change while metadata
+stays constant. The recheck bounds access and detects metadata changes; it does
+not establish payload integrity. Protocol decoders must reject inconsistent
+owned payloads. A malicious sole writer can forge any unkeyed checksum or
+seqlock state, so neither is described as integrity here.
 
 The Linux and Windows native transports, native capability transfer, peer
 authentication, lifecycle containment, and cleanup ledger are not implemented.

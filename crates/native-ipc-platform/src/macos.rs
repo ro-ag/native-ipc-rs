@@ -603,6 +603,31 @@ mod tests {
     };
     use std::mem::size_of;
 
+    struct TestWriterWitness<'a>(&'a mut Mapping);
+    struct TestReaderWitness<'a>(&'a Mapping);
+
+    // SAFETY: test witnesses borrow live Mach mappings for their full bound
+    // lifetime; the writer mapping is unique and peer entries are read-only.
+    unsafe impl SoleWriterMapping for TestWriterWitness<'_> {
+        fn base(&self) -> NonNull<u8> {
+            self.0.address
+        }
+        fn len(&self) -> usize {
+            self.0.mapped_len
+        }
+    }
+
+    // SAFETY: test reader mappings are created from read-only memory entries
+    // and remain borrowed for their full bound lifetime.
+    unsafe impl ReadOnlyMapping for TestReaderWitness<'_> {
+        fn base(&self) -> NonNull<u8> {
+            self.0.address
+        }
+        fn len(&self) -> usize {
+            self.0.mapped_len
+        }
+    }
+
     #[test]
     fn read_only_capability_rejects_writable_mapping() {
         let owner = QuiescentRegion::new(37).unwrap();
@@ -797,5 +822,147 @@ mod tests {
                 LayoutError::CapabilityPaddingNotZero
             ))
         ));
+    }
+
+    #[test]
+    fn mach_mapping_completes_core_publish_observe_and_ack_path() {
+        let producer = RoleId::new(1).unwrap();
+        let acknowledger = RoleId::new(2).unwrap();
+        let specs = [
+            RegionSpec {
+                role: producer,
+                writer: Endpoint::Initiator,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+            RegionSpec {
+                role: acknowledger,
+                writer: Endpoint::Responder,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+        ];
+        let routes = [
+            AcknowledgementRouteSpec {
+                owner: acknowledger,
+                target: producer,
+                slot_index: 0,
+                cell_index: 0,
+            },
+            AcknowledgementRouteSpec {
+                owner: producer,
+                target: acknowledger,
+                slot_index: 0,
+                cell_index: 0,
+            },
+        ];
+        let topology = RegionSetLayout::calculate(
+            [9; 32],
+            11,
+            &specs,
+            &routes,
+            LayoutLimits {
+                maximum_mapping_size: 1 << 20,
+                maximum_slot_count: 2,
+                maximum_acknowledgement_count: 2,
+                maximum_payload_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        let producer_layout = topology.region(producer).unwrap();
+        let mut producer_owner =
+            QuiescentRegion::new(producer_layout.total_size() as usize).unwrap();
+        producer_layout
+            .encode_into(producer_owner.as_bytes_mut())
+            .unwrap();
+        let producer_expected = ValidationExpectations {
+            schema_id: [9; 32],
+            generation: 11,
+            role: producer,
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: producer_owner.len() as u64,
+        };
+        let producer_validated = unsafe {
+            ValidatedRegionLayout::validate(producer_owner.as_bytes(), producer_expected, &topology)
+        }
+        .unwrap();
+        let producer_len = producer_owner.len();
+        let mut producer_runtime = producer_owner.into_local_writer(producer_len).unwrap();
+        let producer_peer = Mapping::map_entry(
+            producer_runtime.mapping.task,
+            producer_runtime.mapping.mapped_len,
+            &producer_runtime.peer_entry,
+        )
+        .unwrap();
+
+        let ack_layout = topology.region(acknowledger).unwrap();
+        let mut ack_owner = QuiescentRegion::new(ack_layout.total_size() as usize).unwrap();
+        ack_layout.encode_into(ack_owner.as_bytes_mut()).unwrap();
+        let ack_expected = ValidationExpectations {
+            schema_id: [9; 32],
+            generation: 11,
+            role: acknowledger,
+            writer: Endpoint::Responder,
+            maximum_mapping_size: ack_owner.len() as u64,
+        };
+        let ack_validated = unsafe {
+            ValidatedRegionLayout::validate(ack_owner.as_bytes(), ack_expected, &topology)
+        }
+        .unwrap();
+        let ack_len = ack_owner.len();
+        let mut ack_runtime = ack_owner.into_local_writer(ack_len).unwrap();
+        let ack_peer = Mapping::map_entry(
+            ack_runtime.mapping.task,
+            ack_runtime.mapping.mapped_len,
+            &ack_runtime.peer_entry,
+        )
+        .unwrap();
+
+        {
+            let mut writer = WriterRegion::new(
+                TestWriterWitness(&mut producer_runtime.mapping),
+                producer_validated.clone(),
+                topology.clone(),
+            )
+            .unwrap();
+            writer
+                .slot(0)
+                .unwrap()
+                .prepare_publish(1, None)
+                .unwrap()
+                .publish(4)
+                .unwrap();
+        }
+        let reader = ReaderRegion::new(
+            TestReaderWitness(&producer_peer),
+            producer_validated,
+            topology.clone(),
+        )
+        .unwrap();
+        let observation = reader.slot(0).unwrap().observe(1).unwrap();
+        reader.slot(0).unwrap().recheck(observation).unwrap();
+
+        {
+            let mut writer = WriterRegion::new(
+                TestWriterWitness(&mut ack_runtime.mapping),
+                ack_validated.clone(),
+                topology.clone(),
+            )
+            .unwrap();
+            writer
+                .acknowledgement(producer, 0)
+                .unwrap()
+                .acknowledge(observation)
+                .unwrap();
+        }
+        let reader =
+            ReaderRegion::new(TestReaderWitness(&ack_peer), ack_validated, topology).unwrap();
+        let acknowledged = reader.acknowledgement(producer, 0).unwrap().observe();
+        assert_eq!(acknowledged.sequence(), 1);
+        assert_eq!(acknowledged.slot_index(), 0);
+        assert_eq!(acknowledged.cell_index(), 0);
     }
 }

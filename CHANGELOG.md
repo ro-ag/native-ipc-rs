@@ -16,3 +16,11 @@ Versioning once a stable API is released.
 - macOS Mach quiescent/local-writer/remote-writer typestates and live
   permission-escalation tests.
 - Explicit incomplete Linux and Windows backends.
+- Composition-validated one-cell-per-slot acknowledgement routes.
+- Audited mapping-to-atomic binding with platform permission witnesses,
+  peer-mutable padding, and compile-time field offsets.
+- Fenced generation/sequence/length snapshot rechecks with an explicit
+  no-payload-integrity guarantee.
+- Explicit macOS page-rounded capability sizes and zero-padding validation.
+- No-default-feature CI tests, core Miri, bounded hostile corpora, and a full
+  common-core binding lifecycle test.
