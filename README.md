@@ -231,7 +231,7 @@ cargo run -p native-ipc --example common_memory
 
 ## Current status
 
-Implemented through `0.3.0`:
+Implemented through `0.4.0`:
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -276,7 +276,7 @@ stack-use-after-return detection are enabled, and the standard library is
 rebuilt with instrumentation so the check covers allocation boundaries beyond
 this workspace's crates.
 
-Still intentionally outside the `0.3` release line are a high-level
+Still intentionally outside the `0.4` release line are a high-level
 negotiation/supervisor API, payload authenticity or encryption, automatic
 guard-page policy, and a stable `1.0` compatibility promise. The current crates
 are low-level building blocks for applications that explicitly own protocol
