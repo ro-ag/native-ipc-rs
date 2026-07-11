@@ -7,20 +7,38 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.97-blue.svg)](rust-toolchain.toml)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%26%20Windows%20ARM64%2FAMD64%20%7C%20macOS%20ARM64-informational.svg)](#supported-targets)
 
-`native-ipc-rs` is a security-oriented Rust foundation for bounded,
-pointer-free IPC over least-authority native shared-memory capabilities. It
-separates a domain-neutral wire/layout core from operating-system capability
-enforcement. It is not yet a complete process transport.
+`native-ipc-rs` consolidates safe cross-process shared memory behind a single
+Rust library. No portable OS primitive exists for sealed, least-authority
+anonymous shared memory — `memfd_create` and file seals are Linux-only, macOS
+instead attenuates Mach memory-entry rights, and Windows duplicates
+exact-rights section handles — so this workspace pairs one security-oriented,
+pointer-free wire/layout core with a native adapter for each kernel's own
+mechanism. It is not yet a complete process transport.
 
 ## Why this repository exists
 
-Shared memory is fast, but a conventional wrapper can accidentally turn an
-untrusted process into a holder of writable aliases, native handles with excess
-rights, or Rust references whose invariants another process can violate.
-Serialization alone does not solve capability transfer, mapping permissions,
-peer identity, process cleanup, or replay across restarts.
+**One safe library instead of three unsafe FFI surfaces.** Every mainstream
+kernel can share memory with least authority, but each one does it with a
+different, non-portable mechanism, and the portable denominators are the weak
+ones. POSIX `shm_open` exists across Unix systems but offers a shared, named
+namespace and no sealing; `memfd_create`'s anonymous, sealable
+objects never left Linux; macOS expresses the same policy as Mach memory
+entries whose maximum protection clamps a peer's rights; Windows expresses it
+as exact-access duplicated section handles. An application that wants the
+strong per-OS behavior otherwise ends up owning three unrelated unsafe FFI
+surfaces, three transfer channels, and three peer-authentication schemes.
+`native-ipc-rs` consolidates them: one API, one security contract, and the
+strongest native object each kernel provides (see
+[supported targets](#supported-targets) for the exact mechanism per platform).
 
-This repository separates those concerns:
+**Safety, not just portability.** Shared memory is fast, but a conventional
+wrapper can accidentally turn an untrusted process into a holder of writable
+aliases, native handles with excess rights, or Rust references whose
+invariants another process can violate. Serialization alone does not solve
+capability transfer, mapping permissions, peer identity, process cleanup, or
+replay across restarts.
+
+This repository addresses both concerns:
 
 - a pointer-free core manually encodes fixed-width wire/layout data and checks
   every hostile length, offset, role, generation, sequence, and resource bound;
@@ -113,8 +131,9 @@ produce a torn owned copy, so protocol decoding must remain hostile-input safe.
 ## Common memory interface
 
 `native_ipc::memory::NativeRegion` selects the strongest supported anonymous
-shared-memory object at compile time. Applications describe intent rather than
-calling Mach, Unix, or Win32 APIs directly:
+shared-memory object at compile time — a sealed `memfd` on Linux, a Mach VM
+memory entry on macOS, an unnamed section on Windows. Applications describe
+intent rather than calling Mach, Unix, or Win32 APIs directly:
 
 ```rust
 use native_ipc::memory::{

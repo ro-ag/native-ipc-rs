@@ -1,7 +1,11 @@
 # native-ipc
 
-`native-ipc` is the public facade for the `native-ipc-rs` workspace. It
-re-exports:
+`native-ipc` is the public facade for the `native-ipc-rs` workspace: one safe
+API for least-authority shared memory across Linux, macOS, and Windows. There
+is no portable OS primitive for sealed anonymous shared memory — `memfd_create`
+exists only on Linux, macOS uses Mach memory-entry rights, and Windows uses
+exact-rights section handles — so this crate consolidates the three native
+mechanisms behind a single interface and security contract. It re-exports:
 
 - `native-ipc-core` for pointer-free codecs, checked shared-memory layouts,
   sequencing, and audited reader/writer bindings; and
@@ -16,8 +20,9 @@ Supported targets are Linux and Windows on ARM64 or AMD64, and macOS on ARM64:
 instead of selecting an unaudited fallback.
 
 The `native_ipc::memory` module provides one allocation and lifecycle API for
-the best native object on the current target: sealed `memfd` on Linux, Mach VM
-memory entries on macOS, and unnamed sections on Windows. Regions may be fixed
+the best native object on the current target — sealed `memfd` on Linux, Mach
+VM memory entries on macOS, and unnamed sections on Windows — so application
+code never branches on the operating system. Regions may be fixed
 or replacement-growable before sharing, can be cleared for reuse, and can be
 explicitly destroyed with a complete clearing pass.
 

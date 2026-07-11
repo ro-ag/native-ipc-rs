@@ -72,6 +72,10 @@ re-acknowledgement is intentionally idempotent.
 
 ## Native policy
 
+No OS-portable primitive provides sealed, least-authority anonymous shared
+memory, so every backend implements the same capability policy with its own
+kernel's native mechanism:
+
 - macOS uses explicit page-rounded capability lengths and typed memory-entry rights. Only the
   quiescent state exposes slices. Consuming transitions choose a local writer
   with a read-only peer entry or a remote writer with a read-write peer entry

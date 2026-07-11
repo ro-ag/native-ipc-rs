@@ -5,6 +5,14 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Documentation
+
+- State the consolidation goal explicitly across the README, crate landing
+  pages, and architecture doc: one safe library over the three non-portable
+  native mechanisms for sealed, least-authority anonymous shared memory —
+  `memfd_create` and file seals are Linux-only, macOS uses Mach memory-entry
+  rights, and Windows uses exact-rights duplicated section handles.
+
 ## [0.3.0] - 2026-07-11
 
 ### Fixed

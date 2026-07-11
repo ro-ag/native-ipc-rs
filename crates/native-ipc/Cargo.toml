@@ -1,6 +1,6 @@
 [package]
 name = "native-ipc"
-description = "Secure-by-construction foundations for native cross-process IPC"
+description = "One safe API for least-authority native shared memory: sealed memfd on Linux, Mach memory entries on macOS, exact-rights sections on Windows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
