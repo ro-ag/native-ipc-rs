@@ -212,7 +212,7 @@ cargo run -p native-ipc --example common_memory
 
 ## Current status
 
-Implemented in `0.1.0`:
+Implemented through `0.3.0`:
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -220,11 +220,16 @@ Implemented in `0.1.0`:
 - role/generation/capacity/index/count/permission-bound reader and writer
   capabilities;
 - split acknowledgement reader/writer capabilities and exact reuse checks;
+- a common cross-platform native-memory lifecycle API with fixed or bounded
+  pre-share growth, mandatory sealing, reusable clearing, and explicit
+  clear-and-destroy;
+- canonical, manifest-bound `CAPABILITY -> READY -> COMMIT` transactions that
+  keep runtime mappings unavailable until both peers finish validation;
 - macOS Mach VM quiescent/local-writer/remote-writer typestates, including live
-  permission probes, authenticated bootstrap, memory-entry transfer/import, and
-  a bidirectional helper-process fixture;
-- Linux sealed `memfd`, exact `SCM_RIGHTS`, `SO_PEERCRED`, `pidfd`, and owned
-  helper lifecycle;
+  permission probes, authenticated bootstrap, memory-entry transfer/import,
+  READY/COMMIT exchange, and a bidirectional helper-process fixture;
+- Linux sealed `memfd`, short-read-safe exact `SCM_RIGHTS`, `SO_PEERCRED`,
+  `pidfd`, and owned helper lifecycle;
 - Windows least-rights unnamed sections, exact-PID private named pipes,
   suspended Job-contained helpers, and cross-process handle import;
 - portable golden vectors, deterministic adversarial fixtures, Miri, and
@@ -252,11 +257,11 @@ stack-use-after-return detection are enabled, and the standard library is
 rebuilt with instrumentation so the check covers allocation boundaries beyond
 this workspace's crates.
 
-Still intentionally outside `0.1.x` are a high-level negotiation/supervisor
-API, payload authenticity or encryption, automatic guard-page policy, and a
-stable `1.0` compatibility promise. The current crates are low-level building
-blocks for applications that explicitly own protocol negotiation, resource
-budgets, compatibility policy, and guard-page decisions.
+Still intentionally outside the `0.3` release line are a high-level
+negotiation/supervisor API, payload authenticity or encryption, automatic
+guard-page policy, and a stable `1.0` compatibility promise. The current crates
+are low-level building blocks for applications that explicitly own protocol
+negotiation, resource budgets, compatibility policy, and guard-page decisions.
 
 ## Toolchain and validation
 
