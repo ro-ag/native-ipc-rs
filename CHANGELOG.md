@@ -5,6 +5,15 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
+### Changed
+
+- **Breaking:** Windows `import_reader` and `import_writer` are now
+  `ChildChannel` methods instead of free functions, and `MacBindingError` /
+  `WindowsError` gained the `ForeignPending` variant. Code calling the free
+  functions or matching those enums exhaustively must update.
+
 ### Fixed
 
 - Bind every pending transfer and import value to its originating channel and
