@@ -5,6 +5,8 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-10
+
 ### Added
 
 - Add a common cross-platform native memory lifecycle API with fixed or bounded
@@ -52,5 +54,6 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ro-ag/native-ipc-rs/releases/tag/v0.1.0

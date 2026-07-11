@@ -14,8 +14,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-native-ipc-core = { path = "../native-ipc-core", version = "0.1.0" }
-native-ipc-platform = { path = "../native-ipc-platform", version = "0.1.0" }
+native-ipc-core = { path = "../native-ipc-core", version = "0.2.0" }
+native-ipc-platform = { path = "../native-ipc-platform", version = "0.2.0" }
 
 [features]
 default = ["std"]
