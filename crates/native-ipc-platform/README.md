@@ -4,6 +4,12 @@ Least-authority native shared-memory mappings, authenticated capability
 transfer, and owned helper lifecycles for
 [`native-ipc`](https://crates.io/crates/native-ipc).
 
+No kernel-portable primitive provides sealed, least-authority anonymous shared
+memory: `memfd_create` and file seals exist only on Linux, macOS clamps rights
+through Mach memory entries, and Windows through exact-access duplicated
+section handles. This crate implements one capability policy on each kernel's
+own mechanism so callers never touch the divergent native APIs.
+
 Supported targets:
 
 - Linux ARM64/AMD64: sealed `memfd`, `SCM_RIGHTS`, `SO_PEERCRED`, and pidfds.
