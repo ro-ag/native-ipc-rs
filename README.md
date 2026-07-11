@@ -102,6 +102,49 @@ The recheck bounds memory access and detects metadata changes. It does not make
 a malicious writer's payload trustworthy: same-sequence mutation may still
 produce a torn owned copy, so protocol decoding must remain hostile-input safe.
 
+## Common memory interface
+
+`native_ipc::memory::NativeRegion` selects the strongest supported anonymous
+shared-memory object at compile time. Applications describe intent rather than
+calling Mach, Unix, or Win32 APIs directly:
+
+```rust
+use native_ipc::memory::{
+    CleanupPolicy, NativeRegion, RegionOptions, WriterOwner,
+};
+
+# fn demo() -> Result<(), native_ipc::memory::MemoryError> {
+let options = RegionOptions::growable(
+    64 * 1024,             // initial logical bytes
+    1024 * 1024,           // maximum before sharing
+    WriterOwner::Creator,  // peer receives read-only access
+)
+.with_cleanup(CleanupPolicy::ClearThenRelease);
+
+let mut region = NativeRegion::allocate(options)?;
+region.initialize(|bytes| bytes[..4].copy_from_slice(b"NIPC"));
+region.grow(128 * 1024)?; // replaces the still-private mapping
+region.clear();           // zero all mapped bytes and keep it reusable
+region.destroy();         // zero all mapped bytes, then release explicitly
+# Ok(())
+# }
+```
+
+| Operation | State | Guarantee |
+| --- | --- | --- |
+| `RegionOptions::fixed` | Before allocation | Mapping cannot grow |
+| `RegionOptions::growable` | Private only | Replacement growth up to an explicit maximum |
+| `initialize` | Quiescent | Closure sees logical bytes; padding remains hidden and zero |
+| `clear` | Quiescent | Volatile-zero the complete mapping and retain it for reuse |
+| `destroy` | Quiescent | Volatile-zero, fence, unmap, and close the anonymous object |
+| `prepare_for_sharing` | Consuming transition | Remove byte/growth access and retain the seal/permission plan |
+
+Sealing is deliberately not an optional Boolean. `SealPolicy::RequiredOnShare`
+is fixed by the safe interface. The consuming platform transition applies
+`memfd` seals, Mach maximum rights, or exact Windows handle rights according to
+the selected backend. Size, writer ownership, and permissions cannot change
+after sharing.
+
 ## Examples
 
 Add the public facade with:
@@ -117,6 +160,7 @@ before native capability transfer:
 cargo run -p native-ipc-core --example bounded_codec
 cargo run -p native-ipc-core --example checked_layout
 cargo run -p native-ipc-platform --example quiescent_region
+cargo run -p native-ipc --example common_memory
 ```
 
 - [`bounded_codec.rs`](crates/native-ipc-core/examples/bounded_codec.rs) defines
@@ -128,6 +172,8 @@ cargo run -p native-ipc-platform --example quiescent_region
 - [`quiescent_region.rs`](crates/native-ipc-platform/examples/quiescent_region.rs)
   allocates the current OS's zeroed native capability and demonstrates that
   mutable slices exist only before the consuming transfer transition.
+- [`common_memory.rs`](crates/native-ipc/examples/common_memory.rs) uses the
+  portable fixed/grow/clear/destroy lifecycle without selecting an OS backend.
 
 ## Security invariants
 

@@ -5,6 +5,13 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Added
+
+- Add a common cross-platform native memory lifecycle API with fixed or bounded
+  pre-share growth, one-writer permission plans, reusable clearing, explicit
+  clear-and-destroy, backend capability reporting, and mandatory sealing on
+  transfer.
+
 ### Documentation
 
 - Add architecture and memory-access diagrams, runnable codec/layout examples,
