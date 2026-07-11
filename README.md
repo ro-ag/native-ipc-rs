@@ -72,9 +72,16 @@ The workspace contains:
 Ordinary byte slices exist only while a new mapping is private and quiescent.
 The creator writes the canonical layout, validates the complete page-rounded
 range, chooses the sole writer, and asks the OS to attenuate the peer's rights.
-After authenticated transfer and import, both sides signal `READY`; runtime APIs
-then operate through mapping-owned capabilities without returning shared
-references.
+After authenticated transfer and import, the peer signals `READY` and the
+creator acknowledges `COMMIT`; consuming typestates expose runtime APIs only
+after that barrier completes. Runtime access remains mapping-owned and never
+returns shared references.
+
+The fixed-width control manifest covers an arbitrary bounded batch of
+directional regions and binds each transaction to authenticated process
+identities, a unique transfer ID, canonical roles, schema and generation,
+native access, and exact capability lengths. Control operations require
+exclusive channel access, so independent transfers cannot interleave.
 
 ```mermaid
 sequenceDiagram
@@ -91,6 +98,7 @@ sequenceDiagram
     OS-->>P: Transfer capability over private channel
     P->>P: Import with exact access and validate again
     P-->>C: READY
+    C-->>P: COMMIT
     C->>R: Copy payload, then Release-publish sequence
     P->>R: Acquire sequence and checked length
     P->>P: Copy payload into owned storage

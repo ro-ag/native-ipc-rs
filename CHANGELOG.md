@@ -5,6 +5,15 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Fixed
+
+- Make native capability bootstrap a canonical `CAPABILITY -> READY -> COMMIT`
+  transaction. Runtime reader and writer regions remain hidden until both peers
+  validate the exact versioned manifest and COMMIT succeeds.
+- Make Linux `SCM_RIGHTS` stream framing tolerate short reads and immediately
+  own every installed descriptor so malformed transfers cannot leak file
+  descriptors.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

@@ -33,3 +33,5 @@ pub enum BackendStatus {
     /// The backend is deliberately unavailable rather than offering weaker behavior.
     Incomplete(&'static str),
 }
+
+mod protocol;

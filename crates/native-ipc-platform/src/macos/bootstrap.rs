@@ -5,6 +5,8 @@ use std::fmt;
 use std::mem::{size_of, zeroed};
 
 use super::{KERN_SUCCESS, MachPort, current_task, deallocate_port};
+use crate::protocol::{CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest};
+use native_ipc_core::layout::ValidationExpectations;
 
 type MachMsgReturn = c_int;
 type PosixSpawnAttr = *mut c_void;
@@ -24,6 +26,9 @@ const MACH_RCV_TRAILER_AUDIT: u32 = 3 << 24;
 const TASK_BOOTSTRAP_PORT: c_int = 4;
 const MESSAGE_ID: c_int = 0x4e49_5043;
 const MESSAGE_MAGIC: [u8; 8] = *b"NIPCMACH";
+const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
+const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const ENV_NONCE: &str = "NATIVE_IPC_MACH_NONCE";
 const ENV_PARENT_PID: &str = "NATIVE_IPC_PARENT_PID";
 const TIMEOUT_MS: u32 = 10_000;
@@ -124,6 +129,7 @@ struct PortMessage {
     descriptor: MachMsgPortDescriptor,
     magic: [u8; 8],
     nonce: [u8; 32],
+    transcript: [u8; CONTROL_FRAME_LEN],
 }
 
 #[repr(C)]
@@ -293,7 +299,12 @@ impl SpawnedHelper {
     /// Receives the helper's control port and authenticates its audit PID.
     pub fn authenticate(mut self) -> Result<ParentChannel, BootstrapError> {
         let receive = self.receive.take().ok_or(BootstrapError::InvalidMessage)?;
-        let child_send = match receive_port(&receive, &self.nonce, self.pid as u32) {
+        let child_send = match receive_port(
+            &receive,
+            &self.nonce,
+            self.pid as u32,
+            &[0; CONTROL_FRAME_LEN],
+        ) {
             Ok(right) => right,
             Err(error) => {
                 terminate_and_reap(self.pid);
@@ -307,6 +318,9 @@ impl SpawnedHelper {
             nonce: self.nonce,
             peer_pid: self.pid as u32,
             reaped: false,
+            pending_entries: Vec::new(),
+            next_transfer_id: 1,
+            poisoned: false,
         };
         self.pid = 0;
         Ok(channel)
@@ -341,21 +355,74 @@ pub struct ParentChannel {
     nonce: [u8; 32],
     peer_pid: u32,
     reaped: bool,
+    pending_entries: Vec<ManifestEntry>,
+    next_transfer_id: u64,
+    poisoned: bool,
 }
 
 impl ParentChannel {
     /// Sends one port right to the authenticated helper.
-    pub(super) fn send(&self, port: MachPort) -> Result<(), BootstrapError> {
-        send_port(self.peer_send.0, port, MACH_MSG_TYPE_COPY_SEND, &self.nonce)
+    pub(super) fn send(
+        &mut self,
+        port: MachPort,
+        expected: ValidationExpectations,
+        len: usize,
+        access: PeerAccess,
+    ) -> Result<(), BootstrapError> {
+        let result = (|| {
+            let entry = ManifestEntry::validated(expected, len, access)
+                .ok_or(BootstrapError::InvalidMessage)?;
+            let transcript = self.single_manifest(entry)?.encode(CAPABILITY_MAGIC);
+            send_port(
+                self.peer_send.0,
+                port,
+                MACH_MSG_TYPE_COPY_SEND,
+                &self.nonce,
+                &transcript,
+            )?;
+            self.pending_entries.push(entry);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
     /// Kernel-authenticated helper PID.
     pub const fn peer_pid(&self) -> u32 {
         self.peer_pid
     }
-    /// Waits for the helper's authenticated READY barrier.
-    pub fn wait_ready(&self) -> Result<(), BootstrapError> {
-        drop(receive_port(&self._receive, &self.nonce, self.peer_pid)?);
-        Ok(())
+    /// Waits for authenticated READY and acknowledges it with COMMIT.
+    pub(super) fn ready_and_commit(&mut self) -> Result<(), BootstrapError> {
+        let result = (|| {
+            let manifest = self.batch_manifest()?;
+            drop(receive_port(
+                &self._receive,
+                &self.nonce,
+                self.peer_pid,
+                &manifest.encode(READY_MAGIC),
+            )?);
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let marker = ReceiveRight::allocate()?;
+            send_port(
+                self.peer_send.0,
+                marker.0,
+                MACH_MSG_TYPE_MAKE_SEND,
+                &self.nonce,
+                &manifest.encode(COMMIT_MAGIC),
+            )?;
+            self.pending_entries.clear();
+            self.next_transfer_id = self
+                .next_transfer_id
+                .checked_add(1)
+                .ok_or(BootstrapError::InvalidMessage)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
     /// Waits for normal helper exit and consumes the child cleanup ledger.
     pub fn wait(mut self) -> Result<(), BootstrapError> {
@@ -369,6 +436,43 @@ impl ParentChannel {
             Err(BootstrapError::Spawn(status))
         }
     }
+
+    fn single_manifest(&self, entry: ManifestEntry) -> Result<TransferManifest, BootstrapError> {
+        TransferManifest::new(
+            self.nonce,
+            std::process::id(),
+            self.peer_pid,
+            self.next_transfer_id,
+            vec![entry],
+        )
+        .ok_or(BootstrapError::InvalidMessage)
+    }
+
+    fn batch_manifest(&self) -> Result<TransferManifest, BootstrapError> {
+        if self.poisoned {
+            return Err(BootstrapError::InvalidMessage);
+        }
+        TransferManifest::new(
+            self.nonce,
+            std::process::id(),
+            self.peer_pid,
+            self.next_transfer_id,
+            self.pending_entries.clone(),
+        )
+        .ok_or(BootstrapError::InvalidMessage)
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+        if !self.reaped {
+            terminate_and_reap(self.peer_pid as Pid);
+            self.reaped = true;
+        }
+    }
+
+    pub(super) fn poison_transaction(&mut self) {
+        self.poison();
+    }
 }
 
 /// Child side obtained from its injected special bootstrap port.
@@ -377,6 +481,9 @@ pub struct ChildChannel {
     receive: ReceiveRight,
     nonce: [u8; 32],
     parent_pid: u32,
+    pending_entries: Vec<ManifestEntry>,
+    next_transfer_id: u64,
+    poisoned: bool,
 }
 
 impl ChildChannel {
@@ -398,27 +505,101 @@ impl ChildChannel {
             return Err(BootstrapError::InvalidEnvironment);
         }
         let receive = ReceiveRight::allocate()?;
-        send_port(parent, receive.0, MACH_MSG_TYPE_MAKE_SEND, &nonce)?;
+        send_port(
+            parent,
+            receive.0,
+            MACH_MSG_TYPE_MAKE_SEND,
+            &nonce,
+            &[0; CONTROL_FRAME_LEN],
+        )?;
         Ok(Self {
             _parent_send: SendRight(parent),
             receive,
             nonce,
             parent_pid,
+            pending_entries: Vec::new(),
+            next_transfer_id: 1,
+            poisoned: false,
         })
     }
     /// Receives one port right from the authenticated parent.
-    pub(super) fn receive(&self) -> Result<SendRight, BootstrapError> {
-        receive_port(&self.receive, &self.nonce, self.parent_pid)
+    pub(super) fn receive(
+        &mut self,
+        expected: ValidationExpectations,
+        len: usize,
+        access: PeerAccess,
+    ) -> Result<SendRight, BootstrapError> {
+        let result = (|| {
+            let entry = ManifestEntry::validated(expected, len, access)
+                .ok_or(BootstrapError::InvalidMessage)?;
+            let transcript = self.single_manifest(entry)?.encode(CAPABILITY_MAGIC);
+            let right = receive_port(&self.receive, &self.nonce, self.parent_pid, &transcript)?;
+            self.pending_entries.push(entry);
+            Ok(right)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
-    /// Signals that all imported mappings passed quiescent validation.
-    pub fn signal_ready(&self) -> Result<(), BootstrapError> {
-        let marker = ReceiveRight::allocate()?;
-        send_port(
-            self._parent_send.0,
-            marker.0,
-            MACH_MSG_TYPE_MAKE_SEND,
-            &self.nonce,
+    /// Signals validation and waits for the creator's COMMIT acknowledgement.
+    pub(super) fn ready_and_wait_commit(&mut self) -> Result<(), BootstrapError> {
+        let result = (|| {
+            let manifest = self.batch_manifest()?;
+            let marker = ReceiveRight::allocate()?;
+            send_port(
+                self._parent_send.0,
+                marker.0,
+                MACH_MSG_TYPE_MAKE_SEND,
+                &self.nonce,
+                &manifest.encode(READY_MAGIC),
+            )?;
+            drop(receive_port(
+                &self.receive,
+                &self.nonce,
+                self.parent_pid,
+                &manifest.encode(COMMIT_MAGIC),
+            )?);
+            self.pending_entries.clear();
+            self.next_transfer_id = self
+                .next_transfer_id
+                .checked_add(1)
+                .ok_or(BootstrapError::InvalidMessage)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn single_manifest(&self, entry: ManifestEntry) -> Result<TransferManifest, BootstrapError> {
+        TransferManifest::new(
+            self.nonce,
+            self.parent_pid,
+            std::process::id(),
+            self.next_transfer_id,
+            vec![entry],
         )
+        .ok_or(BootstrapError::InvalidMessage)
+    }
+
+    fn batch_manifest(&self) -> Result<TransferManifest, BootstrapError> {
+        if self.poisoned {
+            return Err(BootstrapError::InvalidMessage);
+        }
+        TransferManifest::new(
+            self.nonce,
+            self.parent_pid,
+            std::process::id(),
+            self.next_transfer_id,
+            self.pending_entries.clone(),
+        )
+        .ok_or(BootstrapError::InvalidMessage)
+    }
+
+    pub(super) fn poison_transaction(&mut self) {
+        self.poisoned = true;
     }
 }
 
@@ -427,6 +608,7 @@ fn send_port(
     port: MachPort,
     disposition: u8,
     nonce: &[u8; 32],
+    transcript: &[u8; CONTROL_FRAME_LEN],
 ) -> Result<(), BootstrapError> {
     let mut message = PortMessage {
         header: MachMsgHeader {
@@ -449,6 +631,7 @@ fn send_port(
         },
         magic: MESSAGE_MAGIC,
         nonce: *nonce,
+        transcript: *transcript,
     };
     // SAFETY: complete initialized message buffer is live for bounded send.
     mach("mach_msg(send)", unsafe {
@@ -468,6 +651,7 @@ fn receive_port(
     receive: &ReceiveRight,
     nonce: &[u8; 32],
     expected_pid: u32,
+    expected_transcript: &[u8; CONTROL_FRAME_LEN],
 ) -> Result<SendRight, BootstrapError> {
     // SAFETY: zero is valid initialization for receive buffer/out descriptor.
     let mut buffer: ReceiveBuffer = unsafe { zeroed() };
@@ -492,6 +676,7 @@ fn receive_port(
         || buffer.message.descriptor.disposition != MACH_MSG_TYPE_PORT_SEND
         || buffer.message.magic != MESSAGE_MAGIC
         || buffer.message.nonce != *nonce
+        || buffer.message.transcript != *expected_transcript
         || buffer.message.descriptor.name == MACH_PORT_NULL
         || buffer.trailer.trailer_size as usize != size_of::<AuditTrailer>()
     {
@@ -581,7 +766,7 @@ mod tests {
         ValidationExpectations,
     };
     use std::os::unix::ffi::OsStrExt;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn topology() -> (RegionSetLayout, RoleId, RoleId) {
         let producer = RoleId::new(1).unwrap();
@@ -688,14 +873,16 @@ mod tests {
             CString::new("--nocapture").unwrap(),
         ];
         let helper = SpawnedHelper::spawn(&path, &arguments).unwrap();
-        let channel = helper.authenticate().unwrap();
-        let mut writer = owner
-            .transfer_local_writer(expected, topology.clone(), &channel)
+        let mut channel = helper.authenticate().unwrap();
+        let writer = owner
+            .transfer_local_writer(expected, topology.clone(), &mut channel)
             .unwrap();
         let peer_reader = peer_owner
-            .transfer_remote_writer(peer_expected, topology, &channel)
+            .transfer_remote_writer(peer_expected, topology, &mut channel)
             .unwrap();
-        channel.wait_ready().unwrap();
+        let before_commit = Instant::now();
+        let (mut writer, peer_reader) = channel.commit_transfers(writer, peer_reader).unwrap();
+        assert!(before_commit.elapsed() >= Duration::from_millis(90));
         writer.publish(0, 1, None, b"cross-process-mach").unwrap();
         for _ in 0..10_000 {
             if let Ok(payload) = peer_reader.copy_payload(0, 1) {
@@ -731,14 +918,15 @@ mod tests {
             writer: Endpoint::Responder,
             maximum_mapping_size: peer_len as u64,
         };
-        let channel = ChildChannel::connect_from_environment().unwrap();
+        let mut channel = ChildChannel::connect_from_environment().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
         let reader = channel
             .receive_reader(len, expected, topology.clone())
             .unwrap();
-        let mut peer_writer = channel
+        let peer_writer = channel
             .receive_writer(peer_len, peer_expected, topology)
             .unwrap();
-        channel.signal_ready().unwrap();
+        let (reader, mut peer_writer) = channel.commit_imports(reader, peer_writer).unwrap();
         for _ in 0..10_000 {
             if let Ok(payload) = reader.copy_payload(0, 1) {
                 assert_eq!(payload, b"cross-process-mach");
