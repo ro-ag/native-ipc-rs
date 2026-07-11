@@ -5,7 +5,7 @@
 [![docs.rs](https://docs.rs/native-ipc/badge.svg)](https://docs.rs/native-ipc)
 [![license](https://img.shields.io/crates/l/native-ipc.svg)](LICENSE-MIT)
 [![MSRV](https://img.shields.io/badge/MSRV-1.97-blue.svg)](rust-toolchain.toml)
-[![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational.svg)](#platform-capabilities)
+[![platforms](https://img.shields.io/badge/platforms-Linux%20%26%20Windows%20ARM64%2FAMD64%20%7C%20macOS%20ARM64-informational.svg)](#supported-targets)
 
 `native-ipc-rs` is a security-oriented Rust foundation for bounded,
 pointer-free IPC over least-authority native shared-memory capabilities. It
@@ -217,11 +217,21 @@ Implemented in `0.1.0`:
 
 ### Platform capabilities
 
-| Platform | Shared-memory capability | Peer authentication | Lifecycle containment |
-| --- | --- | --- | --- |
-| Linux | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
-| macOS | Mach memory-entry send rights | Mach audit-token PID | private bootstrap port + reap |
-| Windows | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
+#### Supported targets
+
+| Platform | Architecture | Rust target | Shared-memory capability | Peer authentication | Lifecycle containment |
+| --- | --- | --- | --- | --- | --- |
+| Linux | AMD64 | `x86_64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
+| Linux | ARM64 | `aarch64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
+| macOS | ARM64 | `aarch64-apple-darwin` | Mach memory-entry send rights | Mach audit-token PID | private bootstrap port + reap |
+| Windows | AMD64 | `x86_64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
+| Windows | ARM64 | `aarch64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
+
+The public facade and native platform crate fail compilation on other target
+combinations. The platform-neutral `native-ipc-core` crate remains usable
+wherever its documented 64-bit atomic requirement is met. CI runs the full
+workspace and native permission/helper-process tests on all five targets; no
+Intel macOS support is claimed.
 
 Still intentionally outside `0.1.x` are a high-level negotiation/supervisor
 API, payload authenticity or encryption, automatic guard-page policy, and a

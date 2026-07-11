@@ -9,6 +9,12 @@ re-exports:
   capability transfer, and owned helper-process lifecycles on Linux, macOS,
   and Windows.
 
+Supported targets are Linux and Windows on ARM64 or AMD64, and macOS on ARM64:
+`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
+`aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc`, and
+`aarch64-apple-darwin`. Other OS/architecture combinations fail compilation
+instead of selecting an unaudited fallback.
+
 The `native_ipc::memory` module provides one allocation and lifecycle API for
 the best native object on the current target: sealed `memfd` on Linux, Mach VM
 memory entries on macOS, and unnamed sections on Windows. Regions may be fixed

@@ -14,6 +14,15 @@ pub enum NativePlatform {
     Windows,
 }
 
+/// Processor architecture selected for the native backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeArchitecture {
+    /// 64-bit Arm (Rust `aarch64`) architecture.
+    Arm64,
+    /// 64-bit x86 (Rust `x86_64`) architecture.
+    Amd64,
+}
+
 /// Kernel mechanism that freezes shared-memory authority before transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorityMechanism {
@@ -29,6 +38,7 @@ pub enum AuthorityMechanism {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeMemoryCapabilities {
     platform: NativePlatform,
+    architecture: NativeArchitecture,
     authority: AuthorityMechanism,
 }
 
@@ -36,6 +46,11 @@ impl NativeMemoryCapabilities {
     /// Selected operating-system backend.
     pub const fn platform(self) -> NativePlatform {
         self.platform
+    }
+
+    /// Selected processor architecture.
+    pub const fn architecture(self) -> NativeArchitecture {
+        self.architecture
     }
 
     /// Native mechanism used to freeze or attenuate authority.
@@ -68,6 +83,7 @@ impl NativeMemoryCapabilities {
 pub const fn native_memory_capabilities() -> NativeMemoryCapabilities {
     NativeMemoryCapabilities {
         platform: native_platform(),
+        architecture: native_architecture(),
         authority: authority_mechanism(),
     }
 }
@@ -600,6 +616,16 @@ const fn native_platform() -> NativePlatform {
     NativePlatform::Windows
 }
 
+#[cfg(target_arch = "aarch64")]
+const fn native_architecture() -> NativeArchitecture {
+    NativeArchitecture::Arm64
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn native_architecture() -> NativeArchitecture {
+    NativeArchitecture::Amd64
+}
+
 #[cfg(target_os = "linux")]
 const fn authority_mechanism() -> AuthorityMechanism {
     AuthorityMechanism::DescriptorSeals
@@ -616,6 +642,16 @@ const fn authority_mechanism() -> AuthorityMechanism {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_report_the_compilation_architecture() {
+        let capabilities = native_memory_capabilities();
+
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(capabilities.architecture(), NativeArchitecture::Arm64);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(capabilities.architecture(), NativeArchitecture::Amd64);
+    }
 
     #[test]
     fn growable_region_preserves_bytes_and_reports_policy() {
