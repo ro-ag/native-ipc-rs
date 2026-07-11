@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 

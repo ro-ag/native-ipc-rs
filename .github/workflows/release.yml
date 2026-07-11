@@ -10,18 +10,22 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish crates and GitHub release
+  gate:
+    name: verify release commit
     runs-on: ubuntu-latest
-    environment: crates-io
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -33,6 +37,12 @@ jobs:
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: 1.97.0
+          components: clippy,rustfmt
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        with:
+          tool: cargo-deny@0.19.8
 
       - name: Validate tag and workspace version
         id: release
@@ -52,13 +62,72 @@ jobs:
           }
           git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
           test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "release commit is not on origin/main" >&2
+            exit 1
+          }
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful full CI for exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          for _ in $(seq 1 60); do
+            run="$(gh run list --workflow ci.yml --commit "$commit" --event push \
+              --limit 1 --json databaseId,status,conclusion)"
+            id="$(jq -r '.[0].databaseId // empty' <<<"$run")"
+            status="$(jq -r '.[0].status // empty' <<<"$run")"
+            conclusion="$(jq -r '.[0].conclusion // empty' <<<"$run")"
+            if [[ "$status" == "completed" ]]; then
+              [[ "$conclusion" == "success" ]] || {
+                echo "CI run $id concluded $conclusion" >&2
+                exit 1
+              }
+              echo "required successful CI run: $id"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "timed out waiting for full CI on $commit" >&2
+          exit 1
+
+      - name: Run release quality and security gates
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+          cargo test --workspace --all-features --all-targets --locked
+          cargo test --workspace --no-default-features --all-targets --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+          cargo deny check
+          git diff --check
+
+  publish:
+    name: publish crates and GitHub release
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+
+      - name: Install release toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: 1.97.0
 
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -102,8 +171,8 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
