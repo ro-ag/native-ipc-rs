@@ -9,11 +9,12 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/native-ipc-testkit"
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-native-ipc-core = { path = "../native-ipc-core", version = "0.2.0" }
+native-ipc-core = { path = "../native-ipc-core", version = "0.3.0" }
 
 [features]
 default = []

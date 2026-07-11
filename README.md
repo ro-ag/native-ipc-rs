@@ -72,9 +72,16 @@ The workspace contains:
 Ordinary byte slices exist only while a new mapping is private and quiescent.
 The creator writes the canonical layout, validates the complete page-rounded
 range, chooses the sole writer, and asks the OS to attenuate the peer's rights.
-After authenticated transfer and import, both sides signal `READY`; runtime APIs
-then operate through mapping-owned capabilities without returning shared
-references.
+After authenticated transfer and import, the peer signals `READY` and the
+creator acknowledges `COMMIT`; consuming typestates expose runtime APIs only
+after that barrier completes. Runtime access remains mapping-owned and never
+returns shared references.
+
+The fixed-width control manifest covers an arbitrary bounded batch of
+directional regions and binds each transaction to authenticated process
+identities, a unique transfer ID, canonical roles, schema and generation,
+native access, and exact capability lengths. Control operations require
+exclusive channel access, so independent transfers cannot interleave.
 
 ```mermaid
 sequenceDiagram
@@ -91,6 +98,7 @@ sequenceDiagram
     OS-->>P: Transfer capability over private channel
     P->>P: Import with exact access and validate again
     P-->>C: READY
+    C-->>P: COMMIT
     C->>R: Copy payload, then Release-publish sequence
     P->>R: Acquire sequence and checked length
     P->>P: Copy payload into owned storage
@@ -160,6 +168,8 @@ before native capability transfer:
 cargo run -p native-ipc-core --example bounded_codec
 cargo run -p native-ipc-core --example checked_layout
 cargo run -p native-ipc-platform --example quiescent_region
+cargo run -p native-ipc-platform --example ready_commit
+cargo run -p native-ipc-testkit --example hostile_inputs
 cargo run -p native-ipc --example common_memory
 ```
 
@@ -172,6 +182,11 @@ cargo run -p native-ipc --example common_memory
 - [`quiescent_region.rs`](crates/native-ipc-platform/examples/quiescent_region.rs)
   allocates the current OS's zeroed native capability and demonstrates that
   mutable slices exist only before the consuming transfer transition.
+- [`ready_commit.rs`](crates/native-ipc-platform/examples/ready_commit.rs)
+  shows the consuming transaction signatures that withhold runtime mappings
+  until the authenticated READY/COMMIT barrier completes.
+- [`hostile_inputs.rs`](crates/native-ipc-testkit/examples/hostile_inputs.rs)
+  generates bounded truncation, bit-mutation, and boundary-value corpora.
 - [`common_memory.rs`](crates/native-ipc/examples/common_memory.rs) uses the
   portable fixed/grow/clear/destroy lifecycle without selecting an OS backend.
 

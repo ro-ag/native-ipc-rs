@@ -1,4 +1,4 @@
-//! Adversarial inputs and cross-platform golden fixtures for `native-ipc`.
+#![doc = include_str!("../README.md")]
 
 use native_ipc_core::codec::{ENVELOPE_LEN, Envelope, Protocol, encode_message};
 

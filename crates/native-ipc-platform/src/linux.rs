@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -19,11 +19,13 @@ use native_ipc_core::mapping::{
 };
 
 use crate::BackendStatus;
+use crate::protocol::{CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest};
 
 const REQUIRED_SEALS: libc::c_int =
     libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL;
-const FRAME_MAGIC: [u8; 8] = *b"NIPCFD\0\0";
-const FRAME_LEN: usize = 48;
+const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCFD\0\0";
+const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
+const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
 const ENV_SOCKET: &str = "NATIVE_IPC_LINUX_SOCKET";
 const ENV_NONCE: &str = "NATIVE_IPC_SESSION_NONCE";
@@ -133,6 +135,11 @@ impl ChildSession {
         &self.channel
     }
 
+    /// Exclusive transaction access to the authenticated capability channel.
+    pub const fn channel_mut(&mut self) -> &mut AuthenticatedChannel {
+        &mut self.channel
+    }
+
     /// Child process identifier held live and unreaped by this session.
     pub fn child_id(&self) -> u32 {
         self.child.id()
@@ -170,7 +177,7 @@ pub fn connect_spawned_helper() -> Result<AuthenticatedChannel, LinuxError> {
         // SAFETY: scalar identity syscalls have no preconditions.
         gid: unsafe { libc::getegid() },
     };
-    AuthenticatedChannel::new(stream, expected, nonce)
+    AuthenticatedChannel::new_with_identity(stream, expected, nonce, parent_pid, std::process::id())
 }
 
 impl fmt::Display for LinuxError {
@@ -208,6 +215,10 @@ pub struct AuthenticatedChannel {
     nonce: [u8; 32],
     peer: PeerCredentials,
     pidfd: OwnedFd,
+    parent_pid: u32,
+    child_pid: u32,
+    next_transfer_id: u64,
+    poisoned: bool,
 }
 
 impl AuthenticatedChannel {
@@ -217,16 +228,36 @@ impl AuthenticatedChannel {
         expected: PeerCredentials,
         nonce: [u8; 32],
     ) -> Result<Self, LinuxError> {
+        Self::new_with_identity(stream, expected, nonce, std::process::id(), expected.pid)
+    }
+
+    fn new_with_identity(
+        stream: UnixStream,
+        expected: PeerCredentials,
+        nonce: [u8; 32],
+        parent_pid: u32,
+        child_pid: u32,
+    ) -> Result<Self, LinuxError> {
         let peer = peer_credentials(&stream)?;
         if peer != expected || nonce == [0; 32] {
             return Err(LinuxError::WrongPeer);
         }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|_| LinuxError::Bootstrap)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|_| LinuxError::Bootstrap)?;
         let pidfd = pidfd_open(peer.pid)?;
         Ok(Self {
             stream,
             nonce,
             peer,
             pidfd,
+            parent_pid,
+            child_pid,
+            next_transfer_id: 1,
+            poisoned: false,
         })
     }
 
@@ -250,25 +281,119 @@ impl AuthenticatedChannel {
         Ok(result == 1 && poll.revents != 0)
     }
 
-    /// Sends one sealed reader capability with the session nonce and exact size.
-    pub fn send(&self, capability: &ExportedReaderCapability) -> Result<(), LinuxError> {
-        send_fd(
-            &self.stream,
-            &self.nonce,
-            capability.len,
-            capability.fd.as_raw_fd(),
-        )
+    /// Transfers a prepared reader capability and withholds the local writer
+    /// until authenticated peer validation completes the READY/COMMIT barrier.
+    ///
+    /// `prepared` must come from [`QuiescentRegion::prepare_writer`]. This call
+    /// owns the complete serialized transaction and returns only after the peer
+    /// validates the exact manifest and accepts COMMIT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for peer exit, timeout, malformed or stale control
+    /// frames, descriptor-transfer failure, or a mismatched READY transcript.
+    /// Any ambiguous failure poisons the channel and terminates an owned helper.
+    pub fn transfer_writer(
+        &mut self,
+        prepared: PreparedWriter,
+    ) -> Result<WriterRegion<LinuxWriterMapping>, LinuxError> {
+        let result = (|| {
+            self.ensure_live()?;
+            let manifest = self.manifest(prepared.expected, prepared.len, PeerAccess::ReadOnly)?;
+            send_fd(&self.stream, &manifest, prepared.capability.fd.as_raw_fd())?;
+            receive_control(&self.stream, READY_MAGIC, &manifest)?;
+            send_control(&self.stream, COMMIT_MAGIC, &manifest)?;
+            let writer = prepared.region;
+            self.next_transfer_id = self
+                .next_transfer_id
+                .checked_add(1)
+                .ok_or(LinuxError::InvalidFrame)?;
+            Ok(writer)
+        })();
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
 
     /// Receives, validates, maps, and binds one read-only capability.
+    ///
+    /// `expected_len` is the exact page-rounded native capability length;
+    /// `expected` and `topology` identify the canonical region. The returned
+    /// reader remains unavailable internally until COMMIT is received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for peer exit, timeout, malformed ancillary data,
+    /// invalid seals or length, layout rejection, or a mismatched COMMIT.
     pub fn receive_reader(
-        &self,
+        &mut self,
         expected_len: usize,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
     ) -> Result<ReaderRegion<LinuxReaderMapping>, LinuxError> {
-        let fd = receive_fd(&self.stream, &self.nonce, expected_len)?;
-        LinuxReaderMapping::import(fd, expected_len, expected, topology)
+        let result = (|| {
+            self.ensure_live()?;
+            let manifest = self.manifest(expected, expected_len, PeerAccess::ReadOnly)?;
+            let fd = receive_fd(&self.stream, &manifest)?;
+            let pending = LinuxReaderMapping::import(fd, expected_len, expected, topology)?;
+            send_control(&self.stream, READY_MAGIC, &manifest)?;
+            receive_control(&self.stream, COMMIT_MAGIC, &manifest)?;
+            let reader = pending.bind();
+            self.next_transfer_id = self
+                .next_transfer_id
+                .checked_add(1)
+                .ok_or(LinuxError::InvalidFrame)?;
+            Ok(reader)
+        })();
+        if result.is_err() {
+            self.poison();
+        }
+        result
+    }
+
+    fn manifest(
+        &self,
+        expected: ValidationExpectations,
+        len: usize,
+        access: PeerAccess,
+    ) -> Result<TransferManifest, LinuxError> {
+        let entry =
+            ManifestEntry::validated(expected, len, access).ok_or(LinuxError::InvalidFrame)?;
+        TransferManifest::new(
+            self.nonce,
+            self.parent_pid,
+            self.child_pid,
+            self.next_transfer_id,
+            vec![entry],
+        )
+        .ok_or(LinuxError::InvalidFrame)
+    }
+
+    fn ensure_live(&self) -> Result<(), LinuxError> {
+        if self.poisoned || self.peer_exited()? {
+            Err(LinuxError::Bootstrap)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if std::process::id() == self.parent_pid {
+            // SAFETY: pidfd identifies the exact authenticated helper; null
+            // siginfo and zero flags request an ordinary SIGKILL delivery.
+            let _ = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+        }
     }
 }
 
@@ -345,49 +470,46 @@ impl QuiescentRegion {
             return Err(last_os("fcntl(F_ADD_SEALS)"));
         }
         validate_fd(self.fd.as_raw_fd(), self.mapping.len)?;
+        let mapping = LinuxWriterMapping {
+            fd: self.fd,
+            mapping: self.mapping,
+        };
+        let raw = unsafe { libc::fcntl(mapping.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if raw < 0 {
+            return Err(last_os("fcntl(F_DUPFD_CLOEXEC)"));
+        }
+        let len = mapping.mapping.len;
+        let region = WriterRegion::new(mapping, layout, topology)?;
         Ok(PreparedWriter {
-            mapping: LinuxWriterMapping {
-                fd: self.fd,
-                mapping: self.mapping,
+            region,
+            capability: ExportedReaderCapability {
+                // SAFETY: successful fcntl returned a new owned descriptor.
+                fd: unsafe { OwnedFd::from_raw_fd(raw) },
             },
-            layout,
-            topology,
+            expected,
+            len,
         })
     }
 }
 
 /// Sealed sole-writer mapping awaiting export/commit.
+///
+/// ```compile_fail
+/// use native_ipc_platform::linux::PreparedWriter;
+/// fn publish_early(mut pending: PreparedWriter) {
+///     pending.publish(0, 1, None, b"too early").unwrap();
+/// }
+/// ```
 pub struct PreparedWriter {
-    mapping: LinuxWriterMapping,
-    layout: ValidatedRegionLayout,
-    topology: RegionSetLayout,
-}
-
-impl PreparedWriter {
-    /// Duplicates a sealed descriptor that can create only future read-only mappings.
-    pub fn export_reader(&self) -> Result<ExportedReaderCapability, LinuxError> {
-        // SAFETY: fcntl duplicates the live descriptor with close-on-exec.
-        let raw = unsafe { libc::fcntl(self.mapping.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if raw < 0 {
-            return Err(last_os("fcntl(F_DUPFD_CLOEXEC)"));
-        }
-        Ok(ExportedReaderCapability {
-            // SAFETY: successful fcntl returned a new owned descriptor.
-            fd: unsafe { OwnedFd::from_raw_fd(raw) },
-            len: self.mapping.mapping.len,
-        })
-    }
-
-    /// Commits the unique local writer into the audited core bridge.
-    pub fn bind(self) -> Result<WriterRegion<LinuxWriterMapping>, LinuxError> {
-        Ok(WriterRegion::new(self.mapping, self.layout, self.topology)?)
-    }
+    region: WriterRegion<LinuxWriterMapping>,
+    capability: ExportedReaderCapability,
+    expected: ValidationExpectations,
+    len: usize,
 }
 
 /// Sealed descriptor intended for one authenticated reader transfer.
 pub struct ExportedReaderCapability {
     fd: OwnedFd,
-    len: usize,
 }
 
 /// Platform-minted sole-writer witness retaining the memfd and mapping lifetime.
@@ -411,6 +533,16 @@ pub struct LinuxReaderMapping {
     _fd: OwnedFd,
     mapping: Mapping,
 }
+
+struct PendingLinuxReader {
+    region: ReaderRegion<LinuxReaderMapping>,
+}
+
+impl PendingLinuxReader {
+    fn bind(self) -> ReaderRegion<LinuxReaderMapping> {
+        self.region
+    }
+}
 // SAFETY: import maps only PROT_READ after exact anonymous-seal validation.
 unsafe impl ReadOnlyMapping for LinuxReaderMapping {
     fn base(&self) -> NonNull<u8> {
@@ -427,18 +559,16 @@ impl LinuxReaderMapping {
         len: usize,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
-    ) -> Result<ReaderRegion<Self>, LinuxError> {
+    ) -> Result<PendingLinuxReader, LinuxError> {
         validate_fd(fd.as_raw_fd(), len)?;
         let mapping = Mapping::map(fd.as_raw_fd(), len, libc::PROT_READ)?;
         mapping.advise()?;
         // SAFETY: READY/COMMIT protocol keeps the writer quiescent during import.
         let bytes = unsafe { std::slice::from_raw_parts(mapping.base.as_ptr(), len) };
         let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
-        Ok(ReaderRegion::new(
-            Self { _fd: fd, mapping },
-            layout,
-            topology,
-        )?)
+        Ok(PendingLinuxReader {
+            region: ReaderRegion::new(Self { _fd: fd, mapping }, layout, topology)?,
+        })
     }
 }
 
@@ -540,11 +670,8 @@ fn pidfd_open(pid: u32) -> Result<OwnedFd, LinuxError> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-fn send_fd(stream: &UnixStream, nonce: &[u8; 32], len: usize, fd: RawFd) -> Result<(), LinuxError> {
-    let mut frame = [0_u8; FRAME_LEN];
-    frame[..8].copy_from_slice(&FRAME_MAGIC);
-    frame[8..16].copy_from_slice(&(len as u64).to_le_bytes());
-    frame[16..48].copy_from_slice(nonce);
+fn send_fd(stream: &UnixStream, manifest: &TransferManifest, fd: RawFd) -> Result<(), LinuxError> {
+    let mut frame = manifest.encode(CAPABILITY_MAGIC);
     let mut iovec = libc::iovec {
         iov_base: frame.as_mut_ptr().cast(),
         iov_len: frame.len(),
@@ -565,67 +692,156 @@ fn send_fd(stream: &UnixStream, nonce: &[u8; 32], len: usize, fd: RawFd) -> Resu
         std::ptr::write(libc::CMSG_DATA(header).cast::<RawFd>(), fd);
     }
     // SAFETY: iovec/control buffers remain live for the call.
-    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
-    if sent != FRAME_LEN as isize {
-        return Err(if sent < 0 {
-            last_os("sendmsg")
-        } else {
-            LinuxError::InvalidFrame
-        });
+    let sent = loop {
+        // SAFETY: iovec/control buffers remain live for the call. Retrying only
+        // on EINTR is safe because a failing sendmsg transferred no bytes/fd.
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+        if sent >= 0 {
+            break sent as usize;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(last_os("sendmsg"));
+        }
+    };
+    if sent == 0 || sent > CONTROL_FRAME_LEN {
+        return Err(LinuxError::InvalidFrame);
+    }
+    if sent < CONTROL_FRAME_LEN {
+        // SCM_RIGHTS is attached to the first byte. Once that byte is sent,
+        // complete the stream frame without attaching the descriptor again.
+        let mut stream = stream;
+        stream
+            .write_all(&frame[sent..])
+            .map_err(|_| LinuxError::InvalidFrame)?;
     }
     Ok(())
 }
 
-fn receive_fd(
+fn receive_fd(stream: &UnixStream, manifest: &TransferManifest) -> Result<OwnedFd, LinuxError> {
+    let (frame, mut descriptors, flags, ancillary_valid) = receive_message(stream)?;
+    if flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+        || !manifest.matches_frame(CAPABILITY_MAGIC, &frame)
+    {
+        return Err(LinuxError::InvalidFrame);
+    }
+    if !ancillary_valid || descriptors.len() != 1 {
+        return Err(LinuxError::InvalidAncillaryData);
+    }
+    Ok(descriptors.pop().expect("exactly one descriptor"))
+}
+
+fn send_control(
     stream: &UnixStream,
-    nonce: &[u8; 32],
-    expected_len: usize,
-) -> Result<OwnedFd, LinuxError> {
-    let mut frame = [0_u8; FRAME_LEN];
-    let mut iovec = libc::iovec {
-        iov_base: frame.as_mut_ptr().cast(),
-        iov_len: frame.len(),
-    };
-    let control_len = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
-    let mut control = vec![0_u8; control_len];
-    let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_iov = &mut iovec;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
-    // SAFETY: iovec/control buffers remain valid for the call.
-    let received =
-        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
-    if received != FRAME_LEN as isize
-        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
-        || frame[..8] != FRAME_MAGIC
-        || frame[16..48] != *nonce
-        || u64::from_le_bytes(frame[8..16].try_into().expect("fixed range")) != expected_len as u64
-    {
-        return Err(if received < 0 {
-            last_os("recvmsg")
-        } else {
-            LinuxError::InvalidFrame
-        });
+    magic: [u8; 8],
+    manifest: &TransferManifest,
+) -> Result<(), LinuxError> {
+    let frame = manifest.encode(magic);
+    let mut stream = stream;
+    stream
+        .write_all(&frame)
+        .map_err(|_| LinuxError::InvalidFrame)
+}
+
+fn receive_control(
+    stream: &UnixStream,
+    magic: [u8; 8],
+    manifest: &TransferManifest,
+) -> Result<(), LinuxError> {
+    let (frame, descriptors, flags, ancillary_valid) = receive_message(stream)?;
+    if flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 || !manifest.matches_frame(magic, &frame) {
+        return Err(LinuxError::InvalidFrame);
     }
-    // SAFETY: control buffer contains the kernel-produced cmsghdr chain.
-    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-    if header.is_null()
-        || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
-        || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
-        || unsafe { (*header).cmsg_len }
-            != unsafe { libc::CMSG_LEN(size_of::<RawFd>() as u32) } as usize
-        || !unsafe { libc::CMSG_NXTHDR(&message, header) }.is_null()
-    {
+    if !ancillary_valid || !descriptors.is_empty() {
         return Err(LinuxError::InvalidAncillaryData);
     }
-    // SAFETY: exact cmsg length proves one aligned fd payload.
-    let raw = unsafe { std::ptr::read(libc::CMSG_DATA(header).cast::<RawFd>()) };
-    if raw < 0 {
-        return Err(LinuxError::InvalidAncillaryData);
+    Ok(())
+}
+
+fn receive_message(
+    stream: &UnixStream,
+) -> Result<([u8; CONTROL_FRAME_LEN], Vec<OwnedFd>, libc::c_int, bool), LinuxError> {
+    let mut frame = [0_u8; CONTROL_FRAME_LEN];
+    // Leave enough room to adopt and close a bounded set of excess descriptors.
+    // MSG_CTRUNC still fails closed after every descriptor that fit is owned.
+    const MAX_RECEIVED_FDS: u32 = 16;
+    let control_len =
+        unsafe { libc::CMSG_SPACE((size_of::<RawFd>() * MAX_RECEIVED_FDS as usize) as u32) }
+            as usize;
+    let mut descriptors = Vec::new();
+    let mut ancillary_valid = true;
+    let mut flags = 0;
+    let mut offset = 0;
+    while offset < frame.len() {
+        let mut iovec = libc::iovec {
+            // SAFETY: `offset` remains within `frame` and the remaining length
+            // describes the initialized output capacity for recvmsg.
+            iov_base: unsafe { frame.as_mut_ptr().add(offset) }.cast(),
+            iov_len: frame.len() - offset,
+        };
+        let mut control = vec![0_u8; control_len];
+        let mut message: libc::msghdr = unsafe { zeroed() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        let received = loop {
+            // SAFETY: iovec/control buffers remain valid for the call.
+            let received =
+                unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+            if received >= 0 {
+                break received as usize;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err(last_os("recvmsg"));
+            }
+        };
+
+        // Adopt every installed descriptor from every stream fragment before
+        // any fallible frame validation. Drop closes all on rejection.
+        // SAFETY: the kernel initialized the chain within `msg_controllen`.
+        let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        while !header.is_null() {
+            // SAFETY: `header` is part of the kernel-produced chain.
+            let current = unsafe { &*header };
+            let minimum = unsafe { libc::CMSG_LEN(0) } as usize;
+            if current.cmsg_len < minimum || current.cmsg_len > message.msg_controllen {
+                ancillary_valid = false;
+                break;
+            }
+            if current.cmsg_level != libc::SOL_SOCKET || current.cmsg_type != libc::SCM_RIGHTS {
+                ancillary_valid = false;
+            } else {
+                let payload_len = current.cmsg_len - minimum;
+                if payload_len == 0 || !payload_len.is_multiple_of(size_of::<RawFd>()) {
+                    ancillary_valid = false;
+                } else {
+                    let count = payload_len / size_of::<RawFd>();
+                    for index in 0..count {
+                        // SAFETY: cmsg length proves this payload element exists.
+                        let raw = unsafe {
+                            std::ptr::read_unaligned(
+                                libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                            )
+                        };
+                        if raw < 0 {
+                            ancillary_valid = false;
+                        } else {
+                            // SAFETY: SCM_RIGHTS installed this new descriptor.
+                            descriptors.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                        }
+                    }
+                }
+            }
+            // SAFETY: advances within this kernel-produced control buffer.
+            header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+        }
+        flags |= message.msg_flags;
+        if received == 0 || received > frame.len() - offset {
+            return Err(LinuxError::InvalidFrame);
+        }
+        offset += received;
     }
-    // SAFETY: SCM_RIGHTS installed one new descriptor in this process.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    Ok((frame, descriptors, flags, ancillary_valid))
 }
 
 fn page_align(size: usize) -> Result<usize, LinuxError> {
@@ -690,6 +906,52 @@ mod tests {
         AcknowledgementRouteSpec, Endpoint, LayoutError, LayoutLimits, RegionSpec, RoleId,
     };
 
+    fn send_fragmented_with_fds(
+        stream: &UnixStream,
+        frame: &[u8; CONTROL_FRAME_LEN],
+        fds: &[RawFd],
+        first_bytes: usize,
+    ) {
+        send_chunk_with_fds(stream, &frame[..first_bytes], fds);
+        let mut stream = stream;
+        stream.write_all(&frame[first_bytes..]).unwrap();
+    }
+
+    fn send_chunk_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        let mut prefix = bytes.to_vec();
+        let mut iovec = libc::iovec {
+            iov_base: prefix.as_mut_ptr().cast(),
+            iov_len: prefix.len(),
+        };
+        let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
+        let mut control = vec![0_u8; control_len];
+        let mut message: libc::msghdr = unsafe { zeroed() };
+        message.msg_iov = &mut iovec;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        // SAFETY: the control allocation exactly fits the supplied descriptor slice.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr(),
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                fds.len(),
+            );
+            assert_eq!(
+                libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL),
+                bytes.len() as isize
+            );
+        }
+    }
+
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
     #[test]
     fn backend_reports_available() {
         assert_eq!(status(), BackendStatus::Available);
@@ -737,6 +999,111 @@ mod tests {
             AuthenticatedChannel::new(left, actual, [0; 32]),
             Err(LinuxError::WrongPeer)
         ));
+    }
+
+    #[test]
+    fn fragmented_stream_frame_preserves_ancillary_ownership() {
+        let expected = ValidationExpectations {
+            schema_id: [3; 32],
+            generation: 9,
+            role: RoleId::new(7).unwrap(),
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: 4096,
+        };
+        let entry = ManifestEntry::validated(expected, 4096, PeerAccess::ReadOnly).unwrap();
+        let nonce = [4; 32];
+        let manifest = TransferManifest::new(nonce, 1, 2, 1, vec![entry]).unwrap();
+        let frame = manifest.encode(CAPABILITY_MAGIC);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let received = std::thread::scope(|scope| {
+            let task = scope.spawn(|| receive_fd(&receiver, &manifest));
+            send_fragmented_with_fds(&sender, &frame, &[file.as_raw_fd()], 1);
+            task.join().unwrap().unwrap()
+        });
+        assert!(received.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    #[ignore = "spawned in an isolated process by descriptor_cleanup_is_zero_growth"]
+    fn malformed_extra_descriptor_frame_has_zero_fd_growth() {
+        let before = open_fd_count();
+        {
+            let expected = ValidationExpectations {
+                schema_id: [5; 32],
+                generation: 11,
+                role: RoleId::new(8).unwrap(),
+                writer: Endpoint::Responder,
+                maximum_mapping_size: 4096,
+            };
+            let entry = ManifestEntry::validated(expected, 4096, PeerAccess::ReadOnly).unwrap();
+            let nonce = [6; 32];
+            let manifest = TransferManifest::new(nonce, 1, 2, 1, vec![entry]).unwrap();
+            let frame = manifest.encode(CAPABILITY_MAGIC);
+            let first = std::fs::File::open("/dev/null").unwrap();
+            let second = std::fs::File::open("/dev/null").unwrap();
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            std::thread::scope(|scope| {
+                let task = scope.spawn(|| receive_fd(&receiver, &manifest));
+                send_fragmented_with_fds(
+                    &sender,
+                    &frame,
+                    &[first.as_raw_fd(), second.as_raw_fd()],
+                    7,
+                );
+                assert!(matches!(
+                    task.join().unwrap(),
+                    Err(LinuxError::InvalidAncillaryData)
+                ));
+            });
+        }
+        assert_eq!(open_fd_count(), before);
+    }
+
+    #[test]
+    #[ignore = "spawned in an isolated process by descriptor_cleanup_is_zero_growth"]
+    fn ancillary_on_later_stream_fragment_is_adopted_and_rejected() {
+        let before = open_fd_count();
+        {
+            let expected = ValidationExpectations {
+                schema_id: [7; 32],
+                generation: 13,
+                role: RoleId::new(9).unwrap(),
+                writer: Endpoint::Initiator,
+                maximum_mapping_size: 4096,
+            };
+            let entry = ManifestEntry::validated(expected, 4096, PeerAccess::ReadOnly).unwrap();
+            let manifest = TransferManifest::new([8; 32], 1, 2, 1, vec![entry]).unwrap();
+            let frame = manifest.encode(CAPABILITY_MAGIC);
+            let first = std::fs::File::open("/dev/null").unwrap();
+            let second = std::fs::File::open("/dev/null").unwrap();
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            std::thread::scope(|scope| {
+                let task = scope.spawn(|| receive_fd(&receiver, &manifest));
+                send_chunk_with_fds(&sender, &frame[..7], &[first.as_raw_fd()]);
+                send_chunk_with_fds(&sender, &frame[7..], &[second.as_raw_fd()]);
+                assert!(matches!(
+                    task.join().unwrap(),
+                    Err(LinuxError::InvalidAncillaryData)
+                ));
+            });
+        }
+        assert_eq!(open_fd_count(), before);
+    }
+
+    #[test]
+    fn descriptor_cleanup_is_zero_growth() {
+        let executable = std::env::current_exe().unwrap();
+        for test in [
+            "linux::tests::malformed_extra_descriptor_frame_has_zero_fd_growth",
+            "linux::tests::ancillary_on_later_stream_fragment_is_adopted_and_rejected",
+        ] {
+            let status = Command::new(&executable)
+                .args(["--exact", test, "--ignored", "--nocapture"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated descriptor test failed: {test}");
+        }
     }
 
     #[test]
@@ -797,13 +1164,14 @@ mod tests {
             maximum_mapping_size: owner.len() as u64,
         };
         let prepared = owner.prepare_writer(expected, topology.clone()).unwrap();
-        let capability = prepared.export_reader().unwrap();
+        let transfer_len = prepared.len;
+        let capability = &prepared.capability;
 
         // A sealed exported fd cannot create another writable mapping.
         let denied = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                capability.len,
+                transfer_len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 capability.fd.as_raw_fd(),
@@ -823,7 +1191,7 @@ mod tests {
             unsafe {
                 libc::ftruncate(
                     capability.fd.as_raw_fd(),
-                    capability.len.saturating_add(4096) as libc::off_t,
+                    transfer_len.saturating_add(4096) as libc::off_t,
                 )
             },
             -1
@@ -834,25 +1202,33 @@ mod tests {
 
         let (left, right) = UnixStream::pair().unwrap();
         let credentials = peer_credentials(&left).unwrap();
-        let sender = AuthenticatedChannel::new(left, credentials, [8; 32]).unwrap();
-        let receiver = AuthenticatedChannel::new(right, credentials, [8; 32]).unwrap();
-        let reader = std::thread::scope(|scope| {
-            let sent = scope.spawn(|| sender.send(&capability));
-            let received =
-                receiver.receive_reader(prepared.mapping.mapping.len, expected, topology.clone());
-            sent.join().unwrap().unwrap();
-            received.unwrap()
+        let mut sender = AuthenticatedChannel::new(left, credentials, [8; 32]).unwrap();
+        let mut receiver = AuthenticatedChannel::new(right, credentials, [8; 32]).unwrap();
+        std::thread::scope(|scope| {
+            let received = scope.spawn(|| {
+                let reader = receiver
+                    .receive_reader(transfer_len, expected, topology.clone())
+                    .unwrap();
+                for _ in 0..10_000 {
+                    if let Ok(payload) = reader.copy_payload(0, 1) {
+                        assert_eq!(payload, b"linux");
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+                panic!("reader never observed publication");
+            });
+            let mut writer = sender.transfer_writer(prepared).unwrap();
+            assert_eq!(
+                writer.publish(0, 1, None, &[0xaa; 17]).unwrap_err(),
+                BindingError::Layout(LayoutError::PayloadOutOfBounds {
+                    length: 17,
+                    capacity: 16,
+                })
+            );
+            writer.publish(0, 1, None, b"linux").unwrap();
+            received.join().unwrap();
         });
-        let mut writer = prepared.bind().unwrap();
-        assert_eq!(
-            writer.publish(0, 1, None, &[0xaa; 17]).unwrap_err(),
-            BindingError::Layout(LayoutError::PayloadOutOfBounds {
-                length: 17,
-                capacity: 16,
-            })
-        );
-        writer.publish(0, 1, None, b"linux").unwrap();
-        assert_eq!(reader.copy_payload(0, 1).unwrap(), b"linux");
     }
 
     #[test]

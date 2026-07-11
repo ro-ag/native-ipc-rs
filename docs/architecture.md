@@ -82,8 +82,23 @@ re-acknowledgement is intentionally idempotent.
 - Windows uses unnamed sections with least-rights duplicated handles,
   per-launch private PID-checked named pipes, suspended process creation, and
   kill-on-close Job Objects.
-- macOS and Windows use authenticated READY barriers after the peer imports and
-  validates the complete page-rounded capability.
+- All three backends use consuming authenticated READY/COMMIT barriers after
+  the peer imports and validates the complete page-rounded capability. Runtime
+  reader/writer bindings remain withheld until the barrier completes.
+
+Each bootstrap transaction carries a manually encoded, fixed-width,
+little-endian manifest. It binds the control version, nonzero session nonce,
+kernel-authenticated parent and child PIDs, monotonically increasing transfer
+ID, canonical role ordering, schema, generation, writer endpoint, peer access,
+and exact page-rounded capability length. A bounded batch supports up to 16
+directional regions; one READY and one COMMIT activate the whole batch. The
+current macOS and Windows two-direction helpers are convenience adapters over
+that generic batch transcript.
+
+Control channels require exclusive mutable access for capability transfer and
+barrier transitions. This prevents two transactions from interleaving frames;
+any malformed, stale, timed-out, or ambiguous transition poisons the session
+and keeps all pending runtime wrappers private.
 
 ## Unsafe-code policy
 

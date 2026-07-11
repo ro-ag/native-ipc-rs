@@ -1,7 +1,4 @@
-//! Platform capability and mapping implementations.
-//!
-//! macOS, Linux, and Windows adapters implement private authenticated bootstrap,
-//! least-authority shared-memory transfer, and owned helper lifecycles.
+#![doc = include_str!("../README.md")]
 
 #[cfg(not(any(
     all(
@@ -33,3 +30,5 @@ pub enum BackendStatus {
     /// The backend is deliberately unavailable rather than offering weaker behavior.
     Incomplete(&'static str),
 }
+
+mod protocol;

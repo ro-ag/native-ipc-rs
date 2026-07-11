@@ -8,6 +8,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+use crate::protocol::PeerAccess;
 use native_ipc_core::layout::{
     LayoutError, RegionSetLayout, ValidatedRegionLayout, ValidationExpectations,
 };
@@ -79,15 +80,22 @@ unsafe extern "C" {
 }
 
 /// Failure to create or restrict a Mach shared-memory capability.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachError {
     /// Shared regions cannot be empty.
     ZeroSize,
     /// Requested size cannot be page-aligned.
-    SizeOverflow { requested: usize },
+    SizeOverflow {
+        /// Logical byte length that could not be page-aligned.
+        requested: usize,
+    },
     /// Transition size differs from the quiescent region.
-    InvalidViewSize { requested: usize, region: usize },
+    InvalidViewSize {
+        /// Requested capability view length.
+        requested: usize,
+        /// Exact page-rounded region length.
+        region: usize,
+    },
     /// Kernel reported an invalid page size.
     InvalidPageSize(c_int),
     /// Successful allocation returned an unusable address.
@@ -95,7 +103,12 @@ pub enum MachError {
     /// Successful memory-entry creation returned a null capability.
     NullMemoryEntry,
     /// Kernel changed an already aligned entry size.
-    UnexpectedEntrySize { expected: usize, actual: u64 },
+    UnexpectedEntrySize {
+        /// Requested page-rounded memory-entry size.
+        expected: usize,
+        /// Size returned by the Mach kernel.
+        actual: u64,
+    },
     /// Mach kernel call failed.
     Kernel {
         /// Operation name from this bounded implementation.
@@ -284,56 +297,124 @@ impl QuiescentRegion {
     }
 
     /// Validates, transfers a read-only entry, and commits the local writer.
+    ///
+    /// The returned pending value has no payload API. Pass it as part of the
+    /// exact batch to [`bootstrap::ParentChannel::commit_transfers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if layout validation, Mach permission attenuation,
+    /// runtime binding, or authenticated capability transfer fails. Failure
+    /// poisons the active parent transaction.
     pub fn transfer_local_writer(
         self,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
-        channel: &bootstrap::ParentChannel,
-    ) -> Result<WriterRegion<TransferredWriterMapping>, MacBindingError> {
-        // SAFETY: quiescent state covers the exact transferred capability.
-        let layout =
-            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
-        let capability_len = self.len();
-        let region = self.into_local_writer(capability_len)?;
-        channel.send(region.peer_entry.name)?;
-        let LocalWriterRegion {
-            mapping,
-            peer_entry,
-            len: _,
-        } = region;
-        drop(peer_entry);
-        Ok(WriterRegion::new(
-            TransferredWriterMapping { mapping },
-            layout,
-            topology,
-        )?)
+        channel: &mut bootstrap::ParentChannel,
+    ) -> Result<PendingTransferredWriter, MacBindingError> {
+        let result = (|| {
+            // SAFETY: quiescent state covers the exact transferred capability.
+            let layout =
+                unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+            let capability_len = self.len();
+            let region = self.into_local_writer(capability_len)?;
+            let LocalWriterRegion {
+                mapping,
+                peer_entry,
+                len: _,
+            } = region;
+            let runtime =
+                WriterRegion::new(TransferredWriterMapping { mapping }, layout, topology)?;
+            channel.send(
+                peer_entry.name,
+                expected,
+                capability_len,
+                PeerAccess::ReadOnly,
+            )?;
+            drop(peer_entry);
+            Ok(PendingTransferredWriter { runtime })
+        })();
+        if result.is_err() {
+            channel.poison_transaction();
+        }
+        result
     }
 
     /// Validates, transfers the sole writer entry, and commits local read-only access.
+    ///
+    /// The local reader and peer writer remain pending until the batch commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation, permanent local protection downgrade,
+    /// runtime binding, or authenticated capability transfer fails.
     pub fn transfer_remote_writer(
         self,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
-        channel: &bootstrap::ParentChannel,
-    ) -> Result<ReaderRegion<TransferredReaderMapping>, MacBindingError> {
-        // SAFETY: quiescent state covers the exact transferred capability.
-        let layout =
-            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
-        let capability_len = self.len();
-        let region = self.into_remote_writer(capability_len)?;
-        channel.send(region.peer_entry.name)?;
-        let RemoteWriterRegion {
-            mapping,
-            peer_entry,
-            len: _,
-        } = region;
-        drop(peer_entry);
-        Ok(ReaderRegion::new(
-            TransferredReaderMapping { mapping },
-            layout,
-            topology,
-        )?)
+        channel: &mut bootstrap::ParentChannel,
+    ) -> Result<PendingTransferredReader, MacBindingError> {
+        let result = (|| {
+            // SAFETY: quiescent state covers the exact transferred capability.
+            let layout =
+                unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+            let capability_len = self.len();
+            let region = self.into_remote_writer(capability_len)?;
+            let RemoteWriterRegion {
+                mapping,
+                peer_entry,
+                len: _,
+            } = region;
+            let runtime =
+                ReaderRegion::new(TransferredReaderMapping { mapping }, layout, topology)?;
+            channel.send(
+                peer_entry.name,
+                expected,
+                capability_len,
+                PeerAccess::SoleWriter,
+            )?;
+            drop(peer_entry);
+            Ok(PendingTransferredReader { runtime })
+        })();
+        if result.is_err() {
+            channel.poison_transaction();
+        }
+        result
     }
+}
+
+/// Local writer withheld until the authenticated peer validates every import.
+///
+/// ```compile_fail
+/// use native_ipc_platform::macos::PendingTransferredWriter;
+/// fn publish_early(mut pending: PendingTransferredWriter) {
+///     pending.publish(0, 1, None, b"too early").unwrap();
+/// }
+/// ```
+pub struct PendingTransferredWriter {
+    runtime: WriterRegion<TransferredWriterMapping>,
+}
+
+/// Local reader withheld until the authenticated peer validates every import.
+pub struct PendingTransferredReader {
+    runtime: ReaderRegion<TransferredReaderMapping>,
+}
+
+/// Imported reader withheld until READY is acknowledged with COMMIT.
+///
+/// ```compile_fail
+/// use native_ipc_platform::macos::PendingImportedReader;
+/// fn read_early(pending: PendingImportedReader) {
+///     let _ = pending.copy_payload(0, 1);
+/// }
+/// ```
+pub struct PendingImportedReader {
+    runtime: ReaderRegion<ImportedReaderMapping>,
+}
+
+/// Imported writer withheld until READY is acknowledged with COMMIT.
+pub struct PendingImportedWriter {
+    runtime: WriterRegion<ImportedWriterMapping>,
 }
 
 /// Parent-side writer mapping after its read-only entry was transferred.
@@ -394,48 +475,131 @@ unsafe impl SoleWriterMapping for ImportedWriterMapping {
 
 impl bootstrap::ChildChannel {
     /// Receives and binds a read-only memory entry while the parent is quiescent.
+    ///
+    /// `len` is the exact page-rounded entry length. The result is a hidden
+    /// runtime wrapper that becomes accessible only through [`Self::commit_imports`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transcript mismatch, mapping failure, layout
+    /// rejection, or runtime binding failure and poisons the transaction.
     pub fn receive_reader(
-        &self,
+        &mut self,
         len: usize,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
-    ) -> Result<ReaderRegion<ImportedReaderMapping>, MacBindingError> {
-        let right = self.receive()?;
-        let mapping = Mapping::map_port(current_task(), len, right.name(), VM_PROT_READ)?;
-        // SAFETY: authenticated transfer remains quiescent until this call returns.
-        let bytes = unsafe { mapping.bytes(len) };
-        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
-        drop(right);
-        Ok(ReaderRegion::new(
-            ImportedReaderMapping { mapping },
-            layout,
-            topology,
-        )?)
+    ) -> Result<PendingImportedReader, MacBindingError> {
+        let result = (|| {
+            let right = self.receive(expected, len, PeerAccess::ReadOnly)?;
+            let mapping = Mapping::map_port(current_task(), len, right.name(), VM_PROT_READ)?;
+            // SAFETY: authenticated transfer remains quiescent until this call returns.
+            let bytes = unsafe { mapping.bytes(len) };
+            let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+            drop(right);
+            Ok(PendingImportedReader {
+                runtime: ReaderRegion::new(ImportedReaderMapping { mapping }, layout, topology)?,
+            })
+        })();
+        if result.is_err() {
+            self.poison_transaction();
+        }
+        result
     }
 
     /// Receives and binds the sole writable memory entry while quiescent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transcript mismatch, mapping failure, layout
+    /// rejection, or runtime binding failure and poisons the transaction.
     pub fn receive_writer(
-        &self,
+        &mut self,
         len: usize,
         expected: ValidationExpectations,
         topology: RegionSetLayout,
-    ) -> Result<WriterRegion<ImportedWriterMapping>, MacBindingError> {
-        let right = self.receive()?;
-        let mapping = Mapping::map_port(
-            current_task(),
-            len,
-            right.name(),
-            VM_PROT_READ | VM_PROT_WRITE,
-        )?;
-        // SAFETY: authenticated transfer remains quiescent until this call returns.
-        let bytes = unsafe { mapping.bytes(len) };
-        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
-        drop(right);
-        Ok(WriterRegion::new(
-            ImportedWriterMapping { mapping },
-            layout,
-            topology,
-        )?)
+    ) -> Result<PendingImportedWriter, MacBindingError> {
+        let result = (|| {
+            let right = self.receive(expected, len, PeerAccess::SoleWriter)?;
+            let mapping = Mapping::map_port(
+                current_task(),
+                len,
+                right.name(),
+                VM_PROT_READ | VM_PROT_WRITE,
+            )?;
+            // SAFETY: authenticated transfer remains quiescent until this call returns.
+            let bytes = unsafe { mapping.bytes(len) };
+            let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+            drop(right);
+            Ok(PendingImportedWriter {
+                runtime: WriterRegion::new(ImportedWriterMapping { mapping }, layout, topology)?,
+            })
+        })();
+        if result.is_err() {
+            self.poison_transaction();
+        }
+        result
+    }
+}
+
+impl bootstrap::ParentChannel {
+    /// Consumes a complete two-region transfer, waits for peer validation, then
+    /// sends COMMIT before exposing either local runtime capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if READY does not match the exact canonical batch or
+    /// COMMIT cannot be sent unambiguously. The helper is terminated on failure.
+    ///
+    /// ```compile_fail
+    /// use native_ipc_platform::macos::{
+    ///     PendingTransferredReader, PendingTransferredWriter, bootstrap::ParentChannel,
+    /// };
+    /// fn commit_twice(
+    ///     channel: &mut ParentChannel,
+    ///     writer: PendingTransferredWriter,
+    ///     reader: PendingTransferredReader,
+    /// ) {
+    ///     let _ = channel.commit_transfers(writer, reader);
+    ///     let _ = channel.commit_transfers(writer, reader);
+    /// }
+    /// ```
+    pub fn commit_transfers(
+        &mut self,
+        writer: PendingTransferredWriter,
+        reader: PendingTransferredReader,
+    ) -> Result<
+        (
+            WriterRegion<TransferredWriterMapping>,
+            ReaderRegion<TransferredReaderMapping>,
+        ),
+        MacBindingError,
+    > {
+        self.ready_and_commit()?;
+        Ok((writer.runtime, reader.runtime))
+    }
+}
+
+impl bootstrap::ChildChannel {
+    /// Signals validation, waits for creator COMMIT, and only then exposes the
+    /// imported reader and sole-writer runtime capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if READY cannot be sent or the received COMMIT does not
+    /// match the complete canonical batch.
+    pub fn commit_imports(
+        &mut self,
+        reader: PendingImportedReader,
+        writer: PendingImportedWriter,
+    ) -> Result<
+        (
+            ReaderRegion<ImportedReaderMapping>,
+            WriterRegion<ImportedWriterMapping>,
+        ),
+        MacBindingError,
+    > {
+        self.ready_and_wait_commit()?;
+        Ok((reader.runtime, writer.runtime))
     }
 }
 

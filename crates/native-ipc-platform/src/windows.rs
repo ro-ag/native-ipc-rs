@@ -46,6 +46,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::BackendStatus;
+use crate::protocol::{CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest};
 
 /// Windows section, bootstrap, lifecycle, or binding failure.
 #[derive(Debug)]
@@ -220,11 +221,15 @@ impl QuiescentRegion {
         // SAFETY: section is quiescent and complete capability range is borrowed.
         let layout =
             unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let len = self.view.len;
+        let entry = ManifestEntry::validated(expected, len, PeerAccess::ReadOnly)
+            .ok_or(WindowsError::InvalidBootstrap)?;
         Ok(PreparedLocalWriter {
             section: self.section,
-            view: self.view,
-            layout,
-            topology,
+            runtime: WriterRegion::new(WindowsWriterMapping { view: self.view }, layout, topology)?,
+            entry,
+            len,
+            reader_duplicated: false,
         })
     }
 
@@ -240,11 +245,13 @@ impl QuiescentRegion {
         let len = self.view.len;
         drop(self.view);
         let view = View::map(self.section.0, len, FILE_MAP_READ)?;
+        let entry = ManifestEntry::validated(expected, len, PeerAccess::SoleWriter)
+            .ok_or(WindowsError::InvalidBootstrap)?;
         Ok(PreparedRemoteWriter {
             section: self.section,
-            view,
-            layout,
-            topology,
+            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
+            entry,
+            len,
             writer_duplicated: false,
         })
     }
@@ -255,11 +262,19 @@ impl QuiescentRegion {
 pub struct RemoteHandle(pub usize);
 
 /// Local unique writer awaiting a read-only peer handle and READY barrier.
+///
+/// ```compile_fail
+/// use native_ipc_platform::windows::PreparedLocalWriter;
+/// fn publish_early(mut pending: PreparedLocalWriter) {
+///     pending.publish(0, 1, None, b"too early").unwrap();
+/// }
+/// ```
 pub struct PreparedLocalWriter {
     section: OwnedHandle,
-    view: View,
-    layout: ValidatedRegionLayout,
-    topology: RegionSetLayout,
+    runtime: WriterRegion<WindowsWriterMapping>,
+    entry: ManifestEntry,
+    len: usize,
+    reader_duplicated: bool,
 }
 impl PreparedLocalWriter {
     /// Duplicates exactly `FILE_MAP_READ` into a held authenticated target process.
@@ -267,29 +282,25 @@ impl PreparedLocalWriter {
     /// # Safety
     ///
     /// `target_process` must be the held live process authenticated by the pipe.
-    pub unsafe fn duplicate_reader_to(
-        &self,
+    unsafe fn duplicate_reader_to(
+        &mut self,
         target_process: HANDLE,
     ) -> Result<RemoteHandle, WindowsError> {
-        duplicate_to(self.section.0, target_process, FILE_MAP_READ)
-    }
-    /// Closes the full section handle and commits the sole local writer.
-    pub fn bind(self) -> Result<WriterRegion<WindowsWriterMapping>, WindowsError> {
-        drop(self.section);
-        Ok(WriterRegion::new(
-            WindowsWriterMapping { view: self.view },
-            self.layout,
-            self.topology,
-        )?)
+        if self.reader_duplicated {
+            return Err(WindowsError::CapabilityAlreadyTransferred);
+        }
+        let handle = duplicate_to(self.section.0, target_process, FILE_MAP_READ)?;
+        self.reader_duplicated = true;
+        Ok(handle)
     }
 }
 
 /// Local read-only view awaiting the sole remote-writer handle and READY barrier.
 pub struct PreparedRemoteWriter {
     section: OwnedHandle,
-    view: View,
-    layout: ValidatedRegionLayout,
-    topology: RegionSetLayout,
+    runtime: ReaderRegion<WindowsReaderMapping>,
+    entry: ManifestEntry,
+    len: usize,
     writer_duplicated: bool,
 }
 impl PreparedRemoteWriter {
@@ -298,7 +309,7 @@ impl PreparedRemoteWriter {
     /// # Safety
     ///
     /// `target_process` must be the held live process authenticated by the pipe.
-    pub unsafe fn duplicate_writer_to(
+    unsafe fn duplicate_writer_to(
         &mut self,
         target_process: HANDLE,
     ) -> Result<RemoteHandle, WindowsError> {
@@ -309,15 +320,25 @@ impl PreparedRemoteWriter {
         self.writer_duplicated = true;
         Ok(handle)
     }
-    /// Closes the full section handle and commits the local read-only witness.
-    pub fn bind_reader(self) -> Result<ReaderRegion<WindowsReaderMapping>, WindowsError> {
-        drop(self.section);
-        Ok(ReaderRegion::new(
-            WindowsReaderMapping { view: self.view },
-            self.layout,
-            self.topology,
-        )?)
-    }
+}
+
+/// Validated imported reader withheld until the creator acknowledges READY.
+///
+/// ```compile_fail
+/// use native_ipc_platform::windows::PendingImportedReader;
+/// fn read_early(pending: PendingImportedReader) {
+///     let _ = pending.copy_payload(0, 1);
+/// }
+/// ```
+pub struct PendingImportedReader {
+    runtime: ReaderRegion<WindowsReaderMapping>,
+    entry: ManifestEntry,
+}
+
+/// Validated imported writer withheld until the creator acknowledges READY.
+pub struct PendingImportedWriter {
+    runtime: WriterRegion<WindowsWriterMapping>,
+    entry: ManifestEntry,
 }
 
 /// Imports a duplicated section handle using an exact desired mapping access.
@@ -331,18 +352,19 @@ pub unsafe fn import_reader(
     len: usize,
     expected: ValidationExpectations,
     topology: RegionSetLayout,
-) -> Result<ReaderRegion<WindowsReaderMapping>, WindowsError> {
+) -> Result<PendingImportedReader, WindowsError> {
     let section = OwnedHandle::new(handle as HANDLE)?;
     let view = View::map(section.0, len, FILE_MAP_READ)?;
     // SAFETY: READY protocol keeps view quiescent; access is read-only.
     let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
     let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+    let entry = ManifestEntry::validated(expected, len, PeerAccess::ReadOnly)
+        .ok_or(WindowsError::InvalidBootstrap)?;
     drop(section);
-    Ok(ReaderRegion::new(
-        WindowsReaderMapping { view },
-        layout,
-        topology,
-    )?)
+    Ok(PendingImportedReader {
+        runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
+        entry,
+    })
 }
 
 /// Imports the sole duplicated writer handle.
@@ -356,18 +378,19 @@ pub unsafe fn import_writer(
     len: usize,
     expected: ValidationExpectations,
     topology: RegionSetLayout,
-) -> Result<WriterRegion<WindowsWriterMapping>, WindowsError> {
+) -> Result<PendingImportedWriter, WindowsError> {
     let section = OwnedHandle::new(handle as HANDLE)?;
     let view = View::map(section.0, len, FILE_MAP_WRITE)?;
     // SAFETY: READY protocol keeps the sole writer quiescent during validation.
     let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
     let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+    let entry = ManifestEntry::validated(expected, len, PeerAccess::SoleWriter)
+        .ok_or(WindowsError::InvalidBootstrap)?;
     drop(section);
-    Ok(WriterRegion::new(
-        WindowsWriterMapping { view },
-        layout,
-        topology,
-    )?)
+    Ok(PendingImportedWriter {
+        runtime: WriterRegion::new(WindowsWriterMapping { view }, layout, topology)?,
+        entry,
+    })
 }
 
 /// Kill-on-last-handle Job Object used to contain an exact spawned helper tree.
@@ -415,6 +438,7 @@ const PARENT_ENV: &str = "NATIVE_IPC_PARENT_PID";
 const BOOTSTRAP_MAGIC: [u8; 8] = *b"NIPCWIN1";
 const AUTH_MAGIC: [u8; 8] = *b"NIPCAUT1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
+const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
 #[cfg(not(test))]
 const WAIT_MS: u32 = 10_000;
@@ -430,14 +454,39 @@ struct BootstrapFrame {
     child_pid: u32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CapabilityFrame {
-    magic: [u8; 8],
-    reader_handle: usize,
-    writer_handle: usize,
+const CAPABILITY_FRAME_LEN: usize = 40 + CONTROL_FRAME_LEN;
+
+fn encode_capability_frame(
+    reader: RemoteHandle,
     reader_len: usize,
+    writer: RemoteHandle,
     writer_len: usize,
+    transcript: &[u8; CONTROL_FRAME_LEN],
+) -> Result<[u8; CAPABILITY_FRAME_LEN], WindowsError> {
+    let mut frame = [0_u8; CAPABILITY_FRAME_LEN];
+    frame[..8].copy_from_slice(&CAPABILITY_MAGIC);
+    frame[8..16].copy_from_slice(
+        &u64::try_from(reader.0)
+            .map_err(|_| WindowsError::InvalidBootstrap)?
+            .to_le_bytes(),
+    );
+    frame[16..24].copy_from_slice(
+        &u64::try_from(writer.0)
+            .map_err(|_| WindowsError::InvalidBootstrap)?
+            .to_le_bytes(),
+    );
+    frame[24..32].copy_from_slice(
+        &u64::try_from(reader_len)
+            .map_err(|_| WindowsError::InvalidBootstrap)?
+            .to_le_bytes(),
+    );
+    frame[32..40].copy_from_slice(
+        &u64::try_from(writer_len)
+            .map_err(|_| WindowsError::InvalidBootstrap)?
+            .to_le_bytes(),
+    );
+    frame[40..].copy_from_slice(transcript);
+    Ok(frame)
 }
 
 /// Parent-owned exact helper, private pipe, process handle, and kill-on-close job.
@@ -448,6 +497,8 @@ pub struct ChildSession {
     pid: u32,
     nonce: [u8; 32],
     reaped: bool,
+    next_transfer_id: u64,
+    pending_manifest: Option<TransferManifest>,
 }
 
 impl ChildSession {
@@ -545,6 +596,8 @@ impl ChildSession {
             pid: information.dwProcessId,
             nonce,
             reaped: false,
+            next_transfer_id: 1,
+            pending_manifest: None,
         })
     }
 
@@ -557,35 +610,119 @@ impl ChildSession {
         self.pid
     }
     /// Sends the two exact-rights handle values and their complete mapped lengths.
-    pub fn send_capabilities(
-        &self,
-        reader: RemoteHandle,
-        reader_len: usize,
-        writer: RemoteHandle,
-        writer_len: usize,
+    fn send_capabilities(
+        &mut self,
+        reader_handle: RemoteHandle,
+        reader: &PreparedLocalWriter,
+        writer_handle: RemoteHandle,
+        remote_writer: &PreparedRemoteWriter,
     ) -> Result<(), WindowsError> {
-        write_pod(
-            self.pipe.0,
-            &CapabilityFrame {
-                magic: CAPABILITY_MAGIC,
-                reader_handle: reader.0,
-                writer_handle: writer.0,
-                reader_len,
-                writer_len,
-            },
+        if self.pending_manifest.is_some() {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let manifest = TransferManifest::new(
+            self.nonce,
+            unsafe { GetCurrentProcessId() },
+            self.pid,
+            self.next_transfer_id,
+            vec![reader.entry, remote_writer.entry],
         )
+        .ok_or(WindowsError::InvalidBootstrap)?;
+        let frame = encode_capability_frame(
+            reader_handle,
+            reader.len,
+            writer_handle,
+            remote_writer.len,
+            &manifest.encode(CAPABILITY_MAGIC),
+        )?;
+        write_pod(self.pipe.0, &frame)?;
+        self.pending_manifest = Some(manifest);
+        Ok(())
     }
-    /// Waits for the authenticated child to finish import and validation.
-    pub fn wait_ready(&self) -> Result<(), WindowsError> {
-        let ready: BootstrapFrame = read_pod(self.pipe.0)?;
-        if ready.magic == READY_MAGIC
-            && ready.nonce == self.nonce
-            && ready.parent_pid == unsafe { GetCurrentProcessId() }
-            && ready.child_pid == self.pid
-        {
-            Ok(())
-        } else {
-            Err(WindowsError::InvalidBootstrap)
+    /// Consumes prepared mappings after authenticated READY and sends COMMIT.
+    ///
+    /// This method owns capability duplication, the remote-handle cleanup
+    /// ledger, exact manifest transfer, READY validation, and COMMIT. It returns
+    /// `(local_writer, local_reader)` only after successful COMMIT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplication, pipe, transcript, timeout, or process
+    /// failures. Ambiguous failure terminates and reaps the exact held child.
+    ///
+    /// ```compile_fail
+    /// use native_ipc_platform::windows::{
+    ///     ChildSession, PreparedLocalWriter, PreparedRemoteWriter,
+    /// };
+    /// fn commit_twice(
+    ///     session: &mut ChildSession,
+    ///     writer: PreparedLocalWriter,
+    ///     reader: PreparedRemoteWriter,
+    /// ) {
+    ///     let _ = session.commit_transfers(writer, reader);
+    ///     let _ = session.commit_transfers(writer, reader);
+    /// }
+    /// ```
+    pub fn commit_transfers(
+        &mut self,
+        writer: PreparedLocalWriter,
+        reader: PreparedRemoteWriter,
+    ) -> Result<
+        (
+            WriterRegion<WindowsWriterMapping>,
+            ReaderRegion<WindowsReaderMapping>,
+        ),
+        WindowsError,
+    > {
+        let result = self.commit_transfers_inner(writer, reader);
+        if result.is_err() {
+            self.abort_child();
+        }
+        result
+    }
+
+    fn commit_transfers_inner(
+        &mut self,
+        mut writer: PreparedLocalWriter,
+        mut reader: PreparedRemoteWriter,
+    ) -> Result<
+        (
+            WriterRegion<WindowsWriterMapping>,
+            ReaderRegion<WindowsReaderMapping>,
+        ),
+        WindowsError,
+    > {
+        // SAFETY: this session owns the exact authenticated live child handle.
+        let reader_handle = unsafe { writer.duplicate_reader_to(self.process.0)? };
+        // SAFETY: same held child; the preparation enforces one writer duplicate.
+        let writer_handle = unsafe { reader.duplicate_writer_to(self.process.0)? };
+        self.send_capabilities(reader_handle, &writer, writer_handle, &reader)?;
+        let manifest = self
+            .pending_manifest
+            .as_ref()
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        let ready: [u8; CONTROL_FRAME_LEN] = read_pod(self.pipe.0)?;
+        if !manifest.matches_frame(READY_MAGIC, &ready) {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        write_pod(self.pipe.0, &manifest.encode(COMMIT_MAGIC))?;
+        drop(writer.section);
+        drop(reader.section);
+        self.pending_manifest = None;
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        Ok((writer.runtime, reader.runtime))
+    }
+
+    fn abort_child(&mut self) {
+        if !self.reaped {
+            // SAFETY: this session owns the exact authenticated child handle.
+            let _ = unsafe { TerminateProcess(self.process.0, 127) };
+            // SAFETY: same held process; bounded wait completes cleanup.
+            let _ = unsafe { WaitForSingleObject(self.process.0, WAIT_MS) };
+            self.reaped = true;
         }
     }
     /// Waits for a normal helper exit after protocol completion.
@@ -670,6 +807,8 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
         pipe,
         parent_pid,
         nonce,
+        next_transfer_id: 1,
+        pending_transcript: None,
     })
 }
 
@@ -678,6 +817,8 @@ pub struct ChildChannel {
     pipe: OwnedHandle,
     parent_pid: u32,
     nonce: [u8; 32],
+    next_transfer_id: u64,
+    pending_transcript: Option<[u8; CONTROL_FRAME_LEN]>,
 }
 impl ChildChannel {
     /// Held authenticated parent PID.
@@ -689,36 +830,99 @@ impl ChildChannel {
         self.pipe.0
     }
     /// Receives exact-rights handle values only after pipe PID authentication.
+    ///
+    /// The tuple is `(reader_handle, reader_len, writer_handle, writer_len)`.
+    /// Lengths are exact page-rounded capability sizes. Handles remain pending
+    /// and must be imported and passed to [`Self::commit_imports`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate receipt, timeout, truncated or oversized
+    /// frames, invalid fixed-width values, or a malformed capability envelope.
     pub fn receive_capabilities(
-        &self,
+        &mut self,
     ) -> Result<(RemoteHandle, usize, RemoteHandle, usize), WindowsError> {
-        let frame: CapabilityFrame = read_pod(self.pipe.0)?;
-        if frame.magic != CAPABILITY_MAGIC
-            || frame.reader_handle == 0
-            || frame.writer_handle == 0
-            || frame.reader_len == 0
-            || frame.writer_len == 0
-        {
+        if self.pending_transcript.is_some() {
             return Err(WindowsError::InvalidBootstrap);
         }
+        let frame: [u8; CAPABILITY_FRAME_LEN] = read_pod(self.pipe.0)?;
+        if frame[..8] != CAPABILITY_MAGIC {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let reader_handle = usize::try_from(u64::from_le_bytes(
+            frame[8..16].try_into().expect("fixed range"),
+        ))
+        .map_err(|_| WindowsError::InvalidBootstrap)?;
+        let writer_handle = usize::try_from(u64::from_le_bytes(
+            frame[16..24].try_into().expect("fixed range"),
+        ))
+        .map_err(|_| WindowsError::InvalidBootstrap)?;
+        let reader_len = usize::try_from(u64::from_le_bytes(
+            frame[24..32].try_into().expect("fixed range"),
+        ))
+        .map_err(|_| WindowsError::InvalidBootstrap)?;
+        let writer_len = usize::try_from(u64::from_le_bytes(
+            frame[32..40].try_into().expect("fixed range"),
+        ))
+        .map_err(|_| WindowsError::InvalidBootstrap)?;
+        if reader_handle == 0 || writer_handle == 0 || reader_len == 0 || writer_len == 0 {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let mut transcript = [0; CONTROL_FRAME_LEN];
+        transcript.copy_from_slice(&frame[40..]);
+        self.pending_transcript = Some(transcript);
         Ok((
-            RemoteHandle(frame.reader_handle),
-            frame.reader_len,
-            RemoteHandle(frame.writer_handle),
-            frame.writer_len,
+            RemoteHandle(reader_handle),
+            reader_len,
+            RemoteHandle(writer_handle),
+            writer_len,
         ))
     }
-    /// Signals that received mappings were imported and validated.
-    pub fn signal_ready(&self) -> Result<(), WindowsError> {
-        write_pod(
-            self.pipe.0,
-            &BootstrapFrame {
-                magic: READY_MAGIC,
-                nonce: self.nonce,
-                parent_pid: self.parent_pid,
-                child_pid: unsafe { GetCurrentProcessId() },
-            },
+    /// Signals validation, waits for COMMIT, then exposes imported capabilities.
+    ///
+    /// Returns `(imported_reader, imported_writer)` in manifest order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the imported entries do not match the capability
+    /// transcript, READY cannot be sent, or COMMIT is malformed or stale.
+    pub fn commit_imports(
+        &mut self,
+        reader: PendingImportedReader,
+        writer: PendingImportedWriter,
+    ) -> Result<
+        (
+            ReaderRegion<WindowsReaderMapping>,
+            WriterRegion<WindowsWriterMapping>,
+        ),
+        WindowsError,
+    > {
+        let manifest = TransferManifest::new(
+            self.nonce,
+            self.parent_pid,
+            unsafe { GetCurrentProcessId() },
+            self.next_transfer_id,
+            vec![reader.entry, writer.entry],
         )
+        .ok_or(WindowsError::InvalidBootstrap)?;
+        let transcript = self
+            .pending_transcript
+            .as_ref()
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        if !manifest.matches_frame(CAPABILITY_MAGIC, transcript) {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        write_pod(self.pipe.0, &manifest.encode(READY_MAGIC))?;
+        let commit: [u8; CONTROL_FRAME_LEN] = read_pod(self.pipe.0)?;
+        if !manifest.matches_frame(COMMIT_MAGIC, &commit) {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        self.pending_transcript = None;
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        Ok((reader.runtime, writer.runtime))
     }
 }
 
@@ -1186,7 +1390,7 @@ mod tests {
         let mut peer_region = QuiescentRegion::new(peer_layout.total_size() as usize).unwrap();
         peer_layout.encode_into(peer_region.as_bytes_mut()).unwrap();
         let peer_expected = expected(&topology, peer, peer_region.len());
-        let mut prepared_peer = peer_region
+        let prepared_peer = peer_region
             .prepare_remote_writer(peer_expected, topology.clone())
             .unwrap();
         let executable = std::env::current_exe().unwrap();
@@ -1196,37 +1400,11 @@ mod tests {
             OsString::from("--ignored"),
             OsString::from("--nocapture"),
         ];
-        let child = ChildSession::spawn(&executable, &arguments).unwrap();
+        let mut child = ChildSession::spawn(&executable, &arguments).unwrap();
         assert_ne!(child.pid(), unsafe { GetCurrentProcessId() });
-        // SAFETY: held process was authenticated by exact kernel pipe PID.
-        let reader_handle = unsafe {
-            prepared_producer
-                .duplicate_reader_to(child.process_handle())
-                .unwrap()
-        };
-        // SAFETY: same held process; this is the only remote writable duplicate.
-        let writer_handle = unsafe {
-            prepared_peer
-                .duplicate_writer_to(child.process_handle())
-                .unwrap()
-        };
-        assert!(matches!(
-            // SAFETY: the call is intentionally repeated against the same held process
-            // to verify that the typestate rejects a second writable duplicate.
-            unsafe { prepared_peer.duplicate_writer_to(child.process_handle()) },
-            Err(WindowsError::CapabilityAlreadyTransferred)
-        ));
-        child
-            .send_capabilities(
-                reader_handle,
-                prepared_producer.view.len,
-                writer_handle,
-                prepared_peer.view.len,
-            )
+        let (mut writer, reader) = child
+            .commit_transfers(prepared_producer, prepared_peer)
             .unwrap();
-        let mut writer = prepared_producer.bind().unwrap();
-        let reader = prepared_peer.bind_reader().unwrap();
-        child.wait_ready().unwrap();
         writer
             .publish(0, 1, None, b"cross-process-windows")
             .unwrap();
@@ -1272,7 +1450,7 @@ mod tests {
     #[ignore = "spawned only by the exact lifecycle test"]
     fn spawned_helper_entry() {
         let (topology, producer, peer) = topology();
-        let channel = connect_spawned_helper().unwrap();
+        let mut channel = connect_spawned_helper().unwrap();
         assert_ne!(channel.parent_pid(), unsafe { GetCurrentProcessId() });
         let (reader_handle, reader_len, writer_handle, writer_len) =
             channel.receive_capabilities().unwrap();
@@ -1287,7 +1465,7 @@ mod tests {
             .unwrap()
         };
         // SAFETY: manifest designates this exact handle as the sole writer.
-        let mut writer = unsafe {
+        let writer = unsafe {
             import_writer(
                 writer_handle.0,
                 writer_len,
@@ -1296,7 +1474,7 @@ mod tests {
             )
             .unwrap()
         };
-        channel.signal_ready().unwrap();
+        let (reader, mut writer) = channel.commit_imports(reader, writer).unwrap();
         for _ in 0..10_000 {
             if let Ok(payload) = reader.copy_payload(0, 1) {
                 assert_eq!(payload, b"cross-process-windows");

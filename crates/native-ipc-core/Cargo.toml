@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/native-ipc-core"
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
