@@ -13,6 +13,7 @@ const MACH_PORT_NULL: MachPort = 0;
 const MACH_PORT_RIGHT_RECEIVE: c_int = 1;
 const MACH_MSG_TYPE_COPY_SEND: u8 = 19;
 const MACH_MSG_TYPE_MAKE_SEND: u8 = 20;
+const MACH_MSG_TYPE_PORT_SEND: u8 = 17;
 const MACH_MSG_PORT_DESCRIPTOR: u8 = 0;
 const MACH_MSGH_BITS_COMPLEX: u32 = 0x8000_0000;
 const MACH_SEND_MSG: u32 = 0x0000_0001;
@@ -45,6 +46,7 @@ unsafe extern "C" {
         timeout: u32,
         notify: MachPort,
     ) -> MachMsgReturn;
+    fn mach_msg_destroy(message: *mut MachMsgHeader);
     fn task_get_special_port(task: MachPort, which: c_int, port: *mut MachPort) -> c_int;
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
@@ -249,6 +251,7 @@ impl SpawnedHelper {
         let nonce_value = hex(&nonce);
         let parent_pid = std::process::id().to_string();
         let mut environment: Vec<CString> = std::env::vars_os()
+            .filter(|(key, _)| key != ENV_NONCE && key != ENV_PARENT_PID)
             .filter_map(|(key, value)| {
                 CString::new(format!(
                     "{}={}",
@@ -480,15 +483,23 @@ fn receive_port(
             MACH_PORT_NULL,
         )
     })?;
+    let complex = buffer.message.header.bits & MACH_MSGH_BITS_COMPLEX != 0;
     if buffer.message.header.size as usize != size_of::<PortMessage>()
+        || !complex
         || buffer.message.header.id != MESSAGE_ID
         || buffer.message.body.descriptor_count != 1
         || buffer.message.descriptor.descriptor_type != MACH_MSG_PORT_DESCRIPTOR
+        || buffer.message.descriptor.disposition != MACH_MSG_TYPE_PORT_SEND
         || buffer.message.magic != MESSAGE_MAGIC
         || buffer.message.nonce != *nonce
         || buffer.message.descriptor.name == MACH_PORT_NULL
         || buffer.trailer.trailer_size as usize != size_of::<AuditTrailer>()
     {
+        if complex {
+            // SAFETY: the kernel delivered a complex message into this live buffer;
+            // libSystem destroys every delivered descriptor according to its type.
+            unsafe { mach_msg_destroy(&mut buffer.message.header) };
+        }
         return Err(BootstrapError::InvalidMessage);
     }
     // SAFETY: kernel supplied a complete audit trailer of the checked size.
@@ -551,8 +562,8 @@ fn terminate_and_reap(pid: Pid) {
     if pid <= 0 {
         return;
     }
-    // SAFETY: signal is bounded and PID is the held spawned child.
-    let _ = unsafe { kill(pid, 15) };
+    // SAFETY: SIGKILL cannot be ignored and PID is the held spawned child.
+    let _ = unsafe { kill(pid, 9) };
     let mut status = 0;
     // SAFETY: status pointer is valid; held child is reaped at most once here.
     let _ = unsafe { waitpid(pid, &mut status, 0) };

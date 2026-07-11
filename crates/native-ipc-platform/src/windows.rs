@@ -6,14 +6,16 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use native_ipc_core::layout::{RegionSetLayout, ValidatedRegionLayout, ValidationExpectations};
 use native_ipc_core::mapping::{
     BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -33,13 +35,14 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-    PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    SetNamedPipeHandleState,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
-    GetCurrentProcessId, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
+    GetCurrentProcessId, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 
 use crate::BackendStatus;
@@ -68,6 +71,10 @@ pub enum WindowsError {
     InvalidBootstrap,
     /// A sole-writer capability was already duplicated from this preparation.
     CapabilityAlreadyTransferred,
+    /// A bounded bootstrap or lifecycle operation reached its deadline.
+    TimedOut(&'static str),
+    /// The exact helper exited unsuccessfully.
+    ChildExit(u32),
 }
 
 impl fmt::Display for WindowsError {
@@ -409,7 +416,10 @@ const BOOTSTRAP_MAGIC: [u8; 8] = *b"NIPCWIN1";
 const AUTH_MAGIC: [u8; 8] = *b"NIPCAUT1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
 const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+#[cfg(not(test))]
 const WAIT_MS: u32 = 10_000;
+#[cfg(test)]
+const WAIT_MS: u32 = 1_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -451,7 +461,10 @@ impl ChildSession {
             CreateNamedPipeW(
                 pipe_name.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_MESSAGE
+                    | PIPE_READMODE_MESSAGE
+                    | PIPE_NOWAIT
+                    | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 4096,
                 4096,
@@ -460,6 +473,7 @@ impl ChildSession {
             )
         };
         let pipe = OwnedHandle::new(pipe)?;
+        let job = ChildJob::new()?;
 
         let application = wide_null(path.as_os_str());
         let mut command = command_line(path.as_os_str(), arguments);
@@ -492,7 +506,6 @@ impl ChildSession {
         }
         let process = OwnedHandle::new(information.hProcess)?;
         let thread = OwnedHandle::new(information.hThread)?;
-        let job = ChildJob::new()?;
         // SAFETY: CreateProcessW returned this exact child still suspended.
         if let Err(error) = unsafe { job.assign_suspended(process.0) } {
             // SAFETY: exact held child is still suspended.
@@ -506,14 +519,7 @@ impl ChildSession {
             return Err(error);
         }
         drop(thread);
-        // SAFETY: synchronous connection uses a null OVERLAPPED pointer.
-        if unsafe { ConnectNamedPipe(pipe.0, std::ptr::null_mut()) } == 0
-            && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED
-        {
-            let error = last_os("ConnectNamedPipe");
-            let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(error);
-        }
+        connect_pipe(pipe.0, process.0)?;
         // SAFETY: the server pipe is connected and the expected PID is held live.
         unsafe { authenticate_pipe_client(pipe.0, information.dwProcessId)? };
         let hello = BootstrapFrame {
@@ -585,8 +591,19 @@ impl ChildSession {
     /// Waits for a normal helper exit after protocol completion.
     pub fn wait(mut self) -> Result<(), WindowsError> {
         // SAFETY: process is held live for this session.
-        if unsafe { WaitForSingleObject(self.process.0, WAIT_MS) } != WAIT_OBJECT_0 {
-            return Err(last_os("WaitForSingleObject"));
+        match unsafe { WaitForSingleObject(self.process.0, WAIT_MS) } {
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                // SAFETY: held process is signaled and output pointer is valid.
+                if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
+                    return Err(last_os("GetExitCodeProcess"));
+                }
+                if code != 0 {
+                    return Err(WindowsError::ChildExit(code));
+                }
+            }
+            WAIT_TIMEOUT => return Err(WindowsError::TimedOut("helper exit")),
+            _ => return Err(last_os("WaitForSingleObject")),
         }
         self.reaped = true;
         Ok(())
@@ -626,6 +643,11 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
         )
     };
     let pipe = OwnedHandle::new(pipe)?;
+    let mode = PIPE_READMODE_MESSAGE | PIPE_NOWAIT;
+    // SAFETY: connected client pipe and mode pointer are valid.
+    if unsafe { SetNamedPipeHandleState(pipe.0, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+        return Err(last_os("SetNamedPipeHandleState"));
+    }
     // SAFETY: connected pipe client and exact expected parent from spawn environment.
     unsafe { authenticate_pipe_server(pipe.0, parent_pid)? };
     let hello = read_frame(pipe.0)?;
@@ -893,24 +915,35 @@ fn write_frame(pipe: HANDLE, frame: &BootstrapFrame) -> Result<(), WindowsError>
 
 fn write_pod<T>(pipe: HANDLE, value: &T) -> Result<(), WindowsError> {
     let bytes = pod_bytes(value);
-    let mut written = 0;
-    // SAFETY: pipe is live, bytes are valid, and operation is synchronous.
-    if unsafe {
-        WriteFile(
-            pipe,
-            bytes.as_ptr(),
-            bytes.len() as u32,
-            &mut written,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_os("WriteFile"));
+    let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    loop {
+        let mut written = 0;
+        // SAFETY: pipe is live, bytes are valid, and nonblocking operation is synchronous.
+        if unsafe {
+            WriteFile(
+                pipe,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        } != 0
+        {
+            return if written as usize == bytes.len() {
+                Ok(())
+            } else {
+                Err(WindowsError::InvalidBootstrap)
+            };
+        }
+        let code = unsafe { GetLastError() };
+        if code != ERROR_NO_DATA && code != ERROR_PIPE_LISTENING {
+            return Err(WindowsError::Os {
+                operation: "WriteFile",
+                code,
+            });
+        }
+        wait_retry(deadline, "pipe write")?;
     }
-    if written as usize != bytes.len() {
-        return Err(WindowsError::InvalidBootstrap);
-    }
-    Ok(())
 }
 
 fn read_frame(pipe: HANDLE) -> Result<BootstrapFrame, WindowsError> {
@@ -918,25 +951,75 @@ fn read_frame(pipe: HANDLE) -> Result<BootstrapFrame, WindowsError> {
 }
 
 fn read_pod<T>(pipe: HANDLE) -> Result<T, WindowsError> {
-    let mut value: T = unsafe { zeroed() };
-    let mut read = 0;
-    // SAFETY: frame output range is valid and operation is synchronous.
-    if unsafe {
-        ReadFile(
-            pipe,
-            (&mut value as *mut T).cast(),
-            size_of::<T>() as u32,
-            &mut read,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(last_os("ReadFile"));
+    let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    loop {
+        let mut value: T = unsafe { zeroed() };
+        let mut read = 0;
+        // SAFETY: frame output range is valid and nonblocking operation is synchronous.
+        if unsafe {
+            ReadFile(
+                pipe,
+                (&mut value as *mut T).cast(),
+                size_of::<T>() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        } != 0
+        {
+            return if read as usize == size_of::<T>() {
+                Ok(value)
+            } else {
+                Err(WindowsError::InvalidBootstrap)
+            };
+        }
+        let code = unsafe { GetLastError() };
+        if code != ERROR_NO_DATA && code != ERROR_PIPE_LISTENING {
+            return Err(WindowsError::Os {
+                operation: "ReadFile",
+                code,
+            });
+        }
+        wait_retry(deadline, "pipe read")?;
     }
-    if read as usize != size_of::<T>() {
-        return Err(WindowsError::InvalidBootstrap);
+}
+
+fn connect_pipe(pipe: HANDLE, process: HANDLE) -> Result<(), WindowsError> {
+    let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    loop {
+        // SAFETY: server pipe is nonblocking and no OVERLAPPED operation is requested.
+        if unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) } != 0 {
+            return Ok(());
+        }
+        let code = unsafe { GetLastError() };
+        if code == ERROR_PIPE_CONNECTED {
+            return Ok(());
+        }
+        if code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA {
+            return Err(WindowsError::Os {
+                operation: "ConnectNamedPipe",
+                code,
+            });
+        }
+        // SAFETY: exact child process handle is held throughout bootstrap.
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
+            let mut exit = 0;
+            // SAFETY: process is signaled and output is valid.
+            if unsafe { GetExitCodeProcess(process, &mut exit) } != 0 {
+                return Err(WindowsError::ChildExit(exit));
+            }
+            return Err(last_os("GetExitCodeProcess"));
+        }
+        wait_retry(deadline, "pipe connect")?;
     }
-    Ok(value)
+}
+
+fn wait_retry(deadline: Instant, operation: &'static str) -> Result<(), WindowsError> {
+    if Instant::now() >= deadline {
+        Err(WindowsError::TimedOut(operation))
+    } else {
+        std::thread::sleep(Duration::from_millis(1));
+        Ok(())
+    }
 }
 
 fn hex(bytes: &[u8; 32]) -> String {
@@ -1159,6 +1242,33 @@ mod tests {
     }
 
     #[test]
+    fn helper_exit_before_connect_is_bounded() {
+        let executable = std::env::current_exe().unwrap();
+        let arguments = [
+            OsString::from("--exact"),
+            OsString::from("windows::tests::exit_before_connect_entry"),
+            OsString::from("--ignored"),
+        ];
+        let result = ChildSession::spawn(&executable, &arguments);
+        assert!(matches!(
+            result,
+            Err(WindowsError::ChildExit(0) | WindowsError::Os { .. })
+        ));
+    }
+
+    #[test]
+    fn helper_stall_before_auth_is_bounded() {
+        let executable = std::env::current_exe().unwrap();
+        let arguments = [
+            OsString::from("--exact"),
+            OsString::from("windows::tests::stall_before_auth_entry"),
+            OsString::from("--ignored"),
+        ];
+        let result = ChildSession::spawn(&executable, &arguments);
+        assert!(matches!(result, Err(WindowsError::TimedOut("pipe read"))));
+    }
+
+    #[test]
     #[ignore = "spawned only by the exact lifecycle test"]
     fn spawned_helper_entry() {
         let (topology, producer, peer) = topology();
@@ -1196,5 +1306,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("parent never published payload");
+    }
+
+    #[test]
+    #[ignore = "spawned only by the exit-before-connect lifecycle test"]
+    fn exit_before_connect_entry() {}
+
+    #[test]
+    #[ignore = "spawned only by the stalled-auth lifecycle test"]
+    fn stall_before_auth_entry() {
+        let name = wide_null(&std::env::var_os(PIPE_ENV).unwrap());
+        // SAFETY: terminated private pipe name and existing-only open are valid.
+        let pipe = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        let _pipe = OwnedHandle::new(pipe).unwrap();
+        std::thread::sleep(Duration::from_secs(5));
     }
 }
