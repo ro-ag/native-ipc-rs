@@ -1006,6 +1006,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawned in an isolated process by descriptor_cleanup_is_zero_growth"]
     fn malformed_extra_descriptor_frame_has_zero_fd_growth() {
         let before = open_fd_count();
         {
@@ -1041,6 +1042,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawned in an isolated process by descriptor_cleanup_is_zero_growth"]
     fn ancillary_on_later_stream_fragment_is_adopted_and_rejected() {
         let before = open_fd_count();
         {
@@ -1068,6 +1070,21 @@ mod tests {
             });
         }
         assert_eq!(open_fd_count(), before);
+    }
+
+    #[test]
+    fn descriptor_cleanup_is_zero_growth() {
+        let executable = std::env::current_exe().unwrap();
+        for test in [
+            "linux::tests::malformed_extra_descriptor_frame_has_zero_fd_growth",
+            "linux::tests::ancillary_on_later_stream_fragment_is_adopted_and_rejected",
+        ] {
+            let status = Command::new(&executable)
+                .args(["--exact", test, "--ignored", "--nocapture"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated descriptor test failed: {test}");
+        }
     }
 
     #[test]
