@@ -46,7 +46,10 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::BackendStatus;
-use crate::protocol::{CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest};
+use crate::protocol::{
+    CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest, TransferProvenance,
+    mint_channel_id,
+};
 
 /// Windows section, bootstrap, lifecycle, or binding failure.
 #[derive(Debug)]
@@ -76,6 +79,8 @@ pub enum WindowsError {
     TimedOut(&'static str),
     /// The exact helper exited unsuccessfully.
     ChildExit(u32),
+    /// A pending value came from another channel or transfer transaction.
+    ForeignPending,
 }
 
 impl fmt::Display for WindowsError {
@@ -333,64 +338,14 @@ impl PreparedRemoteWriter {
 pub struct PendingImportedReader {
     runtime: ReaderRegion<WindowsReaderMapping>,
     entry: ManifestEntry,
+    provenance: TransferProvenance,
 }
 
 /// Validated imported writer withheld until the creator acknowledges READY.
 pub struct PendingImportedWriter {
     runtime: WriterRegion<WindowsWriterMapping>,
     entry: ManifestEntry,
-}
-
-/// Imports a duplicated section handle using an exact desired mapping access.
-///
-/// # Safety
-///
-/// `handle` must have arrived over the authenticated bootstrap, be owned by this
-/// process, have exactly the manifest rights, and not have been previously closed.
-pub unsafe fn import_reader(
-    handle: usize,
-    len: usize,
-    expected: ValidationExpectations,
-    topology: RegionSetLayout,
-) -> Result<PendingImportedReader, WindowsError> {
-    let section = OwnedHandle::new(handle as HANDLE)?;
-    let view = View::map(section.0, len, FILE_MAP_READ)?;
-    // SAFETY: READY protocol keeps view quiescent; access is read-only.
-    let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
-    let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
-    let entry = ManifestEntry::validated(expected, len, PeerAccess::ReadOnly)
-        .ok_or(WindowsError::InvalidBootstrap)?;
-    drop(section);
-    Ok(PendingImportedReader {
-        runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
-        entry,
-    })
-}
-
-/// Imports the sole duplicated writer handle.
-///
-/// # Safety
-///
-/// Same authenticated ownership requirements as [`import_reader`], plus the
-/// manifest/creator must guarantee no other writable handle or view exists.
-pub unsafe fn import_writer(
-    handle: usize,
-    len: usize,
-    expected: ValidationExpectations,
-    topology: RegionSetLayout,
-) -> Result<PendingImportedWriter, WindowsError> {
-    let section = OwnedHandle::new(handle as HANDLE)?;
-    let view = View::map(section.0, len, FILE_MAP_WRITE)?;
-    // SAFETY: READY protocol keeps the sole writer quiescent during validation.
-    let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
-    let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
-    let entry = ManifestEntry::validated(expected, len, PeerAccess::SoleWriter)
-        .ok_or(WindowsError::InvalidBootstrap)?;
-    drop(section);
-    Ok(PendingImportedWriter {
-        runtime: WriterRegion::new(WindowsWriterMapping { view }, layout, topology)?,
-        entry,
-    })
+    provenance: TransferProvenance,
 }
 
 /// Kill-on-last-handle Job Object used to contain an exact spawned helper tree.
@@ -807,8 +762,10 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
         pipe,
         parent_pid,
         nonce,
+        channel_id: mint_channel_id(),
         next_transfer_id: 1,
         pending_transcript: None,
+        poisoned: false,
     })
 }
 
@@ -817,8 +774,10 @@ pub struct ChildChannel {
     pipe: OwnedHandle,
     parent_pid: u32,
     nonce: [u8; 32],
+    channel_id: u64,
     next_transfer_id: u64,
     pending_transcript: Option<[u8; CONTROL_FRAME_LEN]>,
+    poisoned: bool,
 }
 impl ChildChannel {
     /// Held authenticated parent PID.
@@ -842,7 +801,7 @@ impl ChildChannel {
     pub fn receive_capabilities(
         &mut self,
     ) -> Result<(RemoteHandle, usize, RemoteHandle, usize), WindowsError> {
-        if self.pending_transcript.is_some() {
+        if self.poisoned || self.pending_transcript.is_some() {
             return Err(WindowsError::InvalidBootstrap);
         }
         let frame: [u8; CAPABILITY_FRAME_LEN] = read_pod(self.pipe.0)?;
@@ -878,13 +837,81 @@ impl ChildChannel {
             writer_len,
         ))
     }
+    /// Imports a duplicated read-only section handle for this open transaction.
+    ///
+    /// The pending value is bound to this channel and its current transfer
+    /// transaction; [`Self::commit_imports`] rejects values from any other
+    /// channel or transaction.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must have arrived over this channel's authenticated bootstrap,
+    /// be owned by this process, have exactly the manifest rights, and not have
+    /// been previously closed.
+    pub unsafe fn import_reader(
+        &self,
+        handle: usize,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<PendingImportedReader, WindowsError> {
+        let section = OwnedHandle::new(handle as HANDLE)?;
+        let view = View::map(section.0, len, FILE_MAP_READ)?;
+        // SAFETY: READY protocol keeps view quiescent; access is read-only.
+        let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        let entry = ManifestEntry::validated(expected, len, PeerAccess::ReadOnly)
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        drop(section);
+        Ok(PendingImportedReader {
+            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
+            entry,
+            provenance: self.pending_provenance(),
+        })
+    }
+
+    /// Imports the sole duplicated writer handle for this open transaction.
+    ///
+    /// # Safety
+    ///
+    /// Same authenticated ownership requirements as [`Self::import_reader`],
+    /// plus the manifest/creator must guarantee no other writable handle or
+    /// view exists.
+    pub unsafe fn import_writer(
+        &self,
+        handle: usize,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<PendingImportedWriter, WindowsError> {
+        let section = OwnedHandle::new(handle as HANDLE)?;
+        let view = View::map(section.0, len, FILE_MAP_WRITE)?;
+        // SAFETY: READY protocol keeps the sole writer quiescent during validation.
+        let bytes = unsafe { std::slice::from_raw_parts(view.base.as_ptr(), len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        let entry = ManifestEntry::validated(expected, len, PeerAccess::SoleWriter)
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        drop(section);
+        Ok(PendingImportedWriter {
+            runtime: WriterRegion::new(WindowsWriterMapping { view }, layout, topology)?,
+            entry,
+            provenance: self.pending_provenance(),
+        })
+    }
+
+    /// Provenance stamp binding pending imports to the open transaction.
+    const fn pending_provenance(&self) -> TransferProvenance {
+        TransferProvenance::new(self.channel_id, self.next_transfer_id)
+    }
+
     /// Signals validation, waits for COMMIT, then exposes imported capabilities.
     ///
     /// Returns `(imported_reader, imported_writer)` in manifest order.
     ///
     /// # Errors
     ///
-    /// Returns an error if the imported entries do not match the capability
+    /// Returns an error if either pending value belongs to another channel or
+    /// transfer transaction, the imported entries do not match the capability
     /// transcript, READY cannot be sent, or COMMIT is malformed or stale.
     pub fn commit_imports(
         &mut self,
@@ -897,6 +924,14 @@ impl ChildChannel {
         ),
         WindowsError,
     > {
+        if self.poisoned {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let expected = self.pending_provenance();
+        if reader.provenance != expected || writer.provenance != expected {
+            self.poisoned = true;
+            return Err(WindowsError::ForeignPending);
+        }
         let manifest = TransferManifest::new(
             self.nonce,
             self.parent_pid,
@@ -1456,23 +1491,25 @@ mod tests {
             channel.receive_capabilities().unwrap();
         // SAFETY: exact handles arrived from authenticated parent on private pipe.
         let reader = unsafe {
-            import_reader(
-                reader_handle.0,
-                reader_len,
-                expected(&topology, producer, reader_len),
-                topology.clone(),
-            )
-            .unwrap()
+            channel
+                .import_reader(
+                    reader_handle.0,
+                    reader_len,
+                    expected(&topology, producer, reader_len),
+                    topology.clone(),
+                )
+                .unwrap()
         };
         // SAFETY: manifest designates this exact handle as the sole writer.
         let writer = unsafe {
-            import_writer(
-                writer_handle.0,
-                writer_len,
-                expected(&topology, peer, writer_len),
-                topology,
-            )
-            .unwrap()
+            channel
+                .import_writer(
+                    writer_handle.0,
+                    writer_len,
+                    expected(&topology, peer, writer_len),
+                    topology,
+                )
+                .unwrap()
         };
         let (reader, mut writer) = channel.commit_imports(reader, writer).unwrap();
         for _ in 0..10_000 {
@@ -1484,6 +1521,95 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("parent never published payload");
+    }
+
+    fn detached_channel() -> ChildChannel {
+        let nonce = session_nonce().unwrap();
+        let name = format!(r"\\.\pipe\native-ipc-test-{}", hex(&nonce));
+        let pipe_name = wide_null(OsStr::new(&name));
+        // SAFETY: terminated unique name; null security creates a private instance.
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                pipe_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_MESSAGE
+                    | PIPE_READMODE_MESSAGE
+                    | PIPE_NOWAIT
+                    | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                WAIT_MS,
+                std::ptr::null(),
+            )
+        };
+        ChildChannel {
+            pipe: OwnedHandle::new(pipe).unwrap(),
+            parent_pid: unsafe { GetCurrentProcessId() },
+            nonce,
+            channel_id: mint_channel_id(),
+            next_transfer_id: 1,
+            pending_transcript: None,
+            poisoned: false,
+        }
+    }
+
+    #[test]
+    fn foreign_pending_imports_fail_closed_before_ready() {
+        let (topology, producer, peer) = topology();
+        let producer_layout = topology.region(producer).unwrap();
+        let mut producer_region =
+            QuiescentRegion::new(producer_layout.total_size() as usize).unwrap();
+        producer_layout
+            .encode_into(producer_region.as_bytes_mut())
+            .unwrap();
+        let reader_len = producer_region.len();
+        let reader_expected = expected(&topology, producer, reader_len);
+        let reader_dup = duplicate_to(
+            producer_region.section.0,
+            unsafe { GetCurrentProcess() },
+            FILE_MAP_READ,
+        )
+        .unwrap();
+
+        let peer_layout = topology.region(peer).unwrap();
+        let mut peer_region = QuiescentRegion::new(peer_layout.total_size() as usize).unwrap();
+        peer_layout.encode_into(peer_region.as_bytes_mut()).unwrap();
+        let writer_len = peer_region.len();
+        let writer_expected = expected(&topology, peer, writer_len);
+        let writer_dup = duplicate_to(
+            peer_region.section.0,
+            unsafe { GetCurrentProcess() },
+            FILE_MAP_WRITE,
+        )
+        .unwrap();
+
+        let first = detached_channel();
+        let mut second = detached_channel();
+        // SAFETY: both duplicated handles are locally created, owned, and unused elsewhere.
+        let reader = unsafe {
+            first
+                .import_reader(reader_dup.0, reader_len, reader_expected, topology.clone())
+                .unwrap()
+        };
+        // SAFETY: the writable duplicate is the sole writer handle for its section.
+        let writer = unsafe {
+            first
+                .import_writer(writer_dup.0, writer_len, writer_expected, topology)
+                .unwrap()
+        };
+
+        // Pending imports from the first channel must fail closed on the second
+        // channel before any READY frame is written.
+        assert!(matches!(
+            second.commit_imports(reader, writer),
+            Err(WindowsError::ForeignPending)
+        ));
+        // The mismatched transaction stays poisoned for later operations.
+        assert!(matches!(
+            second.receive_capabilities(),
+            Err(WindowsError::InvalidBootstrap)
+        ));
     }
 
     #[test]
