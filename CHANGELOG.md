@@ -5,6 +5,23 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Fixed
+
+- Bind every pending transfer and import value to its originating channel and
+  transfer transaction. `commit_transfers` and `commit_imports` on macOS and
+  Windows now fail closed with a `ForeignPending` error before READY/COMMIT
+  when any pending value came from another channel or an earlier transaction,
+  and the mismatched transaction is poisoned. Windows imports moved from free
+  functions to `ChildChannel::import_reader`/`ChildChannel::import_writer` so
+  the binding is unforgeable.
+- Return Linux `ChildSession::spawn` bootstrap resources to baseline on every
+  failure path: a construction guard now removes the private bootstrap
+  directory and kills and reaps the helper on pre-accept, timeout, peer
+  credential, and channel construction failures.
+- Stop the macOS null-address allocation branch from speculatively
+  deallocating the page-zero range, and release the parent's extra bootstrap
+  send-right reference even when `posix_spawn` fails.
+
 ### Documentation
 
 - State the consolidation goal explicitly across the README, crate landing

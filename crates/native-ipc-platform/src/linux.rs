@@ -66,6 +66,44 @@ pub struct ChildSession {
     bootstrap_dir: PathBuf,
 }
 
+/// Construction guard returning bootstrap resources to baseline on any failure.
+///
+/// It owns the private bootstrap directory from creation and the helper child
+/// from spawn until a fully constructed [`ChildSession`] assumes both.
+struct BootstrapGuard {
+    bootstrap_dir: Option<PathBuf>,
+    child: Option<Child>,
+}
+
+impl BootstrapGuard {
+    fn dir(&self) -> &std::path::Path {
+        self.bootstrap_dir
+            .as_deref()
+            .expect("directory is owned until disarm")
+    }
+
+    fn disarm(mut self) -> (PathBuf, Child) {
+        (
+            self.bootstrap_dir
+                .take()
+                .expect("directory is owned until disarm"),
+            self.child.take().expect("child is armed before disarm"),
+        )
+    }
+}
+
+impl Drop for BootstrapGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(dir) = self.bootstrap_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 impl ChildSession {
     /// Spawns an exact helper executable and authenticates its post-exec connection.
     pub fn spawn(program: &OsStr, arguments: &[&OsStr]) -> Result<Self, LinuxError> {
@@ -79,9 +117,16 @@ impl ChildSession {
         let suffix = hex(&nonce[..16]);
         let bootstrap_dir = std::env::temp_dir().join(format!("native-ipc-{suffix}"));
         std::fs::create_dir(&bootstrap_dir).map_err(|_| LinuxError::Bootstrap)?;
-        std::fs::set_permissions(&bootstrap_dir, std::fs::Permissions::from_mode(0o700))
+        // Every failure past this point must return the filesystem and process
+        // ledger to baseline: the guard removes the directory and, once the
+        // helper is spawned, kills and reaps it.
+        let mut guard = BootstrapGuard {
+            bootstrap_dir: Some(bootstrap_dir),
+            child: None,
+        };
+        std::fs::set_permissions(guard.dir(), std::fs::Permissions::from_mode(0o700))
             .map_err(|_| LinuxError::Bootstrap)?;
-        let socket_path = bootstrap_dir.join("control.sock");
+        let socket_path = guard.dir().join("control.sock");
         let listener = UnixListener::bind(&socket_path).map_err(|_| LinuxError::Bootstrap)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| LinuxError::Bootstrap)?;
@@ -95,7 +140,7 @@ impl ChildSession {
             .env(ENV_SOCKET, &socket_path)
             .env(ENV_NONCE, hex(&nonce))
             .env(ENV_PARENT_PID, std::process::id().to_string());
-        let mut child = command.spawn().map_err(|_| LinuxError::Bootstrap)?;
+        let child = command.spawn().map_err(|_| LinuxError::Bootstrap)?;
         let expected = PeerCredentials {
             pid: child.id(),
             // SAFETY: scalar identity syscalls have no preconditions.
@@ -103,6 +148,7 @@ impl ChildSession {
             // SAFETY: scalar identity syscalls have no preconditions.
             gid: unsafe { libc::getegid() },
         };
+        guard.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(10);
         let stream = loop {
             match listener.accept() {
@@ -113,8 +159,6 @@ impl ChildSession {
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
                         return Err(LinuxError::Bootstrap);
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -123,6 +167,7 @@ impl ChildSession {
             }
         };
         let channel = AuthenticatedChannel::new(stream, expected, nonce)?;
+        let (bootstrap_dir, child) = guard.disarm();
         Ok(Self {
             child,
             channel,
@@ -1231,8 +1276,28 @@ mod tests {
         });
     }
 
+    // Serializes every test that creates a bootstrap directory so the
+    // zero-growth assertions cannot observe another test's live session.
+    static BOOTSTRAP_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn bootstrap_dirs() -> std::collections::BTreeSet<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("native-ipc-"))
+            })
+            .collect()
+    }
+
     #[test]
     fn spawned_helper_is_pid_authenticated_and_owned() {
+        let _serial = BOOTSTRAP_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let executable = std::env::current_exe().unwrap();
         let arguments = [
             OsStr::new("--exact"),
@@ -1243,6 +1308,36 @@ mod tests {
         let session = ChildSession::spawn(executable.as_os_str(), &arguments).unwrap();
         assert_eq!(session.channel().peer().pid, session.child_id());
         session.terminate().unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_cleans_bootstrap_resources() {
+        let _serial = BOOTSTRAP_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = bootstrap_dirs();
+        let Err(error) =
+            ChildSession::spawn(OsStr::new("/definitely/not/a/real/native-ipc-helper"), &[])
+        else {
+            panic!("spawning a nonexistent helper must fail");
+        };
+        assert!(matches!(error, LinuxError::Bootstrap));
+        assert_eq!(bootstrap_dirs(), before);
+    }
+
+    #[test]
+    fn timed_out_helper_cleans_bootstrap_resources_and_child() {
+        let _serial = BOOTSTRAP_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = bootstrap_dirs();
+        // The helper never connects, so spawn reaches its accept deadline; the
+        // child must be killed and reaped and the directory removed.
+        let Err(error) = ChildSession::spawn(OsStr::new("/bin/sleep"), &[OsStr::new("30")]) else {
+            panic!("a helper that never connects must time out");
+        };
+        assert!(matches!(error, LinuxError::Bootstrap));
+        assert_eq!(bootstrap_dirs(), before);
     }
 
     #[test]
