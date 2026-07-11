@@ -15,3 +15,6 @@ independent review.
 
 Commits should be concise and intentional. Do not add `Co-authored-by` or other
 co-author trailers.
+
+Release operators must follow the dependency-ordered and verification-gated
+procedure in [`docs/releasing.md`](docs/releasing.md).

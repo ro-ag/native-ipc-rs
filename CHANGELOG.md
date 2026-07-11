@@ -5,6 +5,8 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-10
+
 ### Added
 
 - Initial four-crate workspace.
@@ -30,3 +32,6 @@ Versioning once a stable API is released.
 - No-default-feature CI tests, core Miri, bounded hostile corpora, and a full
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
+
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ro-ag/native-ipc-rs/releases/tag/v0.1.0
