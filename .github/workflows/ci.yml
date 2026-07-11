@@ -31,6 +31,8 @@ jobs:
           shared-key: quality-rust-1.97
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check patch whitespace
+        run: git diff --check
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
       - name: Build all features
@@ -62,6 +64,8 @@ jobs:
           shared-key: tests-rust-1.97-${{ matrix.os }}
       - name: Run workspace and native permission tests
         run: cargo test --workspace --all-features --all-targets --locked
+      - name: Test without default features
+        run: cargo test --workspace --no-default-features --all-targets --locked
       - name: Check no-default-feature target surface
         run: cargo check --workspace --no-default-features --all-targets --locked
 
@@ -77,3 +81,36 @@ jobs:
           tool: cargo-deny@0.19.8
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
+
+  miri:
+    name: miri / platform-neutral core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install nightly Miri
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Run Miri on platform-neutral unsafe contracts
+        run: cargo +nightly miri test -p native-ipc-core --lib
+
+  fuzz-smoke:
+    name: fuzz smoke / envelope and layout
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        with:
+          tool: cargo-fuzz@0.13.1
+      - name: Fuzz envelope decoder
+        run: cargo +nightly fuzz run envelope --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=4096 -timeout=5 -rss_limit_mb=1024
+      - name: Fuzz layout decoder
+        run: cargo +nightly fuzz run layout --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=1024

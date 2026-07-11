@@ -53,15 +53,6 @@ impl Endpoint {
     }
 }
 
-/// Actual permissions of the mapping through which validation occurred.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MappingPermissions {
-    /// Peer-owned mapping: acquire-only APIs may be bound.
-    ReadOnly,
-    /// Locally owned mapping: release-store APIs may be bound.
-    ReadWrite,
-}
-
 /// Capacity of one independently permissioned region.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegionSpec {
@@ -75,6 +66,60 @@ pub struct RegionSpec {
     pub payload_bytes: u32,
     /// Number of independently routed acknowledgement cells.
     pub acknowledgement_count: u32,
+}
+
+/// Proposed per-slot acknowledgement route validated during region composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcknowledgementRouteSpec {
+    /// Role whose mapping owns the acknowledgement cell.
+    pub owner: RoleId,
+    /// Producer role whose slot is acknowledged.
+    pub target: RoleId,
+    /// Slot index in the target region.
+    pub slot_index: u32,
+    /// Cell index in the owner region.
+    pub cell_index: u32,
+}
+
+/// A composition-validated, exact per-slot acknowledgement route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcknowledgementRoute {
+    owner: RoleId,
+    target: RoleId,
+    slot_index: u32,
+    cell_index: u32,
+}
+
+impl AcknowledgementRoute {
+    pub(crate) const fn validated(
+        owner: RoleId,
+        target: RoleId,
+        slot_index: u32,
+        cell_index: u32,
+    ) -> Self {
+        Self {
+            owner,
+            target,
+            slot_index,
+            cell_index,
+        }
+    }
+    /// Returns the role that owns the acknowledgement cell.
+    pub const fn owner(self) -> RoleId {
+        self.owner
+    }
+    /// Returns the producer role being acknowledged.
+    pub const fn target(self) -> RoleId {
+        self.target
+    }
+    /// Returns the exact target slot index.
+    pub const fn slot_index(self) -> u32 {
+        self.slot_index
+    }
+    /// Returns the exact owner cell index.
+    pub const fn cell_index(self) -> u32 {
+        self.cell_index
+    }
 }
 
 /// Bounds applied while calculating or validating a region.
@@ -94,6 +139,7 @@ pub struct LayoutLimits {
 #[derive(Clone, Debug)]
 pub struct RegionSetLayout {
     regions: Vec<RegionLayout>,
+    routes: Vec<AcknowledgementRoute>,
 }
 
 impl RegionSetLayout {
@@ -102,6 +148,7 @@ impl RegionSetLayout {
         schema_id: [u8; 32],
         generation: u64,
         specs: &[RegionSpec],
+        route_specs: &[AcknowledgementRouteSpec],
         limits: LayoutLimits,
     ) -> Result<Self, LayoutError> {
         if generation == 0 {
@@ -122,7 +169,8 @@ impl RegionSetLayout {
                 schema_id, generation, spec, limits,
             )?);
         }
-        Ok(Self { regions })
+        let routes = validate_routes(&regions, route_specs)?;
+        Ok(Self { regions, routes })
     }
 
     /// Returns all independent layouts.
@@ -133,6 +181,23 @@ impl RegionSetLayout {
     /// Finds a layout by validated numeric role.
     pub fn region(&self, role: RoleId) -> Option<&RegionLayout> {
         self.regions.iter().find(|region| region.role() == role)
+    }
+
+    /// Returns the validated route for one producer slot.
+    pub fn acknowledgement_route(
+        &self,
+        target: RoleId,
+        slot_index: u32,
+    ) -> Option<AcknowledgementRoute> {
+        self.routes
+            .iter()
+            .copied()
+            .find(|route| route.target == target && route.slot_index == slot_index)
+    }
+
+    /// Returns all exact acknowledgement routes.
+    pub fn acknowledgement_routes(&self) -> &[AcknowledgementRoute] {
+        &self.routes
     }
 }
 
@@ -247,7 +312,7 @@ impl RegionLayout {
     }
 }
 
-/// Expected identity and actual OS permissions for mapping validation.
+/// Expected identity for quiescent mapping validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidationExpectations {
     /// Exact protocol schema.
@@ -260,8 +325,6 @@ pub struct ValidationExpectations {
     pub writer: Endpoint,
     /// Maximum accepted complete mapping size.
     pub maximum_mapping_size: u64,
-    /// Permissions of the native mapping used for runtime access.
-    pub permissions: MappingPermissions,
 }
 
 /// Owned metadata and checked ranges copied from one validated mapping.
@@ -272,19 +335,32 @@ pub struct ValidatedRegionLayout {
     header: RegionHeader,
     acknowledgements: Range<usize>,
     slots: Range<usize>,
-    permissions: MappingPermissions,
+    mapping_size: usize,
+    routes: Vec<AcknowledgementRoute>,
 }
 
 impl ValidatedRegionLayout {
+    /// Returns whether this validation belongs to an exact composed topology.
+    pub fn matches_topology(&self, topology: &RegionSetLayout) -> bool {
+        topology
+            .region(self.role())
+            .is_some_and(|region| region.header == self.header)
+            && self.routes.len() == topology.routes.len()
+            && self
+                .routes
+                .iter()
+                .all(|route| topology.routes.contains(route))
+    }
     /// Validates a mapping while it is quiescent and before peer mutation begins.
     ///
     /// # Safety
     ///
     /// No process may mutate `bytes` for the duration of this call. The caller
-    /// must also truthfully supply the native mapping's permissions.
+    /// mapping must be the exact future capability range.
     pub unsafe fn validate(
         bytes: &[u8],
         expected: ValidationExpectations,
+        topology: &RegionSetLayout,
     ) -> Result<Self, LayoutError> {
         if expected.generation == 0 {
             return Err(LayoutError::ZeroGeneration);
@@ -298,6 +374,10 @@ impl ValidatedRegionLayout {
         validate_header_encoding(&bytes[..REGION_HEADER_SIZE as usize])?;
         let header = decode_header(&bytes[..REGION_HEADER_SIZE as usize]);
         validate_header(&header, bytes.len(), expected)?;
+        match topology.region(expected.role) {
+            Some(region) if region.header == header => {}
+            _ => return Err(LayoutError::TopologyMismatch),
+        }
         let acknowledgements_end = header
             .acknowledgement_offset
             .checked_add(
@@ -317,6 +397,12 @@ impl ValidatedRegionLayout {
             .any(|byte| *byte != 0)
         {
             return Err(LayoutError::AcknowledgementNotZero);
+        }
+        if bytes[header.total_size as usize..]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(LayoutError::CapabilityPaddingNotZero);
         }
         let minimum_stride = align_up(
             SLOT_HEADER_SIZE
@@ -358,7 +444,8 @@ impl ValidatedRegionLayout {
             header,
             acknowledgements,
             slots,
-            permissions: expected.permissions,
+            mapping_size: bytes.len(),
+            routes: topology.routes.clone(),
         })
     }
 
@@ -372,9 +459,9 @@ impl ValidatedRegionLayout {
         self.header.generation
     }
 
-    /// Returns the actual native mapping permission represented by this metadata.
-    pub const fn permissions(&self) -> MappingPermissions {
-        self.permissions
+    /// Returns the exact validated native capability size, including zero padding.
+    pub const fn mapping_size(&self) -> usize {
+        self.mapping_size
     }
 
     /// Returns a checked complete slot range without granting memory access.
@@ -396,31 +483,53 @@ impl ValidatedRegionLayout {
         Ok(start..end)
     }
 
-    /// Binds metadata for a sole writer. Read-only mappings cannot call this successfully.
-    pub fn writer_slot_binding(
+    pub(crate) fn slot_payload_range(
         &self,
         slot: u32,
-        acknowledgement_owner: RoleId,
-    ) -> Result<WriterSlotBinding, LayoutError> {
-        if self.permissions != MappingPermissions::ReadWrite {
-            return Err(LayoutError::WrongMappingPermission);
+        payload_len: u32,
+    ) -> Result<Range<usize>, LayoutError> {
+        if payload_len > self.header.payload_capacity {
+            return Err(LayoutError::PayloadOutOfBounds {
+                length: payload_len,
+                capacity: self.header.payload_capacity,
+            });
         }
-        self.slot_range(slot)?;
+        let slot = self.slot_range(slot)?;
+        let start = slot
+            .start
+            .checked_add(SLOT_HEADER_SIZE as usize)
+            .ok_or(LayoutError::Overflow)?;
+        let end = start
+            .checked_add(payload_len as usize)
+            .ok_or(LayoutError::Overflow)?;
+        if end > slot.end {
+            return Err(LayoutError::RangeOutOfBounds);
+        }
+        Ok(start..end)
+    }
+
+    /// Binds metadata for a sole writer. Read-only mappings cannot call this successfully.
+    pub(crate) fn writer_slot_binding(
+        &self,
+        route: AcknowledgementRoute,
+    ) -> Result<WriterSlotBinding, LayoutError> {
+        if route.target != self.role() {
+            return Err(LayoutError::RouteRegionMismatch);
+        }
+        self.slot_range(route.slot_index)?;
         Ok(WriterSlotBinding::validated(
             self.role(),
             self.generation(),
             self.header.payload_capacity,
-            slot,
+            route.slot_index,
             self.header.slot_count,
-            acknowledgement_owner,
+            route.owner,
+            route.cell_index,
         ))
     }
 
     /// Binds metadata for an acquire-only reader. Writable mappings are not treated as readers.
-    pub fn reader_slot_binding(&self, slot: u32) -> Result<ReaderSlotBinding, LayoutError> {
-        if self.permissions != MappingPermissions::ReadOnly {
-            return Err(LayoutError::WrongMappingPermission);
-        }
+    pub(crate) fn reader_slot_binding(&self, slot: u32) -> Result<ReaderSlotBinding, LayoutError> {
         self.slot_range(slot)?;
         Ok(ReaderSlotBinding::validated(
             self.role(),
@@ -451,41 +560,37 @@ impl ValidatedRegionLayout {
     }
 
     /// Binds a store-capable acknowledgement route only for a writable mapping.
-    pub fn acknowledgement_writer_binding(
+    pub(crate) fn acknowledgement_writer_binding(
         &self,
-        index: u32,
-        target: RoleId,
+        route: AcknowledgementRoute,
     ) -> Result<AcknowledgementWriterBinding, LayoutError> {
-        if self.permissions != MappingPermissions::ReadWrite {
-            return Err(LayoutError::WrongMappingPermission);
+        if route.owner != self.role() {
+            return Err(LayoutError::RouteRegionMismatch);
         }
-        self.acknowledgement_range(index)?;
+        self.acknowledgement_range(route.cell_index)?;
         Ok(AcknowledgementWriterBinding::validated(
-            self.role(),
-            target,
+            route,
             self.generation(),
         ))
     }
 
     /// Binds an acquire-only acknowledgement route only for a read-only mapping.
-    pub fn acknowledgement_reader_binding(
+    pub(crate) fn acknowledgement_reader_binding(
         &self,
-        index: u32,
-        target: RoleId,
+        route: AcknowledgementRoute,
     ) -> Result<AcknowledgementReaderBinding, LayoutError> {
-        if self.permissions != MappingPermissions::ReadOnly {
-            return Err(LayoutError::WrongMappingPermission);
+        if route.owner != self.role() {
+            return Err(LayoutError::RouteRegionMismatch);
         }
-        self.acknowledgement_range(index)?;
+        self.acknowledgement_range(route.cell_index)?;
         Ok(AcknowledgementReaderBinding::validated(
-            self.role(),
-            target,
+            route,
             self.generation(),
         ))
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegionHeader {
     total_size: u64,
     schema_id: [u8; 32],
@@ -555,8 +660,20 @@ pub enum LayoutError {
     SlotOutOfBounds { slot: u32, count: u32 },
     /// Acknowledgement index is outside the negotiated count.
     AcknowledgementOutOfBounds { index: u32, count: u32 },
-    /// Capability direction does not match native mapping permissions.
-    WrongMappingPermission,
+    /// Payload length exceeds its validated fixed-capacity slot.
+    PayloadOutOfBounds { length: u32, capacity: u32 },
+    /// Page-rounded capability padding was not zero before transfer.
+    CapabilityPaddingNotZero,
+    /// A route names a missing role, same-direction owner, or out-of-range index.
+    InvalidAcknowledgementRoute,
+    /// More than one route names a target slot or owner cell.
+    DuplicateAcknowledgementRoute,
+    /// A producer slot or acknowledgement cell has no exact route.
+    IncompleteAcknowledgementRoutes,
+    /// A validated route was applied to a different region.
+    RouteRegionMismatch,
+    /// Validated bytes do not belong to the supplied composed topology.
+    TopologyMismatch,
 }
 
 impl fmt::Display for LayoutError {
@@ -579,6 +696,59 @@ fn validate_counts(spec: RegionSpec, limits: LayoutLimits) -> Result<(), LayoutE
         return Err(LayoutError::LimitExceeded);
     }
     Ok(())
+}
+
+fn validate_routes(
+    regions: &[RegionLayout],
+    specs: &[AcknowledgementRouteSpec],
+) -> Result<Vec<AcknowledgementRoute>, LayoutError> {
+    let total_slots = regions.iter().try_fold(0_usize, |total, region| {
+        total
+            .checked_add(region.header.slot_count as usize)
+            .ok_or(LayoutError::Overflow)
+    })?;
+    let total_cells = regions.iter().try_fold(0_usize, |total, region| {
+        total
+            .checked_add(region.header.acknowledgement_count as usize)
+            .ok_or(LayoutError::Overflow)
+    })?;
+    if specs.len() != total_slots || specs.len() != total_cells {
+        return Err(LayoutError::IncompleteAcknowledgementRoutes);
+    }
+    let mut routes = Vec::new();
+    routes
+        .try_reserve_exact(specs.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    for spec in specs {
+        let owner = regions
+            .iter()
+            .find(|region| region.role() == spec.owner)
+            .ok_or(LayoutError::InvalidAcknowledgementRoute)?;
+        let target = regions
+            .iter()
+            .find(|region| region.role() == spec.target)
+            .ok_or(LayoutError::InvalidAcknowledgementRoute)?;
+        if owner.role() == target.role()
+            || owner.writer() == target.writer()
+            || spec.slot_index >= target.header.slot_count
+            || spec.cell_index >= owner.header.acknowledgement_count
+        {
+            return Err(LayoutError::InvalidAcknowledgementRoute);
+        }
+        if routes.iter().any(|route: &AcknowledgementRoute| {
+            (route.target == spec.target && route.slot_index == spec.slot_index)
+                || (route.owner == spec.owner && route.cell_index == spec.cell_index)
+        }) {
+            return Err(LayoutError::DuplicateAcknowledgementRoute);
+        }
+        routes.push(AcknowledgementRoute::validated(
+            spec.owner,
+            spec.target,
+            spec.slot_index,
+            spec.cell_index,
+        ));
+    }
+    Ok(routes)
 }
 
 fn validate_header(
@@ -604,7 +774,8 @@ fn validate_header(
     if Endpoint::from_raw(header.writer) != Some(expected.writer) {
         return Err(LayoutError::UnexpectedWriter);
     }
-    if header.total_size > mapped_len as u64
+    if mapped_len as u64 > expected.maximum_mapping_size
+        || header.total_size > mapped_len as u64
         || header.total_size > expected.maximum_mapping_size
         || header.total_size > usize::MAX as u64
     {
@@ -770,7 +941,7 @@ mod tests {
                 writer: Endpoint::Initiator,
                 slot_count: 2,
                 payload_bytes: 128,
-                acknowledgement_count: 0,
+                acknowledgement_count: 4,
             },
             RegionSpec {
                 role: ROLE_B,
@@ -782,49 +953,82 @@ mod tests {
         ]
     }
 
+    fn routes() -> [AcknowledgementRouteSpec; 6] {
+        [
+            AcknowledgementRouteSpec {
+                owner: ROLE_B,
+                target: ROLE_A,
+                slot_index: 0,
+                cell_index: 0,
+            },
+            AcknowledgementRouteSpec {
+                owner: ROLE_B,
+                target: ROLE_A,
+                slot_index: 1,
+                cell_index: 1,
+            },
+            AcknowledgementRouteSpec {
+                owner: ROLE_A,
+                target: ROLE_B,
+                slot_index: 0,
+                cell_index: 0,
+            },
+            AcknowledgementRouteSpec {
+                owner: ROLE_A,
+                target: ROLE_B,
+                slot_index: 1,
+                cell_index: 1,
+            },
+            AcknowledgementRouteSpec {
+                owner: ROLE_A,
+                target: ROLE_B,
+                slot_index: 2,
+                cell_index: 2,
+            },
+            AcknowledgementRouteSpec {
+                owner: ROLE_A,
+                target: ROLE_B,
+                slot_index: 3,
+                cell_index: 3,
+            },
+        ]
+    }
+
     fn encoded(role: RoleId) -> (RegionLayout, Vec<u8>) {
-        let set = RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), limits()).unwrap();
+        let set = topology();
         let layout = set.region(role).unwrap().clone();
         let mut bytes = vec![0; layout.total_size() as usize];
         layout.encode_into(&mut bytes).unwrap();
         (layout, bytes)
     }
 
-    fn expected(
-        role: RoleId,
-        writer: Endpoint,
-        size: u64,
-        permissions: MappingPermissions,
-    ) -> ValidationExpectations {
+    fn topology() -> RegionSetLayout {
+        RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &routes(), limits()).unwrap()
+    }
+
+    fn expected(role: RoleId, writer: Endpoint, size: u64) -> ValidationExpectations {
         ValidationExpectations {
             schema_id: SCHEMA,
             generation: GENERATION,
             role,
             writer,
             maximum_mapping_size: size,
-            permissions,
         }
     }
 
     #[test]
     fn configurable_regions_have_checked_independent_layouts() {
-        let set = RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), limits()).unwrap();
+        let set =
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &routes(), limits()).unwrap();
         assert_eq!(set.regions().len(), 2);
-        assert_ne!(
-            set.region(ROLE_A).unwrap().total_size(),
-            set.region(ROLE_B).unwrap().total_size()
-        );
+        assert_eq!(set.acknowledgement_routes().len(), 6);
         let (layout, bytes) = encoded(ROLE_B);
         // SAFETY: owned vector is quiescent and its simulated permission is exact.
         let validated = unsafe {
             ValidatedRegionLayout::validate(
                 &bytes,
-                expected(
-                    ROLE_B,
-                    Endpoint::Responder,
-                    layout.total_size(),
-                    MappingPermissions::ReadOnly,
-                ),
+                expected(ROLE_B, Endpoint::Responder, layout.total_size()),
+                &set,
             )
         }
         .unwrap();
@@ -832,102 +1036,171 @@ mod tests {
         assert_eq!(validated.slot_range(3).unwrap().len(), 128);
         assert_eq!(validated.acknowledgement_range(1).unwrap().len(), 64);
         assert!(validated.reader_slot_binding(0).is_ok());
-        assert_eq!(
-            validated.writer_slot_binding(0, ROLE_A).unwrap_err(),
-            LayoutError::WrongMappingPermission
+        assert!(
+            validated
+                .writer_slot_binding(set.acknowledgement_route(ROLE_B, 0).unwrap())
+                .is_ok()
         );
-        assert!(validated.acknowledgement_reader_binding(0, ROLE_A).is_ok());
+        assert!(
+            validated
+                .acknowledgement_reader_binding(set.acknowledgement_route(ROLE_A, 0).unwrap())
+                .is_ok()
+        );
     }
 
     #[test]
     fn writable_layout_cannot_mint_reader_or_ack_reader_capabilities() {
+        let set = topology();
         let (layout, bytes) = encoded(ROLE_B);
         // SAFETY: owned vector is quiescent and permission is simulated exactly.
         let validated = unsafe {
             ValidatedRegionLayout::validate(
                 &bytes,
-                expected(
-                    ROLE_B,
-                    Endpoint::Responder,
-                    layout.total_size(),
-                    MappingPermissions::ReadWrite,
-                ),
+                expected(ROLE_B, Endpoint::Responder, layout.total_size()),
+                &set,
             )
         }
         .unwrap();
-        assert!(validated.writer_slot_binding(0, ROLE_A).is_ok());
-        assert_eq!(
-            validated.reader_slot_binding(0).unwrap_err(),
-            LayoutError::WrongMappingPermission
-        );
-        assert!(validated.acknowledgement_writer_binding(0, ROLE_A).is_ok());
-        assert_eq!(
+        assert!(
             validated
-                .acknowledgement_reader_binding(0, ROLE_A)
-                .unwrap_err(),
-            LayoutError::WrongMappingPermission
+                .writer_slot_binding(set.acknowledgement_route(ROLE_B, 0).unwrap())
+                .is_ok()
+        );
+        assert!(validated.reader_slot_binding(0).is_ok());
+        assert!(
+            validated
+                .acknowledgement_writer_binding(set.acknowledgement_route(ROLE_A, 0).unwrap())
+                .is_ok()
+        );
+        assert!(
+            validated
+                .acknowledgement_reader_binding(set.acknowledgement_route(ROLE_A, 0).unwrap())
+                .is_ok()
         );
     }
 
     #[test]
     fn malformed_headers_offsets_slots_and_limits_fail_closed() {
+        let topology = topology();
         let (layout, original) = encoded(ROLE_B);
-        let expectation = expected(
-            ROLE_B,
-            Endpoint::Responder,
-            layout.total_size(),
-            MappingPermissions::ReadOnly,
-        );
+        let expectation = expected(ROLE_B, Endpoint::Responder, layout.total_size());
         for offset in [
             0_usize, 8, 12, 16, 24, 56, 64, 68, 72, 84, 88, 100, 108, 112,
         ] {
             let mut bytes = original.clone();
             bytes[offset] ^= 1;
             // SAFETY: mutation occurs before validation and no peer exists.
-            assert!(unsafe { ValidatedRegionLayout::validate(&bytes, expectation) }.is_err());
+            assert!(
+                unsafe { ValidatedRegionLayout::validate(&bytes, expectation, &topology) }.is_err()
+            );
         }
         let slot_start = get_u64(&original, 88) as usize;
         let mut bytes = original;
         bytes[slot_start + 16] = 1;
         // SAFETY: mutation occurs before validation and no peer exists.
         assert_eq!(
-            unsafe { ValidatedRegionLayout::validate(&bytes, expectation) }.unwrap_err(),
+            unsafe { ValidatedRegionLayout::validate(&bytes, expectation, &topology) }.unwrap_err(),
             LayoutError::SlotMetadataNotInitialized
         );
     }
 
     #[test]
     fn rejects_zero_generation_duplicate_roles_and_excess_capacity() {
+        let topology = topology();
         assert_eq!(
-            RegionSetLayout::calculate(SCHEMA, 0, &specs(), limits()).unwrap_err(),
+            RegionSetLayout::calculate(SCHEMA, 0, &specs(), &routes(), limits()).unwrap_err(),
             LayoutError::ZeroGeneration
         );
         let duplicate = [specs()[0], specs()[0]];
         assert_eq!(
-            RegionSetLayout::calculate(SCHEMA, 1, &duplicate, limits()).unwrap_err(),
+            RegionSetLayout::calculate(SCHEMA, 1, &duplicate, &routes(), limits()).unwrap_err(),
             LayoutError::DuplicateRole(ROLE_A)
         );
         let mut too_large = specs();
         too_large[0].slot_count = 33;
         assert_eq!(
-            RegionSetLayout::calculate(SCHEMA, 1, &too_large, limits()).unwrap_err(),
+            RegionSetLayout::calculate(SCHEMA, 1, &too_large, &routes(), limits()).unwrap_err(),
             LayoutError::LimitExceeded
         );
 
         let (layout, bytes) = encoded(ROLE_A);
         let zero_generation = ValidationExpectations {
             generation: 0,
-            ..expected(
-                ROLE_A,
-                Endpoint::Initiator,
-                layout.total_size(),
-                MappingPermissions::ReadOnly,
-            )
+            ..expected(ROLE_A, Endpoint::Initiator, layout.total_size())
         };
         // SAFETY: owned vector is quiescent; the hostile expectation is deliberate.
         assert_eq!(
-            unsafe { ValidatedRegionLayout::validate(&bytes, zero_generation) }.unwrap_err(),
+            unsafe { ValidatedRegionLayout::validate(&bytes, zero_generation, &topology) }
+                .unwrap_err(),
             LayoutError::ZeroGeneration
+        );
+    }
+
+    #[test]
+    fn composition_rejects_ambiguous_and_directionally_invalid_routes() {
+        let mut shared_cell = routes();
+        shared_cell[1].cell_index = shared_cell[0].cell_index;
+        assert_eq!(
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &shared_cell, limits())
+                .unwrap_err(),
+            LayoutError::DuplicateAcknowledgementRoute
+        );
+
+        let mut duplicate_slot = routes();
+        duplicate_slot[1].slot_index = 0;
+        assert_eq!(
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &duplicate_slot, limits())
+                .unwrap_err(),
+            LayoutError::DuplicateAcknowledgementRoute
+        );
+
+        for hostile in [
+            AcknowledgementRouteSpec {
+                owner: RoleId::new(99).unwrap(),
+                ..routes()[0]
+            },
+            AcknowledgementRouteSpec {
+                target: RoleId::new(99).unwrap(),
+                ..routes()[0]
+            },
+            AcknowledgementRouteSpec {
+                slot_index: 99,
+                ..routes()[0]
+            },
+            AcknowledgementRouteSpec {
+                cell_index: 99,
+                ..routes()[0]
+            },
+        ] {
+            let mut hostile_routes = routes();
+            hostile_routes[0] = hostile;
+            assert_eq!(
+                RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &hostile_routes, limits())
+                    .unwrap_err(),
+                LayoutError::InvalidAcknowledgementRoute
+            );
+        }
+
+        let mut wrong_direction = routes();
+        wrong_direction[0].owner = ROLE_A;
+        assert_eq!(
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &wrong_direction, limits())
+                .unwrap_err(),
+            LayoutError::InvalidAcknowledgementRoute
+        );
+
+        let mut same_endpoint = specs();
+        same_endpoint[1].writer = Endpoint::Initiator;
+        assert_eq!(
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &same_endpoint, &routes(), limits())
+                .unwrap_err(),
+            LayoutError::InvalidAcknowledgementRoute
+        );
+
+        assert_eq!(
+            RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &routes()[..5], limits())
+                .unwrap_err(),
+            LayoutError::IncompleteAcknowledgementRoutes
         );
     }
 }

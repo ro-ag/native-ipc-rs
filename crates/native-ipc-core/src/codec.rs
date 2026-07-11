@@ -8,7 +8,7 @@ use core::ops::Range;
 pub const MESSAGE_MAGIC: u32 = 0x4e49_5043;
 /// Current incompatible wire revision.
 pub const VERSION_MAJOR: u16 = 1;
-/// Current additive wire revision.
+/// Current exact wire revision; decoders reject any different minor value.
 pub const VERSION_MINOR: u16 = 0;
 /// Bytes occupied by the common message envelope.
 pub const ENVELOPE_LEN: usize = 72;

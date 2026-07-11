@@ -8,13 +8,21 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+use native_ipc_core::layout::{
+    LayoutError, RegionSetLayout, ValidatedRegionLayout, ValidationExpectations,
+};
+use native_ipc_core::mapping::{
+    BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
+};
+
+pub mod bootstrap;
+
 type KernReturn = c_int;
 type MachPort = u32;
 type MachVmAddress = u64;
 type MachVmSize = u64;
 type MemoryObjectOffset = u64;
 type MemoryObjectSize = u64;
-#[cfg(test)]
 type VmInherit = u32;
 type VmProt = c_int;
 
@@ -25,7 +33,6 @@ const VM_PROT_READ: VmProt = 1;
 const VM_PROT_WRITE: VmProt = 2;
 const VM_PROT_EXECUTE: VmProt = 4;
 const MAP_MEM_VM_SHARE: VmProt = 0x0040_0000;
-#[cfg(test)]
 const VM_INHERIT_NONE: VmInherit = 2;
 
 unsafe extern "C" {
@@ -55,7 +62,6 @@ unsafe extern "C" {
         object_handle: *mut MachPort,
         parent_entry: MachPort,
     ) -> KernReturn;
-    #[cfg(test)]
     fn mach_vm_map(
         target_task: MachPort,
         address: *mut MachVmAddress,
@@ -99,6 +105,47 @@ pub enum MachError {
     },
 }
 
+/// Failure while validating and binding a Mach mapping to the common core.
+#[derive(Debug)]
+pub enum MacBindingError {
+    /// Quiescent bytes failed hostile layout validation.
+    Layout(LayoutError),
+    /// Mach typestate transition failed.
+    Mach(MachError),
+    /// Audited mapping-to-record binding failed.
+    Binding(BindingError),
+    /// Authenticated bootstrap or Mach port transfer failed.
+    Bootstrap(bootstrap::BootstrapError),
+}
+
+impl fmt::Display for MacBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Mach/core binding failed: {self:?}")
+    }
+}
+
+impl std::error::Error for MacBindingError {}
+impl From<LayoutError> for MacBindingError {
+    fn from(value: LayoutError) -> Self {
+        Self::Layout(value)
+    }
+}
+impl From<MachError> for MacBindingError {
+    fn from(value: MachError) -> Self {
+        Self::Mach(value)
+    }
+}
+impl From<BindingError> for MacBindingError {
+    fn from(value: BindingError) -> Self {
+        Self::Binding(value)
+    }
+}
+impl From<bootstrap::BootstrapError> for MacBindingError {
+    fn from(value: bootstrap::BootstrapError) -> Self {
+        Self::Bootstrap(value)
+    }
+}
+
 impl fmt::Display for MachError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Mach shared memory operation failed: {self:?}")
@@ -114,7 +161,7 @@ impl std::error::Error for MachError {}
 #[derive(Debug)]
 pub struct QuiescentRegion {
     mapping: Mapping,
-    len: usize,
+    logical_len: usize,
 }
 
 impl QuiescentRegion {
@@ -128,29 +175,37 @@ impl QuiescentRegion {
         unsafe { mapping.bytes_mut(mapped_len) }.fill(0);
         mapping.protect(VM_PROT_READ | VM_PROT_WRITE, false)?;
         mapping.protect(VM_PROT_READ | VM_PROT_WRITE, true)?;
-        Ok(Self { mapping, len })
+        Ok(Self {
+            mapping,
+            logical_len: len,
+        })
     }
 
-    /// Returns the logical, unpadded length.
+    /// Returns the negotiated page-rounded capability length.
     pub const fn len(&self) -> usize {
-        self.len
+        self.mapping.mapped_len
+    }
+
+    /// Returns the requested logical layout length within the capability.
+    pub const fn logical_len(&self) -> usize {
+        self.logical_len
     }
 
     /// Returns whether the logical region is empty (always false for a valid value).
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        false
     }
 
     /// Borrows quiescent initialization bytes.
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: quiescent state has no peer capability or second mapping.
-        unsafe { self.mapping.bytes(self.len) }
+        unsafe { self.mapping.bytes(self.mapping.mapped_len) }
     }
 
     /// Mutably borrows quiescent initialization bytes.
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: quiescent state plus `&mut self` provides exclusive access.
-        unsafe { self.mapping.bytes_mut(self.len) }
+        unsafe { self.mapping.bytes_mut(self.mapping.mapped_len) }
     }
 
     /// Selects this process as sole writer and creates one read-only peer entry.
@@ -160,7 +215,7 @@ impl QuiescentRegion {
         Ok(LocalWriterRegion {
             mapping: self.mapping,
             peer_entry,
-            len: self.len,
+            len: expected_len,
         })
     }
 
@@ -176,19 +231,243 @@ impl QuiescentRegion {
         Ok(RemoteWriterRegion {
             mapping: self.mapping,
             peer_entry,
-            len: self.len,
+            len: expected_len,
         })
     }
 
     fn validate_transition_size(&self, expected_len: usize) -> Result<(), MachError> {
-        if expected_len == self.len && expected_len != 0 {
+        if expected_len == self.mapping.mapped_len && expected_len != 0 {
             Ok(())
         } else {
             Err(MachError::InvalidViewSize {
                 requested: expected_len,
-                region: self.len,
+                region: self.mapping.mapped_len,
             })
         }
+    }
+
+    /// Validates the complete padded capability, then consumes it as the sole writer.
+    pub fn into_bound_local_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<WriterRegion<MacWriterMapping>, MacBindingError> {
+        // SAFETY: quiescent typestate excludes peer aliases and validation sees
+        // the exact page-rounded capability range that will be transferred.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_local_writer(capability_len)?;
+        Ok(WriterRegion::new(
+            MacWriterMapping { region },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Validates the complete padded capability, then downgrades it to read-only.
+    pub fn into_bound_remote_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<ReaderRegion<MacReaderMapping>, MacBindingError> {
+        // SAFETY: same quiescent exact-capability proof as the local-writer path.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_remote_writer(capability_len)?;
+        Ok(ReaderRegion::new(
+            MacReaderMapping { region },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Validates, transfers a read-only entry, and commits the local writer.
+    pub fn transfer_local_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+        channel: &bootstrap::ParentChannel,
+    ) -> Result<WriterRegion<TransferredWriterMapping>, MacBindingError> {
+        // SAFETY: quiescent state covers the exact transferred capability.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_local_writer(capability_len)?;
+        channel.send(region.peer_entry.name)?;
+        let LocalWriterRegion {
+            mapping,
+            peer_entry,
+            len: _,
+        } = region;
+        drop(peer_entry);
+        Ok(WriterRegion::new(
+            TransferredWriterMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Validates, transfers the sole writer entry, and commits local read-only access.
+    pub fn transfer_remote_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+        channel: &bootstrap::ParentChannel,
+    ) -> Result<ReaderRegion<TransferredReaderMapping>, MacBindingError> {
+        // SAFETY: quiescent state covers the exact transferred capability.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_remote_writer(capability_len)?;
+        channel.send(region.peer_entry.name)?;
+        let RemoteWriterRegion {
+            mapping,
+            peer_entry,
+            len: _,
+        } = region;
+        drop(peer_entry);
+        Ok(ReaderRegion::new(
+            TransferredReaderMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+}
+
+/// Parent-side writer mapping after its read-only entry was transferred.
+pub struct TransferredWriterMapping {
+    mapping: Mapping,
+}
+// SAFETY: the only transferred right is kernel-clamped read-only; local mapping is unique RW.
+unsafe impl SoleWriterMapping for TransferredWriterMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Parent-side read-only mapping after the sole writer entry was transferred.
+pub struct TransferredReaderMapping {
+    mapping: Mapping,
+}
+// SAFETY: local current/maximum protection was permanently downgraded before transfer.
+unsafe impl ReadOnlyMapping for TransferredReaderMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Imported child-side read-only mapping.
+pub struct ImportedReaderMapping {
+    mapping: Mapping,
+}
+// SAFETY: mapping is created with current/maximum read-only protection.
+unsafe impl ReadOnlyMapping for ImportedReaderMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Imported child-side sole-writer mapping.
+pub struct ImportedWriterMapping {
+    mapping: Mapping,
+}
+// SAFETY: authenticated parent creates exactly one RW entry for this role.
+unsafe impl SoleWriterMapping for ImportedWriterMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+impl bootstrap::ChildChannel {
+    /// Receives and binds a read-only memory entry while the parent is quiescent.
+    pub fn receive_reader(
+        &self,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<ReaderRegion<ImportedReaderMapping>, MacBindingError> {
+        let right = self.receive()?;
+        let mapping = Mapping::map_port(current_task(), len, right.name(), VM_PROT_READ)?;
+        // SAFETY: authenticated transfer remains quiescent until this call returns.
+        let bytes = unsafe { mapping.bytes(len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        drop(right);
+        Ok(ReaderRegion::new(
+            ImportedReaderMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Receives and binds the sole writable memory entry while quiescent.
+    pub fn receive_writer(
+        &self,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<WriterRegion<ImportedWriterMapping>, MacBindingError> {
+        let right = self.receive()?;
+        let mapping = Mapping::map_port(
+            current_task(),
+            len,
+            right.name(),
+            VM_PROT_READ | VM_PROT_WRITE,
+        )?;
+        // SAFETY: authenticated transfer remains quiescent until this call returns.
+        let bytes = unsafe { mapping.bytes(len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        drop(right);
+        Ok(WriterRegion::new(
+            ImportedWriterMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+}
+
+/// Platform-minted sole-writer witness for the audited core bridge.
+pub struct MacWriterMapping {
+    region: LocalWriterRegion,
+}
+
+// SAFETY: `LocalWriterRegion` is consuming, owns the mapping lifetime, and its
+// peer memory entry is kernel-clamped read-only.
+unsafe impl SoleWriterMapping for MacWriterMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.region.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.region.mapping.mapped_len
+    }
+}
+
+/// Platform-minted local read-only witness for the audited core bridge.
+pub struct MacReaderMapping {
+    region: RemoteWriterRegion,
+}
+
+// SAFETY: `RemoteWriterRegion` permanently sets current and maximum local
+// protection to read-only before construction and owns the mapping lifetime.
+unsafe impl ReadOnlyMapping for MacReaderMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.region.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.region.mapping.mapped_len
     }
 }
 
@@ -267,7 +546,15 @@ impl Mapping {
         mapped_len: usize,
         entry: &MemoryEntry<Access>,
     ) -> Result<Self, MachError> {
-        let protection = Access::PROTECTION;
+        Self::map_port(task, mapped_len, entry.name, Access::PROTECTION)
+    }
+
+    fn map_port(
+        task: MachPort,
+        mapped_len: usize,
+        port: MachPort,
+        protection: VmProt,
+    ) -> Result<Self, MachError> {
         debug_assert_eq!(protection & VM_PROT_EXECUTE, 0);
         let mut address = 0;
         // SAFETY: entry is live; current/maximum protections exclude execute.
@@ -278,7 +565,7 @@ impl Mapping {
                 mapped_len as MachVmSize,
                 0,
                 VM_FLAGS_ANYWHERE,
-                entry.name,
+                port,
                 0,
                 0,
                 protection,
@@ -480,12 +767,41 @@ fn deallocate_port(task: MachPort, name: MachPort) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use native_ipc_core::layout::{
+        AcknowledgementRouteSpec, Endpoint, LayoutLimits, RegionSetLayout, RegionSpec, RoleId,
+    };
     use std::mem::size_of;
+
+    struct TestWriterWitness<'a>(&'a mut Mapping);
+    struct TestReaderWitness<'a>(&'a Mapping);
+
+    // SAFETY: test witnesses borrow live Mach mappings for their full bound
+    // lifetime; the writer mapping is unique and peer entries are read-only.
+    unsafe impl SoleWriterMapping for TestWriterWitness<'_> {
+        fn base(&self) -> NonNull<u8> {
+            self.0.address
+        }
+        fn len(&self) -> usize {
+            self.0.mapped_len
+        }
+    }
+
+    // SAFETY: test reader mappings are created from read-only memory entries
+    // and remain borrowed for their full bound lifetime.
+    unsafe impl ReadOnlyMapping for TestReaderWitness<'_> {
+        fn base(&self) -> NonNull<u8> {
+            self.0.address
+        }
+        fn len(&self) -> usize {
+            self.0.mapped_len
+        }
+    }
 
     #[test]
     fn read_only_capability_rejects_writable_mapping() {
         let owner = QuiescentRegion::new(37).unwrap();
-        let runtime = owner.into_local_writer(37).unwrap();
+        let capability_len = owner.len();
+        let runtime = owner.into_local_writer(capability_len).unwrap();
         let mut address = 0;
         let protection = VM_PROT_READ | VM_PROT_WRITE;
         // SAFETY: deliberately bypasses typed API to probe kernel enforcement.
@@ -513,7 +829,8 @@ mod tests {
     #[test]
     fn executable_protection_upgrade_is_rejected() {
         let owner = QuiescentRegion::new(37).unwrap();
-        let runtime = owner.into_local_writer(37).unwrap();
+        let capability_len = owner.len();
+        let runtime = owner.into_local_writer(capability_len).unwrap();
         // SAFETY: deliberately requests execute to probe the clamped maximum.
         let result = unsafe {
             mach_vm_protect(
@@ -531,7 +848,8 @@ mod tests {
     fn remote_writer_downgrades_local_mapping_before_escape() {
         let mut owner = QuiescentRegion::new(19).unwrap();
         owner.as_bytes_mut()[0] = 7;
-        let mut runtime = owner.into_remote_writer(19).unwrap();
+        let capability_len = owner.len();
+        let mut runtime = owner.into_remote_writer(capability_len).unwrap();
         assert!(
             runtime
                 .mapping
@@ -556,7 +874,8 @@ mod tests {
     fn local_writer_peer_observes_quiescent_initialization() {
         let mut owner = QuiescentRegion::new(37).unwrap();
         owner.as_bytes_mut()[..5].copy_from_slice(b"hello");
-        let runtime = owner.into_local_writer(37).unwrap();
+        let capability_len = owner.len();
+        let runtime = owner.into_local_writer(capability_len).unwrap();
         let peer = Mapping::map_entry(
             runtime.mapping.task,
             runtime.mapping.mapped_len,
@@ -583,5 +902,231 @@ mod tests {
             ReadWriteCapability::PROTECTION,
             VM_PROT_READ | VM_PROT_WRITE
         );
+    }
+
+    #[test]
+    fn page_capability_padding_is_explicit_validated_and_bound() {
+        let producer = RoleId::new(1).unwrap();
+        let peer = RoleId::new(2).unwrap();
+        let specs = [
+            RegionSpec {
+                role: producer,
+                writer: Endpoint::Initiator,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+            RegionSpec {
+                role: peer,
+                writer: Endpoint::Responder,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+        ];
+        let routes = [
+            AcknowledgementRouteSpec {
+                owner: peer,
+                target: producer,
+                slot_index: 0,
+                cell_index: 0,
+            },
+            AcknowledgementRouteSpec {
+                owner: producer,
+                target: peer,
+                slot_index: 0,
+                cell_index: 0,
+            },
+        ];
+        let set = RegionSetLayout::calculate(
+            [3; 32],
+            7,
+            &specs,
+            &routes,
+            LayoutLimits {
+                maximum_mapping_size: 1 << 20,
+                maximum_slot_count: 2,
+                maximum_acknowledgement_count: 2,
+                maximum_payload_bytes: 64,
+            },
+        )
+        .unwrap();
+        let layout = set.region(producer).unwrap();
+        let mut owner = QuiescentRegion::new(layout.total_size() as usize).unwrap();
+        assert!(owner.len() >= owner.logical_len());
+        assert!(owner.len().is_multiple_of(page_size().unwrap()));
+        layout.encode_into(owner.as_bytes_mut()).unwrap();
+        let expected = ValidationExpectations {
+            schema_id: [3; 32],
+            generation: 7,
+            role: producer,
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: owner.len() as u64,
+        };
+        let mut bound = owner
+            .into_bound_local_writer(expected, set.clone())
+            .unwrap();
+        bound
+            .slot(0)
+            .unwrap()
+            .prepare_publish(1, None)
+            .unwrap()
+            .publish(4)
+            .unwrap();
+
+        let mut hostile = QuiescentRegion::new(layout.total_size() as usize).unwrap();
+        layout.encode_into(hostile.as_bytes_mut()).unwrap();
+        let last = hostile.len() - 1;
+        hostile.as_bytes_mut()[last] = 1;
+        let expected = ValidationExpectations {
+            schema_id: [3; 32],
+            generation: 7,
+            role: producer,
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: hostile.len() as u64,
+        };
+        assert!(matches!(
+            hostile.into_bound_local_writer(expected, set),
+            Err(MacBindingError::Layout(
+                LayoutError::CapabilityPaddingNotZero
+            ))
+        ));
+    }
+
+    #[test]
+    fn mach_mapping_completes_core_publish_observe_and_ack_path() {
+        let producer = RoleId::new(1).unwrap();
+        let acknowledger = RoleId::new(2).unwrap();
+        let specs = [
+            RegionSpec {
+                role: producer,
+                writer: Endpoint::Initiator,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+            RegionSpec {
+                role: acknowledger,
+                writer: Endpoint::Responder,
+                slot_count: 1,
+                payload_bytes: 16,
+                acknowledgement_count: 1,
+            },
+        ];
+        let routes = [
+            AcknowledgementRouteSpec {
+                owner: acknowledger,
+                target: producer,
+                slot_index: 0,
+                cell_index: 0,
+            },
+            AcknowledgementRouteSpec {
+                owner: producer,
+                target: acknowledger,
+                slot_index: 0,
+                cell_index: 0,
+            },
+        ];
+        let topology = RegionSetLayout::calculate(
+            [9; 32],
+            11,
+            &specs,
+            &routes,
+            LayoutLimits {
+                maximum_mapping_size: 1 << 20,
+                maximum_slot_count: 2,
+                maximum_acknowledgement_count: 2,
+                maximum_payload_bytes: 64,
+            },
+        )
+        .unwrap();
+
+        let producer_layout = topology.region(producer).unwrap();
+        let mut producer_owner =
+            QuiescentRegion::new(producer_layout.total_size() as usize).unwrap();
+        producer_layout
+            .encode_into(producer_owner.as_bytes_mut())
+            .unwrap();
+        let producer_expected = ValidationExpectations {
+            schema_id: [9; 32],
+            generation: 11,
+            role: producer,
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: producer_owner.len() as u64,
+        };
+        let producer_validated = unsafe {
+            ValidatedRegionLayout::validate(producer_owner.as_bytes(), producer_expected, &topology)
+        }
+        .unwrap();
+        let producer_len = producer_owner.len();
+        let mut producer_runtime = producer_owner.into_local_writer(producer_len).unwrap();
+        let producer_peer = Mapping::map_entry(
+            producer_runtime.mapping.task,
+            producer_runtime.mapping.mapped_len,
+            &producer_runtime.peer_entry,
+        )
+        .unwrap();
+
+        let ack_layout = topology.region(acknowledger).unwrap();
+        let mut ack_owner = QuiescentRegion::new(ack_layout.total_size() as usize).unwrap();
+        ack_layout.encode_into(ack_owner.as_bytes_mut()).unwrap();
+        let ack_expected = ValidationExpectations {
+            schema_id: [9; 32],
+            generation: 11,
+            role: acknowledger,
+            writer: Endpoint::Responder,
+            maximum_mapping_size: ack_owner.len() as u64,
+        };
+        let ack_validated = unsafe {
+            ValidatedRegionLayout::validate(ack_owner.as_bytes(), ack_expected, &topology)
+        }
+        .unwrap();
+        let ack_len = ack_owner.len();
+        let mut ack_runtime = ack_owner.into_local_writer(ack_len).unwrap();
+        let ack_peer = Mapping::map_entry(
+            ack_runtime.mapping.task,
+            ack_runtime.mapping.mapped_len,
+            &ack_runtime.peer_entry,
+        )
+        .unwrap();
+
+        {
+            let mut writer = WriterRegion::new(
+                TestWriterWitness(&mut producer_runtime.mapping),
+                producer_validated.clone(),
+                topology.clone(),
+            )
+            .unwrap();
+            writer.publish(0, 1, None, b"mach").unwrap();
+        }
+        let reader = ReaderRegion::new(
+            TestReaderWitness(&producer_peer),
+            producer_validated,
+            topology.clone(),
+        )
+        .unwrap();
+        let observation = reader.slot(0).unwrap().observe(1).unwrap();
+        reader.slot(0).unwrap().recheck(observation).unwrap();
+        assert_eq!(reader.copy_payload(0, 1).unwrap(), b"mach");
+
+        {
+            let mut writer = WriterRegion::new(
+                TestWriterWitness(&mut ack_runtime.mapping),
+                ack_validated.clone(),
+                topology.clone(),
+            )
+            .unwrap();
+            writer
+                .acknowledgement(producer, 0)
+                .unwrap()
+                .acknowledge(observation)
+                .unwrap();
+        }
+        let reader =
+            ReaderRegion::new(TestReaderWitness(&ack_peer), ack_validated, topology).unwrap();
+        let acknowledged = reader.acknowledgement(producer, 0).unwrap().observe();
+        assert_eq!(acknowledged.sequence(), 1);
+        assert_eq!(acknowledged.slot_index(), 0);
+        assert_eq!(acknowledged.cell_index(), 0);
     }
 }

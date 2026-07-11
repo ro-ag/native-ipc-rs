@@ -7,12 +7,13 @@ hostile. It owns protocol-neutral encoding, resource limits, region arithmetic,
 atomic publication state, and the facts needed to bind capabilities. It knows
 nothing about native handles or application message meanings.
 
-`native-ipc-platform` turns OS objects into least-authority mappings. Native
-code must validate the actual permission of a received capability, map no more
-than the negotiated size, exclude execute from current and maximum protection,
-and fail closed when the OS cannot enforce the requested rights.
+`native-ipc-platform` turns OS objects into least-authority mapping witnesses.
+The negotiated capability size includes page rounding; bytes outside the
+logical layout are zeroed and validated. Native code excludes execute from
+current and maximum protection and fails closed on weaker rights.
 
-The facade reexports both boundaries without inventing a combined mapping API.
+Core owns the audited conversion from checked ranges and consumed platform
+witnesses to atomic slot and acknowledgement capabilities.
 
 ## Wire envelope
 
@@ -45,11 +46,11 @@ writer endpoint. A 128-byte immutable header is followed by zero or more
 checked addition/multiplication and all concurrently accessed records are
 64-byte aligned.
 
-Validation copies immutable header facts into owned Rust metadata. It returns
-checked numeric ranges but never retains or returns a shared slice. Native
-mapping permission is part of the validated binding: a read-write mapping can
-mint writer/store bindings, and a read-only mapping can mint reader/load
-bindings. These types are intentionally not interchangeable.
+Validation copies immutable header facts into owned metadata, checks zero
+capability padding, and returns numeric ranges without retaining a slice.
+Permission is represented by unsafe platform witness implementations, not a
+caller-provided enum. The bridge consumes the witness, owns its lifetime, and
+checks size, alignment, initialization, generation, and route identity.
 
 ## Publication and reuse
 
@@ -60,26 +61,29 @@ is exactly the prior sequence plus `N`. Overflow is terminal.
 The sole writer mutates opaque payload bytes through a native mapping-specific
 mechanism, stores payload length, and Release-publishes the sequence. The reader
 Acquire-loads the sequence, validates generation and length, copies the payload
-into owned storage, then Acquire-rechecks generation and sequence. The reader
-never claims, releases, or otherwise writes producer-owned metadata.
+into owned storage, fences, then rechecks generation, sequence, and length.
+This detects metadata changes only. Same-sequence malicious mutation can yield
+a torn or inconsistent copy, which must always be parsed as hostile input.
 
-Before a writer can reuse a slot, it must observe an acknowledgement from an
-opposite-direction mapping. Target role, generation, and prior sequence must be
-exact. Greater-than comparisons are insufficient because they permit malicious
-pre-acknowledgement and ABA reuse.
+Before reuse, a writer must observe the cell uniquely routed to that slot from
+an opposite-endpoint region. Owner, target, slot, cell, generation, and prior
+sequence must be exact; greater values remain rejected as future. Equal
+re-acknowledgement is intentionally idempotent.
 
 ## Native policy
 
-- macOS uses Mach VM allocation and typed memory-entry rights. Only the
+- macOS uses explicit page-rounded capability lengths and typed memory-entry rights. Only the
   quiescent state exposes slices. Consuming transitions choose a local writer
   with a read-only peer entry or a remote writer with a read-write peer entry
   after permanently downgrading the local mapping. Current and maximum
   permissions exclude execute.
-- Linux will use sealed anonymous `memfd` objects, private `SCM_RIGHTS`
-  transfer, `SO_PEERCRED`, and `pidfd`. It currently returns incomplete.
-- Windows will use unnamed sections with least-rights duplicated handles,
-  per-launch private named pipes, and kill-on-close Job Objects. It currently
-  returns incomplete.
+- Linux uses sealed anonymous `memfd` objects, exact private `SCM_RIGHTS`
+  transfer, `SO_PEERCRED`, `pidfd`, and parent-owned helper cleanup.
+- Windows uses unnamed sections with least-rights duplicated handles,
+  per-launch private PID-checked named pipes, suspended process creation, and
+  kill-on-close Job Objects.
+- macOS and Windows use authenticated READY barriers after the peer imports and
+  validates the complete page-rounded capability.
 
 ## Unsafe-code policy
 
@@ -87,3 +91,5 @@ Unsafe is restricted to native ABI calls, construction of quiescent byte
 slices, and binding atomics reached through independently validated native
 mappings. Every unsafe operation states its aliasing, lifetime, permission, and
 quiescence obligations. Runtime safe APIs do not expose shared byte slices.
+Miri covers platform-neutral core; native Mach FFI is excluded because the
+interpreter cannot execute those kernel operations.

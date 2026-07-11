@@ -1,7 +1,7 @@
 //! Platform capability and mapping implementations.
 //!
-//! Only the macOS Mach VM typestate is implemented in this initial slice.
-//! Linux and Windows expose explicit fail-closed status values.
+//! macOS, Linux, and Windows adapters implement private authenticated bootstrap,
+//! least-authority shared-memory transfer, and owned helper lifecycles.
 
 #[cfg(target_os = "linux")]
 pub mod linux;
