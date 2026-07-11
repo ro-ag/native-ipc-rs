@@ -607,7 +607,6 @@ struct RegionHeader {
 }
 
 /// Bounded region layout validation failures.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutError {
     /// Checked arithmetic overflowed.
@@ -625,19 +624,39 @@ pub enum LayoutError {
     /// Region has no slots or zero-capacity slots.
     EmptySlots,
     /// Mapping cannot contain the declared region.
-    MappingTooSmall { required: u64, actual: u64 },
+    MappingTooSmall {
+        /// Minimum mapping size required by the encoded layout.
+        required: u64,
+        /// Supplied mapping size.
+        actual: u64,
+    },
     /// Region signature is invalid.
     BadMagic,
     /// Region wire revision is unsupported.
-    BadVersion { major: u16, minor: u16 },
+    BadVersion {
+        /// Received major layout version.
+        major: u16,
+        /// Received minor layout version.
+        minor: u16,
+    },
     /// Encoded header size is noncanonical.
     BadHeaderSize(u32),
     /// Schema identity differs.
     SchemaMismatch,
     /// Generation differs.
-    StaleGeneration { expected: u64, actual: u64 },
+    StaleGeneration {
+        /// Negotiated connection generation.
+        expected: u64,
+        /// Generation encoded in the mapping.
+        actual: u64,
+    },
     /// Role differs.
-    UnexpectedRole { expected: RoleId, actual: u32 },
+    UnexpectedRole {
+        /// Negotiated region role.
+        expected: RoleId,
+        /// Role encoded in the mapping.
+        actual: u32,
+    },
     /// Writer endpoint differs or is invalid.
     UnexpectedWriter,
     /// Reserved bytes or flags are nonzero.
@@ -657,11 +676,26 @@ pub enum LayoutError {
     /// A checked range escapes the mapping.
     RangeOutOfBounds,
     /// Slot index is outside the negotiated count.
-    SlotOutOfBounds { slot: u32, count: u32 },
+    SlotOutOfBounds {
+        /// Requested slot index.
+        slot: u32,
+        /// Validated slot count.
+        count: u32,
+    },
     /// Acknowledgement index is outside the negotiated count.
-    AcknowledgementOutOfBounds { index: u32, count: u32 },
+    AcknowledgementOutOfBounds {
+        /// Requested acknowledgement-cell index.
+        index: u32,
+        /// Validated acknowledgement-cell count.
+        count: u32,
+    },
     /// Payload length exceeds its validated fixed-capacity slot.
-    PayloadOutOfBounds { length: u32, capacity: u32 },
+    PayloadOutOfBounds {
+        /// Requested payload length.
+        length: u32,
+        /// Validated fixed payload capacity.
+        capacity: u32,
+    },
     /// Page-rounded capability padding was not zero before transfer.
     CapabilityPaddingNotZero,
     /// A route names a missing role, same-direction owner, or out-of-range index.

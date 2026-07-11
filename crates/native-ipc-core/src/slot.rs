@@ -589,7 +589,6 @@ impl AcknowledgementObservation {
 }
 
 /// Bounded slot validation failures.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotError {
     /// Generation zero is reserved.
@@ -597,17 +596,40 @@ pub enum SlotError {
     /// Sequence zero is unpublished.
     UnpublishedSequence,
     /// Bound generation differs from shared metadata.
-    StaleGeneration { expected: u64, actual: u64 },
+    StaleGeneration {
+        /// Bound connection generation.
+        expected: u64,
+        /// Generation observed in shared metadata.
+        actual: u64,
+    },
     /// Sequence would wrap.
     SequenceWrap,
     /// Sequence points at a different ring slot.
-    WrongSlot { expected: u32, actual: u32 },
+    WrongSlot {
+        /// Slot selected by the publication sequence.
+        expected: u32,
+        /// Slot supplied by the caller or observation.
+        actual: u32,
+    },
     /// First use of a slot had a noncanonical sequence.
-    UnexpectedFirstSequence { expected: u64, actual: u64 },
+    UnexpectedFirstSequence {
+        /// Canonical first sequence for the slot.
+        expected: u64,
+        /// Requested first sequence.
+        actual: u64,
+    },
     /// Reuse was not exactly one ring rotation later.
-    UnexpectedNextSequence { expected: u64, actual: u64 },
+    UnexpectedNextSequence {
+        /// Exact next sequence after one ring rotation.
+        expected: u64,
+        /// Requested reuse sequence.
+        actual: u64,
+    },
     /// Reuse lacked an acknowledgement.
-    MissingAcknowledgement { sequence: u64 },
+    MissingAcknowledgement {
+        /// Prior sequence that must be acknowledged before reuse.
+        sequence: u64,
+    },
     /// Acknowledgement targets another producer role.
     WrongAcknowledgementTarget,
     /// Acknowledgement came from another routed owner.
@@ -619,21 +641,45 @@ pub enum SlotError {
     /// Acknowledgement came from another generation.
     StaleAcknowledgementGeneration,
     /// Acknowledgement lags the exact prior publication.
-    LaggingAcknowledgement { expected: u64, actual: u64 },
+    LaggingAcknowledgement {
+        /// Exact prior publication sequence required for reuse.
+        expected: u64,
+        /// Older acknowledged sequence supplied by the caller.
+        actual: u64,
+    },
     /// Acknowledgement attempts to pre-authorize future reuse.
-    FutureAcknowledgement { expected: u64, actual: u64 },
+    FutureAcknowledgement {
+        /// Exact prior publication sequence required for reuse.
+        expected: u64,
+        /// Future acknowledged sequence supplied by the caller.
+        actual: u64,
+    },
     /// Observed sequence differs from expectation.
-    StaleSequence { expected: u64, actual: u64 },
+    StaleSequence {
+        /// Sequence requested by the reader.
+        expected: u64,
+        /// Sequence observed in shared metadata.
+        actual: u64,
+    },
     /// Peer-declared payload exceeds fixed capacity.
-    PayloadTooLarge { length: u32, capacity: u32 },
+    PayloadTooLarge {
+        /// Peer-declared payload length.
+        length: u32,
+        /// Validated fixed payload capacity.
+        capacity: u32,
+    },
     /// Payload length changed during the copy window.
-    ChangedPayloadLength { expected: u32, actual: u32 },
+    ChangedPayloadLength {
+        /// Payload length captured before the copy.
+        expected: u32,
+        /// Payload length observed during the recheck.
+        actual: u32,
+    },
     /// Observation belongs to another role.
     WrongObservationRole,
 }
 
 /// Bounded acknowledgement failures.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcknowledgementError {
     /// Slot observation targets another route.
@@ -645,7 +691,12 @@ pub enum AcknowledgementError {
     /// Sequence zero is unpublished.
     UnpublishedSequence,
     /// Acknowledgement moved backwards.
-    NonMonotonic { current: u64, next: u64 },
+    NonMonotonic {
+        /// Currently published acknowledgement sequence.
+        current: u64,
+        /// Requested acknowledgement sequence.
+        next: u64,
+    },
 }
 
 impl fmt::Display for SlotError {

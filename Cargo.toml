@@ -20,7 +20,7 @@ keywords = ["ipc", "shared-memory", "process", "capability", "security"]
 categories = ["os", "memory-management"]
 
 [workspace.lints.rust]
-missing_docs = "warn"
+missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]

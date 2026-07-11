@@ -283,6 +283,16 @@ impl AuthenticatedChannel {
 
     /// Transfers a prepared reader capability and withholds the local writer
     /// until authenticated peer validation completes the READY/COMMIT barrier.
+    ///
+    /// `prepared` must come from [`QuiescentRegion::prepare_writer`]. This call
+    /// owns the complete serialized transaction and returns only after the peer
+    /// validates the exact manifest and accepts COMMIT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for peer exit, timeout, malformed or stale control
+    /// frames, descriptor-transfer failure, or a mismatched READY transcript.
+    /// Any ambiguous failure poisons the channel and terminates an owned helper.
     pub fn transfer_writer(
         &mut self,
         prepared: PreparedWriter,
@@ -307,6 +317,15 @@ impl AuthenticatedChannel {
     }
 
     /// Receives, validates, maps, and binds one read-only capability.
+    ///
+    /// `expected_len` is the exact page-rounded native capability length;
+    /// `expected` and `topology` identify the canonical region. The returned
+    /// reader remains unavailable internally until COMMIT is received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for peer exit, timeout, malformed ancillary data,
+    /// invalid seals or length, layout rejection, or a mismatched COMMIT.
     pub fn receive_reader(
         &mut self,
         expected_len: usize,

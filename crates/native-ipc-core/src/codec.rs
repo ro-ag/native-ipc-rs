@@ -261,11 +261,15 @@ impl RelativeRange {
 }
 
 /// Encoder failures; values remain bounded and contain no peer-provided text.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncodeError {
     /// Destination cannot contain the requested encoding.
-    DestinationTooSmall { required: usize, actual: usize },
+    DestinationTooSmall {
+        /// Minimum destination size.
+        required: usize,
+        /// Supplied destination size.
+        actual: usize,
+    },
     /// A length cannot be represented by the wire format.
     LengthOverflow,
     /// Generation zero is reserved.
@@ -290,15 +294,24 @@ pub enum LimitKind {
 }
 
 /// Decoder failures; values remain bounded and contain no peer-provided text.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
     /// Input ends before a required byte.
-    Truncated { required: usize, actual: usize },
+    Truncated {
+        /// Minimum input size for the attempted decode.
+        required: usize,
+        /// Supplied input size.
+        actual: usize,
+    },
     /// Message signature is not recognized.
     BadMagic(u32),
     /// Wire version is unsupported.
-    BadVersion { major: u16, minor: u16 },
+    BadVersion {
+        /// Received major version.
+        major: u16,
+        /// Received minor version.
+        minor: u16,
+    },
     /// Schema identity differs from the selected protocol.
     SchemaMismatch,
     /// Generation zero is reserved.
@@ -306,13 +319,21 @@ pub enum DecodeError {
     /// Sequence zero is reserved.
     ZeroSequence,
     /// Declared and actual sizes do not form one canonical record.
-    NonCanonicalLength { declared: usize, actual: usize },
+    NonCanonicalLength {
+        /// Length declared by the envelope.
+        declared: usize,
+        /// Length of the supplied record.
+        actual: usize,
+    },
     /// Checked length arithmetic overflowed.
     LengthOverflow,
     /// A checked relative range escapes its containing record.
     RelativeRangeOutOfBounds {
+        /// Peer-declared byte offset.
         offset: u32,
+        /// Peer-declared byte length.
         len: u32,
+        /// Size of the containing validated record.
         containing_len: usize,
     },
     /// A configured resource limit was exceeded.

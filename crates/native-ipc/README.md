@@ -21,6 +21,31 @@ memory entries on macOS, and unnamed sections on Windows. Regions may be fixed
 or replacement-growable before sharing, can be cleared for reuse, and can be
 explicitly destroyed with a complete clearing pass.
 
+## Example
+
+```rust
+use native_ipc::memory::{NativeRegion, RegionOptions, WriterOwner};
+
+let mut region = NativeRegion::allocate(RegionOptions::fixed(
+    4096,
+    WriterOwner::Creator,
+))?;
+region.initialize(|bytes| bytes[..4].copy_from_slice(b"NIPC"));
+let request = region.prepare_for_sharing();
+assert!(request.mapped_len() >= 4096);
+# Ok::<(), native_ipc::memory::MemoryError>(())
+```
+
+Run the complete portable lifecycle example with:
+
+```sh
+cargo run -p native-ipc --example common_memory
+```
+
+The lower-level READY/COMMIT capability transaction is documented by
+[`native-ipc-platform`](https://docs.rs/native-ipc-platform) and its
+[`ready_commit` example](https://github.com/ro-ag/native-ipc-rs/blob/main/crates/native-ipc-platform/examples/ready_commit.rs).
+
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not
 claim integrity against a malicious same-sequence writer.

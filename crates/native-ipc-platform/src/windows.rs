@@ -641,6 +641,15 @@ impl ChildSession {
     }
     /// Consumes prepared mappings after authenticated READY and sends COMMIT.
     ///
+    /// This method owns capability duplication, the remote-handle cleanup
+    /// ledger, exact manifest transfer, READY validation, and COMMIT. It returns
+    /// `(local_writer, local_reader)` only after successful COMMIT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplication, pipe, transcript, timeout, or process
+    /// failures. Ambiguous failure terminates and reaps the exact held child.
+    ///
     /// ```compile_fail
     /// use native_ipc_platform::windows::{
     ///     ChildSession, PreparedLocalWriter, PreparedRemoteWriter,
@@ -821,6 +830,15 @@ impl ChildChannel {
         self.pipe.0
     }
     /// Receives exact-rights handle values only after pipe PID authentication.
+    ///
+    /// The tuple is `(reader_handle, reader_len, writer_handle, writer_len)`.
+    /// Lengths are exact page-rounded capability sizes. Handles remain pending
+    /// and must be imported and passed to [`Self::commit_imports`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate receipt, timeout, truncated or oversized
+    /// frames, invalid fixed-width values, or a malformed capability envelope.
     pub fn receive_capabilities(
         &mut self,
     ) -> Result<(RemoteHandle, usize, RemoteHandle, usize), WindowsError> {
@@ -861,6 +879,13 @@ impl ChildChannel {
         ))
     }
     /// Signals validation, waits for COMMIT, then exposes imported capabilities.
+    ///
+    /// Returns `(imported_reader, imported_writer)` in manifest order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the imported entries do not match the capability
+    /// transcript, READY cannot be sent, or COMMIT is malformed or stale.
     pub fn commit_imports(
         &mut self,
         reader: PendingImportedReader,

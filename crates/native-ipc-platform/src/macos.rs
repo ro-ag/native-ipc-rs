@@ -80,15 +80,22 @@ unsafe extern "C" {
 }
 
 /// Failure to create or restrict a Mach shared-memory capability.
-#[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachError {
     /// Shared regions cannot be empty.
     ZeroSize,
     /// Requested size cannot be page-aligned.
-    SizeOverflow { requested: usize },
+    SizeOverflow {
+        /// Logical byte length that could not be page-aligned.
+        requested: usize,
+    },
     /// Transition size differs from the quiescent region.
-    InvalidViewSize { requested: usize, region: usize },
+    InvalidViewSize {
+        /// Requested capability view length.
+        requested: usize,
+        /// Exact page-rounded region length.
+        region: usize,
+    },
     /// Kernel reported an invalid page size.
     InvalidPageSize(c_int),
     /// Successful allocation returned an unusable address.
@@ -96,7 +103,12 @@ pub enum MachError {
     /// Successful memory-entry creation returned a null capability.
     NullMemoryEntry,
     /// Kernel changed an already aligned entry size.
-    UnexpectedEntrySize { expected: usize, actual: u64 },
+    UnexpectedEntrySize {
+        /// Requested page-rounded memory-entry size.
+        expected: usize,
+        /// Size returned by the Mach kernel.
+        actual: u64,
+    },
     /// Mach kernel call failed.
     Kernel {
         /// Operation name from this bounded implementation.
@@ -285,6 +297,15 @@ impl QuiescentRegion {
     }
 
     /// Validates, transfers a read-only entry, and commits the local writer.
+    ///
+    /// The returned pending value has no payload API. Pass it as part of the
+    /// exact batch to [`bootstrap::ParentChannel::commit_transfers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if layout validation, Mach permission attenuation,
+    /// runtime binding, or authenticated capability transfer fails. Failure
+    /// poisons the active parent transaction.
     pub fn transfer_local_writer(
         self,
         expected: ValidationExpectations,
@@ -320,6 +341,13 @@ impl QuiescentRegion {
     }
 
     /// Validates, transfers the sole writer entry, and commits local read-only access.
+    ///
+    /// The local reader and peer writer remain pending until the batch commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation, permanent local protection downgrade,
+    /// runtime binding, or authenticated capability transfer fails.
     pub fn transfer_remote_writer(
         self,
         expected: ValidationExpectations,
@@ -447,6 +475,14 @@ unsafe impl SoleWriterMapping for ImportedWriterMapping {
 
 impl bootstrap::ChildChannel {
     /// Receives and binds a read-only memory entry while the parent is quiescent.
+    ///
+    /// `len` is the exact page-rounded entry length. The result is a hidden
+    /// runtime wrapper that becomes accessible only through [`Self::commit_imports`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transcript mismatch, mapping failure, layout
+    /// rejection, or runtime binding failure and poisons the transaction.
     pub fn receive_reader(
         &mut self,
         len: usize,
@@ -471,6 +507,11 @@ impl bootstrap::ChildChannel {
     }
 
     /// Receives and binds the sole writable memory entry while quiescent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for transcript mismatch, mapping failure, layout
+    /// rejection, or runtime binding failure and poisons the transaction.
     pub fn receive_writer(
         &mut self,
         len: usize,
@@ -504,6 +545,11 @@ impl bootstrap::ParentChannel {
     /// Consumes a complete two-region transfer, waits for peer validation, then
     /// sends COMMIT before exposing either local runtime capability.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if READY does not match the exact canonical batch or
+    /// COMMIT cannot be sent unambiguously. The helper is terminated on failure.
+    ///
     /// ```compile_fail
     /// use native_ipc_platform::macos::{
     ///     PendingTransferredReader, PendingTransferredWriter, bootstrap::ParentChannel,
@@ -536,6 +582,11 @@ impl bootstrap::ParentChannel {
 impl bootstrap::ChildChannel {
     /// Signals validation, waits for creator COMMIT, and only then exposes the
     /// imported reader and sole-writer runtime capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if READY cannot be sent or the received COMMIT does not
+    /// match the complete canonical batch.
     pub fn commit_imports(
         &mut self,
         reader: PendingImportedReader,

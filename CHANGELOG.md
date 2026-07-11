@@ -14,6 +14,11 @@ Versioning once a stable API is released.
   own every installed descriptor so malformed transfers cannot leak file
   descriptors.
 
+### Documentation
+
+- Add crates.io landing pages, runnable examples, complete public error-field
+  documentation, and cross-target READY/COMMIT API guidance for every crate.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added
