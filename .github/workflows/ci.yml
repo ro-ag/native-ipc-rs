@@ -95,3 +95,22 @@ jobs:
           components: miri
       - name: Run Miri on platform-neutral unsafe contracts
         run: cargo +nightly miri test -p native-ipc-core --lib
+
+  fuzz-smoke:
+    name: fuzz smoke / envelope and layout
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        with:
+          tool: cargo-fuzz@0.13.1
+      - name: Fuzz envelope decoder
+        run: cargo fuzz run envelope --fuzz-dir fuzz -- -runs=10000 -max_len=4096 -timeout=5 -rss_limit_mb=1024
+      - name: Fuzz layout decoder
+        run: cargo fuzz run layout --fuzz-dir fuzz -- -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=1024
