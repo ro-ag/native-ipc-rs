@@ -111,6 +111,6 @@ jobs:
         with:
           tool: cargo-fuzz@0.13.1
       - name: Fuzz envelope decoder
-        run: cargo fuzz run envelope --fuzz-dir fuzz -- -runs=10000 -max_len=4096 -timeout=5 -rss_limit_mb=1024
+        run: cargo +nightly fuzz run envelope --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=4096 -timeout=5 -rss_limit_mb=1024
       - name: Fuzz layout decoder
-        run: cargo fuzz run layout --fuzz-dir fuzz -- -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=1024
+        run: cargo +nightly fuzz run layout --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=1024
