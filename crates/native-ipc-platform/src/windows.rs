@@ -66,6 +66,8 @@ pub enum WindowsError {
     Binding(BindingError),
     /// Bootstrap environment or authenticated handshake was malformed.
     InvalidBootstrap,
+    /// A sole-writer capability was already duplicated from this preparation.
+    CapabilityAlreadyTransferred,
 }
 
 impl fmt::Display for WindowsError {
@@ -236,6 +238,7 @@ impl QuiescentRegion {
             view,
             layout,
             topology,
+            writer_duplicated: false,
         })
     }
 }
@@ -280,18 +283,24 @@ pub struct PreparedRemoteWriter {
     view: View,
     layout: ValidatedRegionLayout,
     topology: RegionSetLayout,
+    writer_duplicated: bool,
 }
 impl PreparedRemoteWriter {
-    /// Duplicates exactly `FILE_MAP_WRITE` into a held authenticated target process.
+    /// Duplicates exactly one `FILE_MAP_WRITE` handle into a held authenticated target.
     ///
     /// # Safety
     ///
     /// `target_process` must be the held live process authenticated by the pipe.
     pub unsafe fn duplicate_writer_to(
-        &self,
+        &mut self,
         target_process: HANDLE,
     ) -> Result<RemoteHandle, WindowsError> {
-        duplicate_to(self.section.0, target_process, FILE_MAP_WRITE)
+        if self.writer_duplicated {
+            return Err(WindowsError::CapabilityAlreadyTransferred);
+        }
+        let handle = duplicate_to(self.section.0, target_process, FILE_MAP_WRITE)?;
+        self.writer_duplicated = true;
+        Ok(handle)
     }
     /// Closes the full section handle and commits the local read-only witness.
     pub fn bind_reader(self) -> Result<ReaderRegion<WindowsReaderMapping>, WindowsError> {
@@ -1094,7 +1103,7 @@ mod tests {
         let mut peer_region = QuiescentRegion::new(peer_layout.total_size() as usize).unwrap();
         peer_layout.encode_into(peer_region.as_bytes_mut()).unwrap();
         let peer_expected = expected(&topology, peer, peer_region.len());
-        let prepared_peer = peer_region
+        let mut prepared_peer = peer_region
             .prepare_remote_writer(peer_expected, topology.clone())
             .unwrap();
         let executable = std::env::current_exe().unwrap();
@@ -1118,6 +1127,12 @@ mod tests {
                 .duplicate_writer_to(child.process_handle())
                 .unwrap()
         };
+        assert!(matches!(
+            // SAFETY: the call is intentionally repeated against the same held process
+            // to verify that the typestate rejects a second writable duplicate.
+            unsafe { prepared_peer.duplicate_writer_to(child.process_handle()) },
+            Err(WindowsError::CapabilityAlreadyTransferred)
+        ));
         child
             .send_capabilities(
                 reader_handle,
