@@ -3,6 +3,21 @@
 //! macOS, Linux, and Windows adapters implement private authenticated bootstrap,
 //! least-authority shared-memory transfer, and owned helper lifecycles.
 
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(
+        target_os = "windows",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
+compile_error!(
+    "native-ipc-platform supports Linux and Windows on aarch64/x86_64, and macOS on aarch64"
+);
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
