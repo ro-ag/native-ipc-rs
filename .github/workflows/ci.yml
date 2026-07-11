@@ -85,6 +85,29 @@ jobs:
       - name: Check no-default-feature target surface
         run: cargo check --workspace --no-default-features --all-targets --locked --target ${{ matrix.target }}
 
+  address-sanitizer:
+    name: address sanitizer / linux-amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install nightly Rust with standard-library sources
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
+      - name: Cache sanitizer artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: address-sanitizer-linux-amd64
+      - name: Run instrumented workspace and native lifecycle tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1
+          RUSTFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
+          RUSTDOCFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
+        run: cargo +nightly test -Zbuild-std --workspace --all-features --all-targets --locked --target x86_64-unknown-linux-gnu
+
   dependencies:
     name: dependency and license policy
     runs-on: ubuntu-latest

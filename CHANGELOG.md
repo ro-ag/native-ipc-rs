@@ -13,6 +13,8 @@ Versioning once a stable API is released.
   transfer.
 - Support and continuously test ARM64 and AMD64 native backends on Linux and
   Windows, with macOS intentionally supported on ARM64 only.
+- Run the full Linux AMD64 workspace and native lifecycle suite under
+  AddressSanitizer with leak and stack-use-after-return detection.
 
 ### Documentation
 
