@@ -1,9 +1,63 @@
 # native-ipc-rs
 
+[![CI](https://github.com/ro-ag/native-ipc-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ro-ag/native-ipc-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/native-ipc.svg)](https://crates.io/crates/native-ipc)
+[![docs.rs](https://docs.rs/native-ipc/badge.svg)](https://docs.rs/native-ipc)
+[![license](https://img.shields.io/crates/l/native-ipc.svg)](LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.97-blue.svg)](rust-toolchain.toml)
+[![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-informational.svg)](#platform-capabilities)
+
 `native-ipc-rs` is a security-oriented Rust foundation for bounded,
 pointer-free IPC over least-authority native shared-memory capabilities. It
 separates a domain-neutral wire/layout core from operating-system capability
 enforcement. It is not yet a complete process transport.
+
+## Why this repository exists
+
+Shared memory is fast, but a conventional wrapper can accidentally turn an
+untrusted process into a holder of writable aliases, native handles with excess
+rights, or Rust references whose invariants another process can violate.
+Serialization alone does not solve capability transfer, mapping permissions,
+peer identity, process cleanup, or replay across restarts.
+
+This repository separates those concerns:
+
+- a pointer-free core manually encodes fixed-width wire/layout data and checks
+  every hostile length, offset, role, generation, sequence, and resource bound;
+- native adapters ask each kernel for least-authority mappings and authenticate
+  the exact helper process before transferring them; and
+- safe runtime APIs expose owned payload copies and typed reader/writer
+  capabilities instead of shared Rust slices.
+
+```mermaid
+flowchart LR
+    subgraph A["Process A"]
+        AA["Application"] --> AC["Bounded codec"]
+        AC --> AW["Sole writer"]
+        AR["Read-only reader"] --> AO["Owned hostile bytes"]
+        ACTL["Bootstrap endpoint"]
+    end
+
+    subgraph K["Kernel-enforced capabilities"]
+        RAB["Region A → B"]
+        RBA["Region B → A"]
+        AUTH["Private authenticated control channel"]
+    end
+
+    subgraph B["Process B"]
+        BA["Application"] --> BC["Bounded codec"]
+        BC --> BW["Sole writer"]
+        BR["Read-only reader"] --> BO["Owned hostile bytes"]
+        BCTL["Bootstrap endpoint"]
+    end
+
+    AW -->|"RW only in A"| RAB
+    RAB -->|"RO in B"| BR
+    BW -->|"RW only in B"| RBA
+    RBA -->|"RO in A"| AR
+    ACTL <-->|"identity, capabilities, READY"| AUTH
+    AUTH <-->|"identity, capabilities, READY"| BCTL
+```
 
 The workspace contains:
 
@@ -12,6 +66,68 @@ The workspace contains:
   and capability bindings;
 - `native-ipc-platform`: native mappings and capability policy; and
 - `native-ipc-testkit`: golden-vector and adversarial conformance helpers.
+
+## How memory is accessed
+
+Ordinary byte slices exist only while a new mapping is private and quiescent.
+The creator writes the canonical layout, validates the complete page-rounded
+range, chooses the sole writer, and asks the OS to attenuate the peer's rights.
+After authenticated transfer and import, both sides signal `READY`; runtime APIs
+then operate through mapping-owned capabilities without returning shared
+references.
+
+```mermaid
+sequenceDiagram
+    participant C as Creator
+    participant OS as Native kernel
+    participant P as Authenticated peer
+    participant R as Shared region
+
+    C->>OS: Allocate zeroed, non-executable region
+    OS-->>C: Exclusive quiescent mapping
+    C->>R: Encode canonical header, slots, and routes
+    C->>C: Validate full mapping and padding
+    C->>OS: Create exact RO or sole-RW peer capability
+    OS-->>P: Transfer capability over private channel
+    P->>P: Import with exact access and validate again
+    P-->>C: READY
+    C->>R: Copy payload, then Release-publish sequence
+    P->>R: Acquire sequence and checked length
+    P->>P: Copy payload into owned storage
+    P->>R: Fence and recheck generation/sequence/length
+    P->>R: Publish exact acknowledgement for reuse
+```
+
+The recheck bounds memory access and detects metadata changes. It does not make
+a malicious writer's payload trustworthy: same-sequence mutation may still
+produce a torn owned copy, so protocol decoding must remain hostile-input safe.
+
+## Examples
+
+Add the public facade with:
+
+```sh
+cargo add native-ipc
+```
+
+Runnable core examples demonstrate the two pieces applications configure
+before native capability transfer:
+
+```sh
+cargo run -p native-ipc-core --example bounded_codec
+cargo run -p native-ipc-core --example checked_layout
+cargo run -p native-ipc-platform --example quiescent_region
+```
+
+- [`bounded_codec.rs`](crates/native-ipc-core/examples/bounded_codec.rs) defines
+  a manual little-endian protocol, encodes an envelope, and decodes it under
+  explicit message/payload/allocation limits.
+- [`checked_layout.rs`](crates/native-ipc-core/examples/checked_layout.rs)
+  composes two directional, single-writer regions with exact acknowledgement
+  routes and bounded capacities.
+- [`quiescent_region.rs`](crates/native-ipc-platform/examples/quiescent_region.rs)
+  allocates the current OS's zeroed native capability and demonstrates that
+  mutable slices exist only before the consuming transfer transition.
 
 ## Security invariants
 
@@ -31,7 +147,7 @@ The workspace contains:
 - Store capabilities require a consumed platform sole-writer witness;
   OS-enforced read-only witnesses grant only acquire capabilities.
 - Runtime mappings never expose ordinary Rust slices. Slice access exists only
-  in a consuming, pre-transfer quiescent macOS typestate.
+  in consuming, pre-transfer quiescent platform typestates.
 
 ## Current status
 
@@ -53,9 +169,19 @@ Implemented in `0.1.0`:
 - portable golden vectors, deterministic adversarial fixtures, Miri, and
   bounded coverage-guided fuzz targets.
 
-The native adapters are intentionally low-level building blocks. Applications
-still own protocol negotiation, resource budgets, compatibility policy, and
-the decision to add guard pages around imported mappings.
+### Platform capabilities
+
+| Platform | Shared-memory capability | Peer authentication | Lifecycle containment |
+| --- | --- | --- | --- |
+| Linux | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
+| macOS | Mach memory-entry send rights | Mach audit-token PID | private bootstrap port + reap |
+| Windows | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
+
+Still intentionally outside `0.1.x` are a high-level negotiation/supervisor
+API, payload authenticity or encryption, automatic guard-page policy, and a
+stable `1.0` compatibility promise. The current crates are low-level building
+blocks for applications that explicitly own protocol negotiation, resource
+budgets, compatibility policy, and guard-page decisions.
 
 ## Toolchain and validation
 

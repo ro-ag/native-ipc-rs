@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible correctness, portability, or documentation problem
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suspected vulnerabilities must use [private vulnerability reporting](https://github.com/ro-ag/native-ipc-rs/security/advisories/new), not this form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest code, command, or repository that reproduces the problem.
+      render: rust
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: native-ipc version or commit
+      placeholder: 0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Platform-neutral core
+        - Multiple platforms
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Rust version, target triple, kernel/OS version, and enabled features.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and releases.
+          required: true
+        - label: This is not a vulnerability report.
+          required: true

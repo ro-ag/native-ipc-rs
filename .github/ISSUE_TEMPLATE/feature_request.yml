@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a bounded protocol, platform, testing, or usability improvement
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: What concrete cross-process problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the API or behavior, including relevant platform differences.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility impact
+      description: Explain effects on trust boundaries, mapping permissions, resource bounds, wire compatibility, or unsafe code.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the roadmap/status notes.
+          required: true

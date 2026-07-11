@@ -5,6 +5,11 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Documentation
+
+- Add architecture and memory-access diagrams, runnable codec/layout examples,
+  status badges, and GitHub community contribution templates.
+
 ## [0.1.0] - 2026-07-10
 
 ### Added
