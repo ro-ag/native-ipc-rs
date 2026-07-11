@@ -687,7 +687,7 @@ pub const fn status() -> BackendStatus {
 mod tests {
     use super::*;
     use native_ipc_core::layout::{
-        AcknowledgementRouteSpec, Endpoint, LayoutLimits, RegionSpec, RoleId,
+        AcknowledgementRouteSpec, Endpoint, LayoutError, LayoutLimits, RegionSpec, RoleId,
     };
 
     #[test]
@@ -701,6 +701,42 @@ mod tests {
         let expected = peer_credentials(&right).unwrap();
         let channel = AuthenticatedChannel::new(left, expected, [7; 32]).unwrap();
         assert_eq!(channel.peer(), expected);
+    }
+
+    #[test]
+    fn invalid_sizes_capabilities_and_peer_identity_fail_exactly() {
+        assert!(matches!(
+            QuiescentRegion::new(0),
+            Err(LinuxError::InvalidSize(0))
+        ));
+        assert!(matches!(
+            QuiescentRegion::new(usize::MAX),
+            Err(LinuxError::InvalidSize(usize::MAX))
+        ));
+
+        let unsealed = QuiescentRegion::new(1).unwrap();
+        assert!(matches!(
+            validate_fd(unsealed.fd.as_raw_fd(), unsealed.len()),
+            Err(LinuxError::InvalidCapability)
+        ));
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let actual = peer_credentials(&right).unwrap();
+        let wrong = PeerCredentials {
+            pid: actual.pid.wrapping_add(1),
+            ..actual
+        };
+        assert!(matches!(
+            AuthenticatedChannel::new(left, wrong, [9; 32]),
+            Err(LinuxError::WrongPeer)
+        ));
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let actual = peer_credentials(&right).unwrap();
+        assert!(matches!(
+            AuthenticatedChannel::new(left, actual, [0; 32]),
+            Err(LinuxError::WrongPeer)
+        ));
     }
 
     #[test]
@@ -775,6 +811,26 @@ mod tests {
             )
         };
         assert_eq!(denied, libc::MAP_FAILED);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+
+        // Seals also deny descriptor writes and any size change with exact EPERM.
+        let byte = 0xff_u8;
+        let written =
+            unsafe { libc::pwrite(capability.fd.as_raw_fd(), (&raw const byte).cast(), 1, 0) };
+        assert_eq!(written, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            unsafe {
+                libc::ftruncate(
+                    capability.fd.as_raw_fd(),
+                    capability.len.saturating_add(4096) as libc::off_t,
+                )
+            },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(unsafe { libc::ftruncate(capability.fd.as_raw_fd(), 1) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
 
         let (left, right) = UnixStream::pair().unwrap();
         let credentials = peer_credentials(&left).unwrap();
@@ -788,6 +844,13 @@ mod tests {
             received.unwrap()
         });
         let mut writer = prepared.bind().unwrap();
+        assert_eq!(
+            writer.publish(0, 1, None, &[0xaa; 17]).unwrap_err(),
+            BindingError::Layout(LayoutError::PayloadOutOfBounds {
+                length: 17,
+                capacity: 16,
+            })
+        );
         writer.publish(0, 1, None, b"linux").unwrap();
         assert_eq!(reader.copy_payload(0, 1).unwrap(), b"linux");
     }

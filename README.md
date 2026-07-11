@@ -231,7 +231,11 @@ The public facade and native platform crate fail compilation on other target
 combinations. The platform-neutral `native-ipc-core` crate remains usable
 wherever its documented 64-bit atomic requirement is met. CI runs the full
 workspace and native permission/helper-process tests on all five targets; no
-Intel macOS support is claimed.
+Intel macOS support is claimed. Linux AMD64 additionally runs every workspace
+and native lifecycle test under AddressSanitizer. Leak detection and
+stack-use-after-return detection are enabled, and the standard library is
+rebuilt with instrumentation so the check covers allocation boundaries beyond
+this workspace's crates.
 
 Still intentionally outside `0.1.x` are a high-level negotiation/supervisor
 API, payload authenticity or encryption, automatic guard-page policy, and a
@@ -252,6 +256,17 @@ cargo check --workspace --no-default-features --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo deny check
 git diff --check
+```
+
+The Linux AMD64 sanitizer job uses nightly Rust because sanitizers and
+instrumented standard-library builds are not stable compiler features:
+
+```sh
+ASAN_OPTIONS="detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1" \
+RUSTFLAGS="-Zsanitizer=address -Cforce-frame-pointers=yes" \
+RUSTDOCFLAGS="-Zsanitizer=address -Cforce-frame-pointers=yes" \
+cargo +nightly test -Zbuild-std --workspace --all-features --all-targets \
+  --locked --target x86_64-unknown-linux-gnu
 ```
 
 The project is dual-licensed under [MIT](LICENSE-MIT) or
