@@ -5,7 +5,10 @@ use std::fmt;
 use std::mem::{size_of, zeroed};
 
 use super::{KERN_SUCCESS, MachPort, current_task, deallocate_port};
-use crate::protocol::{CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest};
+use crate::protocol::{
+    CONTROL_FRAME_LEN, ManifestEntry, PeerAccess, TransferManifest, TransferProvenance,
+    mint_channel_id,
+};
 use native_ipc_core::layout::ValidationExpectations;
 
 type MachMsgReturn = c_int;
@@ -286,9 +289,10 @@ impl SpawnedHelper {
                 envp.as_ptr(),
             )
         };
-        spawn_result(result)?;
-        // Drop the parent's extra send reference; receive right remains.
+        // Drop the parent's extra send reference on every outcome before the
+        // launch result is inspected; the receive right remains owned.
         deallocate_port(current_task(), receive.0);
+        spawn_result(result)?;
         Ok(Self {
             pid,
             nonce,
@@ -319,6 +323,7 @@ impl SpawnedHelper {
             peer_pid: self.pid as u32,
             reaped: false,
             pending_entries: Vec::new(),
+            channel_id: mint_channel_id(),
             next_transfer_id: 1,
             poisoned: false,
         };
@@ -356,6 +361,7 @@ pub struct ParentChannel {
     peer_pid: u32,
     reaped: bool,
     pending_entries: Vec<ManifestEntry>,
+    channel_id: u64,
     next_transfer_id: u64,
     poisoned: bool,
 }
@@ -473,6 +479,11 @@ impl ParentChannel {
     pub(super) fn poison_transaction(&mut self) {
         self.poison();
     }
+
+    /// Provenance stamp binding pending values to the open transaction.
+    pub(super) const fn pending_provenance(&self) -> TransferProvenance {
+        TransferProvenance::new(self.channel_id, self.next_transfer_id)
+    }
 }
 
 /// Child side obtained from its injected special bootstrap port.
@@ -482,6 +493,7 @@ pub struct ChildChannel {
     nonce: [u8; 32],
     parent_pid: u32,
     pending_entries: Vec<ManifestEntry>,
+    channel_id: u64,
     next_transfer_id: u64,
     poisoned: bool,
 }
@@ -518,6 +530,7 @@ impl ChildChannel {
             nonce,
             parent_pid,
             pending_entries: Vec::new(),
+            channel_id: mint_channel_id(),
             next_transfer_id: 1,
             poisoned: false,
         })
@@ -600,6 +613,11 @@ impl ChildChannel {
 
     pub(super) fn poison_transaction(&mut self) {
         self.poisoned = true;
+    }
+
+    /// Provenance stamp binding pending values to the open transaction.
+    pub(super) const fn pending_provenance(&self) -> TransferProvenance {
+        TransferProvenance::new(self.channel_id, self.next_transfer_id)
     }
 }
 
@@ -893,6 +911,81 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("child never published payload");
+    }
+
+    fn spawn_memory_helper() -> ParentChannel {
+        let executable = std::env::current_exe().unwrap();
+        let path = CString::new(executable.as_os_str().as_bytes()).unwrap();
+        let arguments = [
+            CString::new("--exact").unwrap(),
+            CString::new("macos::bootstrap::tests::memory_entry_helper").unwrap(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--nocapture").unwrap(),
+        ];
+        SpawnedHelper::spawn(&path, &arguments)
+            .unwrap()
+            .authenticate()
+            .unwrap()
+    }
+
+    fn pending_pair(
+        channel: &mut ParentChannel,
+    ) -> (
+        super::super::PendingTransferredWriter,
+        super::super::PendingTransferredReader,
+    ) {
+        let (topology, producer, peer) = topology();
+        let layout = topology.region(producer).unwrap();
+        let mut owner = super::super::QuiescentRegion::new(layout.total_size() as usize).unwrap();
+        layout.encode_into(owner.as_bytes_mut()).unwrap();
+        let expected = ValidationExpectations {
+            schema_id: [6; 32],
+            generation: 17,
+            role: producer,
+            writer: Endpoint::Initiator,
+            maximum_mapping_size: owner.len() as u64,
+        };
+        let peer_layout = topology.region(peer).unwrap();
+        let mut peer_owner =
+            super::super::QuiescentRegion::new(peer_layout.total_size() as usize).unwrap();
+        peer_layout.encode_into(peer_owner.as_bytes_mut()).unwrap();
+        let peer_expected = ValidationExpectations {
+            schema_id: [6; 32],
+            generation: 17,
+            role: peer,
+            writer: Endpoint::Responder,
+            maximum_mapping_size: peer_owner.len() as u64,
+        };
+        let writer = owner
+            .transfer_local_writer(expected, topology.clone(), channel)
+            .unwrap();
+        let reader = peer_owner
+            .transfer_remote_writer(peer_expected, topology, channel)
+            .unwrap();
+        (writer, reader)
+    }
+
+    #[test]
+    fn foreign_pending_values_fail_closed_before_commit() {
+        let mut first = spawn_memory_helper();
+        let (first_writer, first_reader) = pending_pair(&mut first);
+
+        let mut second = spawn_memory_helper();
+        let (second_writer, second_reader) = pending_pair(&mut second);
+
+        // Session two must reject session one's pending values before READY/COMMIT.
+        assert!(matches!(
+            second.commit_transfers(first_writer, first_reader),
+            Err(super::super::MacBindingError::ForeignPending)
+        ));
+
+        // The mismatched transaction is poisoned: even the channel's own exact
+        // pending values can no longer commit.
+        assert!(
+            second
+                .commit_transfers(second_writer, second_reader)
+                .is_err()
+        );
     }
 
     #[test]

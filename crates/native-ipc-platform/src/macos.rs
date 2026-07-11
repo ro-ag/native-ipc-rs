@@ -8,7 +8,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-use crate::protocol::PeerAccess;
+use crate::protocol::{PeerAccess, TransferProvenance};
 use native_ipc_core::layout::{
     LayoutError, RegionSetLayout, ValidatedRegionLayout, ValidationExpectations,
 };
@@ -129,6 +129,8 @@ pub enum MacBindingError {
     Binding(BindingError),
     /// Authenticated bootstrap or Mach port transfer failed.
     Bootstrap(bootstrap::BootstrapError),
+    /// A pending value came from another channel or transfer transaction.
+    ForeignPending,
 }
 
 impl fmt::Display for MacBindingError {
@@ -332,7 +334,10 @@ impl QuiescentRegion {
                 PeerAccess::ReadOnly,
             )?;
             drop(peer_entry);
-            Ok(PendingTransferredWriter { runtime })
+            Ok(PendingTransferredWriter {
+                runtime,
+                provenance: channel.pending_provenance(),
+            })
         })();
         if result.is_err() {
             channel.poison_transaction();
@@ -374,7 +379,10 @@ impl QuiescentRegion {
                 PeerAccess::SoleWriter,
             )?;
             drop(peer_entry);
-            Ok(PendingTransferredReader { runtime })
+            Ok(PendingTransferredReader {
+                runtime,
+                provenance: channel.pending_provenance(),
+            })
         })();
         if result.is_err() {
             channel.poison_transaction();
@@ -393,11 +401,13 @@ impl QuiescentRegion {
 /// ```
 pub struct PendingTransferredWriter {
     runtime: WriterRegion<TransferredWriterMapping>,
+    provenance: TransferProvenance,
 }
 
 /// Local reader withheld until the authenticated peer validates every import.
 pub struct PendingTransferredReader {
     runtime: ReaderRegion<TransferredReaderMapping>,
+    provenance: TransferProvenance,
 }
 
 /// Imported reader withheld until READY is acknowledged with COMMIT.
@@ -410,11 +420,13 @@ pub struct PendingTransferredReader {
 /// ```
 pub struct PendingImportedReader {
     runtime: ReaderRegion<ImportedReaderMapping>,
+    provenance: TransferProvenance,
 }
 
 /// Imported writer withheld until READY is acknowledged with COMMIT.
 pub struct PendingImportedWriter {
     runtime: WriterRegion<ImportedWriterMapping>,
+    provenance: TransferProvenance,
 }
 
 /// Parent-side writer mapping after its read-only entry was transferred.
@@ -498,6 +510,7 @@ impl bootstrap::ChildChannel {
             drop(right);
             Ok(PendingImportedReader {
                 runtime: ReaderRegion::new(ImportedReaderMapping { mapping }, layout, topology)?,
+                provenance: self.pending_provenance(),
             })
         })();
         if result.is_err() {
@@ -532,6 +545,7 @@ impl bootstrap::ChildChannel {
             drop(right);
             Ok(PendingImportedWriter {
                 runtime: WriterRegion::new(ImportedWriterMapping { mapping }, layout, topology)?,
+                provenance: self.pending_provenance(),
             })
         })();
         if result.is_err() {
@@ -547,8 +561,10 @@ impl bootstrap::ParentChannel {
     ///
     /// # Errors
     ///
-    /// Returns an error if READY does not match the exact canonical batch or
-    /// COMMIT cannot be sent unambiguously. The helper is terminated on failure.
+    /// Returns an error if either pending value belongs to another channel or
+    /// transfer transaction, if READY does not match the exact canonical batch,
+    /// or if COMMIT cannot be sent unambiguously. The helper is terminated on
+    /// failure.
     ///
     /// ```compile_fail
     /// use native_ipc_platform::macos::{
@@ -574,6 +590,11 @@ impl bootstrap::ParentChannel {
         ),
         MacBindingError,
     > {
+        let expected = self.pending_provenance();
+        if writer.provenance != expected || reader.provenance != expected {
+            self.poison_transaction();
+            return Err(MacBindingError::ForeignPending);
+        }
         self.ready_and_commit()?;
         Ok((writer.runtime, reader.runtime))
     }
@@ -585,8 +606,9 @@ impl bootstrap::ChildChannel {
     ///
     /// # Errors
     ///
-    /// Returns an error if READY cannot be sent or the received COMMIT does not
-    /// match the complete canonical batch.
+    /// Returns an error if either pending value belongs to another channel or
+    /// transfer transaction, if READY cannot be sent, or if the received COMMIT
+    /// does not match the complete canonical batch.
     pub fn commit_imports(
         &mut self,
         reader: PendingImportedReader,
@@ -598,6 +620,11 @@ impl bootstrap::ChildChannel {
         ),
         MacBindingError,
     > {
+        let expected = self.pending_provenance();
+        if reader.provenance != expected || writer.provenance != expected {
+            self.poison_transaction();
+            return Err(MacBindingError::ForeignPending);
+        }
         self.ready_and_wait_commit()?;
         Ok((reader.runtime, writer.runtime))
     }
@@ -769,7 +796,9 @@ impl Mapping {
             }
         };
         let Some(address) = NonNull::new(address_usize as *mut u8) else {
-            deallocate_mapping(task, 0, mapped_len);
+            // VM_FLAGS_ANYWHERE never returns address zero; refuse the value
+            // without speculatively deallocating the page-zero range this code
+            // did not allocate.
             return Err(MachError::InvalidAddress(0));
         };
         Ok(Self {

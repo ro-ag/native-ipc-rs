@@ -111,6 +111,37 @@ impl TransferManifest {
     }
 }
 
+/// Mints a process-unique channel identity for pending-value provenance.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn mint_channel_id() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Unforgeable binding from a pending runtime value to the exact channel
+/// transaction that created it.
+///
+/// Private fields keep values unmintable and unmodifiable outside this crate,
+/// so a commit operation can require that every supplied pending value came
+/// from its own channel and its currently open transfer transaction.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransferProvenance {
+    channel_id: u64,
+    transfer_id: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl TransferProvenance {
+    pub(crate) const fn new(channel_id: u64, transfer_id: u64) -> Self {
+        Self {
+            channel_id,
+            transfer_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
