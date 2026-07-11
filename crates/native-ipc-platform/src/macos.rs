@@ -15,13 +15,14 @@ use native_ipc_core::mapping::{
     BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
 };
 
+pub mod bootstrap;
+
 type KernReturn = c_int;
 type MachPort = u32;
 type MachVmAddress = u64;
 type MachVmSize = u64;
 type MemoryObjectOffset = u64;
 type MemoryObjectSize = u64;
-#[cfg(test)]
 type VmInherit = u32;
 type VmProt = c_int;
 
@@ -32,7 +33,6 @@ const VM_PROT_READ: VmProt = 1;
 const VM_PROT_WRITE: VmProt = 2;
 const VM_PROT_EXECUTE: VmProt = 4;
 const MAP_MEM_VM_SHARE: VmProt = 0x0040_0000;
-#[cfg(test)]
 const VM_INHERIT_NONE: VmInherit = 2;
 
 unsafe extern "C" {
@@ -62,7 +62,6 @@ unsafe extern "C" {
         object_handle: *mut MachPort,
         parent_entry: MachPort,
     ) -> KernReturn;
-    #[cfg(test)]
     fn mach_vm_map(
         target_task: MachPort,
         address: *mut MachVmAddress,
@@ -115,6 +114,8 @@ pub enum MacBindingError {
     Mach(MachError),
     /// Audited mapping-to-record binding failed.
     Binding(BindingError),
+    /// Authenticated bootstrap or Mach port transfer failed.
+    Bootstrap(bootstrap::BootstrapError),
 }
 
 impl fmt::Display for MacBindingError {
@@ -137,6 +138,11 @@ impl From<MachError> for MacBindingError {
 impl From<BindingError> for MacBindingError {
     fn from(value: BindingError) -> Self {
         Self::Binding(value)
+    }
+}
+impl From<bootstrap::BootstrapError> for MacBindingError {
+    fn from(value: bootstrap::BootstrapError) -> Self {
+        Self::Bootstrap(value)
     }
 }
 
@@ -276,6 +282,161 @@ impl QuiescentRegion {
             topology,
         )?)
     }
+
+    /// Validates, transfers a read-only entry, and commits the local writer.
+    pub fn transfer_local_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+        channel: &bootstrap::ParentChannel,
+    ) -> Result<WriterRegion<TransferredWriterMapping>, MacBindingError> {
+        // SAFETY: quiescent state covers the exact transferred capability.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_local_writer(capability_len)?;
+        channel.send(region.peer_entry.name)?;
+        let LocalWriterRegion {
+            mapping,
+            peer_entry,
+            len: _,
+        } = region;
+        drop(peer_entry);
+        Ok(WriterRegion::new(
+            TransferredWriterMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Validates, transfers the sole writer entry, and commits local read-only access.
+    pub fn transfer_remote_writer(
+        self,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+        channel: &bootstrap::ParentChannel,
+    ) -> Result<ReaderRegion<TransferredReaderMapping>, MacBindingError> {
+        // SAFETY: quiescent state covers the exact transferred capability.
+        let layout =
+            unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
+        let capability_len = self.len();
+        let region = self.into_remote_writer(capability_len)?;
+        channel.send(region.peer_entry.name)?;
+        let RemoteWriterRegion {
+            mapping,
+            peer_entry,
+            len: _,
+        } = region;
+        drop(peer_entry);
+        Ok(ReaderRegion::new(
+            TransferredReaderMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+}
+
+/// Parent-side writer mapping after its read-only entry was transferred.
+pub struct TransferredWriterMapping {
+    mapping: Mapping,
+}
+// SAFETY: the only transferred right is kernel-clamped read-only; local mapping is unique RW.
+unsafe impl SoleWriterMapping for TransferredWriterMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Parent-side read-only mapping after the sole writer entry was transferred.
+pub struct TransferredReaderMapping {
+    mapping: Mapping,
+}
+// SAFETY: local current/maximum protection was permanently downgraded before transfer.
+unsafe impl ReadOnlyMapping for TransferredReaderMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Imported child-side read-only mapping.
+pub struct ImportedReaderMapping {
+    mapping: Mapping,
+}
+// SAFETY: mapping is created with current/maximum read-only protection.
+unsafe impl ReadOnlyMapping for ImportedReaderMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+/// Imported child-side sole-writer mapping.
+pub struct ImportedWriterMapping {
+    mapping: Mapping,
+}
+// SAFETY: authenticated parent creates exactly one RW entry for this role.
+unsafe impl SoleWriterMapping for ImportedWriterMapping {
+    fn base(&self) -> NonNull<u8> {
+        self.mapping.address
+    }
+    fn len(&self) -> usize {
+        self.mapping.mapped_len
+    }
+}
+
+impl bootstrap::ChildChannel {
+    /// Receives and binds a read-only memory entry while the parent is quiescent.
+    pub fn receive_reader(
+        &self,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<ReaderRegion<ImportedReaderMapping>, MacBindingError> {
+        let right = self.receive()?;
+        let mapping = Mapping::map_port(current_task(), len, right.name(), VM_PROT_READ)?;
+        // SAFETY: authenticated transfer remains quiescent until this call returns.
+        let bytes = unsafe { mapping.bytes(len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        drop(right);
+        Ok(ReaderRegion::new(
+            ImportedReaderMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
+
+    /// Receives and binds the sole writable memory entry while quiescent.
+    pub fn receive_writer(
+        &self,
+        len: usize,
+        expected: ValidationExpectations,
+        topology: RegionSetLayout,
+    ) -> Result<WriterRegion<ImportedWriterMapping>, MacBindingError> {
+        let right = self.receive()?;
+        let mapping = Mapping::map_port(
+            current_task(),
+            len,
+            right.name(),
+            VM_PROT_READ | VM_PROT_WRITE,
+        )?;
+        // SAFETY: authenticated transfer remains quiescent until this call returns.
+        let bytes = unsafe { mapping.bytes(len) };
+        let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
+        drop(right);
+        Ok(WriterRegion::new(
+            ImportedWriterMapping { mapping },
+            layout,
+            topology,
+        )?)
+    }
 }
 
 /// Platform-minted sole-writer witness for the audited core bridge.
@@ -385,7 +546,15 @@ impl Mapping {
         mapped_len: usize,
         entry: &MemoryEntry<Access>,
     ) -> Result<Self, MachError> {
-        let protection = Access::PROTECTION;
+        Self::map_port(task, mapped_len, entry.name, Access::PROTECTION)
+    }
+
+    fn map_port(
+        task: MachPort,
+        mapped_len: usize,
+        port: MachPort,
+        protection: VmProt,
+    ) -> Result<Self, MachError> {
         debug_assert_eq!(protection & VM_PROT_EXECUTE, 0);
         let mut address = 0;
         // SAFETY: entry is live; current/maximum protections exclude execute.
@@ -396,7 +565,7 @@ impl Mapping {
                 mapped_len as MachVmSize,
                 0,
                 VM_FLAGS_ANYWHERE,
-                entry.name,
+                port,
                 0,
                 0,
                 protection,
