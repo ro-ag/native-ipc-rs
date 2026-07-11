@@ -1,13 +1,14 @@
 //! Audited conversion from native mapping witnesses to atomic capabilities.
 
+use alloc::vec::Vec;
 use core::fmt;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 
 use crate::layout::{LayoutError, RegionSetLayout, RoleId, ValidatedRegionLayout};
 use crate::slot::{
-    AcknowledgementCell, AcknowledgementReader, AcknowledgementWriter, ReaderSlot, SlotError,
-    SlotMetadata, WriterSlot,
+    AcknowledgementCell, AcknowledgementObservation, AcknowledgementReader, AcknowledgementWriter,
+    ReaderSlot, SlotError, SlotMetadata, WriterSlot,
 };
 
 /// Native read-only mapping witness consumed by the audited binding boundary.
@@ -63,6 +64,10 @@ pub enum BindingError {
     Layout(LayoutError),
     /// Shared metadata no longer matches its validated generation.
     Slot(SlotError),
+    /// Owned payload snapshot allocation failed.
+    AllocationFailed,
+    /// Caller payload length cannot be represented by the fixed protocol field.
+    PayloadLengthOverflow,
     /// Validated mapping does not belong to the supplied composed topology.
     TopologyMismatch,
     /// Composed topology has no exact route for the requested target slot.
@@ -133,6 +138,33 @@ impl<M: ReadOnlyMapping> ReaderRegion<M> {
         Ok(unsafe { ReaderSlot::bind(header, binding) }?)
     }
 
+    /// Copies one bounded hostile payload and rechecks its publication metadata.
+    ///
+    /// Same-sequence malicious mutation can still produce torn bytes; the
+    /// returned owned buffer must be decoded as hostile input.
+    pub fn copy_payload(&self, slot: u32, expected_sequence: u64) -> Result<Vec<u8>, BindingError> {
+        let observation = self.slot(slot)?.observe(expected_sequence)?;
+        let range = self
+            .layout
+            .slot_payload_range(slot, observation.payload_len())?;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(range.len())
+            .map_err(|_| BindingError::AllocationFailed)?;
+        // SAFETY: the read-only witness keeps this validated range mapped and
+        // readable; the reserved owned destination is disjoint shared memory.
+        unsafe {
+            owned.set_len(range.len());
+            core::ptr::copy_nonoverlapping(
+                self.mapping.base().as_ptr().add(range.start),
+                owned.as_mut_ptr(),
+                range.len(),
+            );
+        }
+        self.slot(slot)?.recheck(observation)?;
+        Ok(owned)
+    }
+
     /// Binds one checked acknowledgement route without exposing shared bytes.
     pub fn acknowledgement(
         &self,
@@ -197,6 +229,33 @@ impl<M: SoleWriterMapping> WriterRegion<M> {
         // SAFETY: consuming the unique witness and borrowing `self` mutably
         // prevent a second safe writer capability while this borrow is live.
         Ok(unsafe { WriterSlot::bind(header, binding) }?)
+    }
+
+    /// Copies an owned caller payload into a checked slot and publishes it.
+    pub fn publish(
+        &mut self,
+        slot: u32,
+        sequence: u64,
+        acknowledgement: Option<AcknowledgementObservation>,
+        payload: &[u8],
+    ) -> Result<(), BindingError> {
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| BindingError::PayloadLengthOverflow)?;
+        let range = self.layout.slot_payload_range(slot, payload_len)?;
+        let base = self.mapping.base();
+        let mut bound_slot = self.slot(slot)?;
+        let reservation = bound_slot.prepare_publish(sequence, acknowledgement)?;
+        // SAFETY: the unique writer witness and `&mut self` exclude other
+        // writers; the checked payload range is disjoint from slot metadata.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                base.as_ptr().add(range.start),
+                payload.len(),
+            );
+        }
+        reservation.publish(payload_len)?;
+        Ok(())
     }
 
     /// Exclusively binds one checked acknowledgement cell.
@@ -411,13 +470,7 @@ mod tests {
                 set.clone(),
             )
             .unwrap();
-            writer
-                .slot(0)
-                .unwrap()
-                .prepare_publish(1, None)
-                .unwrap()
-                .publish(4)
-                .unwrap();
+            writer.publish(0, 1, None, b"ping").unwrap();
         }
         let reader = ReaderRegion::new(
             ReaderWitness(&producer_memory),
@@ -427,6 +480,7 @@ mod tests {
         .unwrap();
         let observation = reader.slot(0).unwrap().observe(1).unwrap();
         reader.slot(0).unwrap().recheck(observation).unwrap();
+        assert_eq!(reader.copy_payload(0, 1).unwrap(), b"ping");
 
         {
             let mut ack_writer = WriterRegion::new(

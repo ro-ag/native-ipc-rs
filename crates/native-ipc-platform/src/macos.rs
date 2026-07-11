@@ -928,13 +928,7 @@ mod tests {
                 topology.clone(),
             )
             .unwrap();
-            writer
-                .slot(0)
-                .unwrap()
-                .prepare_publish(1, None)
-                .unwrap()
-                .publish(4)
-                .unwrap();
+            writer.publish(0, 1, None, b"mach").unwrap();
         }
         let reader = ReaderRegion::new(
             TestReaderWitness(&producer_peer),
@@ -944,6 +938,7 @@ mod tests {
         .unwrap();
         let observation = reader.slot(0).unwrap().observe(1).unwrap();
         reader.slot(0).unwrap().recheck(observation).unwrap();
+        assert_eq!(reader.copy_payload(0, 1).unwrap(), b"mach");
 
         {
             let mut writer = WriterRegion::new(

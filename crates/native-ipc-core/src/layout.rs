@@ -483,6 +483,31 @@ impl ValidatedRegionLayout {
         Ok(start..end)
     }
 
+    pub(crate) fn slot_payload_range(
+        &self,
+        slot: u32,
+        payload_len: u32,
+    ) -> Result<Range<usize>, LayoutError> {
+        if payload_len > self.header.payload_capacity {
+            return Err(LayoutError::PayloadOutOfBounds {
+                length: payload_len,
+                capacity: self.header.payload_capacity,
+            });
+        }
+        let slot = self.slot_range(slot)?;
+        let start = slot
+            .start
+            .checked_add(SLOT_HEADER_SIZE as usize)
+            .ok_or(LayoutError::Overflow)?;
+        let end = start
+            .checked_add(payload_len as usize)
+            .ok_or(LayoutError::Overflow)?;
+        if end > slot.end {
+            return Err(LayoutError::RangeOutOfBounds);
+        }
+        Ok(start..end)
+    }
+
     /// Binds metadata for a sole writer. Read-only mappings cannot call this successfully.
     pub(crate) fn writer_slot_binding(
         &self,
@@ -635,6 +660,8 @@ pub enum LayoutError {
     SlotOutOfBounds { slot: u32, count: u32 },
     /// Acknowledgement index is outside the negotiated count.
     AcknowledgementOutOfBounds { index: u32, count: u32 },
+    /// Payload length exceeds its validated fixed-capacity slot.
+    PayloadOutOfBounds { length: u32, capacity: u32 },
     /// Page-rounded capability padding was not zero before transfer.
     CapabilityPaddingNotZero,
     /// A route names a missing role, same-direction owner, or out-of-range index.
