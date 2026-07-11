@@ -44,22 +44,18 @@ Implemented in `0.1.0`:
   capabilities;
 - split acknowledgement reader/writer capabilities and exact reuse checks;
 - macOS Mach VM quiescent/local-writer/remote-writer typestates, including live
-  kernel tests for read-only and non-executable maximum permissions;
-- portable golden vectors and adversarial validation fixtures; and
-- explicit fail-closed Linux and Windows backend status.
+  permission probes, authenticated bootstrap, memory-entry transfer/import, and
+  a bidirectional helper-process fixture;
+- Linux sealed `memfd`, exact `SCM_RIGHTS`, `SO_PEERCRED`, `pidfd`, and owned
+  helper lifecycle;
+- Windows least-rights unnamed sections, exact-PID private named pipes,
+  suspended Job-contained helpers, and cross-process handle import;
+- portable golden vectors, deterministic adversarial fixtures, Miri, and
+  bounded coverage-guided fuzz targets.
 
-Incomplete:
-
-- transfer of Mach memory-entry send rights and authenticated bootstrap;
-- Linux sealed `memfd`, `SCM_RIGHTS`, `SO_PEERCRED`, and `pidfd` transport;
-- Windows least-rights unnamed sections, private named pipes, and kill-on-close
-  Job Objects;
-- received Mach capability import/transfer, cross-process helper lifecycle,
-  peer authentication, guard pages, coverage-guided fuzzing, and production
-  cleanup orchestration.
-
-Until those items are complete, this repository must not be described as a
-production-ready isolation transport.
+The native adapters are intentionally low-level building blocks. Applications
+still own protocol negotiation, resource budgets, compatibility policy, and
+the decision to add guard pages around imported mappings.
 
 ## Toolchain and validation
 

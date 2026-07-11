@@ -59,7 +59,9 @@ arithmetic, nonzero generations and sequences, unique per-slot acknowledgement
 routes, exact state transitions, Release publication with a fenced
 generation/sequence/length recheck, platform-minted reader/writer mapping
 witnesses, slice-free runtime APIs, consuming macOS typestates, validated zero
-page padding, and live kernel permission probes.
+page padding, live kernel permission probes, private OS bootstrap channels,
+kernel-derived exact peer PIDs, least-rights capability transfer, post-import
+READY barriers, and parent-owned helper termination/reaping.
 
 Copied payload bytes remain hostile and may be torn or change while metadata
 stays constant. The recheck bounds access and detects metadata changes; it does
@@ -67,9 +69,10 @@ not establish payload integrity. Protocol decoders must reject inconsistent
 owned payloads. A malicious sole writer can forge any unkeyed checksum or
 seqlock state, so neither is described as integrity here.
 
-The Linux and Windows native transports, native capability transfer, peer
-authentication, lifecycle containment, and cleanup ledger are not implemented.
-Their APIs fail closed rather than claiming weaker functionality.
+Linux authenticates Unix peers with `SO_PEERCRED` and tracks exit with pidfds;
+macOS authenticates Mach audit trailers; Windows checks both named-pipe endpoint
+PIDs and assigns the still-suspended helper to a kill-on-close Job. Native
+integration tests exercise capability transfer in real helper processes.
 
 ## Severity Calibration (Critical, High, Medium, Low)
 

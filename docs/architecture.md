@@ -77,11 +77,13 @@ re-acknowledgement is intentionally idempotent.
   with a read-only peer entry or a remote writer with a read-write peer entry
   after permanently downgrading the local mapping. Current and maximum
   permissions exclude execute.
-- Linux will use sealed anonymous `memfd` objects, private `SCM_RIGHTS`
-  transfer, `SO_PEERCRED`, and `pidfd`. It currently returns incomplete.
-- Windows will use unnamed sections with least-rights duplicated handles,
-  per-launch private named pipes, and kill-on-close Job Objects. It currently
-  returns incomplete.
+- Linux uses sealed anonymous `memfd` objects, exact private `SCM_RIGHTS`
+  transfer, `SO_PEERCRED`, `pidfd`, and parent-owned helper cleanup.
+- Windows uses unnamed sections with least-rights duplicated handles,
+  per-launch private PID-checked named pipes, suspended process creation, and
+  kill-on-close Job Objects.
+- macOS and Windows use authenticated READY barriers after the peer imports and
+  validates the complete page-rounded capability.
 
 ## Unsafe-code policy
 
