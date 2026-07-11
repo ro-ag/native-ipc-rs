@@ -6,7 +6,8 @@ crates share one version and are tagged together.
 ## Prerequisites
 
 - The changelog has a dated section for the workspace version.
-- `cargo login` has configured a crates.io API token with publish permission.
+- The GitHub `crates-io` environment has a `CARGO_REGISTRY_TOKEN` secret with
+  publish permission.
 - GitHub CLI authentication can create tags and releases in `ro-ag/native-ipc-rs`.
 - The complete GitHub Actions matrix is green for the release-preparation PR.
 
@@ -22,32 +23,30 @@ cargo deny check
 git diff --check
 ```
 
-Run `cargo publish --dry-run` immediately before each corresponding publish.
-Publishing must follow dependency order because crates.io must index each new
-dependency before its dependents can be packaged.
+The release workflow runs `cargo publish --dry-run` immediately before each
+missing publish. Publishing follows dependency order because crates.io must
+index each new dependency before its dependents can be packaged.
 
-## Publish 0.1.0
-
-```sh
-cargo publish -p native-ipc-core --locked
-# Wait until the crates.io API and index expose native-ipc-core 0.1.0.
-
-cargo publish -p native-ipc-platform --locked
-cargo publish -p native-ipc-testkit --locked
-# Wait until both crates are visible in the crates.io index.
-
-cargo publish -p native-ipc --locked
-```
-
-Never tag a partially published release. After every crate is visible and its
-docs.rs build has started, tag the exact validated commit and create the GitHub
-release from the matching changelog section:
+## Publish
 
 ```sh
 git tag -a v0.1.0 -m "native-ipc 0.1.0"
 git push origin v0.1.0
-gh release create v0.1.0 --verify-tag --title "native-ipc 0.1.0" \
-  --notes-file release-notes.md
+```
+
+Pushing the tag runs `.github/workflows/release.yml`. The workflow verifies the
+tag and workspace versions, skips crate versions already present, publishes
+missing crates in dependency order, waits for crates.io indexing, and creates
+the GitHub Release from the matching changelog section. It is idempotent and can
+be rerun with `workflow_dispatch` against the existing tag.
+
+For recovery only, the equivalent manual publish order is:
+
+```sh
+cargo publish -p native-ipc-core --locked
+cargo publish -p native-ipc-platform --locked
+cargo publish -p native-ipc-testkit --locked
+cargo publish -p native-ipc --locked
 ```
 
 Finally, verify all four crates, their docs.rs pages, the GitHub tag, and the
