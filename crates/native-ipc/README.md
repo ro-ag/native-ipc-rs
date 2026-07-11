@@ -9,6 +9,12 @@ re-exports:
   capability transfer, and owned helper-process lifecycles on Linux, macOS,
   and Windows.
 
+The `native_ipc::memory` module provides one allocation and lifecycle API for
+the best native object on the current target: sealed `memfd` on Linux, Mach VM
+memory entries on macOS, and unnamed sections on Windows. Regions may be fixed
+or replacement-growable before sharing, can be cleared for reuse, and can be
+explicitly destroyed with a complete clearing pass.
+
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not
 claim integrity against a malicious same-sequence writer.
