@@ -410,31 +410,30 @@ fn expired_accept_deadline_never_attempts_accept() {
 }
 
 #[test]
-fn wrong_peer_accept_rechecks_deadline_before_accepting_again() {
+fn continuous_wrong_peer_accepts_cannot_extend_original_deadline() {
     let (wrong_peer, _other_end) = UnixStream::pair().unwrap();
     let actual = peer_credentials(&wrong_peer).unwrap();
     let expected = PeerCredentials {
         pid: actual.pid.wrapping_add(1),
         ..actual
     };
-    let mut wrong_peer = Some(wrong_peer);
     let mut accepts = 0;
-    let deadline = Instant::now() + Duration::from_millis(2);
+    let deadline = Instant::now() + Duration::from_millis(100);
     let result = accept_expected_peer(
         || {
             accepts += 1;
-            while Instant::now() < deadline {
-                std::thread::yield_now();
+            if accepts == 16 {
+                while Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
             }
-            Ok(wrong_peer
-                .take()
-                .expect("deadline must be checked after the first wrong peer"))
+            wrong_peer.try_clone()
         },
         expected,
         deadline,
     );
     assert!(matches!(result, Err(LinuxError::Bootstrap)));
-    assert_eq!(accepts, 1);
+    assert_eq!(accepts, 16);
 }
 
 #[test]
