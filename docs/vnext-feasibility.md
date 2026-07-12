@@ -770,8 +770,11 @@ alternating directions, exact initialized bytes, exact per-direction seals and
 peer access, canonical ordinals/capability order, non-`Clone`/non-`Sync`
 ownership, local profile/expiry rejection, retained coordinator-mapping
 rejection, first/middle/final synthetic preparation failure, owner destruction,
-and exact fd/vNext-map baselines. The independent final adversarial review
-reports no P1/P2/P3. Exact implementation SHA and hosted CI are pending.
+and exact fd/vNext-map baselines. Exact implementation
+`ba13372623dff7a29bd6be1e95f6fdee3c2676c0` is green in all ten hosted jobs in
+[Actions 29213948297](https://github.com/ro-ag/native-ipc-rs/actions/runs/29213948297),
+including native Linux AMD64/Arm64 and Linux AMD64 ASan. The independent final
+adversarial review reports no P1/P2/P3.
 
 G1i-a deliberately performs no accepted capability send or peer import. The
 mixed receiver expectation/import owner, complete-batch IMPORTED/SEALED
