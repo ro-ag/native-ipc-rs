@@ -216,6 +216,10 @@ impl AcceptedTranscriptFacts {
     pub(crate) const fn nonce(&self) -> [u8; 32] {
         self.nonce
     }
+
+    pub(crate) const fn effective_limits(&self) -> SessionLimits {
+        self.effective_limits
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

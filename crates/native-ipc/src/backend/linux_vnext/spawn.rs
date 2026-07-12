@@ -13,6 +13,7 @@ use crate::backend::{
     CoordinatorAcceptedEvidence, CoordinatorChildChannelReceipt, CoordinatorChildImageReceipt,
     ReceiverSpawnerEvidence, SpawnIdentityFacts,
 };
+use crate::control::CONTROL_HEADER_LEN;
 use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
@@ -33,6 +34,7 @@ const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
 const EXEC_ERROR_LEN: usize = 8;
 const NONCE_LEN: usize = 32;
 const MAX_LINUX_HELLO_PAYLOAD: usize = MAX_ZERO_RIGHTS_PACKET_BYTES - HEADER_LEN;
+const MAX_LINUX_CONTROL_PAYLOAD: u32 = (MAX_ZERO_RIGHTS_PACKET_BYTES - CONTROL_HEADER_LEN) as u32;
 const BOOTSTRAP_ENV: &[u8] = b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD";
 #[cfg(test)]
 std::thread_local! {
@@ -1075,6 +1077,10 @@ fn validate_linux_offer(mut offer: LinuxHelloOffer) -> Result<LinuxHelloOffer, L
             NegotiationWireError::RequiredFeatureNotSupported,
         ));
     }
+    offer.limits.max_control_payload_bytes = offer
+        .limits
+        .max_control_payload_bytes
+        .min(MAX_LINUX_CONTROL_PAYLOAD);
     offer
         .limits
         .validate()

@@ -1,6 +1,8 @@
 use super::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
+const HEADER_LEN: usize = CONTROL_HEADER_LEN;
+
 assert_impl_all!(ControlState: Send);
 assert_not_impl_any!(ControlState: Sync, Clone);
 assert_not_impl_any!(ValidatedControlHeader: Clone);

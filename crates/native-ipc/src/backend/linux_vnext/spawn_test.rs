@@ -55,6 +55,84 @@ fn hello_offer(payload_len: usize) -> LinuxHelloOffer {
     }
 }
 
+#[test]
+fn linux_control_limit_is_capped_before_both_hellos_and_transcript() {
+    assert_eq!(
+        crate::control::control_wire_len(MAX_LINUX_CONTROL_PAYLOAD as usize),
+        Some(MAX_ZERO_RIGHTS_PACKET_BYTES)
+    );
+
+    let lower = MAX_LINUX_CONTROL_PAYLOAD - 1;
+    let mut lower_offer = hello_offer(0);
+    lower_offer.limits.max_control_payload_bytes = lower;
+    assert_eq!(
+        validate_linux_offer(lower_offer)
+            .unwrap()
+            .limits
+            .max_control_payload_bytes,
+        lower
+    );
+
+    for offered in [
+        SessionLimits::default().max_control_payload_bytes,
+        crate::session::HARD_MAX_CONTROL_PAYLOAD_BYTES,
+    ] {
+        let mut offer = hello_offer(0);
+        offer.limits.max_control_payload_bytes = offered;
+        assert_eq!(
+            validate_linux_offer(offer)
+                .unwrap()
+                .limits
+                .max_control_payload_bytes,
+            MAX_LINUX_CONTROL_PAYLOAD
+        );
+    }
+
+    let mut zero = hello_offer(0);
+    zero.limits.max_control_payload_bytes = 0;
+    assert!(matches!(
+        validate_linux_offer(zero),
+        Err(LinuxSpawnError::NativeNegotiation(
+            NegotiationError::ZeroLimit
+        ))
+    ));
+
+    let atomics = discover_atomic_capabilities().unwrap();
+    let nonce = [0x61; NONCE_LEN];
+    let coordinator_offer = validate_linux_offer(hello_offer(0)).unwrap();
+    let receiver_offer = validate_linux_offer(hello_offer(0)).unwrap();
+    let coordinator =
+        make_hello(SenderRole::Coordinator, nonce, coordinator_offer, atomics).unwrap();
+    let receiver = make_hello(SenderRole::Receiver, nonce, receiver_offer, atomics).unwrap();
+    assert_eq!(
+        coordinator.limits.max_control_payload_bytes,
+        MAX_LINUX_CONTROL_PAYLOAD
+    );
+    assert_eq!(
+        receiver.limits.max_control_payload_bytes,
+        MAX_LINUX_CONTROL_PAYLOAD
+    );
+    let mut transcript =
+        NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics).unwrap();
+    let challenge = DecisionChallenge::from_os_csprng([0x62; 16]).unwrap();
+    let coordinator_accept = transcript.coordinator_accept(challenge).unwrap();
+    transcript
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    let receiver_accept = transcript.receiver_accept().unwrap();
+    transcript
+        .validate_accept(receiver_accept, SenderRole::Receiver)
+        .unwrap();
+    assert_eq!(
+        transcript
+            .take_accepted_facts()
+            .unwrap()
+            .effective_limits()
+            .max_control_payload_bytes,
+        MAX_LINUX_CONTROL_PAYLOAD
+    );
+}
+
 fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }

@@ -169,7 +169,7 @@ impl ReceiverSpawnerEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeerState {
     Running,
-    Exited(i32),
+    ExitedUnknown,
 }
 
 /// Bounded platform-neutral native session transport failure.
@@ -183,16 +183,16 @@ pub(crate) enum SessionTransportError {
     Native,
 }
 
-mod sealed {
-    pub trait Sealed {}
+pub(crate) mod sealed {
+    pub(crate) trait Sealed {}
 }
 
-/// Private authenticated duplex record transport.
+/// Private authenticated duplex zero-rights record transport.
 ///
-/// Implementations must validate a fixed record header and `maximum` before
-/// allocating, preserve one caller-derived absolute deadline across every
-/// retry/chunk, and poison themselves after ambiguous partial transmission.
-trait AuthenticatedControl: sealed::Sealed {
+/// Implementations must reject ancillary capability delivery, bound record
+/// allocation by `maximum`, preserve one caller-derived absolute deadline
+/// across every retry, and poison themselves after ambiguous transmission.
+pub(crate) trait AuthenticatedZeroRightsTransport: sealed::Sealed {
     fn send_record(
         &mut self,
         bytes: &[u8],
@@ -205,7 +205,8 @@ trait AuthenticatedControl: sealed::Sealed {
         deadline: AbsoluteDeadline,
     ) -> Result<Vec<u8>, SessionTransportError>;
 
-    /// Performs one nonblocking kernel observation of peer lifecycle state.
+    /// Performs one nonblocking peer observation without inventing an exit
+    /// code that the authenticated record transport cannot prove.
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError>;
 
     /// Permanently invalidates the transport. Every later I/O operation must
@@ -214,12 +215,14 @@ trait AuthenticatedControl: sealed::Sealed {
 }
 
 /// Coordinator-only owned-child lifecycle operations.
-trait OwnedChildControl: AuthenticatedControl {
+pub(crate) trait OwnedChildLifecycle: sealed::Sealed {
     fn terminate_and_reap(
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionTransportError>;
 }
+
+mod accepted_control;
 
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
@@ -294,3 +297,7 @@ pub(crate) fn mint_incarnation() -> Result<[u8; 16], ()> {
 #[cfg(test)]
 #[path = "mod_test.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "accepted_control_test.rs"]
+mod accepted_control_tests;

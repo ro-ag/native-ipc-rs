@@ -113,11 +113,16 @@ header length `u32`; complete frame length `u32`; payload length `u32`; kind
 `u64`. The opaque payload follows immediately. Application kinds occupy
 `0x8000_0000..=u32::MAX`; lower values remain disjoint native protocol kinds.
 
-The private decoder validates the fixed header, negotiated/hard payload bound,
-nonce, and exact next sequence before payload allocation or transport read. A
-borrow-bound pending-receive guard poisons on every unsuccessful finish or
-Drop. Successful exact payload finalization allocates once and advances the
-receive sequence once. Send and receive sequences are independent; exhaustion,
-replay/reorder, malformed peer input, partial receive, and transaction conflict
-are terminal. Public control APIs remain unavailable until authenticated Ready
-session construction exists.
+The record transport independently bounds or preallocates the complete record
+from the negotiated native maximum before reading it. The private decoder then
+validates the fixed header, negotiated/hard payload bound, nonce, and exact next
+sequence before payload exposure or any second allocation derived from peer
+fields. On Linux, `SOCK_SEQPACKET` consumes the record with one bounded
+`recvmsg`, never `MSG_PEEK`, and adopts then closes injected ancillary rights
+before rejection. A borrow-bound pending-receive guard poisons on every
+unsuccessful finish or Drop. Successful exact payload finalization reuses that
+single owned record allocation and advances the receive sequence once. Send
+and receive sequences are independent; exhaustion, replay/reorder, malformed
+peer input, partial receive, and transaction conflict are terminal. Public
+control APIs remain unavailable until authenticated Ready session construction
+exists.
