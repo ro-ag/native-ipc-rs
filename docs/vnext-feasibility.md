@@ -50,6 +50,8 @@ exact post-exec state, irreversibility, and fork-plus-exec inheritance. The hook
 mints no witness and is not accepted by memory preparation; it must first be
 integrated with exact-image/authenticated-channel receipts, a retained pidfd,
 and deadline-bounded cleanup ownership for the same session.
+The hook checkpoint passed both native Linux architectures and ASan in
+[Actions 29180257562](https://github.com/ro-ag/native-ipc-rs/actions/runs/29180257562).
 
 Primary sources:
 <https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html> and
@@ -124,6 +126,9 @@ Native tests execute through the held descriptor after replacing its original
 path and prove that CLOEXEC removes the descriptor in the new image. The
 scaffold does not mint an `ImageIdentityReceipt`; that still requires the
 inherited bootstrap, authenticated channel, and bounded process owner below.
+The deterministic held-exec checkpoint passed native Linux AMD64/Arm64, ASan,
+and all auxiliary gates in
+[Actions 29180802767](https://github.com/ro-ag/native-ipc-rs/actions/runs/29180802767).
 
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;
