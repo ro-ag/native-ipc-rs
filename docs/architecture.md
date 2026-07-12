@@ -140,6 +140,16 @@ legacy zero profile before native I/O, and exact frame comparison rejects peer
 profile substitution. This session policy fact is not proof that any individual
 memfd has completed import, final sealing, mapping, READY, or COMMIT.
 
+The private Linux G1e coordinator entry point consumes one complete portable
+`TransferBatch`. It derives every manifest entry from the transaction-owned
+`PreparedRegion` metadata and retains all prepared regions beside the native
+transaction guard; the raw-entry coordinator constructor exists only in tests.
+Empty batches fail before transaction entry or ID consumption, and abandoned
+guards poison before their retained batch is destroyed. The internal send step
+still receives a separately prepared native capability collection, so G1e does
+not yet prove descriptor-to-object identity or constitute the complete Linux
+prepared-memory adapter.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

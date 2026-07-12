@@ -603,6 +603,40 @@ Local macOS Rust 1.97 and privileged seccomp-unconfined Arm64 Docker full gates
 pass; Docker remains container/emulation characterization only. Independent
 adversarial review reports no P1/P2/P3.
 
+Phase 5i-G1e removes caller-supplied coordinator manifest entries from the
+production transaction boundary. The coordinator now consumes one complete
+portable `TransferBatch`, derives region ID, library-minted incarnation,
+writer direction, complementary peer access, logical length, and mapped length
+from its owned `PreparedRegion` values, and passes those derived entries to the
+G1c/G1d canonical manifest minting path. The open native transaction retains
+the resulting `PendingBatch`; callers cannot extract a region or independent
+pending token while the guard is live.
+
+The adjacent corpus covers 1/2/4/16 batches, reverse input order, mixed writer
+directions, canonical IDs/access ordinals, empty-batch rejection before native
+I/O or transaction-ID consumption, and continued transaction ownership through
+the existing terminal guard. The former raw-entry coordinator constructor is
+test-only so hostile frame/limit cases can still exercise the portable reducer.
+
+G1e deliberately stops before native memory conversion. Its internal send
+method still accepts the backend capability collection separately; the Linux
+adapter must next prepare each owned region, bind each exact fd/object/seal
+state to its canonical entry and ordinal, retain local pending mappings, and
+remove that remaining substitution seam. Receiver `ExpectedBatch`, native
+import validation, IMPORTED/SEALED, READY/COMMIT, activation, and public APIs
+also remain unimplemented. Exact implementation/review/hosted evidence is
+pending. The current implementation commit is
+`c8c9558ac714d0e34014c34f939034294a868632`, green across all ten jobs in
+[Actions 29207363955](https://github.com/ro-ag/native-ipc-rs/actions/runs/29207363955).
+Local macOS Rust 1.97 and privileged seccomp-unconfined Arm64 Docker full gates
+pass; Docker remains container/emulation characterization only. Independent
+review found one P3 evidence gap: the initial corpus did not observe retained
+resource destruction or assert every derived entry field. A minimal test-only
+drop observer now proves transport poison precedes every prepared-region
+destruction on both abandonment and send failure, and the 1/2/4/16 corpus
+asserts exact incarnation, lengths, writer, access, and ordinal. Focused
+re-review reports no remaining P1/P2/P3.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
