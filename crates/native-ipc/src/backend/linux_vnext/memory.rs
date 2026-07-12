@@ -12,6 +12,10 @@ const F_SEAL_EXEC: libc::c_int = 0x0020;
 const PREFIX_SEALS: libc::c_int = F_SEAL_EXEC | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
 const FINAL_SEALS: libc::c_int = PREFIX_SEALS | libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL;
 const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+#[cfg(test)]
+const PR_SET_MDWE: libc::c_int = 65;
+#[cfg(test)]
+const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MemfdError {
@@ -448,6 +452,24 @@ fn probe_kernel_nx(fd: RawFd, mapping: &VmMapping) -> Result<NxProbeFacts, Memfd
     })
 }
 
+#[cfg(test)]
+fn enable_irreversible_mdwe() -> Result<(), MemfdError> {
+    // SAFETY: PR_SET_MDWE accepts this scalar mask and zero trailing arguments.
+    if unsafe {
+        libc::prctl(
+            PR_SET_MDWE,
+            PR_MDWE_REFUSE_EXEC_GAIN,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    } != 0
+    {
+        return Err(last_native());
+    }
+    Ok(())
+}
+
 impl Drop for VmMapping {
     fn drop(&mut self) {
         // SAFETY: this value uniquely owns this local mapping.
@@ -648,18 +670,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawned alone as a disposable MDWE plus kernel-NX characterization helper"]
+    fn isolated_mdwe_kernel_nx_probe_helper() {
+        let disposable = PrivateMemfd::new(73).unwrap();
+        enable_irreversible_mdwe().unwrap();
+        let facts = probe_kernel_nx(
+            disposable.fd.as_raw_fd(),
+            disposable.mapping.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            facts,
+            NxProbeFacts {
+                new_executable_mapping_denied: false,
+                existing_mapping_upgrade_denied: true,
+            }
+        );
+    }
+
+    #[test]
     fn isolated_process_confirms_kernel_nx_gap() {
         let executable = std::env::current_exe().unwrap();
-        let status = Command::new(executable)
-            .args([
-                "--exact",
-                "backend::linux_vnext::memory::tests::isolated_kernel_nx_probe_helper",
-                "--ignored",
-                "--nocapture",
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        for helper in [
+            "backend::linux_vnext::memory::tests::isolated_kernel_nx_probe_helper",
+            "backend::linux_vnext::memory::tests::isolated_mdwe_kernel_nx_probe_helper",
+        ] {
+            let status = Command::new(&executable)
+                .args(["--exact", helper, "--ignored", "--nocapture"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated NX helper failed: {helper}");
+        }
     }
 
     #[test]
