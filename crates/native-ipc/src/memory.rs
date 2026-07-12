@@ -498,6 +498,14 @@ impl NativeRegion {
         })
     }
 
+    pub(crate) fn prepare_with_writer(
+        mut self,
+        writer: WriterOwner,
+    ) -> Result<NativeShareRequest, MemoryError> {
+        self.options.permissions = PermissionPlan::new(writer);
+        self.prepare_for_sharing()
+    }
+
     fn inner(&self) -> &PlatformQuiescentRegion {
         self.inner
             .as_ref()

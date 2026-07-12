@@ -18,6 +18,8 @@ pub use native_ipc_core as core;
 
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
+/// Platform-neutral consuming region ownership states.
+pub mod region;
 
 mod backend;
 mod protocol;
