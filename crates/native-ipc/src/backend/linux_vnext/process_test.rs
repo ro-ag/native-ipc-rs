@@ -1325,6 +1325,51 @@ fn wait_for_pidfd_ready(pidfd: RawFd, deadline: AbsoluteDeadline) {
     }
 }
 
+fn wait_for_descendant_session(descendant: libc::pid_t, pidfd: RawFd, deadline: AbsoluteDeadline) {
+    loop {
+        // SAFETY: getsid accepts any scalar PID. This controlled descendant
+        // remains owned by its live parent while the caller retains its pidfd.
+        let session = unsafe { libc::getsid(descendant) };
+        if session == descendant {
+            return;
+        }
+        if session == -1 {
+            panic!(
+                "getsid failed before escaped descendant entered its session: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let mut event = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the sole pollfd remains live for this nonblocking exit check.
+        let result = unsafe { libc::poll(&mut event, 1, 0) };
+        if result == -1 {
+            panic!(
+                "pidfd poll failed while awaiting escaped descendant session: {}",
+                io::Error::last_os_error()
+            );
+        }
+        if result > 0 {
+            if event.revents & libc::POLLIN != 0 {
+                panic!("escaped descendant exited before entering its own session");
+            }
+            panic!(
+                "unexpected pidfd poll events while awaiting escaped descendant session: {:#x}",
+                event.revents
+            );
+        }
+        assert!(
+            !deadline.is_expired(),
+            "escaped descendant did not enter its own session before the deadline; last SID was {session}"
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 #[ignore = "spawned alone by fresh_session_containment_is_precise"]
 fn isolated_fresh_session_containment_helper() {
@@ -1368,6 +1413,7 @@ fn isolated_fresh_session_containment_helper() {
     // disposable-helper cleanup backstop.
     let (escaping, descendant, descendant_pidfd, pid_file) =
         containment_child("escape", deadline());
+    wait_for_descendant_session(descendant, descendant_pidfd.as_raw_fd(), deadline());
     assert_eq!(
         // SAFETY: the controlled escaped descendant is live.
         unsafe { libc::getsid(descendant) },
