@@ -44,6 +44,13 @@ library views exclude execute and memfd mode cannot gain execute; MDWE-tree
 mappings cannot gain execute or become RWX; RX aliases remain possible; and an
 unrelated receiver-writer delegate may retain then upgrade a pre-seal RW view.
 
+The private pre-exec hook installs the exact inherited mask and propagates
+setup failure through `Command`'s exec-error path. Controlled helpers verify
+exact post-exec state, irreversibility, and fork-plus-exec inheritance. The hook
+mints no witness and is not accepted by memory preparation; it must first be
+integrated with exact-image/authenticated-channel receipts, a retained pidfd,
+and deadline-bounded cleanup ownership for the same session.
+
 Primary sources:
 <https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html> and
 <https://man7.org/linux/man-pages/man2/pr_set_mdwe.2const.html>

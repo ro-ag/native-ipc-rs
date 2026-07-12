@@ -14,6 +14,10 @@ Versioning once a stable API is released.
   receiver-writer setup, an fd delegated outside the MDWE-inheriting process
   tree may also retain RW and later gain execute. This residual authority is
   explicit rather than overstated as object-level NX.
+- Add a private trusted pre-exec hook that installs exact inherited MDWE and
+  propagates setup failure before exec. It deliberately mints no witness;
+  memory preparation remains gated until exact-image, authenticated-channel,
+  pidfd, and bounded-cleanup ownership are combined.
 
 ### Changed
 
