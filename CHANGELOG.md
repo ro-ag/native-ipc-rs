@@ -20,7 +20,8 @@ Versioning once a stable API is released.
   pidfd, and bounded-cleanup ownership are combined.
 - Add private Linux executable evidence that opens an absolute native ELF with
   `openat2` symlink/magic-link rejection, retains its inode, opens the child's
-  pidfd, and compares `/proc/PID/exe` before any image receipt can be minted.
+  pidfd, executes through the held CLOEXEC descriptor, and compares
+  `/proc/PID/exe` before any image receipt can be minted.
 
 ### Changed
 

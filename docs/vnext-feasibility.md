@@ -119,9 +119,11 @@ The private `HeldExecutable`/`VerifiedExecutable` scaffold now implements the
 absolute native-ELF `openat2` policy, held device/inode, immediate pidfd, and
 post-spawn `/proc/PID/exe` comparison. It rejects relative paths,
 symlink/magic-link resolution, nonfiles, non-executables, non-ELF artifacts,
-and wrong spawned images. It does not yet execute the held artifact or mint an
-`ImageIdentityReceipt`; those require the inherited bootstrap, authenticated
-channel, and bounded process owner below.
+foreign-class/machine ELF, wrong spawned images, and already-reaped children.
+Native tests execute through the held descriptor after replacing its original
+path and prove that CLOEXEC removes the descriptor in the new image. The
+scaffold does not mint an `ImageIdentityReceipt`; that still requires the
+inherited bootstrap, authenticated channel, and bounded process owner below.
 
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;

@@ -118,6 +118,10 @@ impl HeldExecutable {
             child_pid,
         })
     }
+
+    fn command(&self) -> Command {
+        Command::new(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
 }
 
 impl VerifiedExecutable {
@@ -262,6 +266,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const ENV_DESCENDANT: &str = "NATIVE_IPC_MDWE_DESCENDANT";
+    const ENV_HELD_EXECUTABLE_FD: &str = "NATIVE_IPC_HELD_EXECUTABLE_FD";
+    const ENV_HELD_EXECUTABLE_KEY: &str = "NATIVE_IPC_HELD_EXECUTABLE_KEY";
+    const ENV_IDENTITY_HANDSHAKE_FD: &str = "NATIVE_IPC_IDENTITY_HANDSHAKE_FD";
     const PR_MDWE_NO_INHERIT: libc::c_ulong = 2;
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -278,6 +285,11 @@ mod tests {
     struct ExecutableFixture {
         directory: std::path::PathBuf,
         file: std::path::PathBuf,
+    }
+
+    struct IdentityHandshake {
+        parent: OwnedFd,
+        child: Option<OwnedFd>,
     }
 
     impl TestChild {
@@ -360,6 +372,86 @@ mod tests {
                 .unwrap();
             Self { directory, file }
         }
+
+        fn copy_from(source: &Path) -> Self {
+            let fixture = Self::new(&[]);
+            std::fs::copy(source, &fixture.file).unwrap();
+            fixture
+        }
+    }
+
+    impl IdentityHandshake {
+        fn configure(command: &mut Command) -> Self {
+            let mut pair = [-1; 2];
+            // SAFETY: output has room for two descriptors and flags are valid.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                        0,
+                        pair.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            // SAFETY: successful socketpair returned two owned descriptors.
+            let parent = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+            // SAFETY: successful socketpair returned two owned descriptors.
+            let child = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+            let inherited = child.as_raw_fd();
+            command.env(ENV_IDENTITY_HANDSHAKE_FD, inherited.to_string());
+            // SAFETY: the closure performs only one scalar fcntl before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(inherited, libc::F_SETFD, 0) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Self {
+                parent,
+                child: Some(child),
+            }
+        }
+
+        fn child_spawned(&mut self) {
+            self.child.take();
+        }
+
+        fn wait_ready(&self) {
+            let mut ready = libc::pollfd {
+                fd: self.parent.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd remains live for this bounded controlled wait.
+            assert_eq!(unsafe { libc::poll(&mut ready, 1, 5_000) }, 1);
+            assert_ne!(ready.revents & libc::POLLIN, 0);
+            let mut byte = 0_u8;
+            // SAFETY: one-byte output is live and controlled helper sends once.
+            assert_eq!(
+                unsafe { libc::recv(self.parent.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, 0) },
+                1
+            );
+            assert_eq!(byte, b'R');
+        }
+
+        fn release(&self) {
+            // SAFETY: one-byte input is live and controlled helper receives once.
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        self.parent.as_raw_fd(),
+                        (&b'G' as *const u8).cast(),
+                        1,
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                1
+            );
+        }
     }
 
     impl Drop for ExecutableFixture {
@@ -379,6 +471,59 @@ mod tests {
         header[20..24].copy_from_slice(&1_u32.to_le_bytes());
         header[52..54].copy_from_slice(&(ELF_HEADER_LEN as u16).to_le_bytes());
         header
+    }
+
+    fn configure_held_cloexec_probe(command: &mut Command, held: &HeldExecutable) {
+        let raw = held.fd.as_raw_fd();
+        // SAFETY: scalar query of the live held descriptor.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        command.env(ENV_HELD_EXECUTABLE_FD, raw.to_string()).env(
+            ENV_HELD_EXECUTABLE_KEY,
+            format!("{}:{}", held.key.device, held.key.inode),
+        );
+    }
+
+    fn assert_held_description_closed() {
+        let Some(raw) = std::env::var_os(ENV_HELD_EXECUTABLE_FD) else {
+            return;
+        };
+        let raw: RawFd = raw.to_string_lossy().parse().unwrap();
+        let expected = std::env::var(ENV_HELD_EXECUTABLE_KEY).unwrap();
+        let (device, inode) = expected.split_once(':').unwrap();
+        let expected = ExecutableKey {
+            device: device.parse().unwrap(),
+            inode: inode.parse().unwrap(),
+        };
+        // Numeric fd slots may be reused by the loader. Either EBADF or a
+        // different object proves the held executable description was closed.
+        // SAFETY: scalar query intentionally probes this inherited slot.
+        if unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0 {
+            assert_ne!(file_key(raw).unwrap().0, expected);
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    fn identity_helper_handshake() {
+        let Some(raw) = std::env::var_os(ENV_IDENTITY_HANDSHAKE_FD) else {
+            return;
+        };
+        let raw: RawFd = raw.to_string_lossy().parse().unwrap();
+        // SAFETY: the trusted test pre-exec path transferred sole ownership.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: controlled one-byte READY send.
+        assert_eq!(
+            unsafe { libc::send(fd.as_raw_fd(), (&b'R' as *const u8).cast(), 1, 0) },
+            1
+        );
+        let mut release = 0_u8;
+        // SAFETY: controlled one-byte release receive.
+        assert_eq!(
+            unsafe { libc::recv(fd.as_raw_fd(), (&mut release as *mut u8).cast(), 1, 0,) },
+            1
+        );
+        assert_eq!(release, b'G');
     }
 
     fn open_fd_count() -> usize {
@@ -401,7 +546,9 @@ mod tests {
     #[test]
     #[ignore = "spawned as the exact post-exec MDWE helper and descendant"]
     fn exact_image_mdwe_helper() {
+        assert_held_description_closed();
         assert_eq!(get_mdwe().unwrap(), PR_MDWE_REFUSE_EXEC_GAIN);
+        identity_helper_handshake();
         assert_ne!(set_mdwe(0), 0, "irreversible MDWE unexpectedly cleared");
         assert_eq!(get_mdwe().unwrap(), PR_MDWE_REFUSE_EXEC_GAIN);
         assert_ne!(
@@ -421,6 +568,9 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ENV_DESCENDANT, "1")
+                .env_remove(ENV_HELD_EXECUTABLE_FD)
+                .env_remove(ENV_HELD_EXECUTABLE_KEY)
+                .env_remove(ENV_IDENTITY_HANDSHAKE_FD)
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -433,7 +583,7 @@ mod tests {
         let before = open_fd_count();
         let executable = std::env::current_exe().unwrap();
         let held = HeldExecutable::open(&executable).unwrap();
-        let mut command = Command::new(executable);
+        let mut command = held.command();
         command
             .args([
                 "--exact",
@@ -442,28 +592,79 @@ mod tests {
                 "--nocapture",
             ])
             .env_remove(ENV_DESCENDANT);
+        configure_held_cloexec_probe(&mut command, &held);
+        let mut handshake = IdentityHandshake::configure(&mut command);
         install_mdwe_preexec(&mut command);
         let mut child = TestChild::spawn(&mut command, true);
+        handshake.child_spawned();
+        handshake.wait_ready();
         let child_pid = child.child_mut().id();
         let verified = held.verify_child(child.child_mut()).unwrap();
         assert_eq!(verified.child_pid(), child_pid);
         assert!(verified.pidfd() >= 0);
         assert_ne!(verified.key().inode, 0);
+        handshake.release();
         child.wait_success();
         drop(verified);
+        drop(handshake);
+        assert_eq!(open_fd_count(), before);
+
+        let before = open_fd_count();
+        let executable = std::env::current_exe().unwrap();
+        let fixture = ExecutableFixture::copy_from(&executable);
+        let held = HeldExecutable::open(&fixture.file).unwrap();
+        std::fs::remove_file(&fixture.file).unwrap();
+        std::fs::copy("/bin/sleep", &fixture.file).unwrap();
+        let mut command = held.command();
+        command
+            .args([
+                "--exact",
+                "backend::linux_vnext::process::tests::exact_image_mdwe_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ENV_DESCENDANT, "1");
+        configure_held_cloexec_probe(&mut command, &held);
+        let mut handshake = IdentityHandshake::configure(&mut command);
+        install_mdwe_preexec(&mut command);
+        let mut child = TestChild::spawn(&mut command, true);
+        handshake.child_spawned();
+        handshake.wait_ready();
+        let verified = held.verify_child(child.child_mut()).unwrap();
+        handshake.release();
+        child.wait_success();
+        drop(verified);
+        drop(handshake);
+        drop(fixture);
         assert_eq!(open_fd_count(), before);
 
         let before = open_fd_count();
         let executable = std::env::current_exe().unwrap();
         let held = HeldExecutable::open(&executable).unwrap();
-        let mut command = Command::new("/bin/sleep");
-        command.arg("30");
+        let wrong = ExecutableFixture::copy_from(&executable);
+        let mut command = Command::new(&wrong.file);
+        command
+            .args([
+                "--exact",
+                "backend::linux_vnext::process::tests::exact_image_mdwe_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ENV_DESCENDANT, "1");
+        configure_held_cloexec_probe(&mut command, &held);
+        let mut handshake = IdentityHandshake::configure(&mut command);
+        install_mdwe_preexec(&mut command);
         let mut child = TestChild::spawn(&mut command, true);
+        handshake.child_spawned();
+        handshake.wait_ready();
         assert!(matches!(
             held.verify_child(child.child_mut()),
             Err(SpawnPolicyError::WrongExecutable)
         ));
+        handshake.release();
         drop(child);
+        drop(handshake);
+        drop(wrong);
         assert_eq!(open_fd_count(), before);
 
         let executable = std::env::current_exe().unwrap();
