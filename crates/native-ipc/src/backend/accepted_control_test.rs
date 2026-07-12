@@ -4,6 +4,7 @@ use crate::control::{CONTROL_HEADER_LEN, ControlError, ControlFrame, ControlStat
 use crate::protocol::{
     CapabilityFrame, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
 };
+use crate::session::SessionLimits;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -191,10 +192,31 @@ fn frame(kind_offset: u32, payload: &[u8]) -> ControlFrame {
 }
 
 fn dispatcher(maximum: u32) -> (AcceptedControlDispatcher<MockTransport>, MockHandle) {
+    dispatcher_with_transactions(maximum, SessionLimits::default().max_transactions)
+}
+
+fn parameters(nonce: [u8; 32], maximum: u32, max_transactions: u64) -> AcceptedSessionParameters {
+    AcceptedSessionParameters {
+        facts: SpawnIdentityFacts::new(10, 11, 1, 1, 1, 1, nonce).unwrap(),
+        limits: SessionLimits {
+            max_control_payload_bytes: maximum,
+            max_transactions,
+            ..SessionLimits::default()
+        },
+    }
+}
+
+fn dispatcher_with_transactions(
+    maximum: u32,
+    max_transactions: u64,
+) -> (AcceptedControlDispatcher<MockTransport>, MockHandle) {
     let handle = MockHandle::default();
-    let dispatcher = AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, maximum)
-        .ok()
-        .unwrap();
+    let dispatcher = AcceptedControlDispatcher::new(
+        MockTransport(handle.clone()),
+        parameters(NONCE, maximum, max_transactions),
+    )
+    .ok()
+    .unwrap();
     (dispatcher, handle)
 }
 
@@ -205,15 +227,35 @@ fn encode(nonce: [u8; 32], maximum: u32, frame: &ControlFrame) -> Vec<u8> {
     bytes
 }
 
-fn capability_frame(nonce: [u8; 32], transaction: u64, count: usize) -> CapabilityFrame {
-    let entries = (1..=count)
+fn manifest_entries(count: usize) -> Vec<ManifestEntry> {
+    (1..=count)
         .map(|ordinal| {
             let region = ordinal as u128;
             let native = NativeRegionSpec::new(region, [ordinal as u8; 16], 1, 1, 4096).unwrap();
             ManifestEntry::from_native(native, PeerAccess::ReadOnly)
         })
-        .collect();
-    let manifest = TransferManifest::new(nonce, 10, 11, transaction, entries).unwrap();
+        .collect()
+}
+
+fn capability_frame(nonce: [u8; 32], transaction: u64, count: usize) -> CapabilityFrame {
+    capability_frame_for_identity(nonce, 10, 11, transaction, count)
+}
+
+fn capability_frame_for_identity(
+    nonce: [u8; 32],
+    parent_pid: u32,
+    child_pid: u32,
+    transaction: u64,
+    count: usize,
+) -> CapabilityFrame {
+    let manifest = TransferManifest::new(
+        nonce,
+        parent_pid,
+        child_pid,
+        transaction,
+        manifest_entries(count),
+    )
+    .unwrap();
     CapabilityFrame::from_manifest(&manifest)
 }
 
@@ -310,14 +352,13 @@ fn local_reserved_and_oversized_frames_are_recoverable_without_io() {
 
 #[test]
 fn capability_transaction_is_inseparable_terminal_and_blocks_application_control() {
-    let native = capability_frame(NONCE, 1, 1);
     let (mut coordinator, handle) = dispatcher(MAXIMUM);
     let original_deadline = deadline();
     {
         let mut transaction = coordinator
-            .begin_capability_transaction(original_deadline)
+            .begin_capability_transaction(manifest_entries(1), original_deadline)
             .unwrap();
-        transaction.send(&native, 1).unwrap();
+        transaction.send(1).unwrap();
     }
     let facts = handle.0.lock().unwrap();
     assert_eq!(facts.capability_send_calls, 1);
@@ -331,9 +372,11 @@ fn capability_transaction_is_inseparable_terminal_and_blocks_application_control
     let drops = Arc::new(AtomicUsize::new(0));
     enqueue_capability(&handle, application, 1, drops.clone());
     {
-        let mut transaction = receiver.await_capability_transaction(deadline()).unwrap();
+        let mut transaction = receiver
+            .await_capability_transaction(manifest_entries(1), deadline())
+            .unwrap();
         assert_eq!(
-            transaction.receive(&native).map(|_| ()),
+            transaction.receive().map(|_| ()),
             Err(AcceptedControlError::Transport(
                 SessionTransportError::MalformedRecord
             ))
@@ -347,13 +390,15 @@ fn capability_transaction_is_inseparable_terminal_and_blocks_application_control
 #[test]
 fn received_capabilities_stay_transaction_owned_for_one_two_and_sixteen_rights() {
     for count in [1, 2, 16] {
-        let native = capability_frame(NONCE, count as u64, count);
+        let native = capability_frame(NONCE, 1, count);
         let (mut receiver, handle) = dispatcher(MAXIMUM);
         let drops = Arc::new(AtomicUsize::new(0));
         enqueue_capability(&handle, native.as_bytes().to_vec(), count, drops.clone());
         {
-            let mut transaction = receiver.await_capability_transaction(deadline()).unwrap();
-            let capabilities = transaction.receive(&native).unwrap();
+            let mut transaction = receiver
+                .await_capability_transaction(manifest_entries(count), deadline())
+                .unwrap();
+            let capabilities = transaction.receive().unwrap();
             assert_eq!(capabilities.count, count);
             assert_eq!(drops.load(Ordering::SeqCst), 0);
         }
@@ -364,14 +409,14 @@ fn received_capabilities_stay_transaction_owned_for_one_two_and_sixteen_rights()
 
 #[test]
 fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
-    let expected = capability_frame(NONCE, 7, 1);
+    let expected = capability_frame(NONCE, 1, 1);
     for actual_count in [0, 2, 16] {
         let (mut coordinator, handle) = dispatcher(MAXIMUM);
         {
             let mut transaction = coordinator
-                .begin_capability_transaction(deadline())
+                .begin_capability_transaction(manifest_entries(1), deadline())
                 .unwrap();
-            assert!(transaction.send(&expected, actual_count).is_err());
+            assert!(transaction.send(actual_count).is_err());
         }
         assert_eq!(handle.0.lock().unwrap().capability_send_calls, 1);
         assert_poisoned_without_more_io(&mut coordinator, &handle);
@@ -387,24 +432,30 @@ fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
             drops.clone(),
         );
         {
-            let mut transaction = receiver.await_capability_transaction(deadline()).unwrap();
-            assert!(transaction.receive(&expected).is_err());
+            let mut transaction = receiver
+                .await_capability_transaction(manifest_entries(1), deadline())
+                .unwrap();
+            assert!(transaction.receive().is_err());
         }
         assert_eq!(drops.load(Ordering::SeqCst), actual_count);
         assert_poisoned_without_more_io(&mut receiver, &handle);
     }
 
     for substituted in [
-        capability_frame([0x32; 32], 7, 1),
-        capability_frame(NONCE, 8, 1),
-        capability_frame(NONCE, 7, 2),
+        capability_frame([0x32; 32], 1, 1),
+        capability_frame(NONCE, 2, 1),
+        capability_frame(NONCE, 1, 2),
+        capability_frame_for_identity(NONCE, 12, 11, 1, 1),
+        capability_frame_for_identity(NONCE, 10, 12, 1, 1),
     ] {
         let (mut receiver, handle) = dispatcher(MAXIMUM);
         let drops = Arc::new(AtomicUsize::new(0));
         enqueue_capability(&handle, substituted.as_bytes().to_vec(), 1, drops.clone());
         {
-            let mut transaction = receiver.await_capability_transaction(deadline()).unwrap();
-            assert!(transaction.receive(&expected).is_err());
+            let mut transaction = receiver
+                .await_capability_transaction(manifest_entries(1), deadline())
+                .unwrap();
+            assert!(transaction.receive().is_err());
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_poisoned_without_more_io(&mut receiver, &handle);
@@ -414,10 +465,10 @@ fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
     handle.0.lock().unwrap().capability_error_on_call = Some(1);
     {
         let mut transaction = coordinator
-            .begin_capability_transaction(deadline())
+            .begin_capability_transaction(manifest_entries(1), deadline())
             .unwrap();
         assert_eq!(
-            transaction.send(&expected, 1),
+            transaction.send(1),
             Err(AcceptedControlError::Transport(
                 SessionTransportError::Native
             ))
@@ -429,15 +480,15 @@ fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
 
 #[test]
 fn same_guard_capability_replay_never_performs_a_second_native_operation() {
-    let expected = capability_frame(NONCE, 10, 1);
+    let expected = capability_frame(NONCE, 1, 1);
     let (mut coordinator, handle) = dispatcher(MAXIMUM);
     {
         let mut transaction = coordinator
-            .begin_capability_transaction(deadline())
+            .begin_capability_transaction(manifest_entries(1), deadline())
             .unwrap();
-        transaction.send(&expected, 1).unwrap();
+        transaction.send(1).unwrap();
         assert_eq!(
-            transaction.send(&expected, 1),
+            transaction.send(1),
             Err(AcceptedControlError::Control(ControlError::ReplayOrReorder))
         );
     }
@@ -460,10 +511,12 @@ fn same_guard_capability_replay_never_performs_a_second_native_operation() {
         queued_drops.clone(),
     );
     {
-        let mut transaction = receiver.await_capability_transaction(deadline()).unwrap();
-        assert_eq!(transaction.receive(&expected).unwrap().count, 1);
+        let mut transaction = receiver
+            .await_capability_transaction(manifest_entries(1), deadline())
+            .unwrap();
+        assert_eq!(transaction.receive().unwrap().count, 1);
         assert_eq!(
-            transaction.receive(&expected).map(|_| ()),
+            transaction.receive().map(|_| ()),
             Err(AcceptedControlError::Control(ControlError::ReplayOrReorder))
         );
         assert_eq!(installed_drops.load(Ordering::SeqCst), 0);
@@ -478,8 +531,152 @@ fn same_guard_capability_replay_never_performs_a_second_native_operation() {
 }
 
 #[test]
+fn accepted_owner_mints_identity_and_monotonic_transaction_ids() {
+    let (mut coordinator, handle) = dispatcher_with_transactions(MAXIMUM, 2);
+    for _ in 0..2 {
+        let mut transaction = coordinator
+            .begin_capability_transaction(manifest_entries(1), deadline())
+            .unwrap();
+        transaction.send(1).unwrap();
+        transaction.complete_for_test();
+    }
+    let facts = handle.0.lock().unwrap();
+    assert_eq!(facts.capability_send_calls, 2);
+    assert_eq!(
+        facts.capability_sent[0].0,
+        capability_frame(NONCE, 1, 1).as_bytes()
+    );
+    assert_eq!(
+        facts.capability_sent[1].0,
+        capability_frame(NONCE, 2, 1).as_bytes()
+    );
+    drop(facts);
+
+    assert!(matches!(
+        coordinator.begin_capability_transaction(manifest_entries(1), deadline()),
+        Err(AcceptedControlError::Control(
+            ControlError::SequenceExhausted
+        ))
+    ));
+    assert_eq!(handle.0.lock().unwrap().capability_send_calls, 2);
+    assert_poisoned_without_more_io(&mut coordinator, &handle);
+}
+
+#[test]
+fn nth_capability_operation_failure_is_terminal_without_followup_io() {
+    let (mut coordinator, handle) = dispatcher_with_transactions(MAXIMUM, 3);
+    handle.0.lock().unwrap().capability_error_on_call = Some(2);
+
+    let mut first = coordinator
+        .begin_capability_transaction(manifest_entries(1), deadline())
+        .unwrap();
+    first.send(1).unwrap();
+    first.complete_for_test();
+
+    {
+        let mut second = coordinator
+            .begin_capability_transaction(manifest_entries(1), deadline())
+            .unwrap();
+        assert_eq!(
+            second.send(1),
+            Err(AcceptedControlError::Transport(
+                SessionTransportError::Native
+            ))
+        );
+    }
+
+    let facts = handle.0.lock().unwrap();
+    assert_eq!(facts.capability_send_calls, 2);
+    assert_eq!(facts.capability_sent.len(), 1);
+    assert_eq!(
+        facts.capability_sent[0].0,
+        capability_frame(NONCE, 1, 1).as_bytes()
+    );
+    drop(facts);
+    assert!(matches!(
+        coordinator.begin_capability_transaction(manifest_entries(1), deadline()),
+        Err(AcceptedControlError::Control(ControlError::Poisoned))
+    ));
+    assert_eq!(handle.0.lock().unwrap().capability_send_calls, 2);
+}
+
+#[test]
+fn local_manifest_limit_and_expired_deadline_fail_before_transaction() {
+    let limits = SessionLimits {
+        max_regions_per_batch: 2,
+        max_region_bytes: 8192,
+        max_batch_bytes: 8192,
+        max_control_payload_bytes: MAXIMUM,
+        ..SessionLimits::default()
+    };
+    let handle = MockHandle::default();
+    let mut coordinator = AcceptedControlDispatcher::new(
+        MockTransport(handle.clone()),
+        AcceptedSessionParameters {
+            facts: SpawnIdentityFacts::new(10, 11, 1, 1, 1, 1, NONCE).unwrap(),
+            limits,
+        },
+    )
+    .ok()
+    .unwrap();
+
+    let duplicate = manifest_entries(1);
+    let duplicate = vec![duplicate[0], duplicate[0]];
+    assert!(matches!(
+        coordinator.begin_capability_transaction(duplicate, deadline()),
+        Err(AcceptedControlError::Control(ControlError::NonCanonical))
+    ));
+    assert!(matches!(
+        coordinator.begin_capability_transaction(manifest_entries(3), deadline()),
+        Err(AcceptedControlError::Control(ControlError::PayloadTooLarge))
+    ));
+    let oversized = NativeRegionSpec::new(44, [44; 16], 1, 16_384, 16_384).unwrap();
+    assert!(matches!(
+        coordinator.begin_capability_transaction(
+            vec![ManifestEntry::from_native(oversized, PeerAccess::ReadOnly)],
+            deadline(),
+        ),
+        Err(AcceptedControlError::Control(ControlError::PayloadTooLarge))
+    ));
+    let first = NativeRegionSpec::new(45, [45; 16], 1, 4096, 8192).unwrap();
+    let second = NativeRegionSpec::new(46, [46; 16], 1, 4096, 8192).unwrap();
+    assert!(matches!(
+        coordinator.begin_capability_transaction(
+            vec![
+                ManifestEntry::from_native(first, PeerAccess::ReadOnly),
+                ManifestEntry::from_native(second, PeerAccess::ReadOnly),
+            ],
+            deadline(),
+        ),
+        Err(AcceptedControlError::Control(ControlError::PayloadTooLarge))
+    ));
+
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        std::hint::spin_loop();
+    }
+    assert!(matches!(
+        coordinator.begin_capability_transaction(manifest_entries(1), expired),
+        Err(AcceptedControlError::Transport(
+            SessionTransportError::DeadlineExpired
+        ))
+    ));
+    assert_eq!(handle.0.lock().unwrap().capability_send_calls, 0);
+
+    let mut transaction = coordinator
+        .begin_capability_transaction(manifest_entries(1), deadline())
+        .unwrap();
+    transaction.send(1).unwrap();
+    transaction.complete_for_test();
+    assert_eq!(
+        handle.0.lock().unwrap().capability_sent[0].0,
+        capability_frame(NONCE, 1, 1).as_bytes()
+    );
+    coordinator.send(&frame(0, b"ok"), deadline()).unwrap();
+}
+
+#[test]
 fn hostile_continuous_transaction_traffic_cannot_retry_or_replace_the_deadline() {
-    let expected = capability_frame(NONCE, 9, 1);
     let (mut receiver, handle) = dispatcher(MAXIMUM);
     let drops = Arc::new(AtomicUsize::new(0));
     for _ in 0..64 {
@@ -493,9 +690,9 @@ fn hostile_continuous_transaction_traffic_cannot_retry_or_replace_the_deadline()
     let original_deadline = deadline();
     {
         let mut transaction = receiver
-            .await_capability_transaction(original_deadline)
+            .await_capability_transaction(manifest_entries(1), original_deadline)
             .unwrap();
-        assert!(transaction.receive(&expected).is_err());
+        assert!(transaction.receive().is_err());
     }
     let facts = handle.0.lock().unwrap();
     assert_eq!(facts.capability_receive_calls, 1);
@@ -594,10 +791,12 @@ fn ambiguous_receive_error_poisons_without_retry() {
 fn queued_valid_application_record_is_not_drained_on_construction() {
     let handle = MockHandle::default();
     enqueue(&handle, encode(NONCE, MAXIMUM, &frame(0, b"queued")));
-    let mut dispatcher =
-        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM)
-            .ok()
-            .unwrap();
+    let mut dispatcher = AcceptedControlDispatcher::new(
+        MockTransport(handle.clone()),
+        parameters(NONCE, MAXIMUM, SessionLimits::default().max_transactions),
+    )
+    .ok()
+    .unwrap();
     assert_eq!(handle.0.lock().unwrap().receive_calls, 0);
     assert_eq!(dispatcher.receive(deadline()).unwrap(), frame(0, b"queued"));
 }
@@ -631,10 +830,12 @@ fn canonical_record_bound_is_header_plus_negotiated_payload() {
     let (_, handle) = dispatcher(MAXIMUM);
     enqueue(&handle, vec![0; CONTROL_HEADER_LEN + MAXIMUM as usize + 1]);
     handle.0.lock().unwrap().return_oversized_success = true;
-    let mut dispatcher =
-        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM)
-            .ok()
-            .unwrap();
+    let mut dispatcher = AcceptedControlDispatcher::new(
+        MockTransport(handle.clone()),
+        parameters(NONCE, MAXIMUM, SessionLimits::default().max_transactions),
+    )
+    .ok()
+    .unwrap();
     assert_eq!(
         dispatcher.receive(deadline()),
         Err(AcceptedControlError::Transport(

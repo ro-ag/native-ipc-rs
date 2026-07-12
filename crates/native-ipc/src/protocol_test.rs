@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::SessionLimits;
 
 fn entry(role: u32) -> ManifestEntry {
     let spec = NativeRegionSpec::new(role.into(), [role as u8; 16], 1, 4096, 4096).unwrap();
@@ -47,6 +48,51 @@ fn capability_frame_has_the_only_native_capability_magic() {
     assert_eq!(frame.capability_count(), 1);
     assert_ne!(&frame.as_bytes()[..8], b"NIPCAPP1");
     assert!(manifest.matches_frame(CAPABILITY_MAGIC, frame.as_bytes()));
+}
+
+#[test]
+fn manifest_checks_negotiated_count_region_and_batch_limits() {
+    let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1), entry(2)]).unwrap();
+    let limits = SessionLimits {
+        max_regions_per_batch: 2,
+        max_region_bytes: 4096,
+        max_batch_bytes: 8192,
+        ..SessionLimits::default()
+    };
+    assert!(manifest.fits_limits(limits));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_regions_per_batch: 1,
+        ..limits
+    }));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_region_bytes: 4095,
+        ..limits
+    }));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_batch_bytes: 8191,
+        ..limits
+    }));
+
+    let rounded = NativeRegionSpec::new(3, [3; 16], 1, 4095, 4096).unwrap();
+    let rounded = TransferManifest::new(
+        [9; 32],
+        10,
+        11,
+        12,
+        vec![ManifestEntry::from_native(rounded, PeerAccess::ReadOnly)],
+    )
+    .unwrap();
+    let rounded_limits = SessionLimits {
+        max_regions_per_batch: 1,
+        max_region_bytes: 4095,
+        max_batch_bytes: 4096,
+        ..SessionLimits::default()
+    };
+    assert!(rounded.fits_limits(rounded_limits));
+    assert!(!rounded.fits_limits(SessionLimits {
+        max_region_bytes: 4094,
+        ..rounded_limits
+    }));
 }
 
 #[test]

@@ -1,3 +1,5 @@
+use crate::session::SessionLimits;
+
 pub(crate) const CONTROL_VERSION: u32 = 1;
 pub(crate) const MAX_TRANSFER_ENTRIES: usize = 16;
 pub(crate) const ENTRY_LEN: usize = 64;
@@ -215,6 +217,16 @@ impl TransferManifest {
             frame[start + 58..start + 60].copy_from_slice(&entry.flags.to_le_bytes());
         }
         frame
+    }
+
+    pub(crate) fn fits_limits(&self, limits: SessionLimits) -> bool {
+        self.entries.len() <= usize::from(limits.max_regions_per_batch)
+            && self.total_logical <= limits.max_batch_bytes
+            && self.total_mapped <= limits.max_batch_bytes
+            && self
+                .entries
+                .iter()
+                .all(|entry| entry.logical_len <= limits.max_region_bytes)
     }
 
     #[allow(dead_code)] // macOS compares the same fixed transcript in Mach receive validation.

@@ -615,7 +615,7 @@ impl CoordinatorAcceptedEvidenceOwner {
 
     fn into_control(self) -> Result<CoordinatorAcceptedControl, LinuxSpawnError> {
         let facts = self.evidence.facts();
-        let (nonce, maximum_payload) = self.evidence.control_parameters();
+        let parameters = self.evidence.session_parameters();
         let transport = CoordinatorLinuxControlTransport {
             lifecycle: self.lifecycle,
             endpoint: self.endpoint,
@@ -629,7 +629,7 @@ impl CoordinatorAcceptedEvidenceOwner {
             poisoned: false,
             not_sync: PhantomData,
         };
-        match AcceptedControlDispatcher::new(transport, nonce, maximum_payload) {
+        match AcceptedControlDispatcher::new(transport, parameters) {
             Ok(dispatcher) => Ok(dispatcher),
             Err(mut transport) => {
                 let _ = transport.terminate_and_reap(self.deadline);
@@ -646,7 +646,7 @@ impl ReceiverAcceptedEvidenceOwner {
 
     fn into_control(self) -> Result<ReceiverAcceptedControl, LinuxSpawnError> {
         let facts = self.evidence.facts();
-        let (nonce, maximum_payload) = self.evidence.control_parameters();
+        let parameters = self.evidence.session_parameters();
         let transport = ReceiverLinuxControlTransport {
             endpoint: self.endpoint,
             _evidence: self.evidence,
@@ -658,7 +658,7 @@ impl ReceiverAcceptedEvidenceOwner {
             poisoned: false,
             not_sync: PhantomData,
         };
-        AcceptedControlDispatcher::new(transport, nonce, maximum_payload)
+        AcceptedControlDispatcher::new(transport, parameters)
             .map_err(|_| LinuxSpawnError::InvalidInput)
     }
 }

@@ -1,9 +1,9 @@
 use super::{
-    AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport, OwnedChildLifecycle,
-    PeerState, ReceiverCapabilityTransport, SessionTransportError,
+    AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
+    OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
-use crate::protocol::CapabilityFrame;
+use crate::protocol::{CapabilityFrame, ManifestEntry, TransferManifest};
 use crate::session::AbsoluteDeadline;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +20,8 @@ pub(crate) struct AcceptedControlDispatcher<T> {
     transport: T,
     state: ControlState,
     maximum_wire_len: usize,
+    parameters: AcceptedSessionParameters,
+    next_transaction: u64,
 }
 
 /// Coordinator-owned open native transaction on the accepted session owner.
@@ -29,6 +31,7 @@ pub(crate) struct AcceptedControlDispatcher<T> {
 /// the inseparable session owner.
 pub(crate) struct CoordinatorCapabilityTransaction<'a, T: CoordinatorCapabilityTransport> {
     dispatcher: &'a mut AcceptedControlDispatcher<T>,
+    frame: CapabilityFrame,
     deadline: AbsoluteDeadline,
     attempted: bool,
     already_poisoned: bool,
@@ -41,6 +44,7 @@ pub(crate) struct CoordinatorCapabilityTransaction<'a, T: CoordinatorCapabilityT
 /// endpoint or independent pending tokens.
 pub(crate) struct ReceiverCapabilityTransaction<'a, T: ReceiverCapabilityTransport> {
     dispatcher: &'a mut AcceptedControlDispatcher<T>,
+    frame: CapabilityFrame,
     deadline: AbsoluteDeadline,
     received: Option<T::ReceivedCapabilities>,
     attempted: bool,
@@ -48,7 +52,14 @@ pub(crate) struct ReceiverCapabilityTransaction<'a, T: ReceiverCapabilityTranspo
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
-    pub(crate) fn new(transport: T, nonce: [u8; 32], maximum_payload: u32) -> Result<Self, T> {
+    pub(crate) fn new(transport: T, parameters: AcceptedSessionParameters) -> Result<Self, T> {
+        let facts = parameters.facts();
+        let limits = parameters.limits();
+        let nonce = facts.nonce();
+        let maximum_payload = limits.max_control_payload_bytes;
+        if limits.validate().is_err() {
+            return Err(transport);
+        }
         let Some(maximum_wire_len) = usize::try_from(maximum_payload)
             .ok()
             .and_then(control_wire_len)
@@ -62,6 +73,8 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
             transport,
             state,
             maximum_wire_len,
+            parameters,
+            next_transaction: 1,
         })
     }
 
@@ -158,11 +171,13 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
 impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
     pub(crate) fn begin_capability_transaction(
         &mut self,
+        entries: Vec<ManifestEntry>,
         deadline: AbsoluteDeadline,
     ) -> Result<CoordinatorCapabilityTransaction<'_, T>, AcceptedControlError> {
-        self.begin_native_transaction(deadline)?;
+        let frame = self.begin_native_transaction(entries, deadline)?;
         Ok(CoordinatorCapabilityTransaction {
             dispatcher: self,
+            frame,
             deadline,
             attempted: false,
             already_poisoned: false,
@@ -175,11 +190,13 @@ impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
     /// receiver-originated start record.
     pub(crate) fn await_capability_transaction(
         &mut self,
+        expected_entries: Vec<ManifestEntry>,
         deadline: AbsoluteDeadline,
     ) -> Result<ReceiverCapabilityTransaction<'_, T>, AcceptedControlError> {
-        self.begin_native_transaction(deadline)?;
+        let frame = self.begin_native_transaction(expected_entries, deadline)?;
         Ok(ReceiverCapabilityTransaction {
             dispatcher: self,
+            frame,
             deadline,
             received: None,
             attempted: false,
@@ -191,29 +208,57 @@ impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
     fn begin_native_transaction(
         &mut self,
+        entries: Vec<ManifestEntry>,
         deadline: AbsoluteDeadline,
-    ) -> Result<(), AcceptedControlError> {
+    ) -> Result<CapabilityFrame, AcceptedControlError> {
+        if self.state.is_poisoned() {
+            return Err(AcceptedControlError::Control(ControlError::Poisoned));
+        }
         if deadline.is_expired() {
             return Err(AcceptedControlError::Transport(
                 SessionTransportError::DeadlineExpired,
             ));
         }
+        let limits = self.parameters.limits();
+        if self.next_transaction > limits.max_transactions {
+            self.poison_both();
+            return Err(AcceptedControlError::Control(
+                ControlError::SequenceExhausted,
+            ));
+        }
+        let facts = self.parameters.facts();
+        let Some(manifest) = TransferManifest::new(
+            facts.nonce(),
+            facts.parent_pid(),
+            facts.child_pid(),
+            self.next_transaction,
+            entries,
+        ) else {
+            return Err(AcceptedControlError::Control(ControlError::NonCanonical));
+        };
+        if !manifest.fits_limits(limits) {
+            return Err(AcceptedControlError::Control(ControlError::PayloadTooLarge));
+        }
         match self.state.begin_transaction() {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(error) => {
                 if self.state.is_poisoned() {
                     self.transport.poison();
                 }
-                Err(AcceptedControlError::Control(error))
+                return Err(AcceptedControlError::Control(error));
             }
         }
+        self.next_transaction = self
+            .next_transaction
+            .checked_add(1)
+            .expect("negotiated transaction maximum cannot approach u64 overflow");
+        Ok(CapabilityFrame::from_manifest(&manifest))
     }
 }
 
 impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> {
     pub(crate) fn send(
         &mut self,
-        frame: &CapabilityFrame,
         capabilities: T::Capabilities<'_>,
     ) -> Result<(), AcceptedControlError> {
         if self.attempted {
@@ -221,11 +266,11 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
             return Err(AcceptedControlError::Control(ControlError::ReplayOrReorder));
         }
         self.attempted = true;
-        if let Err(error) =
-            self.dispatcher
-                .transport
-                .send_capability_record(frame, capabilities, self.deadline)
-        {
+        if let Err(error) = self.dispatcher.transport.send_capability_record(
+            &self.frame,
+            capabilities,
+            self.deadline,
+        ) {
             self.poison();
             return Err(AcceptedControlError::Transport(error));
         }
@@ -238,6 +283,19 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
             self.already_poisoned = true;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(mut self) {
+        assert!(
+            self.attempted,
+            "test completion requires one capability send"
+        );
+        self.dispatcher
+            .state
+            .end_transaction()
+            .expect("test completion follows one open transaction");
+        self.already_poisoned = true;
+    }
 }
 
 impl<T: CoordinatorCapabilityTransport> Drop for CoordinatorCapabilityTransaction<'_, T> {
@@ -247,10 +305,7 @@ impl<T: CoordinatorCapabilityTransport> Drop for CoordinatorCapabilityTransactio
 }
 
 impl<T: ReceiverCapabilityTransport> ReceiverCapabilityTransaction<'_, T> {
-    pub(crate) fn receive(
-        &mut self,
-        expected: &CapabilityFrame,
-    ) -> Result<&T::ReceivedCapabilities, AcceptedControlError> {
+    pub(crate) fn receive(&mut self) -> Result<&T::ReceivedCapabilities, AcceptedControlError> {
         if self.attempted {
             self.poison();
             return Err(AcceptedControlError::Control(ControlError::ReplayOrReorder));
@@ -259,7 +314,7 @@ impl<T: ReceiverCapabilityTransport> ReceiverCapabilityTransaction<'_, T> {
         let received = match self
             .dispatcher
             .transport
-            .receive_capability_record(expected, self.deadline)
+            .receive_capability_record(&self.frame, self.deadline)
         {
             Ok(received) => received,
             Err(error) => {

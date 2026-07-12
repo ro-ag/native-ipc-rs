@@ -524,7 +524,9 @@ fn spawn_helper() {
 }
 
 fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mode: &str) -> ! {
-    let (nonce, maximum) = evidence.evidence.control_parameters();
+    let parameters = evidence.evidence.session_parameters();
+    let nonce = parameters.facts().nonce();
+    let maximum = parameters.limits().max_control_payload_bytes;
     let raw_frame = |payload_len: usize| {
         let mut state = ControlState::new(nonce, payload_len.max(1) as u32).unwrap();
         let frame = ControlFrame {

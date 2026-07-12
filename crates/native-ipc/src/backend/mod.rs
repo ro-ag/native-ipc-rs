@@ -6,7 +6,7 @@
 
 use crate::negotiation::AcceptedTranscriptFacts;
 use crate::protocol::CapabilityFrame;
-use crate::session::AbsoluteDeadline;
+use crate::session::{AbsoluteDeadline, SessionLimits};
 use core::cell::Cell;
 use core::marker::PhantomData;
 
@@ -20,6 +20,24 @@ pub(crate) struct SpawnIdentityFacts {
     child_uid: u32,
     child_gid: u32,
     nonce: [u8; 32],
+}
+
+/// Exact accepted-session provenance and negotiated limits retained by the
+/// inseparable dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedSessionParameters {
+    facts: SpawnIdentityFacts,
+    limits: SessionLimits,
+}
+
+impl AcceptedSessionParameters {
+    pub(crate) const fn facts(self) -> SpawnIdentityFacts {
+        self.facts
+    }
+
+    pub(crate) const fn limits(self) -> SessionLimits {
+        self.limits
+    }
 }
 
 impl SpawnIdentityFacts {
@@ -132,11 +150,11 @@ impl CoordinatorAcceptedEvidence {
         self.facts
     }
 
-    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
-        (
-            self.transcript.nonce(),
-            self.transcript.effective_limits().max_control_payload_bytes,
-        )
+    pub(crate) const fn session_parameters(&self) -> AcceptedSessionParameters {
+        AcceptedSessionParameters {
+            facts: self.facts,
+            limits: self.transcript.effective_limits(),
+        }
     }
 }
 
@@ -172,11 +190,11 @@ impl ReceiverSpawnerEvidence {
         self.facts
     }
 
-    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
-        (
-            self.transcript.nonce(),
-            self.transcript.effective_limits().max_control_payload_bytes,
-        )
+    pub(crate) const fn session_parameters(&self) -> AcceptedSessionParameters {
+        AcceptedSessionParameters {
+            facts: self.facts,
+            limits: self.transcript.effective_limits(),
+        }
     }
 }
 

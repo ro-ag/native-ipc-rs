@@ -77,6 +77,11 @@ fn coordinator_evidence_requires_exact_channel_image_and_transcript_identity() {
     let accepted =
         CoordinatorAcceptedEvidence::combine(channel, image, accepted_transcript(nonce)).unwrap();
     assert_eq!(accepted.facts(), facts(11, nonce));
+    assert_eq!(accepted.session_parameters().facts(), facts(11, nonce));
+    assert_eq!(
+        accepted.session_parameters().limits(),
+        SessionLimits::default()
+    );
 
     assert!(SpawnIdentityFacts::new(0, 11, 0, 0, 0, 0, nonce).is_none());
     assert!(SpawnIdentityFacts::new(10, 10, 0, 0, 0, 0, nonce).is_none());
@@ -93,6 +98,11 @@ fn receiver_evidence_is_role_scoped_and_nonce_bound() {
     }
     .unwrap();
     assert_eq!(receiver.facts, identity);
+    assert_eq!(receiver.session_parameters().facts(), identity);
+    assert_eq!(
+        receiver.session_parameters().limits(),
+        SessionLimits::default()
+    );
 
     // SAFETY: the mismatch is intentional and must fail before evidence exists.
     let mismatch = unsafe {
