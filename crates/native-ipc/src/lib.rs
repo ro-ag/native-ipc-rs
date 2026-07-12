@@ -31,6 +31,8 @@ mod backend;
 #[allow(dead_code)]
 mod control;
 #[allow(dead_code)]
+mod liveness;
+#[allow(dead_code)]
 mod negotiation;
 mod protocol;
 

@@ -5,6 +5,8 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ops::Range;
 
+use crate::liveness::{LivenessState, RegionLease, ResourceError};
+
 /// Checked active-memory access failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessError {
@@ -52,13 +54,23 @@ unsafe extern "C" {
 /// # Safety
 ///
 /// The pointer must remain readable and initialized for `len` bytes until the
-/// owner is dropped. Peer mutation may occur concurrently; no Rust reference
+/// owner is dropped. This value must uniquely own the exact local VM mapping
+/// described by that pointer and `len`: it may not delegate lifetime to an
+/// `Arc`, duplicate mapping owner, or other value that can retain the local
+/// mapping after this owner is dropped. Its non-panicking destructor must
+/// synchronously destroy that exact local mapping before returning. These
+/// local-ownership obligations do not revoke or shorten the peer's separately
+/// authorized mapping. Peer mutation may occur concurrently; no Rust reference
 /// may be formed from the pointer. The pointer must be aligned to the stable,
 /// nonzero `page_size`; pointer, length, and page size must not change.
 pub(crate) unsafe trait ActiveReadOwner: Send + Sync {
     fn as_ptr(&self) -> *const u8;
     fn len(&self) -> usize;
     fn page_size(&self) -> usize;
+    #[allow(dead_code)]
+    fn liveness_state(&self) -> Option<LivenessState> {
+        None
+    }
 }
 
 /// Private lifetime/permission witness for the sole stable writable mapping.
@@ -68,12 +80,18 @@ pub(crate) unsafe trait ActiveReadOwner: Send + Sync {
 /// In addition to [`ActiveReadOwner`], the current endpoint must have native
 /// store authority for the complete range and no safe local writer alias.
 /// `as_mut_ptr()` must be stable, writable for `len` bytes, aligned to
-/// `page_size`, and identify the exact same base/range as `as_ptr()`.
+/// `page_size`, and identify the exact same base/range as `as_ptr()`. This
+/// value has the same unique exact-local-mapping ownership, synchronous unmap,
+/// and non-panicking destructor obligations as [`ActiveReadOwner`].
 pub(crate) unsafe trait ActiveWriteOwner: Send {
     fn as_ptr(&self) -> *const u8;
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
     fn page_size(&self) -> usize;
+    #[allow(dead_code)]
+    fn liveness_state(&self) -> Option<LivenessState> {
+        None
+    }
 }
 
 /// Stable read-only mapping of peer-writable hostile bytes.
@@ -93,9 +111,33 @@ pub struct ActiveReader {
     logical_len: usize,
 }
 
+#[allow(dead_code)]
+struct LeasedReadOwner {
+    owner: Option<Box<dyn ActiveReadOwner>>,
+    lease: Option<RegionLease>,
+}
+
+#[allow(dead_code)]
+struct LeasedWriteOwner {
+    owner: Option<Box<dyn ActiveWriteOwner>>,
+    lease: Option<RegionLease>,
+}
+
+pub(crate) struct LeaseReservation {
+    lease: Option<RegionLease>,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum ActivationError {
+    Access(AccessError),
+    Resource(ResourceError),
+    MappingLengthOverflow,
+}
+
 impl ActiveReader {
-    #[allow(dead_code)]
-    pub(crate) fn new(
+    fn from_owner(
         owner: Box<dyn ActiveReadOwner>,
         logical_len: usize,
     ) -> Result<Self, AccessError> {
@@ -107,6 +149,38 @@ impl ActiveReader {
             return Err(AccessError::OutOfBounds);
         }
         Ok(Self { owner, logical_len })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unleased_for_test(
+        owner: Box<dyn ActiveReadOwner>,
+        logical_len: usize,
+    ) -> Result<Self, AccessError> {
+        Self::from_owner(owner, logical_len)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_leased(
+        owner: Box<dyn ActiveReadOwner>,
+        logical_len: usize,
+        reservation: LeaseReservation,
+    ) -> Result<Self, ActivationError> {
+        let mut active = Self::from_owner(owner, logical_len).map_err(ActivationError::Access)?;
+        let mapped_len = u64::try_from(active.owner.len())
+            .map_err(|_| ActivationError::MappingLengthOverflow)?;
+        let lease = reservation
+            .complete(mapped_len)
+            .map_err(ActivationError::Resource)?;
+        active.owner = Box::new(LeasedReadOwner {
+            owner: Some(active.owner),
+            lease: Some(lease),
+        });
+        Ok(active)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn liveness_state(&self) -> Option<LivenessState> {
+        self.owner.liveness_state()
     }
 
     /// Logical application-visible byte length.
@@ -176,8 +250,7 @@ pub struct ActiveWriter {
 }
 
 impl ActiveWriter {
-    #[allow(dead_code)]
-    pub(crate) fn new(
+    fn from_owner(
         mut owner: Box<dyn ActiveWriteOwner>,
         logical_len: usize,
     ) -> Result<Self, AccessError> {
@@ -194,6 +267,38 @@ impl ActiveWriter {
             logical_len,
             _not_sync: PhantomData,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unleased_for_test(
+        owner: Box<dyn ActiveWriteOwner>,
+        logical_len: usize,
+    ) -> Result<Self, AccessError> {
+        Self::from_owner(owner, logical_len)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn new_leased(
+        owner: Box<dyn ActiveWriteOwner>,
+        logical_len: usize,
+        reservation: LeaseReservation,
+    ) -> Result<Self, ActivationError> {
+        let mut active = Self::from_owner(owner, logical_len).map_err(ActivationError::Access)?;
+        let mapped_len = u64::try_from(active.owner.len())
+            .map_err(|_| ActivationError::MappingLengthOverflow)?;
+        let lease = reservation
+            .complete(mapped_len)
+            .map_err(ActivationError::Resource)?;
+        active.owner = Box::new(LeasedWriteOwner {
+            owner: Some(active.owner),
+            lease: Some(lease),
+        });
+        Ok(active)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn liveness_state(&self) -> Option<LivenessState> {
+        self.owner.liveness_state()
     }
 
     /// Logical application-visible byte length.
@@ -290,6 +395,127 @@ impl ActiveWriter {
     }
 }
 
+unsafe impl ActiveReadOwner for LeasedReadOwner {
+    fn as_ptr(&self) -> *const u8 {
+        self.owner().as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.owner().len()
+    }
+
+    fn page_size(&self) -> usize {
+        self.owner().page_size()
+    }
+
+    fn liveness_state(&self) -> Option<LivenessState> {
+        Some(self.lease().state())
+    }
+}
+
+unsafe impl ActiveWriteOwner for LeasedWriteOwner {
+    fn as_ptr(&self) -> *const u8 {
+        self.owner().as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.owner_mut().as_mut_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.owner().len()
+    }
+
+    fn page_size(&self) -> usize {
+        self.owner().page_size()
+    }
+
+    fn liveness_state(&self) -> Option<LivenessState> {
+        Some(self.lease().state())
+    }
+}
+
+#[allow(dead_code)]
+impl LeasedReadOwner {
+    fn owner(&self) -> &dyn ActiveReadOwner {
+        &**self.owner.as_ref().expect("mapping precedes lease drop")
+    }
+
+    fn lease(&self) -> &RegionLease {
+        self.lease.as_ref().expect("lease follows mapping drop")
+    }
+}
+
+#[allow(dead_code)]
+impl LeasedWriteOwner {
+    fn owner(&self) -> &dyn ActiveWriteOwner {
+        &**self.owner.as_ref().expect("mapping precedes lease drop")
+    }
+
+    fn owner_mut(&mut self) -> &mut dyn ActiveWriteOwner {
+        &mut **self.owner.as_mut().expect("mapping precedes lease drop")
+    }
+
+    fn lease(&self) -> &RegionLease {
+        self.lease.as_ref().expect("lease follows mapping drop")
+    }
+}
+
+impl Drop for LeasedReadOwner {
+    fn drop(&mut self) {
+        let lease_guard = self.lease.take();
+        drop(self.owner.take());
+        drop(lease_guard);
+    }
+}
+
+impl Drop for LeasedWriteOwner {
+    fn drop(&mut self) {
+        let lease_guard = self.lease.take();
+        drop(self.owner.take());
+        drop(lease_guard);
+    }
+}
+
+impl LeaseReservation {
+    pub(super) fn new(lease: RegionLease) -> Self {
+        Self {
+            lease: Some(lease),
+            not_sync: PhantomData,
+        }
+    }
+
+    fn complete(mut self, actual_mapped_len: u64) -> Result<RegionLease, ResourceError> {
+        let lease = self
+            .lease
+            .as_ref()
+            .expect("reservation retains its charge until completion or drop");
+        if lease.bytes() != actual_mapped_len {
+            return Err(ResourceError::MappedLengthMismatch {
+                reserved: lease.bytes(),
+                actual: actual_mapped_len,
+            });
+        }
+        match lease.state() {
+            LivenessState::Active => {}
+            LivenessState::Poisoned => return Err(ResourceError::Poisoned),
+            LivenessState::Closed => return Err(ResourceError::Closed),
+        }
+        Ok(self
+            .lease
+            .take()
+            .expect("validated reservation still owns its charge"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        self,
+        actual_mapped_len: u64,
+    ) -> Result<RegionLease, ResourceError> {
+        self.complete(actual_mapped_len)
+    }
+}
+
 fn checked_end(offset: usize, length: usize, limit: usize) -> Result<usize, AccessError> {
     let end = offset.checked_add(length).ok_or(AccessError::OutOfBounds)?;
     if end > limit {
@@ -347,6 +573,9 @@ fn prefault_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::liveness::{LivenessState, ResourceError, ResourceOwner};
+    use crate::session::SessionLimits;
+    use std::sync::{Arc, Barrier};
 
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
@@ -382,12 +611,98 @@ mod tests {
         }
     }
 
+    struct BlockingReaderOwner {
+        bytes: Box<[u8]>,
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    unsafe impl ActiveReadOwner for BlockingReaderOwner {
+        fn as_ptr(&self) -> *const u8 {
+            self.bytes.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn page_size(&self) -> usize {
+            1
+        }
+    }
+
+    impl Drop for BlockingReaderOwner {
+        fn drop(&mut self) {
+            self.started.wait();
+            self.release.wait();
+        }
+    }
+
+    struct DropFlagReaderOwner {
+        bytes: Box<[u8]>,
+        dropped: Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    struct PanickingReaderOwner(Box<[u8]>);
+
+    unsafe impl ActiveReadOwner for DropFlagReaderOwner {
+        fn as_ptr(&self) -> *const u8 {
+            self.bytes.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn page_size(&self) -> usize {
+            1
+        }
+    }
+
+    impl Drop for DropFlagReaderOwner {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    unsafe impl ActiveReadOwner for PanickingReaderOwner {
+        fn as_ptr(&self) -> *const u8 {
+            self.0.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        fn page_size(&self) -> usize {
+            1
+        }
+    }
+
+    impl Drop for PanickingReaderOwner {
+        fn drop(&mut self) {
+            panic!("deliberate private-owner contract violation");
+        }
+    }
+
+    fn lease_limits() -> SessionLimits {
+        SessionLimits {
+            max_active_regions: 2,
+            max_active_bytes: 16,
+            ..SessionLimits::default()
+        }
+    }
+
     #[test]
     fn checked_volatile_access_and_prefault_are_bounded() {
         assert_send_sync::<ActiveReader>();
         assert_send::<ActiveWriter>();
-        let reader =
-            ActiveReader::new(Box::new(ReaderOwner(vec![1, 2, 3, 4, 5].into())), 5).unwrap();
+        let reader = ActiveReader::new_unleased_for_test(
+            Box::new(ReaderOwner(vec![1, 2, 3, 4, 5].into())),
+            5,
+        )
+        .unwrap();
         let mut output = [0; 3];
         reader.read_into(1, &mut output).unwrap();
         assert_eq!(output, [2, 3, 4]);
@@ -398,7 +713,9 @@ mod tests {
         assert_eq!(reader.prefault(0..5).unwrap().pages_touched, 5);
         assert_eq!(reader.prefault(3..5).unwrap().pages_touched, 2);
 
-        let mut writer = ActiveWriter::new(Box::new(WriterOwner(vec![0; 5].into())), 5).unwrap();
+        let mut writer =
+            ActiveWriter::new_unleased_for_test(Box::new(WriterOwner(vec![0; 5].into())), 5)
+                .unwrap();
         writer.write_from(1, &[7, 8]).unwrap();
         writer.fill(3..5, 9).unwrap();
         assert_eq!(writer.prefault(0..5).unwrap().pages_touched, 5);
@@ -410,5 +727,93 @@ mod tests {
             assert!(!writer.as_ptr().is_null());
             assert!(!writer.as_mut_ptr().is_null());
         }
+    }
+
+    #[test]
+    fn active_mapping_retains_shared_liveness_until_mapping_drop_finishes() {
+        let mut resources = ResourceOwner::new(lease_limits()).unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let reader = ActiveReader::new_leased(
+            Box::new(BlockingReaderOwner {
+                bytes: vec![0; 4].into(),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            4,
+            resources.reserve(4).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reader.liveness_state(), Some(LivenessState::Active));
+        resources.poison();
+        assert_eq!(reader.liveness_state(), Some(LivenessState::Poisoned));
+
+        let drop_thread = std::thread::spawn(move || drop(reader));
+        started.wait();
+        assert!(matches!(
+            resources.try_close(),
+            Err(ResourceError::ActiveLeases(_))
+        ));
+        release.wait();
+        drop_thread.join().unwrap();
+        resources.try_close().unwrap();
+    }
+
+    #[test]
+    fn rejected_mapping_is_destroyed_and_its_charge_rolls_back() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let mut resources = ResourceOwner::new(lease_limits()).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result = ActiveReader::new_leased(
+            Box::new(DropFlagReaderOwner {
+                bytes: vec![0; 3].into(),
+                dropped: Arc::clone(&dropped),
+            }),
+            3,
+            resources.reserve(4).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(ActivationError::Resource(
+                ResourceError::MappedLengthMismatch {
+                    reserved: 4,
+                    actual: 3
+                }
+            ))
+        ));
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(resources.active_lease_facts().regions, 0);
+    }
+
+    #[test]
+    fn active_writer_retains_the_same_exact_resource_lease() {
+        let mut resources = ResourceOwner::new(lease_limits()).unwrap();
+        let mut writer = ActiveWriter::new_leased(
+            Box::new(WriterOwner(vec![0; 5].into())),
+            5,
+            resources.reserve(5).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(writer.liveness_state(), Some(LivenessState::Active));
+        writer.write_from(0, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(resources.active_lease_facts().regions, 1);
+        drop(writer);
+        assert_eq!(resources.active_lease_facts().regions, 0);
+    }
+
+    #[test]
+    fn owner_destructor_panic_cannot_leak_the_resource_charge() {
+        let mut resources = ResourceOwner::new(lease_limits()).unwrap();
+        let reader = ActiveReader::new_leased(
+            Box::new(PanickingReaderOwner(vec![0; 4].into())),
+            4,
+            resources.reserve(4).unwrap(),
+        )
+        .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(reader)));
+        assert!(panic.is_err());
+        assert_eq!(resources.active_lease_facts().regions, 0);
+        resources.try_close().unwrap();
     }
 }

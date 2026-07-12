@@ -281,15 +281,17 @@ mod tests {
     }
 
     fn reader(bytes: usize) -> ActiveReader {
-        ActiveReader::new(Box::new(ReadOwner(vec![0; bytes].into())), bytes).unwrap()
+        ActiveReader::new_unleased_for_test(Box::new(ReadOwner(vec![0; bytes].into())), bytes)
+            .unwrap()
     }
 
     fn writer(bytes: usize) -> ActiveWriter {
-        ActiveWriter::new(Box::new(WriteOwner(vec![0; bytes].into())), bytes).unwrap()
+        ActiveWriter::new_unleased_for_test(Box::new(WriteOwner(vec![0; bytes].into())), bytes)
+            .unwrap()
     }
 
     fn counting_reader(drops: &Arc<AtomicUsize>) -> ActiveReader {
-        ActiveReader::new(
+        ActiveReader::new_unleased_for_test(
             Box::new(CountingReadOwner {
                 bytes: vec![0; 8].into(),
                 drops: Arc::clone(drops),
