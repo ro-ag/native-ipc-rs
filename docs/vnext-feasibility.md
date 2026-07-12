@@ -12,10 +12,14 @@ mode bits clear, installs `F_SEAL_EXEC`, and implies `MFD_ALLOW_SEALING`. Native
 AMD64 and Arm64 execution in [Actions 29179189298](https://github.com/ro-ag/native-ipc-rs/actions/runs/29179189298)
 confirmed that the seal rejects executable mode changes. The GitHub run proved
 that an already-existing writable mapping can still gain `PROT_EXEC` through
-`mprotect` after all required seals are installed. A local native Linux Arm64
-Docker reproduction additionally proved that a brand-new `PROT_EXEC` mapping
-of the sealed object succeeds. The mode/seal policy therefore does not provide
-VM maximum-protection enforcement for either existing or new views.
+`mprotect` after all required seals are installed. An initial Linux Arm64
+Docker-VM characterization suggested that a brand-new `PROT_EXEC` mapping also
+succeeds. Exact native AMD64 and Arm64 execution in
+[Actions 29179590235](https://github.com/ro-ag/native-ipc-rs/actions/runs/29179590235)
+then confirmed that fresh shared RX alias while irreversible MDWE was active;
+MDWE denied only the existing RW-to-RWX upgrade. The mode/seal policy, even
+combined with MDWE, therefore does not provide object-level maximum VM
+protection against dual RW/RX aliases.
 
 Those results contradict the vNext requirement for both directions. A peer
 reader can create a new executable view of a coordinator-writer object, while
@@ -37,7 +41,9 @@ requires either a normative threat/guarantee change or a separately proven
 mandatory containment mechanism that a malicious receiver cannot remove or
 bypass. No such unprivileged mechanism is currently specified.
 
-Primary source: <https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html>
+Primary sources:
+<https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html> and
+<https://man7.org/linux/man-pages/man2/pr_set_mdwe.2const.html>
 
 ## Linux peer-writer seal order
 
