@@ -1,4 +1,6 @@
-use super::{AuthenticatedZeroRightsTransport, PeerState, SessionTransportError};
+use super::{
+    AuthenticatedZeroRightsTransport, OwnedChildLifecycle, PeerState, SessionTransportError,
+};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
 use crate::session::AbsoluteDeadline;
 
@@ -19,11 +21,19 @@ pub(crate) struct AcceptedControlDispatcher<T> {
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
-    pub(crate) fn new(transport: T, nonce: [u8; 32], maximum_payload: u32) -> Option<Self> {
-        let maximum_wire_len = control_wire_len(usize::try_from(maximum_payload).ok()?)?;
-        Some(Self {
+    pub(crate) fn new(transport: T, nonce: [u8; 32], maximum_payload: u32) -> Result<Self, T> {
+        let Some(maximum_wire_len) = usize::try_from(maximum_payload)
+            .ok()
+            .and_then(control_wire_len)
+        else {
+            return Err(transport);
+        };
+        let Some(state) = ControlState::new(nonce, maximum_payload) else {
+            return Err(transport);
+        };
+        Ok(Self {
             transport,
-            state: ControlState::new(nonce, maximum_payload)?,
+            state,
             maximum_wire_len,
         })
     }
@@ -139,5 +149,16 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
     fn poison_both(&mut self) {
         self.state.poison();
         self.transport.poison();
+    }
+}
+
+impl<T: AuthenticatedZeroRightsTransport + OwnedChildLifecycle> AcceptedControlDispatcher<T> {
+    pub(crate) fn terminate_and_reap(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.transport.poison();
+        self.state.poison();
+        self.transport.terminate_and_reap(deadline)
     }
 }

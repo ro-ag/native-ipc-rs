@@ -304,6 +304,16 @@ pub(super) struct ExactChildCleanup {
     last_native_error: Option<i32>,
 }
 
+impl ExactChildCleanup {
+    pub(super) const fn direct_child_complete(self) -> bool {
+        self.direct_child.is_some()
+    }
+
+    pub(super) const fn last_native_error(self) -> Option<i32> {
+        self.last_native_error
+    }
+}
+
 struct ReapTask {
     pidfd: Arc<OwnedFd>,
 }

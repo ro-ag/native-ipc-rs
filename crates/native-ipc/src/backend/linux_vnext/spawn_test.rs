@@ -1,4 +1,6 @@
 use super::*;
+use crate::backend::accepted_control::AcceptedControlError;
+use crate::control::{ControlError, ControlFrame, ControlState};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +27,16 @@ assert_impl_all!(CoordinatorAcceptedEvidenceOwner: Send);
 assert_not_impl_any!(CoordinatorAcceptedEvidenceOwner: Sync, Clone);
 assert_impl_all!(ReceiverAcceptedEvidenceOwner: Send);
 assert_not_impl_any!(ReceiverAcceptedEvidenceOwner: Sync, Clone);
+assert_impl_all!(CoordinatorLinuxControlTransport: Send, AuthenticatedZeroRightsTransport, OwnedChildLifecycle);
+assert_not_impl_any!(CoordinatorLinuxControlTransport: Sync, Clone);
+assert_impl_all!(ReceiverLinuxControlTransport: Send, AuthenticatedZeroRightsTransport);
+assert_not_impl_any!(ReceiverLinuxControlTransport: Sync, Clone, OwnedChildLifecycle);
+assert_impl_all!(CoordinatorAcceptedControl: Send);
+assert_not_impl_any!(CoordinatorAcceptedControl: Sync, Clone);
+assert_impl_all!(ReceiverAcceptedControl: Send);
+assert_not_impl_any!(ReceiverAcceptedControl: Sync, Clone);
+
+const APPLICATION_CONTROL_KIND: u32 = 0x8000_0047;
 
 fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
@@ -301,7 +313,11 @@ fn spawn_helper() {
             .unwrap()
             .parse::<usize>()
             .unwrap();
-        let state = receive_inherited_hello(raw, hello_offer(receiver_payload_len), deadline())
+        let mut receiver_offer = hello_offer(receiver_payload_len);
+        if let Ok(limit) = std::env::var("NATIVE_IPC_VNEXT_CONTROL_LIMIT") {
+            receiver_offer.limits.max_control_payload_bytes = limit.parse().unwrap();
+        }
+        let state = receive_inherited_hello(raw, receiver_offer, deadline())
             .expect("receiver HELLO exchange");
         assert_eq!(
             state._peer_application_payload.len(),
@@ -345,6 +361,9 @@ fn spawn_helper() {
                     // SAFETY: scalar process/credential queries have no pointers.
                     assert_eq!(facts.child_gid(), unsafe { libc::getgid() });
                     assert_ne!(facts.nonce(), [0; NONCE_LEN]);
+                    if let Ok(mode) = std::env::var("NATIVE_IPC_VNEXT_CONTROL_MODE") {
+                        run_accepted_control_receiver(evidence, &mode);
+                    }
                     let _evidence = evidence;
                     loop {
                         // SAFETY: keep evidence state alive until coordinator cleanup.
@@ -366,6 +385,111 @@ fn spawn_helper() {
     }
     loop {
         // SAFETY: pause blocks this disposable helper until exact pidfd cleanup.
+        unsafe { libc::pause() };
+    }
+}
+
+fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mode: &str) -> ! {
+    let (nonce, maximum) = evidence.evidence.control_parameters();
+    let raw_frame = |payload_len: usize| {
+        let mut state = ControlState::new(nonce, payload_len.max(1) as u32).unwrap();
+        let frame = ControlFrame {
+            kind: APPLICATION_CONTROL_KIND,
+            payload: vec![0x5a; payload_len],
+        };
+        let mut bytes = vec![0; state.encoded_len(&frame).unwrap()];
+        state.encode_into(&frame, &mut bytes).unwrap();
+        bytes
+    };
+    match mode {
+        "echo" => {
+            let expected = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let response = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut control = evidence.into_control().unwrap();
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"ready".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            let received = control.receive(deadline()).unwrap();
+            assert_eq!(received.kind, APPLICATION_CONTROL_KIND);
+            assert_eq!(received.payload, vec![0x41; expected]);
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: vec![0x52; response],
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            loop {
+                let _control = &control;
+                // SAFETY: coordinator exact-child cleanup terminates this helper.
+                unsafe { libc::pause() };
+            }
+        }
+        "rights" => {
+            let bytes = raw_frame(1);
+            // SAFETY: successful open returns one uniquely owned descriptor.
+            let raw =
+                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            assert!(raw >= 0);
+            // SAFETY: successful open returned one uniquely owned descriptor.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+            evidence
+                .endpoint
+                .send(&bytes, &[descriptor.as_raw_fd()])
+                .unwrap();
+        }
+        "truncated" => {
+            evidence.endpoint.send_zero_rights(b"NIPCAPP1").unwrap();
+        }
+        "oversize" => {
+            assert_eq!(maximum, 8);
+            evidence.endpoint.send_zero_rights(&raw_frame(9)).unwrap();
+        }
+        "replay" => {
+            let bytes = raw_frame(1);
+            evidence.endpoint.send_zero_rights(&bytes).unwrap();
+            evidence.endpoint.send_zero_rights(&bytes).unwrap();
+        }
+        "wrong-credentials" => {
+            let bytes = raw_frame(1);
+            // SAFETY: fork creates a disposable malicious delegate with a
+            // distinct kernel PID but the inherited authenticated endpoint.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                let _ = evidence.endpoint.send_zero_rights(&bytes);
+                // SAFETY: disposable delegate exits without Rust teardown.
+                unsafe { libc::_exit(0) }
+            }
+            let mut status = 0;
+            // SAFETY: this helper owns the exact disposable delegate child.
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        }
+        "silent" => {}
+        "exit" => {
+            let mut control = evidence.into_control().unwrap();
+            let _ = control.receive(deadline()).unwrap();
+            // SAFETY: coordinator retains exact lifecycle cleanup authority.
+            unsafe { libc::_exit(0) }
+        }
+        _ => panic!("unknown accepted control mode"),
+    }
+    loop {
+        // SAFETY: coordinator exact-child cleanup terminates this helper.
         unsafe { libc::pause() };
     }
 }
@@ -552,6 +676,171 @@ fn decision_environment(
     .into_iter()
     .map(|(key, value)| (OsString::from(key), OsString::from(value)))
     .collect()
+}
+
+fn control_environment(
+    mode: &str,
+    coordinator_len: usize,
+    receiver_len: usize,
+    control_limit: u32,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = decision_environment(0, 0, "accept");
+    environment.extend([
+        (
+            OsString::from("NATIVE_IPC_VNEXT_CONTROL_MODE"),
+            OsString::from(mode),
+        ),
+        (
+            OsString::from("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN"),
+            OsString::from(coordinator_len.to_string()),
+        ),
+        (
+            OsString::from("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN"),
+            OsString::from(receiver_len.to_string()),
+        ),
+        (
+            OsString::from("NATIVE_IPC_VNEXT_CONTROL_LIMIT"),
+            OsString::from(control_limit.to_string()),
+        ),
+    ]);
+    environment
+}
+
+fn accepted_control(
+    mode: &str,
+    coordinator_len: usize,
+    receiver_len: usize,
+    control_limit: u32,
+) -> (CoordinatorAcceptedControl, libc::pid_t) {
+    let mut offer = hello_offer(0);
+    offer.limits.max_control_payload_bytes = control_limit;
+    let owner = spawn_negotiating(
+        &std::env::current_exe().unwrap(),
+        &helper_arguments(),
+        &control_environment(mode, coordinator_len, receiver_len, control_limit),
+        offer,
+        deadline(),
+    )
+    .unwrap();
+    let pid = owner.pid();
+    let accepted = match owner.decide(ApplicationDecision::Accept).unwrap() {
+        DecisionOutcome::Accepted(accepted) => accepted,
+        DecisionOutcome::Rejected { .. } => panic!("accepted control negotiation rejected"),
+    };
+    let evidence = accepted.into_evidence().unwrap();
+    (evidence.into_control().unwrap(), pid)
+}
+
+#[test]
+#[ignore = "spawned alone by accepted_native_control_is_bounded_authenticated_and_role_scoped"]
+fn isolated_accepted_native_control_is_bounded_authenticated_and_role_scoped() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+
+    for length in [0, MAX_LINUX_CONTROL_PAYLOAD as usize] {
+        let (mut control, pid) =
+            accepted_control("echo", length, length, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.try_poll_peer().unwrap(), PeerState::Running);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control
+            .send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: vec![0x41; length],
+                },
+                deadline(),
+            )
+            .unwrap();
+        let received = control.receive(deadline()).unwrap();
+        assert_eq!(received.kind, APPLICATION_CONTROL_KIND);
+        assert_eq!(received.payload, vec![0x52; length]);
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for mode in ["rights", "truncated", "oversize", "wrong-credentials"] {
+        let limit = if mode == "oversize" {
+            8
+        } else {
+            MAX_LINUX_CONTROL_PAYLOAD
+        };
+        let (mut control, pid) = accepted_control(mode, 0, 0, limit);
+        assert!(control.receive(deadline()).is_err(), "mode {mode}");
+        assert_eq!(
+            control.receive(deadline()),
+            Err(AcceptedControlError::Control(ControlError::Poisoned)),
+            "mode {mode} did not poison persistently"
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let (mut replay, pid) = accepted_control("replay", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+    assert_eq!(replay.receive(deadline()).unwrap().payload, vec![0x5a]);
+    assert_eq!(
+        replay.receive(deadline()),
+        Err(AcceptedControlError::Control(ControlError::ReplayOrReorder))
+    );
+    replay.terminate_and_reap(deadline()).unwrap();
+    drop(replay);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let (mut silent, pid) = accepted_control("silent", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+    let short_deadline = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        silent.receive(short_deadline),
+        Err(AcceptedControlError::Transport(
+            SessionTransportError::DeadlineExpired
+        ))
+    );
+    silent.terminate_and_reap(deadline()).unwrap();
+    drop(silent);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let (mut exited, pid) = accepted_control("exit", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+    exited
+        .send(
+            &ControlFrame {
+                kind: APPLICATION_CONTROL_KIND,
+                payload: Vec::new(),
+            },
+            deadline(),
+        )
+        .unwrap();
+    let observation_deadline = deadline();
+    loop {
+        if exited.try_poll_peer().unwrap() == PeerState::ExitedUnknown {
+            break;
+        }
+        assert!(!observation_deadline.is_expired());
+        std::thread::yield_now();
+    }
+    exited.terminate_and_reap(deadline()).unwrap();
+    drop(exited);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+}
+
+#[test]
+fn accepted_native_control_is_bounded_authenticated_and_role_scoped() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_accepted_native_control_is_bounded_authenticated_and_role_scoped",
+    );
+}
+
+#[test]
+fn receiver_control_observes_socket_hup_without_inventing_exit_status() {
+    let (peer, receiver) = SeqPacketEndpoint::pair().unwrap();
+    assert_eq!(
+        observe_accepted_control_peer(receiver.fd.as_raw_fd(), None).unwrap(),
+        PeerState::Running
+    );
+    drop(peer);
+    assert_eq!(
+        observe_accepted_control_peer(receiver.fd.as_raw_fd(), None).unwrap(),
+        PeerState::ExitedUnknown
+    );
 }
 
 #[test]

@@ -430,7 +430,7 @@ fn isolated_queued_oversize_and_injected_rights_are_consumed_without_fd_growth()
     );
     assert_eq!(
         receiver.receive_zero_rights(credentials).err().unwrap(),
-        PacketError::Truncated
+        PacketError::RecordTooLarge
     );
     assert!(matches!(
         receiver.receive_zero_rights(credentials),
@@ -447,6 +447,77 @@ fn isolated_queued_oversize_and_injected_rights_are_consumed_without_fd_growth()
     assert_eq!(open_fd_count(), before + 1);
     drop(file);
     assert_eq!(open_fd_count(), before);
+}
+
+#[test]
+fn zero_length_seqpacket_after_peer_close_is_peer_exit() {
+    let (sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let credentials = current_credentials();
+    drop(sender);
+    assert!(matches!(
+        receiver.receive_zero_rights(credentials),
+        Err(PacketError::PeerExited)
+    ));
+}
+
+#[test]
+fn live_peer_zero_length_seqpacket_is_malformed_not_peer_exit() {
+    let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let credentials = current_credentials();
+    // Linux SOCK_SEQPACKET permits an empty record even though the safe
+    // transport deliberately rejects creating one.
+    // SAFETY: the connected socket is live and the empty buffer is not read.
+    assert_eq!(
+        unsafe {
+            libc::send(
+                sender.fd.as_raw_fd(),
+                core::ptr::null(),
+                0,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        0
+    );
+    assert!(matches!(
+        receiver.receive_zero_rights(credentials),
+        Err(PacketError::Truncated)
+    ));
+    sender.send_zero_rights(b"still-live").unwrap();
+    assert_eq!(
+        receiver.receive_zero_rights(credentials).unwrap().bytes,
+        b"still-live"
+    );
+}
+
+#[test]
+fn post_receive_hup_poll_interrupt_is_terminal_without_second_recvmsg() {
+    let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let credentials = current_credentials();
+    // Queue an empty hostile record followed by a valid sentinel. If the
+    // post-consumption poll EINTR were exposed as retryable, one receive call
+    // would silently consume both records.
+    // SAFETY: the connected socket is live and the empty buffer is not read.
+    assert_eq!(
+        unsafe {
+            libc::send(
+                sender.fd.as_raw_fd(),
+                core::ptr::null(),
+                0,
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        0
+    );
+    sender.send_zero_rights(b"sentinel").unwrap();
+    receiver.post_receive_poll_errno = Some(libc::EINTR);
+    assert!(matches!(
+        receiver.receive_zero_rights(credentials),
+        Err(PacketError::Native(errno)) if errno == libc::EINTR
+    ));
+    assert_eq!(
+        receiver.receive_zero_rights(credentials).unwrap().bytes,
+        b"sentinel"
+    );
 }
 
 #[test]
@@ -745,7 +816,7 @@ fn truncated_ancillary_closes_every_fd_that_the_kernel_installed() {
     send_unchecked_rights(&sender, b"packet", &descriptors);
     assert!(matches!(
         receive_until(&mut receiver, 6, current_credentials(), MAX_PACKET_FDS),
-        Err(PacketError::Truncated)
+        Err(PacketError::MalformedAncillary)
     ));
     assert_eq!(open_fd_count(), before);
 }
@@ -760,7 +831,7 @@ fn truncated_payload_closes_rights_installed_before_msg_trunc_is_reported() {
     send_unchecked_rights(&sender, &bytes, &[file.as_raw_fd()]);
     assert!(matches!(
         receive_until(&mut receiver, CONTROL_FRAME_LEN, current_credentials(), 1),
-        Err(PacketError::Truncated)
+        Err(PacketError::RecordTooLarge)
     ));
     assert_eq!(open_fd_count(), before);
 }

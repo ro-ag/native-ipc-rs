@@ -9,9 +9,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::backend::accepted_control::AcceptedControlDispatcher;
 use crate::backend::{
-    CoordinatorAcceptedEvidence, CoordinatorChildChannelReceipt, CoordinatorChildImageReceipt,
-    ReceiverSpawnerEvidence, SpawnIdentityFacts,
+    AuthenticatedZeroRightsTransport, CoordinatorAcceptedEvidence, CoordinatorChildChannelReceipt,
+    CoordinatorChildImageReceipt, OwnedChildLifecycle, PeerState, ReceiverSpawnerEvidence,
+    SessionTransportError, SpawnIdentityFacts, sealed,
 };
 use crate::control::CONTROL_HEADER_LEN;
 use crate::negotiation::{
@@ -158,17 +160,39 @@ struct AcceptedLinuxReceiver {
 
 struct CoordinatorAcceptedEvidenceOwner {
     lifecycle: Option<ExactChildLifecycle>,
-    _endpoint: SeqPacketEndpoint,
-    _executable: HeldExecutable,
-    _evidence: CoordinatorAcceptedEvidence,
+    endpoint: SeqPacketEndpoint,
+    executable: HeldExecutable,
+    evidence: CoordinatorAcceptedEvidence,
+    deadline: AbsoluteDeadline,
     not_sync: PhantomData<Cell<()>>,
 }
 
 struct ReceiverAcceptedEvidenceOwner {
-    _endpoint: SeqPacketEndpoint,
-    _evidence: ReceiverSpawnerEvidence,
+    endpoint: SeqPacketEndpoint,
+    evidence: ReceiverSpawnerEvidence,
     not_sync: PhantomData<Cell<()>>,
 }
+
+struct CoordinatorLinuxControlTransport {
+    lifecycle: Option<ExactChildLifecycle>,
+    endpoint: SeqPacketEndpoint,
+    _executable: HeldExecutable,
+    _evidence: CoordinatorAcceptedEvidence,
+    peer: PacketCredentials,
+    poisoned: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct ReceiverLinuxControlTransport {
+    endpoint: SeqPacketEndpoint,
+    _evidence: ReceiverSpawnerEvidence,
+    peer: PacketCredentials,
+    poisoned: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+type CoordinatorAcceptedControl = AcceptedControlDispatcher<CoordinatorLinuxControlTransport>;
+type ReceiverAcceptedControl = AcceptedControlDispatcher<ReceiverLinuxControlTransport>;
 
 struct ReceiverDecisionPending {
     endpoint: SeqPacketEndpoint,
@@ -525,9 +549,10 @@ impl AcceptedLinuxSpawn {
         };
         Ok(CoordinatorAcceptedEvidenceOwner {
             lifecycle: self.lifecycle.take(),
-            _endpoint: self.endpoint,
-            _executable: self.executable,
-            _evidence: evidence,
+            endpoint: self.endpoint,
+            executable: self.executable,
+            evidence,
+            deadline: self.deadline,
             not_sync: PhantomData,
         })
     }
@@ -554,8 +579,8 @@ impl AcceptedLinuxReceiver {
         let evidence = unsafe { ReceiverSpawnerEvidence::from_verified_native(facts, transcript) }
             .map_err(|_| LinuxSpawnError::InvalidInput)?;
         Ok(ReceiverAcceptedEvidenceOwner {
-            _endpoint: self.endpoint,
-            _evidence: evidence,
+            endpoint: self.endpoint,
+            evidence,
             not_sync: PhantomData,
         })
     }
@@ -567,7 +592,7 @@ impl CoordinatorAcceptedEvidenceOwner {
     }
 
     fn facts(&self) -> SpawnIdentityFacts {
-        self._evidence.facts()
+        self.evidence.facts()
     }
 
     fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
@@ -575,11 +600,331 @@ impl CoordinatorAcceptedEvidenceOwner {
             let _ = lifecycle.terminate_and_reap(deadline);
         }
     }
+
+    fn into_control(self) -> Result<CoordinatorAcceptedControl, LinuxSpawnError> {
+        let facts = self.evidence.facts();
+        let (nonce, maximum_payload) = self.evidence.control_parameters();
+        let transport = CoordinatorLinuxControlTransport {
+            lifecycle: self.lifecycle,
+            endpoint: self.endpoint,
+            _executable: self.executable,
+            _evidence: self.evidence,
+            peer: PacketCredentials {
+                pid: facts.child_pid(),
+                uid: facts.child_uid(),
+                gid: facts.child_gid(),
+            },
+            poisoned: false,
+            not_sync: PhantomData,
+        };
+        match AcceptedControlDispatcher::new(transport, nonce, maximum_payload) {
+            Ok(dispatcher) => Ok(dispatcher),
+            Err(mut transport) => {
+                let _ = transport.terminate_and_reap(self.deadline);
+                Err(LinuxSpawnError::InvalidInput)
+            }
+        }
+    }
 }
 
 impl ReceiverAcceptedEvidenceOwner {
     fn facts(&self) -> SpawnIdentityFacts {
-        self._evidence.facts()
+        self.evidence.facts()
+    }
+
+    fn into_control(self) -> Result<ReceiverAcceptedControl, LinuxSpawnError> {
+        let facts = self.evidence.facts();
+        let (nonce, maximum_payload) = self.evidence.control_parameters();
+        let transport = ReceiverLinuxControlTransport {
+            endpoint: self.endpoint,
+            _evidence: self.evidence,
+            peer: PacketCredentials {
+                pid: facts.parent_pid(),
+                uid: facts.parent_uid(),
+                gid: facts.parent_gid(),
+            },
+            poisoned: false,
+            not_sync: PhantomData,
+        };
+        AcceptedControlDispatcher::new(transport, nonce, maximum_payload)
+            .map_err(|_| LinuxSpawnError::InvalidInput)
+    }
+}
+
+impl sealed::Sealed for CoordinatorLinuxControlTransport {}
+impl sealed::Sealed for ReceiverLinuxControlTransport {}
+
+impl AuthenticatedZeroRightsTransport for CoordinatorLinuxControlTransport {
+    fn send_record(
+        &mut self,
+        bytes: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        let pidfd = self
+            .lifecycle
+            .as_ref()
+            .ok_or(SessionTransportError::PeerExited)?
+            .pidfd();
+        send_accepted_control_record(
+            &mut self.endpoint,
+            Some(pidfd),
+            &mut self.poisoned,
+            bytes,
+            deadline,
+        )
+    }
+
+    fn receive_record(
+        &mut self,
+        maximum: usize,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Vec<u8>, SessionTransportError> {
+        let pidfd = self
+            .lifecycle
+            .as_ref()
+            .ok_or(SessionTransportError::PeerExited)?
+            .pidfd();
+        receive_accepted_control_record(
+            &mut self.endpoint,
+            Some(pidfd),
+            self.peer,
+            &mut self.poisoned,
+            maximum,
+            deadline,
+        )
+    }
+
+    fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
+        if self.poisoned {
+            return Err(SessionTransportError::Native);
+        }
+        let pidfd = self
+            .lifecycle
+            .as_ref()
+            .ok_or(SessionTransportError::PeerExited)?
+            .pidfd();
+        observe_accepted_control_peer(self.endpoint.fd.as_raw_fd(), Some(pidfd))
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+    }
+}
+
+impl OwnedChildLifecycle for CoordinatorLinuxControlTransport {
+    fn terminate_and_reap(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.poisoned = true;
+        let lifecycle = self
+            .lifecycle
+            .take()
+            .ok_or(SessionTransportError::PeerExited)?;
+        let cleanup = lifecycle.terminate_and_reap(deadline);
+        if cleanup.direct_child_complete() {
+            Ok(())
+        } else if cleanup.last_native_error().is_some() {
+            Err(SessionTransportError::Native)
+        } else {
+            Err(SessionTransportError::DeadlineExpired)
+        }
+    }
+}
+
+impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
+    fn send_record(
+        &mut self,
+        bytes: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        send_accepted_control_record(
+            &mut self.endpoint,
+            None,
+            &mut self.poisoned,
+            bytes,
+            deadline,
+        )
+    }
+
+    fn receive_record(
+        &mut self,
+        maximum: usize,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Vec<u8>, SessionTransportError> {
+        receive_accepted_control_record(
+            &mut self.endpoint,
+            None,
+            self.peer,
+            &mut self.poisoned,
+            maximum,
+            deadline,
+        )
+    }
+
+    fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
+        if self.poisoned {
+            return Err(SessionTransportError::Native);
+        }
+        observe_accepted_control_peer(self.endpoint.fd.as_raw_fd(), None)
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+    }
+}
+
+fn send_accepted_control_record(
+    endpoint: &mut SeqPacketEndpoint,
+    peer_pidfd: Option<RawFd>,
+    poisoned: &mut bool,
+    bytes: &[u8],
+    deadline: AbsoluteDeadline,
+) -> Result<(), SessionTransportError> {
+    if *poisoned {
+        return Err(SessionTransportError::Native);
+    }
+    if bytes.is_empty() || bytes.len() > MAX_ZERO_RIGHTS_PACKET_BYTES {
+        return Err(SessionTransportError::RecordTooLarge);
+    }
+    loop {
+        if let Some(pidfd) = peer_pidfd {
+            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
+        } else if deadline.is_expired() {
+            return Err(SessionTransportError::DeadlineExpired);
+        }
+        match endpoint.send_zero_rights(bytes) {
+            Ok(()) => {
+                if deadline.is_expired() {
+                    *poisoned = true;
+                    return Err(SessionTransportError::DeadlineExpired);
+                }
+                return Ok(());
+            }
+            Err(PacketError::Interrupted) => continue,
+            Err(PacketError::WouldBlock) => {
+                poll_accepted_control(
+                    endpoint.fd.as_raw_fd(),
+                    peer_pidfd,
+                    libc::POLLOUT,
+                    deadline,
+                )?;
+            }
+            Err(error) => return Err(map_packet_transport_error(error)),
+        }
+    }
+}
+
+fn receive_accepted_control_record(
+    endpoint: &mut SeqPacketEndpoint,
+    peer_pidfd: Option<RawFd>,
+    peer: PacketCredentials,
+    poisoned: &mut bool,
+    maximum: usize,
+    deadline: AbsoluteDeadline,
+) -> Result<Vec<u8>, SessionTransportError> {
+    if *poisoned {
+        return Err(SessionTransportError::Native);
+    }
+    if maximum == 0 || maximum > MAX_ZERO_RIGHTS_PACKET_BYTES {
+        return Err(SessionTransportError::RecordTooLarge);
+    }
+    loop {
+        if let Some(pidfd) = peer_pidfd {
+            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
+        } else if deadline.is_expired() {
+            return Err(SessionTransportError::DeadlineExpired);
+        }
+        match endpoint.receive_zero_rights_bounded(maximum, peer) {
+            Ok(packet) => {
+                if deadline.is_expired() {
+                    *poisoned = true;
+                    return Err(SessionTransportError::DeadlineExpired);
+                }
+                debug_assert!(packet.descriptors.is_empty());
+                debug_assert_eq!(packet.credentials, peer);
+                return Ok(packet.bytes);
+            }
+            Err(PacketError::Interrupted) => continue,
+            Err(PacketError::WouldBlock) => {
+                poll_accepted_control(endpoint.fd.as_raw_fd(), peer_pidfd, libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(map_packet_transport_error(error)),
+        }
+    }
+}
+
+fn poll_accepted_control(
+    socket: RawFd,
+    peer_pidfd: Option<RawFd>,
+    requested: libc::c_short,
+    deadline: AbsoluteDeadline,
+) -> Result<(), SessionTransportError> {
+    match peer_pidfd {
+        Some(pidfd) => super::poll_until(socket, pidfd, requested, deadline)
+            .map_err(map_packet_transport_error),
+        None => poll_socket(socket, requested, deadline).map_err(map_spawn_transport_error),
+    }
+}
+
+fn observe_accepted_control_peer(
+    socket: RawFd,
+    peer_pidfd: Option<RawFd>,
+) -> Result<PeerState, SessionTransportError> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: socket,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: peer_pidfd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let count = if peer_pidfd.is_some() { 2 } else { 1 };
+    // SAFETY: `count` selects initialized entries from the live array.
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), count, 0) };
+    if result < 0 {
+        return Err(SessionTransportError::Native);
+    }
+    if descriptors[0].revents & libc::POLLNVAL != 0 {
+        return Err(SessionTransportError::Native);
+    }
+    if descriptors[0].revents & (libc::POLLERR | libc::POLLHUP) != 0
+        || (peer_pidfd.is_some() && descriptors[1].revents != 0)
+    {
+        return Ok(PeerState::ExitedUnknown);
+    }
+    Ok(PeerState::Running)
+}
+
+fn map_packet_transport_error(error: PacketError) -> SessionTransportError {
+    match error {
+        PacketError::DeadlineExpired => SessionTransportError::DeadlineExpired,
+        PacketError::PeerExited => SessionTransportError::PeerExited,
+        PacketError::WrongPeer => SessionTransportError::IdentityMismatch,
+        PacketError::RecordTooLarge => SessionTransportError::RecordTooLarge,
+        PacketError::InvalidInput
+        | PacketError::Truncated
+        | PacketError::MalformedAncillary
+        | PacketError::WrongDescriptorCount => SessionTransportError::MalformedRecord,
+        PacketError::WouldBlock
+        | PacketError::Interrupted
+        | PacketError::AmbiguousAfterSend
+        | PacketError::AmbiguousAfterReceive
+        | PacketError::Poisoned
+        | PacketError::Native(_) => SessionTransportError::Native,
+    }
+}
+
+fn map_spawn_transport_error(error: LinuxSpawnError) -> SessionTransportError {
+    match error {
+        LinuxSpawnError::DeadlineExpired => SessionTransportError::DeadlineExpired,
+        LinuxSpawnError::ExitedBeforeConfirmation => SessionTransportError::PeerExited,
+        LinuxSpawnError::Packet(error) => map_packet_transport_error(error),
+        _ => SessionTransportError::Native,
     }
 }
 

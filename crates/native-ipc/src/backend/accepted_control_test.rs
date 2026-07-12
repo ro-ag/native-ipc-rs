@@ -109,8 +109,9 @@ fn frame(kind_offset: u32, payload: &[u8]) -> ControlFrame {
 
 fn dispatcher(maximum: u32) -> (AcceptedControlDispatcher<MockTransport>, MockHandle) {
     let handle = MockHandle::default();
-    let dispatcher =
-        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, maximum).unwrap();
+    let dispatcher = AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, maximum)
+        .ok()
+        .unwrap();
     (dispatcher, handle)
 }
 
@@ -323,7 +324,9 @@ fn queued_valid_application_record_is_not_drained_on_construction() {
     let handle = MockHandle::default();
     enqueue(&handle, encode(NONCE, MAXIMUM, &frame(0, b"queued")));
     let mut dispatcher =
-        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM).unwrap();
+        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM)
+            .ok()
+            .unwrap();
     assert_eq!(handle.0.lock().unwrap().receive_calls, 0);
     assert_eq!(dispatcher.receive(deadline()).unwrap(), frame(0, b"queued"));
 }
@@ -358,7 +361,9 @@ fn canonical_record_bound_is_header_plus_negotiated_payload() {
     enqueue(&handle, vec![0; CONTROL_HEADER_LEN + MAXIMUM as usize + 1]);
     handle.0.lock().unwrap().return_oversized_success = true;
     let mut dispatcher =
-        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM).unwrap();
+        AcceptedControlDispatcher::new(MockTransport(handle.clone()), NONCE, MAXIMUM)
+            .ok()
+            .unwrap();
     assert_eq!(
         dispatcher.receive(deadline()),
         Err(AcceptedControlError::Transport(

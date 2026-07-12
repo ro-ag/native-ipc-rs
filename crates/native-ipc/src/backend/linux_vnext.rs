@@ -95,6 +95,7 @@ enum PacketError {
     WouldBlock,
     Interrupted,
     Truncated,
+    RecordTooLarge,
     MalformedAncillary,
     WrongPeer,
     WrongDescriptorCount,
@@ -147,6 +148,8 @@ impl ReceivedAncillary {
 struct SeqPacketEndpoint {
     fd: OwnedFd,
     not_sync: PhantomData<Cell<()>>,
+    #[cfg(test)]
+    post_receive_poll_errno: Option<i32>,
 }
 
 struct ProcessBoundEndpoint {
@@ -188,6 +191,8 @@ impl SeqPacketEndpoint {
         Self {
             fd,
             not_sync: PhantomData,
+            #[cfg(test)]
+            post_receive_poll_errno: None,
         }
     }
 
@@ -297,7 +302,15 @@ impl SeqPacketEndpoint {
         &mut self,
         expected_peer: PacketCredentials,
     ) -> Result<ReceivedPacket, PacketError> {
-        self.receive_bounded(MAX_ZERO_RIGHTS_PACKET_BYTES, None, expected_peer, 0)
+        self.receive_zero_rights_bounded(MAX_ZERO_RIGHTS_PACKET_BYTES, expected_peer)
+    }
+
+    fn receive_zero_rights_bounded(
+        &mut self,
+        capacity: usize,
+        expected_peer: PacketCredentials,
+    ) -> Result<ReceivedPacket, PacketError> {
+        self.receive_bounded(capacity, None, expected_peer, 0)
     }
 
     fn receive_bounded(
@@ -347,10 +360,23 @@ impl SeqPacketEndpoint {
         // installed every nonnegative SCM_RIGHTS descriptor in this process.
         let ancillary = unsafe { adopt_received_ancillary(&message, control_len)? };
 
-        if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-            return Err(PacketError::Truncated);
+        if message.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(PacketError::MalformedAncillary);
         }
-        if received == 0 || expected_len.is_some_and(|expected| received as usize != expected) {
+        if message.msg_flags & libc::MSG_TRUNC != 0 {
+            return Err(PacketError::RecordTooLarge);
+        }
+        if received == 0 {
+            return Err(if self.socket_has_hung_up()? {
+                PacketError::PeerExited
+            } else {
+                // SOCK_SEQPACKET permits a live peer to enqueue an empty
+                // record. Consuming one is malformed input, not proof that
+                // the peer exited.
+                PacketError::Truncated
+            });
+        }
+        if expected_len.is_some_and(|expected| received as usize != expected) {
             return Err(PacketError::Truncated);
         }
         let (descriptors, credentials) = ancillary.validate(expected_peer, expected_descriptors)?;
@@ -360,6 +386,31 @@ impl SeqPacketEndpoint {
             descriptors,
             credentials,
         })
+    }
+
+    fn socket_has_hung_up(&mut self) -> Result<bool, PacketError> {
+        #[cfg(test)]
+        if let Some(errno) = self.post_receive_poll_errno.take() {
+            return Err(PacketError::Native(errno));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is a live pollfd for the duration of the call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            // recvmsg already consumed the empty hostile record. In particular,
+            // EINTR here is terminal and must never make a caller retry receive.
+            return Err(PacketError::Native(
+                io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+            ));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(PacketError::Native(libc::EBADF));
+        }
+        Ok(descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0)
     }
 }
 

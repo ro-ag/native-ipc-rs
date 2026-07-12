@@ -130,6 +130,13 @@ impl CoordinatorAcceptedEvidence {
     pub(crate) const fn facts(&self) -> SpawnIdentityFacts {
         self.facts
     }
+
+    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
+        (
+            self.transcript.nonce(),
+            self.transcript.effective_limits().max_control_payload_bytes,
+        )
+    }
 }
 
 /// Receiver-only evidence of the authenticated trusted spawning coordinator.
@@ -162,6 +169,13 @@ impl ReceiverSpawnerEvidence {
 
     pub(crate) const fn facts(&self) -> SpawnIdentityFacts {
         self.facts
+    }
+
+    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
+        (
+            self.transcript.nonce(),
+            self.transcript.effective_limits().max_control_payload_bytes,
+        )
     }
 }
 
