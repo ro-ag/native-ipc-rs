@@ -79,3 +79,21 @@ The public constants in `session` define the implementation's finite maxima:
 16 TiB active bytes, 2^48 transactions, and independent 16 MiB bootstrap and
 application-control payload maxima. These bounds are checked before native
 import or allocation and may only change with a reviewed wire/API revision.
+
+## Application control framing
+
+Application control uses magic `NIPCAPP1`, exact wire version 1.0, and a
+72-byte little-endian fixed header: magic `[u8; 8]`; major and minor `u16`;
+header length `u32`; complete frame length `u32`; payload length `u32`; kind
+`u32`; zero flags `u32`; session nonce `[u8; 32]`; and per-direction sequence
+`u64`. The opaque payload follows immediately. Application kinds occupy
+`0x8000_0000..=u32::MAX`; lower values remain disjoint native protocol kinds.
+
+The private decoder validates the fixed header, negotiated/hard payload bound,
+nonce, and exact next sequence before payload allocation or transport read. A
+borrow-bound pending-receive guard poisons on every unsuccessful finish or
+Drop. Successful exact payload finalization allocates once and advances the
+receive sequence once. Send and receive sequences are independent; exhaustion,
+replay/reorder, malformed peer input, partial receive, and transaction conflict
+are terminal. Public control APIs remain unavailable until authenticated Ready
+session construction exists.
