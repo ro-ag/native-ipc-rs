@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 assert_impl_all!(TransferBatch: Send);
 assert_not_impl_any!(TransferBatch: Sync, Clone);
+assert_impl_all!(ExpectedBatch: Send);
+assert_not_impl_any!(ExpectedBatch: Clone);
 assert_impl_all!(ActiveRegionSet: Send);
 assert_not_impl_any!(ActiveRegionSet: Sync, Clone);
 
@@ -18,6 +20,62 @@ fn prepared(id: u128, writer: WriterEndpoint, bytes: usize) -> PreparedRegion {
             writer,
         })
         .unwrap()
+}
+
+fn expected(id: u128, writer: WriterEndpoint, logical_len: usize) -> ExpectedRegion {
+    ExpectedRegion {
+        id: RegionId::new(id).unwrap(),
+        writer,
+        logical_len,
+    }
+}
+
+#[test]
+fn expected_batch_is_complete_canonical_metadata_before_receipt() {
+    let batch = ExpectedBatch::try_from_specs(vec![
+        expected(4, WriterEndpoint::Receiver, 17),
+        expected(1, WriterEndpoint::Coordinator, 3),
+        expected(2, WriterEndpoint::Coordinator, 5),
+    ])
+    .unwrap();
+    assert_eq!(batch.len(), 3);
+    assert_eq!(batch.total_logical, 25);
+    assert_eq!(
+        batch
+            .regions
+            .iter()
+            .map(|region| region.id.get())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4]
+    );
+    assert_eq!(batch.regions[2].writer, WriterEndpoint::Receiver);
+}
+
+#[test]
+fn expected_batch_rejects_empty_zero_duplicate_and_seventeen() {
+    assert!(matches!(
+        ExpectedBatch::try_from_specs(Vec::new()),
+        Err(BatchError::Empty)
+    ));
+    assert!(matches!(
+        ExpectedBatch::try_from_specs(vec![expected(1, WriterEndpoint::Coordinator, 0)]),
+        Err(BatchError::InvalidRegionLength)
+    ));
+    assert!(matches!(
+        ExpectedBatch::try_from_specs(vec![
+            expected(1, WriterEndpoint::Coordinator, 1),
+            expected(1, WriterEndpoint::Receiver, 1),
+        ]),
+        Err(BatchError::DuplicateRegionId(id)) if id == RegionId::new(1).unwrap()
+    ));
+    assert!(matches!(
+        ExpectedBatch::try_from_specs(
+            (1..=17)
+                .map(|id| expected(id, WriterEndpoint::Coordinator, 1))
+                .collect()
+        ),
+        Err(BatchError::TooManyRegions)
+    ));
 }
 
 struct ReadOwner(Box<[u8]>);

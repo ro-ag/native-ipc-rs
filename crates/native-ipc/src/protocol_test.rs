@@ -51,6 +51,45 @@ fn capability_frame_has_the_only_native_capability_magic() {
 }
 
 #[test]
+fn capability_frame_decode_requires_canonical_structure_and_reserved_bytes() {
+    let manifest = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1), entry(2)],
+    )
+    .unwrap();
+    let frame = CapabilityFrame::from_manifest(&manifest);
+    let (decoded, decoded_manifest) = CapabilityFrame::decode(frame.as_bytes()).unwrap();
+    assert_eq!(decoded.as_bytes(), frame.as_bytes());
+    assert_eq!(decoded_manifest.entries(), manifest.entries());
+    assert_eq!(decoded_manifest.total_logical(), 8192);
+    assert_eq!(decoded_manifest.total_mapped(), 8192);
+    assert_eq!(
+        decoded_manifest.authority_profile(),
+        NativeAuthorityProfile::LinuxMdweV1
+    );
+
+    for offset in [0, 8, 12, 64, 68, 72, 80, 88, 148, 152, 154, 156, 224] {
+        let mut wrong = *frame.as_bytes();
+        wrong[offset] ^= 1;
+        assert!(CapabilityFrame::decode(&wrong).is_none(), "offset {offset}");
+    }
+    for offset in [16, 48, 52, 56, 76, 112, 144, 160] {
+        let mut substituted = *frame.as_bytes();
+        substituted[offset] ^= 1;
+        let (decoded, _) = CapabilityFrame::decode(&substituted).unwrap();
+        assert_eq!(decoded.as_bytes(), &substituted, "offset {offset}");
+    }
+    assert!(CapabilityFrame::decode(&frame.as_bytes()[..CONTROL_FRAME_LEN - 1]).is_none());
+    let mut oversized = frame.as_bytes().to_vec();
+    oversized.push(0);
+    assert!(CapabilityFrame::decode(&oversized).is_none());
+}
+
+#[test]
 fn vnext_authority_profile_is_exactly_transcript_bound() {
     let legacy = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
     let linux = TransferManifest::new_with_authority(

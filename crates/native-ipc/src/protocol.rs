@@ -151,9 +151,60 @@ impl CapabilityFrame {
     pub(crate) const fn capability_count(&self) -> usize {
         self.capability_count
     }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, TransferManifest)> {
+        let manifest = TransferManifest::decode(CAPABILITY_MAGIC, bytes)?;
+        Some((Self::from_manifest(&manifest), manifest))
+    }
 }
 
 impl TransferManifest {
+    fn decode(magic: [u8; 8], frame: &[u8]) -> Option<Self> {
+        if frame.len() != CONTROL_FRAME_LEN
+            || frame[..8] != magic
+            || u32::from_le_bytes(frame[8..12].try_into().ok()?) != CONTROL_VERSION
+        {
+            return None;
+        }
+        let count = usize::try_from(u32::from_le_bytes(frame[12..16].try_into().ok()?)).ok()?;
+        if !(1..=MAX_TRANSFER_ENTRIES).contains(&count) {
+            return None;
+        }
+        let authority_profile = match u32::from_le_bytes(frame[76..80].try_into().ok()?) {
+            0 => NativeAuthorityProfile::Legacy,
+            1 => NativeAuthorityProfile::LinuxMdweV1,
+            _ => return None,
+        };
+        let mut entries = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = 96 + index * ENTRY_LEN;
+            let access = match u32::from_le_bytes(frame[start + 52..start + 56].try_into().ok()?) {
+                1 => PeerAccess::ReadOnly,
+                2 => PeerAccess::SoleWriter,
+                _ => return None,
+            };
+            entries.push(ManifestEntry {
+                region_id: u128::from_le_bytes(frame[start..start + 16].try_into().ok()?),
+                incarnation: frame[start + 16..start + 32].try_into().ok()?,
+                logical_len: u64::from_le_bytes(frame[start + 32..start + 40].try_into().ok()?),
+                mapped_len: u64::from_le_bytes(frame[start + 40..start + 48].try_into().ok()?),
+                writer: u32::from_le_bytes(frame[start + 48..start + 52].try_into().ok()?),
+                access,
+                ordinal: u16::from_le_bytes(frame[start + 56..start + 58].try_into().ok()?),
+                flags: u16::from_le_bytes(frame[start + 58..start + 60].try_into().ok()?),
+            });
+        }
+        let manifest = Self::new_with_authority(
+            frame[16..48].try_into().ok()?,
+            u32::from_le_bytes(frame[48..52].try_into().ok()?),
+            u32::from_le_bytes(frame[52..56].try_into().ok()?),
+            u64::from_le_bytes(frame[56..64].try_into().ok()?),
+            authority_profile,
+            entries,
+        )?;
+        (manifest.encode(magic).as_slice() == frame).then_some(manifest)
+    }
+
     pub(crate) fn new(
         nonce: [u8; 32],
         parent_pid: u32,
@@ -271,6 +322,26 @@ impl TransferManifest {
                 .entries
                 .iter()
                 .all(|entry| entry.logical_len <= limits.max_region_bytes)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn authority_profile(&self) -> NativeAuthorityProfile {
+        self.authority_profile
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn total_logical(&self) -> u64 {
+        self.total_logical
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn total_mapped(&self) -> u64 {
+        self.total_mapped
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
     }
 
     #[allow(dead_code)] // macOS compares the same fixed transcript in Mach receive validation.
