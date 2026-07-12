@@ -169,6 +169,12 @@ cleaned child; it therefore mints no image, channel, session, or memory
 authority. Future bootstrap-fd collision policy and native AMD64/Arm64 evidence
 also remain required.
 
+The extended scaffold passed native Linux AMD64/Arm64 and Linux AMD64 ASan at
+commit `cd38c26` in CI run
+[`29182825256`](https://github.com/ro-ag/native-ipc-rs/actions/runs/29182825256).
+That evidence validates this private mechanism checkpoint only; it does not
+remove the production lifecycle, authenticated HELLO, or bootstrap-fd blockers.
+
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;
 PID/path checks or a leak-prone probe are not substitutes.
