@@ -40,6 +40,16 @@ fn canonical_manifest_is_fixed_width_sorted_and_exact() {
 }
 
 #[test]
+fn capability_frame_has_the_only_native_capability_magic() {
+    let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
+    let frame = CapabilityFrame::from_manifest(&manifest);
+    assert_eq!(&frame.as_bytes()[..8], &CAPABILITY_MAGIC);
+    assert_eq!(frame.capability_count(), 1);
+    assert_ne!(&frame.as_bytes()[..8], b"NIPCAPP1");
+    assert!(manifest.matches_frame(CAPABILITY_MAGIC, frame.as_bytes()));
+}
+
+#[test]
 fn exact_frame_rejects_every_transcript_field_and_size_change() {
     let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1), entry(2)]).unwrap();
     let magic = *b"NIPCTEST";

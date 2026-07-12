@@ -5,6 +5,7 @@
 )]
 
 use crate::negotiation::AcceptedTranscriptFacts;
+use crate::protocol::CapabilityFrame;
 use crate::session::AbsoluteDeadline;
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -226,6 +227,39 @@ pub(crate) trait AuthenticatedZeroRightsTransport: sealed::Sealed {
     /// Permanently invalidates the transport. Every later I/O operation must
     /// fail immediately without touching native state.
     fn poison(&mut self);
+}
+
+/// Coordinator-only capability-record send operation on the accepted owner.
+///
+/// The associated value is backend-owned borrowed authority. Implementations
+/// must send exactly one canonical capability record with 1..=16 native
+/// capabilities under the supplied absolute deadline.
+pub(crate) trait CoordinatorCapabilityTransport: AuthenticatedZeroRightsTransport {
+    type Capabilities<'a>
+    where
+        Self: 'a;
+
+    fn send_capability_record(
+        &mut self,
+        frame: &CapabilityFrame,
+        capabilities: Self::Capabilities<'_>,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError>;
+}
+
+/// Receiver-only capability-record receive operation on the accepted owner.
+///
+/// The returned backend value must immediately own every installed native
+/// capability and keep it transaction-bound until that value is destroyed or
+/// consumed by a later complete import state machine.
+pub(crate) trait ReceiverCapabilityTransport: AuthenticatedZeroRightsTransport {
+    type ReceivedCapabilities;
+
+    fn receive_capability_record(
+        &mut self,
+        expected: &CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self::ReceivedCapabilities, SessionTransportError>;
 }
 
 /// Coordinator-only owned-child lifecycle operations.

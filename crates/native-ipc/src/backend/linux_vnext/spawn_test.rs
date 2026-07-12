@@ -1,6 +1,7 @@
 use super::*;
 use crate::backend::accepted_control::AcceptedControlError;
 use crate::control::{ControlError, ControlFrame, ControlState};
+use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -27,10 +28,10 @@ assert_impl_all!(CoordinatorAcceptedEvidenceOwner: Send);
 assert_not_impl_any!(CoordinatorAcceptedEvidenceOwner: Sync, Clone);
 assert_impl_all!(ReceiverAcceptedEvidenceOwner: Send);
 assert_not_impl_any!(ReceiverAcceptedEvidenceOwner: Sync, Clone);
-assert_impl_all!(CoordinatorLinuxControlTransport: Send, AuthenticatedZeroRightsTransport, OwnedChildLifecycle);
-assert_not_impl_any!(CoordinatorLinuxControlTransport: Sync, Clone);
-assert_impl_all!(ReceiverLinuxControlTransport: Send, AuthenticatedZeroRightsTransport);
-assert_not_impl_any!(ReceiverLinuxControlTransport: Sync, Clone, OwnedChildLifecycle);
+assert_impl_all!(CoordinatorLinuxControlTransport: Send, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport, OwnedChildLifecycle);
+assert_not_impl_any!(CoordinatorLinuxControlTransport: Sync, Clone, ReceiverCapabilityTransport);
+assert_impl_all!(ReceiverLinuxControlTransport: Send, AuthenticatedZeroRightsTransport, ReceiverCapabilityTransport);
+assert_not_impl_any!(ReceiverLinuxControlTransport: Sync, Clone, CoordinatorCapabilityTransport, OwnedChildLifecycle);
 assert_impl_all!(CoordinatorAcceptedControl: Send);
 assert_not_impl_any!(CoordinatorAcceptedControl: Sync, Clone);
 assert_impl_all!(ReceiverAcceptedControl: Send);
@@ -64,6 +65,28 @@ fn hello_offer(payload_len: usize) -> LinuxHelloOffer {
             ..SessionLimits::default()
         },
         application_payload: (0..payload_len).map(|index| index as u8).collect(),
+    }
+}
+
+fn native_capability_frame(transaction: u64, count: usize) -> CapabilityFrame {
+    let entries = (1..=count)
+        .map(|ordinal| {
+            let native =
+                NativeRegionSpec::new(ordinal as u128, [ordinal as u8; 16], 1, 1, 4096).unwrap();
+            ManifestEntry::from_native(native, PeerAccess::ReadOnly)
+        })
+        .collect();
+    let manifest = TransferManifest::new([0x41; 32], 10, 11, transaction, entries).unwrap();
+    CapabilityFrame::from_manifest(&manifest)
+}
+
+fn local_packet_credentials() -> PacketCredentials {
+    PacketCredentials {
+        pid: std::process::id(),
+        // SAFETY: scalar credential queries have no pointer arguments.
+        uid: unsafe { libc::getuid() },
+        // SAFETY: scalar credential queries have no pointer arguments.
+        gid: unsafe { libc::getgid() },
     }
 }
 
@@ -143,6 +166,117 @@ fn linux_control_limit_is_capped_before_both_hellos_and_transcript() {
             .max_control_payload_bytes,
         MAX_LINUX_CONTROL_PAYLOAD
     );
+}
+
+#[test]
+fn accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds() {
+    let credentials = local_packet_credentials();
+    let file = std::fs::File::open("/dev/null").unwrap();
+
+    for count in [1, 2, 16] {
+        let frame = native_capability_frame(count as u64, count);
+        let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+        let raw = vec![file.as_raw_fd(); count];
+        let mut sender_poisoned = false;
+        send_accepted_capability_record(
+            &mut sender,
+            None,
+            &mut sender_poisoned,
+            &frame,
+            &raw,
+            deadline(),
+        )
+        .unwrap();
+        let before_receive = open_fd_count();
+        let mut receiver_poisoned = false;
+        let received = receive_accepted_capability_record(
+            &mut receiver,
+            None,
+            credentials,
+            &mut receiver_poisoned,
+            &frame,
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(received.len(), count);
+        assert_eq!(open_fd_count(), before_receive + count);
+        for descriptor in &received.descriptors {
+            // SAFETY: descriptor is live and F_GETFD has no pointer argument.
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        drop(received);
+        assert_eq!(open_fd_count(), before_receive);
+    }
+
+    let expected = native_capability_frame(21, 1);
+    for count in [0, 2, 16] {
+        let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+        sender
+            .send(expected.as_bytes(), &vec![file.as_raw_fd(); count])
+            .unwrap();
+        let before_receive = open_fd_count();
+        let mut poisoned = false;
+        assert!(matches!(
+            receive_accepted_capability_record(
+                &mut receiver,
+                None,
+                credentials,
+                &mut poisoned,
+                &expected,
+                deadline(),
+            ),
+            Err(SessionTransportError::MalformedRecord)
+        ));
+        assert_eq!(open_fd_count(), before_receive);
+    }
+
+    for hostile in [
+        native_capability_frame(22, 1).as_bytes().to_vec(),
+        b"NIPCAPP1".to_vec(),
+    ] {
+        let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+        sender.send(&hostile, &[file.as_raw_fd()]).unwrap();
+        let before_receive = open_fd_count();
+        let mut poisoned = false;
+        assert!(matches!(
+            receive_accepted_capability_record(
+                &mut receiver,
+                None,
+                credentials,
+                &mut poisoned,
+                &expected,
+                deadline(),
+            ),
+            Err(SessionTransportError::MalformedRecord)
+        ));
+        assert_eq!(open_fd_count(), before_receive);
+    }
+
+    let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    sender
+        .send(expected.as_bytes(), &[file.as_raw_fd()])
+        .unwrap();
+    let wrong = PacketCredentials {
+        pid: credentials.pid.saturating_add(1),
+        ..credentials
+    };
+    let before_receive = open_fd_count();
+    let mut poisoned = false;
+    assert!(matches!(
+        receive_accepted_capability_record(
+            &mut receiver,
+            None,
+            wrong,
+            &mut poisoned,
+            &expected,
+            deadline(),
+        ),
+        Err(SessionTransportError::IdentityMismatch)
+    ));
+    assert_eq!(open_fd_count(), before_receive);
 }
 
 fn open_fd_count() -> usize {

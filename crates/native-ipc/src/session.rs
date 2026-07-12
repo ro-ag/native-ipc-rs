@@ -227,7 +227,7 @@ impl AtomicCapabilities {
 }
 
 /// One monotonic absolute deadline shared by a complete operation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AbsoluteDeadline(Instant);
 
 impl AbsoluteDeadline {

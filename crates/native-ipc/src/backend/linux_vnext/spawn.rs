@@ -5,15 +5,16 @@ use core::marker::PhantomData;
 use std::ffi::{CString, OsString};
 use std::io;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::backend::accepted_control::AcceptedControlDispatcher;
 use crate::backend::{
-    AuthenticatedZeroRightsTransport, CoordinatorAcceptedEvidence, CoordinatorChildChannelReceipt,
-    CoordinatorChildImageReceipt, OwnedChildLifecycle, PeerState, ReceiverSpawnerEvidence,
-    SessionTransportError, SpawnIdentityFacts, sealed,
+    AuthenticatedZeroRightsTransport, CoordinatorAcceptedEvidence, CoordinatorCapabilityTransport,
+    CoordinatorChildChannelReceipt, CoordinatorChildImageReceipt, OwnedChildLifecycle, PeerState,
+    ReceiverCapabilityTransport, ReceiverSpawnerEvidence, SessionTransportError,
+    SpawnIdentityFacts, sealed,
 };
 use crate::control::CONTROL_HEADER_LEN;
 use crate::negotiation::{
@@ -21,6 +22,7 @@ use crate::negotiation::{
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
     decode_frame,
 };
+use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame};
 use crate::session::{AbsoluteDeadline, NegotiationError, SessionLimits};
 
 use super::process::{ExactChildLifecycle, HeldExecutable, PreparedExactChildLifecycle};
@@ -189,6 +191,16 @@ struct ReceiverLinuxControlTransport {
     peer: PacketCredentials,
     poisoned: bool,
     not_sync: PhantomData<Cell<()>>,
+}
+
+struct LinuxReceivedCapabilities {
+    descriptors: Vec<OwnedFd>,
+}
+
+impl LinuxReceivedCapabilities {
+    const fn len(&self) -> usize {
+        self.descriptors.len()
+    }
 }
 
 type CoordinatorAcceptedControl = AcceptedControlDispatcher<CoordinatorLinuxControlTransport>;
@@ -732,6 +744,38 @@ impl OwnedChildLifecycle for CoordinatorLinuxControlTransport {
     }
 }
 
+impl CoordinatorCapabilityTransport for CoordinatorLinuxControlTransport {
+    type Capabilities<'a> = &'a [BorrowedFd<'a>];
+
+    fn send_capability_record(
+        &mut self,
+        frame: &CapabilityFrame,
+        capabilities: Self::Capabilities<'_>,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        let pidfd = self
+            .lifecycle
+            .as_ref()
+            .ok_or(SessionTransportError::PeerExited)?
+            .pidfd();
+        let mut raw = [-1; super::MAX_PACKET_FDS];
+        if capabilities.len() != frame.capability_count() || capabilities.len() > raw.len() {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        for (destination, capability) in raw.iter_mut().zip(capabilities) {
+            *destination = capability.as_raw_fd();
+        }
+        send_accepted_capability_record(
+            &mut self.endpoint,
+            Some(pidfd),
+            &mut self.poisoned,
+            frame,
+            &raw[..capabilities.len()],
+            deadline,
+        )
+    }
+}
+
 impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
     fn send_record(
         &mut self,
@@ -771,6 +815,25 @@ impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
 
     fn poison(&mut self) {
         self.poisoned = true;
+    }
+}
+
+impl ReceiverCapabilityTransport for ReceiverLinuxControlTransport {
+    type ReceivedCapabilities = LinuxReceivedCapabilities;
+
+    fn receive_capability_record(
+        &mut self,
+        expected: &CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self::ReceivedCapabilities, SessionTransportError> {
+        receive_accepted_capability_record(
+            &mut self.endpoint,
+            None,
+            self.peer,
+            &mut self.poisoned,
+            expected,
+            deadline,
+        )
     }
 }
 
@@ -844,6 +907,95 @@ fn receive_accepted_control_record(
                 debug_assert!(packet.descriptors.is_empty());
                 debug_assert_eq!(packet.credentials, peer);
                 return Ok(packet.bytes);
+            }
+            Err(PacketError::Interrupted) => continue,
+            Err(PacketError::WouldBlock) => {
+                poll_accepted_control(endpoint.fd.as_raw_fd(), peer_pidfd, libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(map_packet_transport_error(error)),
+        }
+    }
+}
+
+fn send_accepted_capability_record(
+    endpoint: &mut SeqPacketEndpoint,
+    peer_pidfd: Option<RawFd>,
+    poisoned: &mut bool,
+    frame: &CapabilityFrame,
+    capabilities: &[RawFd],
+    deadline: AbsoluteDeadline,
+) -> Result<(), SessionTransportError> {
+    if *poisoned {
+        return Err(SessionTransportError::Native);
+    }
+    if capabilities.is_empty()
+        || capabilities.len() > super::MAX_PACKET_FDS
+        || capabilities.iter().any(|descriptor| *descriptor < 0)
+    {
+        return Err(SessionTransportError::MalformedRecord);
+    }
+    loop {
+        if let Some(pidfd) = peer_pidfd {
+            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
+        } else if deadline.is_expired() {
+            return Err(SessionTransportError::DeadlineExpired);
+        }
+        match endpoint.send(frame.as_bytes(), capabilities) {
+            Ok(()) => {
+                if deadline.is_expired() {
+                    *poisoned = true;
+                    return Err(SessionTransportError::DeadlineExpired);
+                }
+                return Ok(());
+            }
+            Err(PacketError::Interrupted) => continue,
+            Err(PacketError::WouldBlock) => {
+                poll_accepted_control(
+                    endpoint.fd.as_raw_fd(),
+                    peer_pidfd,
+                    libc::POLLOUT,
+                    deadline,
+                )?;
+            }
+            Err(error) => return Err(map_packet_transport_error(error)),
+        }
+    }
+}
+
+fn receive_accepted_capability_record(
+    endpoint: &mut SeqPacketEndpoint,
+    peer_pidfd: Option<RawFd>,
+    peer: PacketCredentials,
+    poisoned: &mut bool,
+    expected: &CapabilityFrame,
+    deadline: AbsoluteDeadline,
+) -> Result<LinuxReceivedCapabilities, SessionTransportError> {
+    if *poisoned {
+        return Err(SessionTransportError::Native);
+    }
+    if !(1..=super::MAX_PACKET_FDS).contains(&expected.capability_count()) {
+        return Err(SessionTransportError::MalformedRecord);
+    }
+    loop {
+        if let Some(pidfd) = peer_pidfd {
+            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
+        } else if deadline.is_expired() {
+            return Err(SessionTransportError::DeadlineExpired);
+        }
+        match endpoint.receive(CONTROL_FRAME_LEN, peer, expected.capability_count()) {
+            Ok(packet) => {
+                if deadline.is_expired() {
+                    *poisoned = true;
+                    return Err(SessionTransportError::DeadlineExpired);
+                }
+                if packet.bytes.as_slice() != expected.as_bytes() {
+                    return Err(SessionTransportError::MalformedRecord);
+                }
+                debug_assert_eq!(packet.credentials, peer);
+                debug_assert_eq!(packet.descriptors.len(), expected.capability_count());
+                return Ok(LinuxReceivedCapabilities {
+                    descriptors: packet.descriptors,
+                });
             }
             Err(PacketError::Interrupted) => continue,
             Err(PacketError::WouldBlock) => {

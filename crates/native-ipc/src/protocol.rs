@@ -2,6 +2,11 @@ pub(crate) const CONTROL_VERSION: u32 = 1;
 pub(crate) const MAX_TRANSFER_ENTRIES: usize = 16;
 pub(crate) const ENTRY_LEN: usize = 64;
 pub(crate) const CONTROL_FRAME_LEN: usize = 96 + MAX_TRANSFER_ENTRIES * ENTRY_LEN;
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
@@ -86,6 +91,40 @@ pub(crate) struct TransferManifest {
     total_logical: u64,
     total_mapped: u64,
     entries: Vec<ManifestEntry>,
+}
+
+/// Exact canonical capability packet expected by both transaction endpoints.
+///
+/// Construction from a validated manifest keeps application framing and native
+/// transaction framing disjoint without exposing caller-selected wire magic.
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+pub(crate) struct CapabilityFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+    capability_count: usize,
+}
+
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+impl CapabilityFrame {
+    pub(crate) fn from_manifest(manifest: &TransferManifest) -> Self {
+        Self {
+            bytes: manifest.encode(CAPABILITY_MAGIC),
+            capability_count: manifest.entries.len(),
+        }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) const fn capability_count(&self) -> usize {
+        self.capability_count
+    }
 }
 
 impl TransferManifest {

@@ -1,7 +1,9 @@
 use super::{
-    AuthenticatedZeroRightsTransport, OwnedChildLifecycle, PeerState, SessionTransportError,
+    AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport, OwnedChildLifecycle,
+    PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
+use crate::protocol::CapabilityFrame;
 use crate::session::AbsoluteDeadline;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +20,31 @@ pub(crate) struct AcceptedControlDispatcher<T> {
     transport: T,
     state: ControlState,
     maximum_wire_len: usize,
+}
+
+/// Coordinator-owned open native transaction on the accepted session owner.
+///
+/// G1b deliberately has no completion operation. Until the complete native
+/// preparation plus READY/COMMIT reducer exists, dropping this value poisons
+/// the inseparable session owner.
+pub(crate) struct CoordinatorCapabilityTransaction<'a, T: CoordinatorCapabilityTransport> {
+    dispatcher: &'a mut AcceptedControlDispatcher<T>,
+    deadline: AbsoluteDeadline,
+    attempted: bool,
+    already_poisoned: bool,
+}
+
+/// Receiver-owned open native transaction and its immediately owned imports.
+///
+/// Installed capabilities cannot leave this guard in G1b. A later complete
+/// import state machine may consume them without exposing the accepted native
+/// endpoint or independent pending tokens.
+pub(crate) struct ReceiverCapabilityTransaction<'a, T: ReceiverCapabilityTransport> {
+    dispatcher: &'a mut AcceptedControlDispatcher<T>,
+    deadline: AbsoluteDeadline,
+    received: Option<T::ReceivedCapabilities>,
+    attempted: bool,
+    already_poisoned: bool,
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
@@ -122,7 +149,55 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         }
     }
 
-    pub(crate) fn begin_transaction(&mut self) -> Result<(), AcceptedControlError> {
+    fn poison_both(&mut self) {
+        self.state.poison();
+        self.transport.poison();
+    }
+}
+
+impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
+    pub(crate) fn begin_capability_transaction(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CoordinatorCapabilityTransaction<'_, T>, AcceptedControlError> {
+        self.begin_native_transaction(deadline)?;
+        Ok(CoordinatorCapabilityTransaction {
+            dispatcher: self,
+            deadline,
+            attempted: false,
+            already_poisoned: false,
+        })
+    }
+}
+
+impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
+    /// Awaits a coordinator-initiated native transaction without sending any
+    /// receiver-originated start record.
+    pub(crate) fn await_capability_transaction(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ReceiverCapabilityTransaction<'_, T>, AcceptedControlError> {
+        self.begin_native_transaction(deadline)?;
+        Ok(ReceiverCapabilityTransaction {
+            dispatcher: self,
+            deadline,
+            received: None,
+            attempted: false,
+            already_poisoned: false,
+        })
+    }
+}
+
+impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
+    fn begin_native_transaction(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), AcceptedControlError> {
+        if deadline.is_expired() {
+            return Err(AcceptedControlError::Transport(
+                SessionTransportError::DeadlineExpired,
+            ));
+        }
         match self.state.begin_transaction() {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -133,22 +208,83 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
             }
         }
     }
+}
 
-    pub(crate) fn end_transaction(&mut self) -> Result<(), AcceptedControlError> {
-        match self.state.end_transaction() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if self.state.is_poisoned() {
-                    self.transport.poison();
-                }
-                Err(AcceptedControlError::Control(error))
-            }
+impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> {
+    pub(crate) fn send(
+        &mut self,
+        frame: &CapabilityFrame,
+        capabilities: T::Capabilities<'_>,
+    ) -> Result<(), AcceptedControlError> {
+        if self.attempted {
+            self.poison();
+            return Err(AcceptedControlError::Control(ControlError::ReplayOrReorder));
         }
+        self.attempted = true;
+        if let Err(error) =
+            self.dispatcher
+                .transport
+                .send_capability_record(frame, capabilities, self.deadline)
+        {
+            self.poison();
+            return Err(AcceptedControlError::Transport(error));
+        }
+        Ok(())
     }
 
-    fn poison_both(&mut self) {
-        self.state.poison();
-        self.transport.poison();
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+}
+
+impl<T: CoordinatorCapabilityTransport> Drop for CoordinatorCapabilityTransaction<'_, T> {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
+impl<T: ReceiverCapabilityTransport> ReceiverCapabilityTransaction<'_, T> {
+    pub(crate) fn receive(
+        &mut self,
+        expected: &CapabilityFrame,
+    ) -> Result<&T::ReceivedCapabilities, AcceptedControlError> {
+        if self.attempted {
+            self.poison();
+            return Err(AcceptedControlError::Control(ControlError::ReplayOrReorder));
+        }
+        self.attempted = true;
+        let received = match self
+            .dispatcher
+            .transport
+            .receive_capability_record(expected, self.deadline)
+        {
+            Ok(received) => received,
+            Err(error) => {
+                self.poison();
+                return Err(AcceptedControlError::Transport(error));
+            }
+        };
+        self.received = Some(received);
+        Ok(self
+            .received
+            .as_ref()
+            .expect("successful receive retains transaction-owned capabilities"))
+    }
+
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+}
+
+impl<T: ReceiverCapabilityTransport> Drop for ReceiverCapabilityTransaction<'_, T> {
+    fn drop(&mut self) {
+        self.poison();
     }
 }
 
