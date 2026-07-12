@@ -7,6 +7,14 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::Thread;
+use std::time::Duration;
+
+use crate::session::AbsoluteDeadline;
 
 const PR_SET_MDWE: libc::c_int = 65;
 const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
@@ -236,6 +244,413 @@ fn open_pidfd(pid: u32) -> Result<OwnedFd, SpawnPolicyError> {
     }
     // SAFETY: successful pidfd_open returned a new owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+const LIFECYCLE_IDLE: u8 = 0;
+const LIFECYCLE_WAIT: u8 = 1;
+const LIFECYCLE_TERMINATE: u8 = 2;
+const REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Exact direct-child exit observed and consumed through the atomic pidfd.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactChildExit {
+    Exited(i32),
+    Signaled {
+        signal: i32,
+        dumped_core: bool,
+    },
+    /// Process-global child disposition or another waiter consumed the status.
+    AlreadyReaped,
+}
+
+/// Bounded explicit cleanup result. An incomplete result leaves the dedicated
+/// worker holding the same atomic pidfd until kernel cleanup becomes possible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExactChildCleanup {
+    Complete(ExactChildExit),
+    Incomplete { last_native_error: Option<i32> },
+}
+
+struct ReapTask {
+    pidfd: Arc<OwnedFd>,
+}
+
+struct LifecycleShared {
+    task: Mutex<Option<ReapTask>>,
+    task_ready: Condvar,
+    request: AtomicU8,
+    finished: AtomicBool,
+    last_native_error: AtomicI32,
+    completion: Mutex<Option<ExactChildExit>>,
+    completion_ready: Condvar,
+    cancel_unarmed: AtomicBool,
+    terminal_incomplete: AtomicBool,
+    #[cfg(test)]
+    signal_interrupts: AtomicU32,
+    #[cfg(test)]
+    signal_failure: AtomicI32,
+    #[cfg(test)]
+    poll_failure: AtomicI32,
+    #[cfg(test)]
+    reap_failure: AtomicI32,
+}
+
+/// Worker prepared before acquiring a child, so every successful clone can
+/// transfer its pidfd into an already-durable cleanup owner without spawning
+/// or waiting from `Drop`.
+struct PreparedExactChildLifecycle {
+    shared: Arc<LifecycleShared>,
+    worker: Thread,
+    armed: bool,
+}
+
+/// Private exact-child owner. This is deliberately not a receipt and cannot
+/// construct authenticated channel, session, or memory authority.
+struct ExactChildLifecycle {
+    pidfd: Arc<OwnedFd>,
+    pid: libc::pid_t,
+    shared: Arc<LifecycleShared>,
+    worker: Thread,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl PreparedExactChildLifecycle {
+    fn new() -> Result<Self, SpawnPolicyError> {
+        let shared = Arc::new(LifecycleShared {
+            task: Mutex::new(None),
+            task_ready: Condvar::new(),
+            request: AtomicU8::new(LIFECYCLE_IDLE),
+            finished: AtomicBool::new(false),
+            last_native_error: AtomicI32::new(0),
+            completion: Mutex::new(None),
+            completion_ready: Condvar::new(),
+            cancel_unarmed: AtomicBool::new(false),
+            terminal_incomplete: AtomicBool::new(false),
+            #[cfg(test)]
+            signal_interrupts: AtomicU32::new(0),
+            #[cfg(test)]
+            signal_failure: AtomicI32::new(0),
+            #[cfg(test)]
+            poll_failure: AtomicI32::new(0),
+            #[cfg(test)]
+            reap_failure: AtomicI32::new(0),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("native-ipc-child-reaper".into())
+            .spawn(move || exact_child_reaper(worker_shared))
+            .map_err(native_error)?;
+        let worker_thread = worker.thread().clone();
+        drop(worker);
+        Ok(Self {
+            shared,
+            worker: worker_thread,
+            armed: false,
+        })
+    }
+
+    fn arm(
+        mut self,
+        pid: libc::pid_t,
+        pidfd: OwnedFd,
+    ) -> Result<ExactChildLifecycle, SpawnPolicyError> {
+        let pidfd = Arc::new(pidfd);
+        *lock_unpoisoned(&self.shared.task) = Some(ReapTask {
+            pidfd: Arc::clone(&pidfd),
+        });
+        self.armed = true;
+        self.shared.task_ready.notify_one();
+        self.worker.unpark();
+        if pid <= 0 {
+            self.shared
+                .request
+                .store(LIFECYCLE_TERMINATE, Ordering::Release);
+            self.worker.unpark();
+            return Err(SpawnPolicyError::Native(libc::EINVAL));
+        }
+        Ok(ExactChildLifecycle {
+            pidfd,
+            pid,
+            shared: Arc::clone(&self.shared),
+            worker: self.worker.clone(),
+            not_sync: PhantomData,
+        })
+    }
+}
+
+impl Drop for PreparedExactChildLifecycle {
+    fn drop(&mut self) {
+        if !self.armed {
+            // Hold the predicate mutex while cancelling and notifying so the
+            // worker cannot miss the transition between its check and wait.
+            let task = lock_unpoisoned(&self.shared.task);
+            self.shared.cancel_unarmed.store(true, Ordering::Release);
+            self.shared.task_ready.notify_one();
+            drop(task);
+            self.worker.unpark();
+        }
+    }
+}
+
+impl ExactChildLifecycle {
+    fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    fn pidfd(&self) -> RawFd {
+        self.pidfd.as_raw_fd()
+    }
+
+    fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.request(LIFECYCLE_WAIT);
+        self.wait_for_completion(deadline)
+    }
+
+    fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.request(LIFECYCLE_TERMINATE);
+        self.wait_for_completion(deadline)
+    }
+
+    fn request(&self, request: u8) {
+        self.shared.request.fetch_max(request, Ordering::AcqRel);
+        self.worker.unpark();
+    }
+
+    fn wait_for_completion(&self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        let mut completion = lock_unpoisoned(&self.shared.completion);
+        loop {
+            if let Some(exit) = *completion {
+                return ExactChildCleanup::Complete(exit);
+            }
+            if self.shared.terminal_incomplete.load(Ordering::Acquire) {
+                let code = self.shared.last_native_error.load(Ordering::Acquire);
+                return ExactChildCleanup::Incomplete {
+                    last_native_error: (code != 0).then_some(code),
+                };
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                let code = self.shared.last_native_error.load(Ordering::Acquire);
+                return ExactChildCleanup::Incomplete {
+                    last_native_error: (code != 0).then_some(code),
+                };
+            }
+            completion = match self
+                .shared
+                .completion_ready
+                .wait_timeout(completion, remaining)
+            {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+}
+
+impl Drop for ExactChildLifecycle {
+    fn drop(&mut self) {
+        if !self.shared.finished.load(Ordering::Acquire) {
+            self.request(LIFECYCLE_TERMINATE);
+        }
+    }
+}
+
+fn exact_child_reaper(shared: Arc<LifecycleShared>) {
+    let task = {
+        let mut task = lock_unpoisoned(&shared.task);
+        loop {
+            if let Some(task) = task.take() {
+                break task;
+            }
+            if shared.cancel_unarmed.load(Ordering::Acquire) {
+                return;
+            }
+            task = match shared.task_ready.wait(task) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    };
+
+    let mut signal_attempted = false;
+    loop {
+        let request = shared.request.load(Ordering::Acquire);
+        if request == LIFECYCLE_IDLE {
+            std::thread::park();
+            continue;
+        }
+        if request == LIFECYCLE_TERMINATE && !signal_attempted {
+            match signal_exact_child_with_faults(task.pidfd.as_raw_fd(), libc::SIGKILL, &shared) {
+                Ok(()) | Err(libc::ESRCH) => signal_attempted = true,
+                Err(libc::EINTR) => {
+                    std::thread::park_timeout(REAPER_POLL_INTERVAL);
+                    continue;
+                }
+                Err(code) => retain_incomplete_cleanup(&shared, code),
+            }
+        }
+
+        let mut event = libc::pollfd {
+            fd: task.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        #[cfg(test)]
+        let injected_poll_failure = shared.poll_failure.swap(0, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected_poll_failure = 0;
+        let polled = if injected_poll_failure != 0 {
+            -1
+        } else {
+            // SAFETY: the sole pollfd and its pidfd remain live for this bounded poll.
+            unsafe {
+                libc::poll(
+                    &mut event,
+                    1,
+                    REAPER_POLL_INTERVAL.as_millis() as libc::c_int,
+                )
+            }
+        };
+        if polled < 0 {
+            let code = if injected_poll_failure != 0 {
+                injected_poll_failure
+            } else {
+                io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            };
+            if code == libc::EINTR {
+                std::thread::park_timeout(REAPER_POLL_INTERVAL);
+                continue;
+            }
+            retain_incomplete_cleanup(&shared, code);
+        }
+        if polled == 0
+            || event.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0
+        {
+            continue;
+        }
+        #[cfg(test)]
+        let injected_reap_failure = shared.reap_failure.swap(0, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected_reap_failure = 0;
+        let reaped = if injected_reap_failure != 0 {
+            Err(injected_reap_failure)
+        } else {
+            reap_exact_child(task.pidfd.as_raw_fd())
+        };
+        match reaped {
+            Ok(Some(exit)) => {
+                *lock_unpoisoned(&shared.completion) = Some(exit);
+                shared.finished.store(true, Ordering::Release);
+                shared.completion_ready.notify_all();
+                return;
+            }
+            Ok(None) => std::thread::park_timeout(REAPER_POLL_INTERVAL),
+            Err(code) => retain_incomplete_cleanup(&shared, code),
+        }
+    }
+}
+
+fn retain_incomplete_cleanup(shared: &LifecycleShared, code: i32) -> ! {
+    let completion = lock_unpoisoned(&shared.completion);
+    shared.last_native_error.store(code, Ordering::Release);
+    shared.terminal_incomplete.store(true, Ordering::Release);
+    shared.completion_ready.notify_all();
+    drop(completion);
+    // The worker deliberately keeps its ReapTask and exact pidfd on its stack.
+    // A non-retryable failure cannot be retried safely and must not spin.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn signal_exact_child_with_faults(
+    pidfd: RawFd,
+    signal: libc::c_int,
+    shared: &LifecycleShared,
+) -> Result<(), i32> {
+    #[cfg(not(test))]
+    let _ = shared;
+    #[cfg(test)]
+    {
+        let failure = shared.signal_failure.swap(0, Ordering::AcqRel);
+        if failure != 0 {
+            return Err(failure);
+        }
+    }
+    #[cfg(test)]
+    if shared
+        .signal_interrupts
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return Err(libc::EINTR);
+    }
+    signal_exact_child(pidfd, signal)
+}
+
+fn signal_exact_child(pidfd: RawFd, signal: libc::c_int) -> Result<(), i32> {
+    // SAFETY: pidfd is held live by the lifecycle and scalar signal arguments
+    // target only the exact kernel process object represented by that pidfd.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            core::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+    }
+}
+
+fn reap_exact_child(pidfd: RawFd) -> Result<Option<ExactChildExit>, i32> {
+    // SAFETY: zero is valid initialization for waitid output.
+    let mut information: libc::siginfo_t = unsafe { core::mem::zeroed() };
+    // SAFETY: P_PIDFD binds the wait to this exact owned child; WNOHANG prevents
+    // an unexpected kernel wait even after pidfd readiness was observed.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd as libc::id_t,
+            &mut information,
+            libc::WEXITED | libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        let code = io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        return if code == libc::ECHILD {
+            Ok(Some(ExactChildExit::AlreadyReaped))
+        } else if code == libc::EINTR {
+            Ok(None)
+        } else {
+            Err(code)
+        };
+    }
+    let status = unsafe { information.si_status() };
+    match information.si_code {
+        libc::CLD_EXITED => Ok(Some(ExactChildExit::Exited(status))),
+        libc::CLD_KILLED => Ok(Some(ExactChildExit::Signaled {
+            signal: status,
+            dumped_core: false,
+        })),
+        libc::CLD_DUMPED => Ok(Some(ExactChildExit::Signaled {
+            signal: status,
+            dumped_core: true,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

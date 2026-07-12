@@ -3,7 +3,7 @@ use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::session::AbsoluteDeadline;
 
@@ -79,14 +79,14 @@ struct RawChildError {
 }
 
 struct AtomicExecChild {
-    pidfd: OwnedFd,
-    pid: libc::pid_t,
+    lifecycle: ExactChildLifecycle,
     held: HeldExecutable,
-    not_sync: PhantomData<Cell<()>>,
 }
 
 static_assertions::assert_impl_all!(AtomicExecChild: Send);
 static_assertions::assert_not_impl_any!(AtomicExecChild: Sync, Clone);
+static_assertions::assert_impl_all!(ExactChildLifecycle: Send);
+static_assertions::assert_not_impl_any!(ExactChildLifecycle: Sync, Clone);
 
 assert_impl_all!(HeldExecutable: Send);
 assert_not_impl_any!(HeldExecutable: Sync, Clone);
@@ -346,6 +346,54 @@ fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
+fn open_task_count() -> usize {
+    std::fs::read_dir("/proc/self/task").unwrap().count()
+}
+
+fn assert_drop_returns(child: AtomicExecChild) {
+    let (finished, observed) = std::sync::mpsc::sync_channel(0);
+    let dropper = std::thread::spawn(move || {
+        drop(child);
+        let _ = finished.send(());
+    });
+    observed
+        .recv_timeout(Duration::from_millis(500))
+        .expect("exact-child Drop waited for process cleanup");
+    dropper.join().unwrap();
+}
+
+fn wait_for_child_baseline(
+    expected_fds: usize,
+    expected_tasks: usize,
+    pid: libc::pid_t,
+    deadline: AbsoluteDeadline,
+) {
+    loop {
+        if open_fd_count() == expected_fds && open_task_count() == expected_tasks {
+            break;
+        }
+        assert!(!deadline.is_expired(), "child cleanup missed its baseline");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // SAFETY: the worker has dropped its pidfd and exited. ECHILD now proves
+    // no waitable status or zombie remains for this direct-child PID.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, core::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    let children = std::fs::read_to_string("/proc/thread-self/children").unwrap();
+    assert!(
+        !children
+            .split_ascii_whitespace()
+            .any(|child| child.parse::<libc::pid_t>() == Ok(pid))
+    );
+}
+
 fn pidfd_reported_pid(pidfd: RawFd) -> i64 {
     let contents = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")).unwrap();
     contents
@@ -428,6 +476,7 @@ fn atomic_clone_exec_for_test(
     let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
     let reader_raw = reader.as_raw_fd();
     let writer_raw = writer.as_raw_fd();
+    let prepared_lifecycle = PreparedExactChildLifecycle::new().unwrap();
 
     let mut raw_pidfd = -1;
     let clone_arguments = CloneArgs {
@@ -504,13 +553,9 @@ fn atomic_clone_exec_for_test(
     assert!(raw_pidfd >= 0);
     // SAFETY: successful CLONE_PIDFD atomically installed this descriptor.
     let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    let lifecycle = prepared_lifecycle.arm(pid, pidfd).unwrap();
     drop(writer);
-    let child = AtomicExecChild {
-        pidfd,
-        pid,
-        held,
-        not_sync: PhantomData,
-    };
+    let child = AtomicExecChild { lifecycle, held };
 
     let mut record = [0_u8; EXEC_ERROR_LEN];
     let mut received = 0_usize;
@@ -538,7 +583,7 @@ fn atomic_clone_exec_for_test(
         if read == 0 {
             return if received == 0 {
                 let mut event = libc::pollfd {
-                    fd: child.pidfd.as_raw_fd(),
+                    fd: child.pidfd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
@@ -585,7 +630,7 @@ fn atomic_clone_exec_for_test(
                 revents: 0,
             },
             libc::pollfd {
-                fd: child.pidfd.as_raw_fd(),
+                fd: child.pidfd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -602,8 +647,44 @@ fn atomic_clone_exec_for_test(
 }
 
 impl AtomicExecChild {
+    fn pid(&self) -> libc::pid_t {
+        self.lifecycle.pid()
+    }
+
+    fn pidfd(&self) -> RawFd {
+        self.lifecycle.pidfd()
+    }
+
+    fn inject_signal_interrupts(&self, count: u32) {
+        self.lifecycle
+            .shared
+            .signal_interrupts
+            .store(count, Ordering::Release);
+    }
+
+    fn inject_signal_failure(&self, code: i32) {
+        self.lifecycle
+            .shared
+            .signal_failure
+            .store(code, Ordering::Release);
+    }
+
+    fn inject_poll_failure(&self, code: i32) {
+        self.lifecycle
+            .shared
+            .poll_failure
+            .store(code, Ordering::Release);
+    }
+
+    fn inject_reap_failure(&self, code: i32) {
+        self.lifecycle
+            .shared
+            .reap_failure
+            .store(code, Ordering::Release);
+    }
+
     fn held_image_matches(&self) -> bool {
-        let path = std::ffi::CString::new(format!("/proc/{}/exe", self.pid)).unwrap();
+        let path = std::ffi::CString::new(format!("/proc/{}/exe", self.pid())).unwrap();
         // SAFETY: path is NUL-terminated and flags need no mode.
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if raw < 0 {
@@ -625,7 +706,7 @@ impl AtomicExecChild {
             let result = unsafe {
                 libc::waitid(
                     libc::P_PIDFD,
-                    self.pidfd.as_raw_fd() as libc::id_t,
+                    self.pidfd() as libc::id_t,
                     &mut information,
                     libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
                 )
@@ -652,7 +733,7 @@ impl AtomicExecChild {
             if deadline.is_expired() {
                 return Err(AtomicExecError::Deadline);
             }
-            std::thread::yield_now();
+            std::thread::park_timeout(deadline.remaining().min(Duration::from_millis(1)));
         }
     }
 
@@ -662,7 +743,7 @@ impl AtomicExecChild {
             unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
-                    self.pidfd.as_raw_fd(),
+                    self.pidfd(),
                     libc::SIGCONT,
                     core::ptr::null::<libc::siginfo_t>(),
                     0,
@@ -672,48 +753,14 @@ impl AtomicExecChild {
         );
     }
 
-    fn wait_and_reap(self, deadline: AbsoluteDeadline) -> i32 {
-        loop {
-            let mut event = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout = deadline
-                .remaining()
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as libc::c_int;
-            // SAFETY: one pollfd remains live for the bounded call.
-            let result = unsafe { libc::poll(&mut event, 1, timeout) };
-            assert!(result >= 0);
-            assert!(!deadline.is_expired());
-            if result == 0 || event.revents & libc::POLLIN == 0 {
-                continue;
-            }
-            let mut status = 0;
-            // SAFETY: pidfd pins identity; WNOHANG cannot block.
-            assert_eq!(
-                unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) },
-                self.pid
-            );
-            return status;
-        }
+    fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        let Self { lifecycle, held: _ } = self;
+        lifecycle.wait_and_reap(deadline)
     }
 
-    fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> i32 {
-        // SAFETY: pidfd is the sole atomic identity handle; SIGKILL is scalar.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                libc::SIGKILL,
-                core::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
-        self.wait_and_reap(deadline)
+    fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        let Self { lifecycle, held: _ } = self;
+        lifecycle.terminate_and_reap(deadline)
     }
 }
 
@@ -1032,13 +1079,13 @@ fn isolated_atomic_clone_exec_state_machine_helper() {
         let _ = child.terminate_and_reap(deadline());
         panic!("held exec failed: {error:?}")
     });
-    assert_eq!(
-        pidfd_reported_pid(child.pidfd.as_raw_fd()),
-        i64::from(child.pid)
-    );
+    assert_eq!(pidfd_reported_pid(child.pidfd()), i64::from(child.pid()));
     child.resume();
     let status = child.wait_and_reap(deadline());
-    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert_eq!(
+        status,
+        ExactChildCleanup::Complete(ExactChildExit::Exited(0))
+    );
 
     let fixture = ExecutableFixture::copy_from(&executable);
     let held = HeldExecutable::open(&fixture.file).unwrap();
@@ -1058,7 +1105,10 @@ fn isolated_atomic_clone_exec_state_machine_helper() {
     });
     child.resume();
     let status = child.wait_and_reap(deadline());
-    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert_eq!(
+        status,
+        ExactChildCleanup::Complete(ExactChildExit::Exited(0))
+    );
     drop(fixture);
 
     for (fault, expected) in [
@@ -1100,7 +1150,10 @@ fn isolated_atomic_clone_exec_state_machine_helper() {
         };
         assert_eq!(error, expected);
         let status = child.wait_and_reap(deadline());
-        assert!(libc::WIFEXITED(status));
+        assert!(matches!(
+            status,
+            ExactChildCleanup::Complete(ExactChildExit::Exited(_))
+        ));
     }
 
     let held = HeldExecutable::open(&executable).unwrap();
@@ -1121,7 +1174,13 @@ fn isolated_atomic_clone_exec_state_machine_helper() {
     };
     assert_eq!(error, AtomicExecError::Deadline);
     let status = child.terminate_and_reap(deadline());
-    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(
+        status,
+        ExactChildCleanup::Complete(ExactChildExit::Signaled {
+            signal: libc::SIGKILL,
+            dumped_core: false,
+        })
+    );
 
     assert_eq!(open_fd_count(), before);
 }
@@ -1139,6 +1198,256 @@ fn atomic_clone_exec_state_machine_is_bounded() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+fn lifecycle_child(deadline: AbsoluteDeadline) -> AtomicExecChild {
+    let executable = std::env::current_exe().unwrap();
+    let held = HeldExecutable::open(&executable).unwrap();
+    let environment = atomic_exec_environment(&held);
+    atomic_clone_exec_for_test(
+        held,
+        &atomic_exec_arguments(),
+        &environment,
+        AtomicExecFault::None,
+        deadline,
+    )
+    .unwrap_or_else(|(error, child)| {
+        drop(child);
+        panic!("lifecycle child failed before its checkpoint: {error:?}")
+    })
+}
+
+#[test]
+#[ignore = "spawned alone by exact_child_lifecycle_drop_and_reap_are_bounded"]
+fn isolated_exact_child_lifecycle_drop_and_reap_helper() {
+    let expected_fds = open_fd_count();
+    let expected_tasks = open_task_count();
+    let deadline = || AbsoluteDeadline::after(Duration::from_secs(5)).unwrap();
+
+    drop(PreparedExactChildLifecycle::new().unwrap());
+    let cancellation_deadline = deadline();
+    while open_fd_count() != expected_fds || open_task_count() != expected_tasks {
+        assert!(
+            !cancellation_deadline.is_expired(),
+            "unarmed lifecycle worker did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    assert_eq!(pidfd_reported_pid(child.pidfd()), i64::from(pid));
+    assert_drop_returns(child);
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    let executable = std::env::current_exe().unwrap();
+    let held = HeldExecutable::open(&executable).unwrap();
+    let environment = atomic_exec_environment(&held);
+    let short = AbsoluteDeadline::after(Duration::from_millis(2)).unwrap();
+    let (error, stalled) = match atomic_clone_exec_for_test(
+        held,
+        &atomic_exec_arguments(),
+        &environment,
+        AtomicExecFault::Stall,
+        short,
+    ) {
+        Ok(child) => {
+            drop(child);
+            panic!("pre-exec stall unexpectedly reached exec")
+        }
+        Err(failure) => failure,
+    };
+    assert_eq!(error, AtomicExecError::Deadline);
+    let stalled_pid = stalled.pid();
+    assert_drop_returns(stalled);
+    wait_for_child_baseline(expected_fds, expected_tasks, stalled_pid, deadline());
+
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    assert_eq!(pidfd_reported_pid(child.pidfd()), i64::from(pid));
+    child.inject_signal_interrupts(3);
+    let cleanup = child.terminate_and_reap(deadline());
+    assert_eq!(
+        cleanup,
+        ExactChildCleanup::Complete(ExactChildExit::Signaled {
+            signal: libc::SIGKILL,
+            dumped_core: false,
+        })
+    );
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    let broad_waiter = std::thread::spawn(|| {
+        let mut status = 0;
+        // SAFETY: this isolated helper owns exactly one direct child, and the
+        // lifecycle worker remains idle until after this broad wait completes.
+        let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
+        (waited, status)
+    });
+    child.resume();
+    let (waited, status) = broad_waiter.join().unwrap();
+    assert_eq!(waited, pid);
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert_eq!(
+        child.wait_and_reap(deadline()),
+        ExactChildCleanup::Complete(ExactChildExit::AlreadyReaped)
+    );
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    child.inject_signal_interrupts(3);
+    let short = AbsoluteDeadline::after(Duration::from_millis(2)).unwrap();
+    assert_eq!(
+        child.terminate_and_reap(short),
+        ExactChildCleanup::Incomplete {
+            last_native_error: None,
+        }
+    );
+    // Consuming explicit cleanup has returned, but its pre-established worker
+    // still owns the atomic pidfd and eventually exhausts retryable EINTR.
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    for cycle in 0..16 {
+        let child = lifecycle_child(deadline());
+        let pid = child.pid();
+        if cycle % 2 == 0 {
+            assert_drop_returns(child);
+        } else {
+            assert_eq!(
+                child.terminate_and_reap(deadline()),
+                ExactChildCleanup::Complete(ExactChildExit::Signaled {
+                    signal: libc::SIGKILL,
+                    dumped_core: false,
+                })
+            );
+        }
+        wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+    }
+}
+
+#[test]
+#[ignore = "spawned alone by exact_child_lifecycle_drop_and_reap_are_bounded"]
+fn isolated_exact_child_terminal_cleanup_failure_helper() {
+    let deadline = || AbsoluteDeadline::after(Duration::from_secs(5)).unwrap();
+
+    let child = lifecycle_child(deadline());
+    child.inject_signal_failure(libc::EIO);
+    let started = Instant::now();
+    assert_eq!(
+        child.terminate_and_reap(deadline()),
+        ExactChildCleanup::Incomplete {
+            last_native_error: Some(libc::EIO),
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let child = lifecycle_child(deadline());
+    child.inject_poll_failure(libc::EIO);
+    let started = Instant::now();
+    assert_eq!(
+        child.terminate_and_reap(deadline()),
+        ExactChildCleanup::Incomplete {
+            last_native_error: Some(libc::EIO),
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let child = lifecycle_child(deadline());
+    child.inject_reap_failure(libc::EIO);
+    let started = Instant::now();
+    assert_eq!(
+        child.terminate_and_reap(deadline()),
+        ExactChildCleanup::Incomplete {
+            last_native_error: Some(libc::EIO),
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    // These workers deliberately retain their exact pidfds until this isolated
+    // process exits. Process teardown is the backstop for simulated terminal
+    // failures, which are excluded from baseline-restoration claims.
+}
+
+#[test]
+fn exact_child_lifecycle_drop_and_reap_are_bounded() {
+    let executable = std::env::current_exe().unwrap();
+    for helper in [
+        "backend::linux_vnext::process::tests::isolated_exact_child_lifecycle_drop_and_reap_helper",
+        "backend::linux_vnext::process::tests::isolated_exact_child_terminal_cleanup_failure_helper",
+    ] {
+        let status = Command::new(&executable)
+            .args(["--exact", helper, "--ignored", "--nocapture"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated lifecycle helper failed: {helper}"
+        );
+    }
+}
+
+fn install_sigchld_disposition(handler: libc::sighandler_t, flags: libc::c_int) {
+    // SAFETY: zeroed sigaction is fully initialized before installation.
+    let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    action.sa_sigaction = handler;
+    action.sa_flags = flags;
+    // SAFETY: mask storage and action are initialized for SIGCHLD.
+    assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+    // SAFETY: these helpers run alone in disposable subprocesses.
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGCHLD, &action, core::ptr::null_mut()) },
+        0
+    );
+}
+
+fn exercise_automatic_reap_disposition() {
+    let expected_fds = open_fd_count();
+    let expected_tasks = open_task_count();
+    let deadline = || AbsoluteDeadline::after(Duration::from_secs(5)).unwrap();
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    assert_eq!(pidfd_reported_pid(child.pidfd()), i64::from(pid));
+    child.resume();
+    assert_eq!(
+        child.wait_and_reap(deadline()),
+        ExactChildCleanup::Complete(ExactChildExit::AlreadyReaped)
+    );
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+}
+
+#[test]
+#[ignore = "spawned alone by exact_child_lifecycle_handles_sigchld_auto_reap"]
+fn isolated_exact_child_lifecycle_sigchld_ignored_helper() {
+    install_sigchld_disposition(libc::SIG_IGN, 0);
+    exercise_automatic_reap_disposition();
+}
+
+#[test]
+#[ignore = "spawned alone by exact_child_lifecycle_handles_sigchld_auto_reap"]
+fn isolated_exact_child_lifecycle_no_cldwait_helper() {
+    install_sigchld_disposition(libc::SIG_DFL, libc::SA_NOCLDWAIT);
+    exercise_automatic_reap_disposition();
+}
+
+#[test]
+fn exact_child_lifecycle_handles_sigchld_auto_reap() {
+    let executable = std::env::current_exe().unwrap();
+    for helper in [
+        "backend::linux_vnext::process::tests::isolated_exact_child_lifecycle_sigchld_ignored_helper",
+        "backend::linux_vnext::process::tests::isolated_exact_child_lifecycle_no_cldwait_helper",
+    ] {
+        let status = Command::new(&executable)
+            .args(["--exact", helper, "--ignored", "--nocapture"])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated disposition helper failed: {helper}"
+        );
+    }
 }
 
 #[test]
