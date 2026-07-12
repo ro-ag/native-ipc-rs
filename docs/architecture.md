@@ -146,9 +146,35 @@ The private Linux G1e coordinator entry point consumes one complete portable
 transaction guard; the raw-entry coordinator constructor exists only in tests.
 Empty batches fail before transaction entry or ID consumption, and abandoned
 guards poison before their retained batch is destroyed. The internal send step
-still receives a separately prepared native capability collection, so G1e does
-not yet prove descriptor-to-object identity or constitute the complete Linux
-prepared-memory adapter.
+receives a separately prepared native capability collection only in tests; the
+production Linux entry point is superseded by G1f. G1e alone does not prove
+descriptor-to-object identity or constitute the complete Linux prepared-memory
+adapter.
+
+Linux G1f-a converts a retained all-coordinator-writer `TransferBatch` into one
+private native batch before any capability escapes. Conversion preserves the
+initialized memfd contents, canonicalizes by `RegionId`, installs and verifies
+`F_SEAL_EXEC | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_FUTURE_WRITE |
+F_SEAL_SEAL`, and retains both the original coordinator writer mapping and one
+same-object exported descriptor per canonical ordinal. The original and export
+are revalidated against the same device/inode/length key immediately before
+send. Pending drop clears the complete shared mapping according to
+`ClearThenRelease` before closing it. Receiver-writer entries fail locally in
+this slice; their IMPORTED/SEALED ordering remains separate work.
+
+Linux G1f-b moves that native batch into a wrapper whose first field is the
+accepted-owner transaction guard and whose second field is the complete native
+batch. Thus abandonment or send failure poisons the inseparable session before
+any pending mapping or fd is destroyed. Preparation, transaction entry,
+pre-send revalidation, and native send carry one exactly equal caller-derived
+absolute deadline; replacement deadlines fail before transaction entry. The
+wrapper constructs the borrowed fd slice from its own canonical batch and never
+accepts caller-provided descriptors or exposes the endpoint. There is still no
+production completion operation, receiver native import, or READY/COMMIT.
+Independent review found and closed both production substitution paths through
+the older raw-entry and prepared-batch test scaffolds. Linux-specific event
+tests also prove transport poison precedes native-batch cleanup on abandonment
+and injected pre-send revalidation failure.
 
 ## Unsafe-code policy
 

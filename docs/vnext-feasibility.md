@@ -618,14 +618,14 @@ I/O or transaction-ID consumption, and continued transaction ownership through
 the existing terminal guard. The former raw-entry coordinator constructor is
 test-only so hostile frame/limit cases can still exercise the portable reducer.
 
-G1e deliberately stops before native memory conversion. Its internal send
-method still accepts the backend capability collection separately; the Linux
-adapter must next prepare each owned region, bind each exact fd/object/seal
-state to its canonical entry and ordinal, retain local pending mappings, and
-remove that remaining substitution seam. Receiver `ExpectedBatch`, native
+G1e deliberately stops before native memory conversion. Its separately supplied
+backend capability collection is now test-only; the production Linux G1f
+adapter prepares each owned region, binds each exact fd/object/seal state to its
+canonical entry and ordinal, and retains local pending mappings. Receiver
+`ExpectedBatch`, native
 import validation, IMPORTED/SEALED, READY/COMMIT, activation, and public APIs
 also remain unimplemented. Exact implementation/review/hosted evidence is
-pending. The current implementation commit is
+recorded separately below. The G1e implementation commit is
 `c8c9558ac714d0e34014c34f939034294a868632`, green across all ten jobs in
 [Actions 29207363955](https://github.com/ro-ag/native-ipc-rs/actions/runs/29207363955).
 Local macOS Rust 1.97 and privileged seccomp-unconfined Arm64 Docker full gates
@@ -636,6 +636,56 @@ drop observer now proves transport poison precedes every prepared-region
 destruction on both abandonment and send failure, and the 1/2/4/16 corpus
 asserts exact incarnation, lengths, writer, access, and ordinal. Focused
 re-review reports no remaining P1/P2/P3.
+
+Phase 5i-G1f-a implements the first real prepared-memory batch adapter for the
+coordinator-writer direction. It consumes an all-coordinator-writer portable
+`TransferBatch`, sorts owned regions by `RegionId`, preserves exact initialized
+bytes while replacing the portable mapping owner, installs the complete final
+memfd seal set, duplicates one export descriptor, and proves the original and
+export resolve to the same anonymous tmpfs object key and mapped length. The
+adapter owns every mapping/fd and derives manifest entries and capability order
+from the same vector.
+
+One caller-derived `AbsoluteDeadline` is stored in the prepared native batch.
+Preparation checks it before and after native conversion, sealing, validation,
+duplication, and each entry; pre-send revalidation checks the same stored value.
+G1f-b refuses a different transaction deadline and the accepted native send
+uses that same value. Expiry and deadline substitution occur before capability
+escape. Pending `ClearThenRelease` destruction clears the shared bytes through
+the retained writer mapping before unmapping/closing; failure at first, middle,
+or final preparation entry restores isolated fd/map baselines.
+
+Phase 5i-G1f-b then moves the prepared native batch into the accepted Linux
+coordinator transaction. The wrapper derives the exact frame entries and fd
+slice from its owned canonical batch, revalidates every object immediately
+before the one native send, and keeps the accepted socket, pidfd, image,
+evidence, prepared mappings, original fds, and export fds inseparable. A real
+exact-child test transfers 1/2/4/16 initialized regions over the already
+accepted seqpacket, checks exact credentials/frame/rights through the existing
+transport, verifies final seals and read-only peer mappings, rejects new writer
+mappings, exercises deadline substitution without poisoning, and restores
+fd/task/child baselines. Dropping the still-terminal transaction persistently
+poisons ordinary control.
+
+G1f supports coordinator-writer batches only. Receiver-writer preparation still
+requires transaction/full-manifest binding, peer native import and object
+validation, IMPORTED, final coordinator sealing, SEALED, and receiver seal
+revalidation. A production receiver `ExpectedBatch`, complete mixed-direction
+adapter, READY/COMMIT, activation, and public APIs remain unimplemented. Exact
+implementation `f94c93f7273fb7a9f33779c1a9aba90817e0b2a4` plus the scoped
+mapping-baseline correction `1c8a3ad4bcde2c5d555d31a96949d51bb19f55f1`
+are green across all ten jobs in
+[Actions 29210607343](https://github.com/ro-ag/native-ipc-rs/actions/runs/29210607343).
+The accepted-send implementation
+`4e8231bbeadb1d38ca2525b9baf78df9c3526026` is green across all ten jobs in
+[Actions 29210656133](https://github.com/ro-ag/native-ipc-rs/actions/runs/29210656133).
+Local macOS Rust 1.97 and privileged seccomp-unconfined Arm64 Docker full gates
+pass; Docker remains container/emulation characterization only. Independent
+review found two P2 production substitution paths through the earlier raw and
+prepared test scaffolds; both are now `cfg(test)`. Two P3 evidence gaps were
+also fixed by checking every initialized logical byte and directly observing
+poison before native cleanup on abandonment and revalidation failure. Final
+re-review reports no P1/P2/P3.
 
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
