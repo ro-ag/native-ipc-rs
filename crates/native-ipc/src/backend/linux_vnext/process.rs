@@ -276,6 +276,7 @@ mod tests {
     const CLONE_PIDFD: u64 = 0x0000_1000;
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
     const EXEC_ERROR_LEN: usize = 8;
+    const REPLACEMENT_IMAGE: &str = "/bin/sh";
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[repr(C)]
@@ -1044,7 +1045,7 @@ mod tests {
         let fixture = ExecutableFixture::copy_from(&executable);
         let held = HeldExecutable::open(&fixture.file).unwrap();
         std::fs::remove_file(&fixture.file).unwrap();
-        std::fs::copy("/bin/sleep", &fixture.file).unwrap();
+        std::fs::copy(REPLACEMENT_IMAGE, &fixture.file).unwrap();
         let mut command = held.command();
         command
             .args([
@@ -1099,7 +1100,10 @@ mod tests {
 
         let executable = std::env::current_exe().unwrap();
         let held = HeldExecutable::open(&executable).unwrap();
-        let mut exited = Command::new("/bin/true").spawn().unwrap();
+        let mut exited = Command::new(&executable)
+            .args(["--exact", "native-ipc-intentionally-missing-test"])
+            .spawn()
+            .unwrap();
         assert!(exited.wait().unwrap().success());
         assert!(matches!(
             held.verify_child(&mut exited),
@@ -1283,7 +1287,7 @@ mod tests {
         let fixture = ExecutableFixture::copy_from(&executable);
         let held = HeldExecutable::open(&fixture.file).unwrap();
         std::fs::remove_file(&fixture.file).unwrap();
-        std::fs::copy("/bin/sleep", &fixture.file).unwrap();
+        std::fs::copy(REPLACEMENT_IMAGE, &fixture.file).unwrap();
         let environment = atomic_exec_environment(&held);
         let child = atomic_clone_exec_for_test(
             held,

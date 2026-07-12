@@ -1333,11 +1333,24 @@ mod tests {
         let before = bootstrap_dirs();
         // The helper never connects, so spawn reaches its accept deadline; the
         // child must be killed and reaped and the directory removed.
-        let Err(error) = ChildSession::spawn(OsStr::new("/bin/sleep"), &[OsStr::new("30")]) else {
+        let executable = std::env::current_exe().unwrap();
+        let arguments = [
+            OsStr::new("--exact"),
+            OsStr::new("linux::tests::nonconnecting_helper_entry"),
+            OsStr::new("--ignored"),
+            OsStr::new("--nocapture"),
+        ];
+        let Err(error) = ChildSession::spawn(executable.as_os_str(), &arguments) else {
             panic!("a helper that never connects must time out");
         };
         assert!(matches!(error, LinuxError::Bootstrap));
         assert_eq!(bootstrap_dirs(), before);
+    }
+
+    #[test]
+    #[ignore = "spawned only by the bootstrap-timeout integration test"]
+    fn nonconnecting_helper_entry() {
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[test]
