@@ -490,6 +490,47 @@ and supplies no receiver-side exact parent pidfd, image, or exit-code proof.
 Physical Arm64, packaged-crate, exact-release, and whole-vNext evidence remain
 unverified.
 
+Phase 5i-G1b extends that same private `AcceptedControlDispatcher` owner with
+one dependency-ordered capability transport checkpoint. It does not extract or
+duplicate the accepted endpoint. Sealed role-specific traits let only the
+coordinator begin and send the first capability record; the receiver can only
+await and receive it. The transaction guard mutably borrows the dispatcher,
+stores the caller-derived absolute deadline once, and passes that same value to
+the native operation without accepting a replacement deadline.
+
+The capability record is constructed only from the canonical transfer manifest
+with exact `NIPCCAP1` magic. Its manifest entry count is the required installed
+fd count, so callers cannot independently select a different expected count.
+Linux sends 1..=16 borrowed fds on the already-owned accepted seqpacket and
+receives with one exact-size `recvmsg`, exact directional credentials, exact fd
+count, and exact full-frame comparison. Every installed fd is immediately an
+`OwnedFd`; successful imports stay inside the receiver transaction guard, while
+wrong credentials, 0/2/N rights for a one-entry manifest, truncation,
+application-frame interleaving, nonce/transaction/manifest substitution, I/O
+failure, replay, or guard destruction closes them and persistently poisons the
+inseparable session owner.
+
+G1b intentionally provides no transaction completion operation. It therefore
+cannot resume ordinary application control after capability escape and makes no
+READY, COMMIT, activation, mapping, or public `Session<Ready>` claim. Remaining
+work includes transaction ID allocation/limit charging, the complete 1..=16
+prepared-memory adapter, receiver expected-batch validation and import,
+receiver-writer IMPORTED/SEALED preparation, exact full-manifest READY/COMMIT,
+activation/lease integration, and public session/control APIs.
+
+Local macOS Rust 1.97 all-feature tests and strict Clippy pass. Privileged,
+seccomp-unconfined Rust 1.97 Arm64 Docker passes the focused native capability
+transport and portable accepted-owner corpus. Docker remains emulation/
+container characterization only, not native-host, physical Arm64, packaged,
+release, or whole-vNext evidence. Exact implementation commit
+`c34e904f2451907a3f35c7b17cf79636c19187aa` is green across all ten jobs in
+[Actions 29205870709](https://github.com/ro-ag/native-ipc-rs/actions/runs/29205870709),
+including hosted native Linux AMD64/Arm64 and ASan plus non-Linux and auxiliary
+gates. Independent review found one P3 missing same-guard replay test; the added
+coordinator/receiver regression proves one native operation, retained duplicate
+input, transaction-owned fd cleanup, and persistent poison. Focused re-review
+reports no remaining P1/P2/P3.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

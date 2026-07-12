@@ -113,6 +113,16 @@ barrier transitions. This prevents two transactions from interleaving frames;
 any malformed, stale, timed-out, or ambiguous transition poisons the session
 and keeps all pending runtime wrappers private.
 
+The private Linux G1b checkpoint keeps accepted application-control and native
+capability traffic in one `AcceptedControlDispatcher`. Sealed role-specific
+transport traits let only the coordinator send the first canonical capability
+record while the receiver can only await it. A transaction guard borrows that
+owner, stores the caller's one absolute deadline, and owns every installed fd;
+it never yields the socket, pidfd, executable, evidence, or descriptors. Until
+the manifest-bound import/seal and READY/COMMIT reducer exists, the guard has no
+completion operation and its destruction persistently poisons the session.
+This is a terminal transport/ownership checkpoint, not an active batch.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte
