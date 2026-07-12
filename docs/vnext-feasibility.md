@@ -278,10 +278,10 @@ the fresh group remains explicitly unverified as described above. Local Rust
 replacement, exactly one inherited bootstrap socket, closure of the held,
 pipe, and original pair descriptors, every fixed error stage, malformed and
 partial records, silence, deadline expiry, repeated Drop, panic, and
-fd/task/child baselines. Native exact-target evidence for this new composition
-is still required.
+fd/task/child baselines. This composition is included in the Phase 5i-D hosted
+exact-target evidence below; physical Arm64 release evidence remains required.
 
-The next local Phase 5i-D checkpoint consumes that owner through one
+Phase 5i-D consumes that owner through one
 `spawn_negotiating` entry so the caller cannot replace the absolute deadline
 between image confirmation and HELLO. The coordinator generates one nonzero
 32-byte nonce with nonblocking `getrandom`, sends exactly one canonical
@@ -310,9 +310,25 @@ The resulting private `NegotiatingLinuxSpawn` is `Send`, non-`Sync`, and
 non-`Clone`. It exposes no endpoint, raw descriptor, ACCEPT/READY state,
 receipt, session, control, batch, or memory authority. Duplicate/flood/replay
 records cannot mint authority at this HELLO-only typestate and still require
-explicit native coverage at the later ACCEPT/poison transition. Hosted native
-AMD64/Arm64, ASan, physical Arm64, exact release-commit, and packaged-crate
-evidence are pending; no release claim follows from Docker.
+explicit native coverage at the later ACCEPT/poison transition.
+
+The first exact hosted tip, `2f21c59`, is not completion evidence: run
+[29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
+failed only its Linux AMD64 ASan job because the containment test harness
+published an escaped descendant PID before that child completed `setsid`; the
+test observed the child's old session rather than waiting for the intended
+kernel transition. Exact commit `0ae24f9` corrects that scheduling race with one
+bounded `AbsoluteDeadline` wait for the exact descendant's session while
+retaining its pidfd and the final exact SID assertion. All ten hosted jobs,
+including native Linux AMD64/Arm64 and ASan, are green in
+[Actions 29199137594](https://github.com/ro-ag/native-ipc-rs/actions/runs/29199137594).
+Those non-root hosted runners prove the normal bidirectional credential path;
+the privileged real-ID/effective-ID split remains Arm64 seccomp-unconfined
+Docker characterization only. The hosted Linux Arm64 result is VM
+characterization, not physical Arm64 release evidence. ACCEPT/READY, public
+session and receipt composition, fd/control/batch/memory authority, physical
+Arm64, exact release-commit, and packaged-crate evidence remain unverified; no
+release claim follows from Docker or this hosted mechanism checkpoint.
 
 The exact variable-packet correction commit `ad4ca15` is green across all ten
 hosted jobs, including native Linux AMD64/Arm64 and ASan, in
