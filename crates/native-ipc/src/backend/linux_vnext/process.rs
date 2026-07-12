@@ -263,12 +263,24 @@ enum ExactChildExit {
     AlreadyReaped,
 }
 
-/// Bounded explicit cleanup result. An incomplete result leaves the dedicated
-/// worker holding the same atomic pidfd until kernel cleanup becomes possible.
+/// Bounded facts about the fresh Unix process group owned with the child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExactChildCleanup {
-    Complete(ExactChildExit),
-    Incomplete { last_native_error: Option<i32> },
+enum DescendantCleanup {
+    /// The child never reached the trusted post-`setsid` checkpoint.
+    NotEstablished,
+    /// A fresh session/group exists, but Linux has no race-resistant
+    /// process-group handle. Numeric PGID signaling is deliberately omitted.
+    FreshGroupUnverified,
+}
+
+/// Bounded explicit cleanup result. An incomplete direct-child result leaves
+/// the dedicated worker holding the same atomic pidfd until kernel cleanup
+/// becomes possible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactChildCleanup {
+    direct_child: Option<ExactChildExit>,
+    descendants: DescendantCleanup,
+    last_native_error: Option<i32>,
 }
 
 struct ReapTask {
@@ -285,6 +297,8 @@ struct LifecycleShared {
     completion_ready: Condvar,
     cancel_unarmed: AtomicBool,
     terminal_incomplete: AtomicBool,
+    fresh_session: AtomicBool,
+    descendant_cleanup: Mutex<DescendantCleanup>,
     #[cfg(test)]
     signal_interrupts: AtomicU32,
     #[cfg(test)]
@@ -339,6 +353,8 @@ impl PreparedExactChildLifecycle {
             completion_ready: Condvar::new(),
             cancel_unarmed: AtomicBool::new(false),
             terminal_incomplete: AtomicBool::new(false),
+            fresh_session: AtomicBool::new(false),
+            descendant_cleanup: Mutex::new(DescendantCleanup::NotEstablished),
             #[cfg(test)]
             signal_interrupts: AtomicU32::new(0),
             #[cfg(test)]
@@ -408,6 +424,12 @@ impl ExactChildLifecycle {
         self.pidfd.as_raw_fd()
     }
 
+    /// Records the trusted child-side `setsid` checkpoint. This is containment
+    /// state only and cannot mint image, channel, session, or memory authority.
+    fn establish_fresh_session(&self) {
+        self.shared.fresh_session.store(true, Ordering::Release);
+    }
+
     fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
         self.request(LIFECYCLE_WAIT);
         self.wait_for_completion(deadline)
@@ -427,18 +449,26 @@ impl ExactChildLifecycle {
         let mut completion = lock_unpoisoned(&self.shared.completion);
         loop {
             if let Some(exit) = *completion {
-                return ExactChildCleanup::Complete(exit);
+                return ExactChildCleanup {
+                    direct_child: Some(exit),
+                    descendants: *lock_unpoisoned(&self.shared.descendant_cleanup),
+                    last_native_error: None,
+                };
             }
             if self.shared.terminal_incomplete.load(Ordering::Acquire) {
                 let code = self.shared.last_native_error.load(Ordering::Acquire);
-                return ExactChildCleanup::Incomplete {
+                return ExactChildCleanup {
+                    direct_child: None,
+                    descendants: *lock_unpoisoned(&self.shared.descendant_cleanup),
                     last_native_error: (code != 0).then_some(code),
                 };
             }
             let remaining = deadline.remaining();
             if remaining.is_zero() {
                 let code = self.shared.last_native_error.load(Ordering::Acquire);
-                return ExactChildCleanup::Incomplete {
+                return ExactChildCleanup {
+                    direct_child: None,
+                    descendants: *lock_unpoisoned(&self.shared.descendant_cleanup),
                     last_native_error: (code != 0).then_some(code),
                 };
             }
@@ -480,11 +510,17 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
     };
 
     let mut signal_attempted = false;
+    let mut descendant_cleanup_attempted = false;
     loop {
         let request = shared.request.load(Ordering::Acquire);
         if request == LIFECYCLE_IDLE {
             std::thread::park();
             continue;
+        }
+        if request == LIFECYCLE_TERMINATE && !descendant_cleanup_attempted {
+            let cleanup = descendant_cleanup_limit(&shared);
+            *lock_unpoisoned(&shared.descendant_cleanup) = cleanup;
+            descendant_cleanup_attempted = true;
         }
         if request == LIFECYCLE_TERMINATE && !signal_attempted {
             match signal_exact_child_with_faults(task.pidfd.as_raw_fd(), libc::SIGKILL, &shared) {
@@ -535,6 +571,11 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
         {
             continue;
         }
+        if !descendant_cleanup_attempted {
+            let cleanup = descendant_cleanup_limit(&shared);
+            *lock_unpoisoned(&shared.descendant_cleanup) = cleanup;
+            descendant_cleanup_attempted = true;
+        }
         #[cfg(test)]
         let injected_reap_failure = shared.reap_failure.swap(0, Ordering::AcqRel);
         #[cfg(not(test))]
@@ -554,6 +595,14 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
             Ok(None) => std::thread::park_timeout(REAPER_POLL_INTERVAL),
             Err(code) => retain_incomplete_cleanup(&shared, code),
         }
+    }
+}
+
+fn descendant_cleanup_limit(shared: &LifecycleShared) -> DescendantCleanup {
+    if shared.fresh_session.load(Ordering::Acquire) {
+        DescendantCleanup::FreshGroupUnverified
+    } else {
+        DescendantCleanup::NotEstablished
     }
 }
 

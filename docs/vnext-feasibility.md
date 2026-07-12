@@ -193,9 +193,34 @@ forever while retaining the exact pidfd. It neither blocks in Drop nor retries
 a permanent fault. Isolated tests cover live/stalled Drop, cancellation,
 exact-child SIGKILL/reap, incomplete explicit cleanup followed by durable
 cleanup, `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, a broad waiter, and persistent
-signal/poll/reap failures. Future bootstrap-fd collision policy, authenticated
-HELLO composition, a fresh process group, and physical Arm64 release evidence
-remain required.
+signal/poll/reap failures.
+
+The private atomic-exec checkpoint now calls `setsid` in the trusted raw child
+before MDWE and held-image exec. Success creates a fresh session and process
+group whose SID and PGID equal the clone-time child PID. The lifecycle records
+that fact only after the trusted exec-error protocol proves the child passed
+`setsid`; it still mints no receipt. Cleanup never submits a numeric PGID
+signal. Linux has no pidfd-equivalent process-group handle and no atomic
+"validate this pidfd leader, then signal its group" operation. Even after
+`waitid(P_PIDFD, ... | WNOWAIT)` reports `CLD_STOPPED`, a malicious same-UID
+delegate can send `SIGCONT` or `SIGKILL`; the leader can exit and a broad waiter
+can reap it before `kill(-pgid)` executes. The number may then identify an
+unrelated group. The lifecycle therefore reports a fresh but unverified group
+and uses only pidfd operations for exact direct-child termination/reap.
+
+Native-style disposable tests prove post-exec SID/PGID identity, `setsid`
+failure, nonblocking Drop, exact cleanup after broad/automatic reap, and the
+intentional survival of both an ordinary group descendant and a malicious
+descendant that creates a new session. Test-only pidfds provide their
+disposable-helper cleanup backstop. Race-resistant descendant teardown is a
+kernel impossibility under the stated malicious-receiver and broad-waiter model
+without stronger trusted containment such as a broker-controlled cgroup or PID
+namespace. A task in an uninterruptible kernel wait can also prevent bounded
+successful direct-child reap; the durable worker retains the exact pidfd and
+the bounded result remains incomplete. This checkpoint is currently
+Docker-characterized and requires native AMD64/Arm64 execution.
+Bootstrap-fd collision policy, authenticated HELLO composition, and physical
+Arm64 release evidence also remain required.
 
 The extended scaffold passed native Linux AMD64/Arm64 and Linux AMD64 ASan at
 commit `cd38c26` in CI run
@@ -209,11 +234,13 @@ where all jobs passed and both hosted Linux runners identified themselves as
 Azure VMs. That hosted execution is characterization rather than physical
 Arm64 release evidence.
 
-The durable owner removes the leak-prone cleanup blocker in isolation. Linux
+The durable owner removes the leak-prone exact direct-child cleanup blocker in
+isolation. The fresh-session checkpoint characterizes grouping but cannot
+provide race-resistant descendant teardown. Linux
 image identity still cannot mint the final authenticated-endpoint receipt until
 that owner is composed with the collision-safe inherited bootstrap fd,
-authenticated nonce-bound HELLO, exact packet credentials, and fresh process
-group for the same child. This still blocks the safe session constructor;
+authenticated nonce-bound HELLO, and exact packet credentials for the same
+child. This still blocks the safe session constructor;
 PID/path checks or a standalone private probe are not substitutes.
 
 Primary sources: Linux man-pages for [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html),
@@ -262,11 +289,14 @@ conformance pass.
 
 ## Process containment
 
-- Linux and macOS: feasible for the exact direct child and ordinary
-  descendants using a fresh session/process group, bounded group termination,
-  a race-resistant direct-child lifecycle handle where available, and exact
-  direct-child reap. A malicious descendant may escape the group or retain a
-  delegated capability; baseline cleanup cannot prevent or revoke that.
+- Linux: fresh session/process-group creation and exact direct-child pidfd
+  cleanup are feasible. Race-resistant numeric group termination is not:
+  same-UID delegates plus broad/automatic reaping can invalidate and reuse the
+  PGID between any leader check and `kill(-pgid)`. Ordinary and escaped
+  descendants therefore remain unverified without stronger trusted cgroup,
+  broker, or namespace containment.
+- macOS: fresh group/session feasibility remains separate native work; Linux's
+  pidfd evidence does not establish a race-resistant macOS group handle.
 - Windows: feasible by creating the child suspended, assigning it to an
   unnamed kill-on-close Job before resume, rejecting setup if assignment or
   required Job policy fails, and retaining process/thread/Job handles in RAII.
@@ -295,13 +325,18 @@ apparent tensions resolve as follows:
    not dual RW/RX aliases or the outside-tree receiver-writer delegation case.
 4. Windows remote cleanup is containment/process teardown, not unsafe numeric
    remote-handle closure after resume.
-5. Unix process-group cleanup covers the direct child and ordinary descendants
-   but cannot contain an actively escaping malicious descendant; the spec
-   already forbids making the stronger claim.
+5. Linux process-group creation does not make numeric PGID termination
+   race-resistant. The section 9 MUST for bounded ordinary-descendant group
+   termination conflicts with the malicious-receiver plus broad-waiter model
+   unless stronger trusted containment is added. The private checkpoint fails
+   closed by omitting numeric group signals and blocks release pending a
+   normative amendment or mandatory stronger containment.
 6. A bounded termination/reap attempt does not guarantee successful bounded
    reap when a task is stuck in an uninterruptible kernel wait; the cleanup
    ledger retains ownership and reports this exact incomplete state.
 
-The mechanism design is feasible under the explicit Linux kernel limit above.
-Phase 0's execute-authority contradiction is resolved normatively; release
-remains blocked on implementation and exact five-target evidence.
+The memory-authority mechanism design is feasible under the explicit Linux
+kernel limit above. Phase 0's execute-authority contradiction is resolved, but
+the newly proven Linux process-group identity contradiction blocks release
+pending a normative amendment or mandatory stronger containment. Exact
+five-target implementation evidence also remains outstanding.
