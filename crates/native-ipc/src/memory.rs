@@ -139,8 +139,11 @@ impl PermissionPlan {
         }
     }
 
-    /// Shared executable mappings are never permitted.
-    pub const fn executable(self) -> bool {
+    /// Whether a mapping created by the library requests execute authority.
+    ///
+    /// This does not describe every alias a malicious native-capability holder
+    /// may create under the documented target-specific authority limits.
+    pub const fn library_view_executable(self) -> bool {
         false
     }
 }
@@ -367,7 +370,10 @@ pub struct NativeRegion {
 }
 
 impl NativeRegion {
-    /// Allocates a zeroed, anonymous, non-executable native region.
+    /// Allocates a zeroed anonymous region with a non-executable library view.
+    ///
+    /// Delegated native authority follows the documented target policy; on
+    /// Linux, a malicious memfd holder may create a separate executable alias.
     pub fn allocate(options: RegionOptions) -> Result<Self, MemoryError> {
         validate_options(options)?;
         let inner = PlatformQuiescentRegion::new(options.logical_len())?;
@@ -719,6 +725,7 @@ mod tests {
         assert!(status.can_grow);
         assert_eq!(status.permissions.creator_access(), MemoryAccess::ReadWrite);
         assert_eq!(status.permissions.peer_access(), MemoryAccess::ReadOnly);
+        assert!(!status.permissions.library_view_executable());
         region.initialize(|bytes| assert_eq!(&bytes[..4], b"NIPC"));
     }
 

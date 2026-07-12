@@ -113,7 +113,7 @@ sequenceDiagram
     participant P as Authenticated peer
     participant R as Shared region
 
-    C->>OS: Allocate zeroed, non-executable region
+    C->>OS: Allocate zeroed region with non-executable library view
     OS-->>C: Exclusive quiescent mapping
     C->>R: Encode canonical header, slots, and routes
     C->>C: Validate full mapping and padding

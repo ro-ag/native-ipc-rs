@@ -1,4 +1,4 @@
-//! Linux 6.3+ non-executable memfd direction preparation.
+//! Linux 6.3+ least-authority memfd direction preparation.
 
 use core::cell::Cell;
 use core::marker::PhantomData;

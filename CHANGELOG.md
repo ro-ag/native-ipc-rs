@@ -5,6 +5,22 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Security
+
+- Define the strongest achievable Linux shared-memory authority contract:
+  `MFD_NOEXEC_SEAL`, complete seal ordering, non-executable library views, and
+  inherited irreversible MDWE are mandatory. Native AMD64/Arm64 evidence shows
+  Linux still permits a malicious delegated peer to create RX aliases. During
+  receiver-writer setup, an fd delegated outside the MDWE-inheriting process
+  tree may also retain RW and later gain execute. This residual authority is
+  explicit rather than overstated as object-level NX.
+
+### Changed
+
+- **Breaking:** rename `PermissionPlan::executable()` to
+  `library_view_executable()`. The old name incorrectly suggested a guarantee
+  about every alias a malicious native-capability holder could create.
+
 ## [0.4.0] - 2026-07-11
 
 ### Changed

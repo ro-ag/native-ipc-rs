@@ -15,8 +15,11 @@ lifecycle containment, and platform policy.
 
 Assets include the trusted process's memory integrity, availability, native
 capabilities, generation identity, payload confidentiality, and the guarantee
-that a peer reader cannot mutate writer-owned mappings or introduce executable
-shared pages.
+that a peer reader cannot mutate writer-owned mappings. Library-created shared
+views are non-executable. Linux's documented direction-specific authority—RX
+aliases plus a receiver-writer fd delegate outside the MDWE tree retaining then
+upgrading a pre-seal RW view—is an accepted kernel limit, not a claimed
+object-level NX guarantee.
 
 The main trust boundaries are:
 
@@ -38,8 +41,9 @@ Developer-controlled inputs include protocol implementations and unsafe native
 adapters.
 
 Assumptions are that supported targets provide lock-free 64-bit atomics with
-cross-process semantics, the native kernel correctly enforces maximum mapping
-rights, the caller authenticates the intended peer, and callers uphold the
+cross-process semantics, the native kernel correctly enforces the
+backend-specific authority contract, the caller authenticates the intended
+peer, and callers uphold the
 documented unsafe binding/quiescence contracts. Compromise of the kernel,
 physical memory attacks, and a malicious trusted-process caller invoking unsafe
 APIs incorrectly are out of scope.
@@ -77,8 +81,12 @@ integration tests exercise capability transfer in real helper processes.
 ## Severity Calibration (Critical, High, Medium, Low)
 
 Critical issues include safe-code remote memory corruption or arbitrary code
-execution in the trusted process, or a reader capability that reliably permits
-creating an executable writable mapping. High issues include cross-process
+execution in the trusted process, or authority exceeding the documented native
+backend limit. Linux RX aliases, dual RW/RX aliases inside the MDWE tree, and a
+receiver-writer fd delegate outside that tree retaining then upgrading its
+pre-seal RW view are explicit kernel limits of the malicious receiver
+principal. A library-created executable view or failure to install MDWE remains
+a security failure. High issues include cross-process
 write authority where read-only was promised, unchecked peer lengths reaching
 unsafe slice construction, stale-generation acceptance, or exact-ack bypass
 allowing attacker-controlled concurrent aliasing.

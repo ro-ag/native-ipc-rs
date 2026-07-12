@@ -13,7 +13,7 @@ Invariant: every native mechanism has an implementable least-authority state
 machine, and impossible revocation/containment claims are explicitly excluded.
 
 Deliverables: [`vnext-feasibility.md`](vnext-feasibility.md), primary-source
-evidence, focused native probes for NX memfds/seal order/credentials/Mach
+evidence, focused native probes for memfd execute authority/seal order/credentials/Mach
 maximum rights/Windows duplicate teardown, and target evidence placeholders.
 Validation: document link checks plus native probes where runners exist.
 
@@ -57,12 +57,16 @@ portable corpus and host process integration.
 
 ## Phase 5 — Linux GNU AMD64/Arm64 backend
 
-Invariant: Linux 6.3+ uses NX memfds, exact peer-writer seal preparation,
-credentialed `SOCK_SEQPACKET` ancillary framing, pidfds, and contained owned
-child cleanup with no fd leaks.
+Invariant: Linux 6.3+ uses `MFD_NOEXEC_SEAL`, inherited irreversible MDWE,
+exact peer-writer seal preparation, credentialed `SOCK_SEQPACKET` ancillary
+framing, pidfds, and contained owned-child cleanup with no fd leaks. Library
+views never request execute. The kernel-demonstrated RX aliases and the
+receiver-writer principal's ability to delegate a pre-seal fd outside the MDWE
+tree and retain an upgradeable RW view remain explicit.
 
 Tests: every seal/preparation state, 0/1/2/N `SCM_RIGHTS`, every truncation and
-ancillary mutation, exact credentials, resize/write/execute denial, hostile
+ancillary mutation, exact credentials, resize/write/permission-upgrade denial,
+isolated positive RX-alias and pre-seal outside-tree delegation characterizations, hostile
 deadline and Nth-operation faults. Validation: native AMD64 and Arm64 only;
 cross-build results stay unverified.
 

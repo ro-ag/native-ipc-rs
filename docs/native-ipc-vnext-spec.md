@@ -34,7 +34,10 @@ not evidence of a native security guarantee.
 
 The ordinary safe API MUST provide:
 
-1. anonymous, zeroed, non-executable native shared memory;
+1. anonymous, zeroed native shared memory whose library-created views exclude
+   execute and whose delegated authority is attenuated to the strongest
+   supported kernel mechanism, subject only to the explicit Linux residual
+   authority in section 8.2;
 2. quiescent initialization before any capability escapes;
 3. a consuming local-writer or peer-writer choice for each region;
 4. opaque application-neutral region handles;
@@ -46,7 +49,8 @@ The ordinary safe API MUST provide:
 10. checked allocation-free runtime copies and an explicit unsafe pointer
     escape hatch for application atomics and real-time layouts;
 11. peer lifecycle observation, poisoning, termination, reaping, and cleanup;
-12. identical public semantics on every supported platform;
+12. identical public API and runtime semantics on every supported platform,
+    with target-specific kernel authority limits stated explicitly;
 13. bounded authenticated application-control framing for negotiation and
     non-real-time lifecycle messages; and
 14. native adversarial tests for every claimed security property.
@@ -60,7 +64,8 @@ manipulate an fd, Mach port, address, Windows handle, socket path, or pipe name.
 
 - allocation, mapping, page rounding, pre-share growth, and cleanup;
 - logical length versus mapped/capability length;
-- native read/write/non-execute authority;
+- native read/write authority, non-executable library views, and exact
+  target-specific residual execute authority;
 - peer authentication, session freshness, and absolute deadlines;
 - capability framing, batching, provenance, READY, and COMMIT;
 - limits for sessions, regions, batches, control frames, and native objects;
@@ -136,15 +141,21 @@ For safe callers, a hostile peer MUST NOT cause:
 - unchecked slice construction from peer values;
 - writable aliasing contrary to the documented authority model;
 - use-after-free, double-close, double-unmap, or double-reap;
-- executable shared memory or reader write authority;
+- executable mappings in the trusted process or reader write authority;
 - stale, replayed, substituted, or foreign transactions becoming active;
 - partial exposure of an uncommitted batch;
 - hostile traffic extending an operation beyond its deadline; or
 - resource leaks on covered failure paths.
 
 Exactly one endpoint MUST have library-managed store authority per region. The
-other endpoint MUST receive kernel-enforced read-only authority. Neither may
-obtain execute authority through the library.
+other endpoint MUST receive kernel-enforced read-only authority. The library
+MUST NOT create an executable shared-memory view. macOS and Windows delegated
+capabilities MUST exclude execute through kernel-enforced maximum rights. On
+Linux, the direction-specific section 8.2 residual authority applies. It
+includes peer RX aliases and, for receiver-writer setup, an unrelated
+non-MDWE-tree delegate retaining then upgrading a pre-seal RW view. These
+kernel limits MUST be documented and MUST NOT be described as kernel-enforced
+object-level NX.
 
 Here “endpoint” means the coordinator or receiver authority principal, not one
 OS mapping or PID; an authorized receiver may duplicate/delegate only the same
@@ -161,6 +172,13 @@ atomicity.
 
 Native capabilities are delegatable. A malicious peer and its delegates are
 one trust principal. Delegation MUST NOT increase delivered authority.
+
+On Linux, delivered authority expressly includes the direction-specific limits
+in section 8.2. MDWE is process authority, not memfd-object authority: it
+constrains the spawned receiver and inheriting descendants, but does not travel
+with an fd delegated outside that MDWE-inheriting process tree. Every such
+delegate remains part of the same malicious receiver authority principal. No
+stronger confinement or revocation is claimed.
 
 “Sealed” means size/authority attenuation defined by the backend. It does not
 mean immutable, encrypted, revocable, or safe from the authorized writer.
@@ -265,8 +283,9 @@ let prepared = region.prepare(RegionSpec {
 ```
 
 Allocation MUST reject zero length/overflow, be page-aligned and zeroed, and
-exclude execute. Logical length and mapped length remain distinct. Page padding
-MUST be zero before transfer and inaccessible through safe runtime APIs.
+create no executable library mapping. Logical length and mapped length remain
+distinct. Page padding MUST be zero before transfer and inaccessible through
+safe runtime APIs.
 
 `RegionOptions` includes `GuardPolicy::{BestEffort, Require, Disable}`. Where
 native placement permits reliable guard pages, inaccessible pages surround the
@@ -545,7 +564,9 @@ The manifest is manually encoded, fixed-width, bounded, versioned, and binds:
   - region ID and library-minted object incarnation;
   - writer endpoint/complementary access;
   - logical and mapped/capability lengths;
-  - capability ordinal and non-executable/authority flags; and
+  - capability ordinal and the library-view non-execute flag; and
+- session-wide trusted platform authority facts, including Linux pre-exec MDWE
+  and the direction-specific residual limitations;
 - zero reserved bytes.
 
 It MUST NOT contain pointers, `usize`, raw native handle values, `repr(Rust)`
@@ -605,10 +626,11 @@ is still owned and cleaned before return.
 
 ### 8.1 Common
 
-Each acquired resource enters RAII immediately. Backends exclude execute and
-verify their complete backend-specific authority state: Linux object type/fd
-mode/seals plus negative map probes, Mach entry and current/maximum VM rights,
-or Windows section protection/duplicated access/view rights. They disable
+Each acquired resource enters RAII immediately. Backends never create an
+executable shared-memory view and verify their complete backend-specific
+authority state: Linux object type/fd mode/seals plus MDWE and characterization
+probes, Mach entry and current/maximum VM rights, or Windows section
+protection/duplicated access/view rights. They disable
 inheritance except the intentional bootstrap endpoint, freeze size/authority,
 preserve stable active addresses, hide padding, and fail rather than select a
 weaker fallback.
@@ -616,17 +638,41 @@ weaker fallback.
 ### 8.2 Linux GNU AMD64/Arm64
 
 Target baseline: Linux kernel 6.3+ and glibc 2.31+, verified before release.
-Kernel 6.3 is required because older ordinary memfds cannot enforce the
-hostile-peer non-execute guarantee. See the kernel's
+Kernel 6.3 is required for `MFD_NOEXEC_SEAL` and irreversible MDWE. See the kernel's
 [`MFD_NOEXEC_SEAL` design](https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html).
 
-**Open blocking contradiction (2026-07-11):** native AMD64/Arm64 and local
-Linux Arm64 Docker probes show that an `MFD_NOEXEC_SEAL` object with
-`F_SEAL_EXEC` still permits both a new `PROT_EXEC` mapping and an executable
-`mprotect` upgrade of an existing writable mapping. The requirements below are
-not relaxed: current Linux preparation MUST fail closed before capability
-escape, and Linux release remains blocked until a normative amendment or a
-separately proven mandatory kernel containment mechanism resolves this gap.
+**Accepted kernel limit (2026-07-11):** native AMD64/Arm64 probes show that an
+`MFD_NOEXEC_SEAL` object with `F_SEAL_EXEC` still permits executable VM views.
+Irreversible `PR_SET_MDWE(PR_MDWE_REFUSE_EXEC_GAIN)` rejects an executable
+upgrade of an existing writable view but still permits a separate shared RX
+alias while the writable alias remains live. Therefore Linux cannot provide
+object-level NX against a malicious delegated peer. The library MUST expose
+this limit accurately, MUST NOT claim parity with Mach/Windows maximum execute
+rights, and MUST retain every stronger protection below.
+
+Before the initial authenticated receiver exec, the trusted library-owned
+pre-exec path MUST install exactly `PR_MDWE_REFUSE_EXEC_GAIN` without
+`PR_MDWE_NO_INHERIT`; failure MUST propagate through the trusted spawn/exec
+error path, abort spawn, and clean up. Capability transfer MUST NOT begin unless
+that path and exact-image exec succeed. Security relies on kernel inheritance
+and irreversibility, not a receiver assertion. This protection prevents a
+receiver from converting an existing non-executable mapping into an executable
+mapping or creating one mapping that is simultaneously writable and
+executable. It does not prevent dual RW/RX aliases of the same memfd and MUST
+NOT be documented as doing so. Controlled native helpers MUST verify
+`PR_GET_MDWE` after exec and in descendants.
+
+The residual authority is direction-specific. A coordinator-writer capability
+escapes only after future-write sealing, so the receiver principal and its
+delegates can create RX aliases but cannot regain store authority. A
+receiver-writer fd necessarily escapes before `F_SEAL_FUTURE_WRITE`; the
+receiver may delegate it to an unrelated non-MDWE process, which may establish
+an RW view before `IMPORTED` and later upgrade that retained view to executable.
+That possible RWX view is part of the accepted receiver-principal authority and
+does not create a second authority principal with store rights. The library
+MUST document it, MUST keep the transfer window bounded by one absolute
+deadline, and MUST complete future-write sealing immediately after the exact
+manifest-bound import receipt.
 
 Memory uses `memfd_create(MFD_CLOEXEC | MFD_NOEXEC_SEAL)`, checked `ftruncate`,
 and verifies the implied `F_SEAL_EXEC` plus `F_SEAL_GROW | F_SEAL_SHRINK |
@@ -788,7 +834,10 @@ This is an acceptance example, not library API:
 The profile passes only when all four differently sized regions activate in
 one transaction; peer authority is complementary; none is visible early; one
 READY/COMMIT covers all; injected failure at first/middle/final entry exposes
-none; every reader rejects native writes/execute; runtime access has no
+none; every reader rejects native writes, macOS/Windows reject execute, and
+Linux denies permission upgrades inside the MDWE-inheriting tree while
+positively characterizing the complete direction-specific section 8.2
+residual; runtime access has no
 allocation/syscall/wait; and peer crash cannot block access/monitor cleanup.
 
 The library and fixture contain no VST3 symbol or plug-in ABI structure.
@@ -843,7 +892,7 @@ only when active mappings drop.
 ### 12.5 Native permission/framing corpus
 
 For every platform/direction, subprocess tests prove reader read, reader store
-failure, writable/executable upgrade failure, designated writer success,
+failure, designated writer success,
 opposite endpoint denial, post-prepare resize denial, wrong object rejection,
 zero padding, safe padding inaccessibility, guard-page faults when required,
 and accurate best-effort guard capability reporting.
@@ -854,6 +903,17 @@ multiple messages, wrong level/type, invalid cmsg lengths/alignment,
 new writable mappings between every peer-writer preparation state; assert size
 is frozen before escape and no coordinator writable view exists for a
 receiver-writer entry after transfer.
+Linux also proves inherited MDWE, denial of RW-to-executable upgrades and
+single-view RWX mappings within the MDWE-inheriting process tree, and the
+documented success of a separate RX alias. For receiver-writer entries it also
+proves that an unrelated non-MDWE delegate can retain a pre-seal RW view and
+later upgrade it. Positive residual-authority probes MUST run only in
+disposable helpers and MUST NOT make a production payload executable.
+Native failure tests MUST prove that injected or real `PR_SET_MDWE` failure
+prevents exec and capability transfer and restores fd/child/resource baselines;
+the exact spawned image observes exactly `PR_MDWE_REFUSE_EXEC_GAIN`; fork and
+exec descendants retain it; clearing MDWE or adding `PR_MDWE_NO_INHERIT` fails;
+and no receiver-supplied MDWE claim can authorize capability transfer.
 
 macOS additionally tests every header/descriptor/trailer size, audit token,
 complex bit, count/type/disposition, extra installed rights, and port baseline.
@@ -919,6 +979,11 @@ OS-specific orchestration, Linux single-region transactions, macOS/Windows
 fixed tuples, caller-composable pending tokens, and application schema/layout
 fields in the base native manifest.
 
+Rename `PermissionPlan::executable()` to
+`PermissionPlan::library_view_executable()`. The result describes mappings
+created by the library, not every alias a malicious delegated-capability holder
+can create under the target-specific authority contract.
+
 Publish migration examples for 1, 2, 4, and 16 regions, mixed directions,
 bootstrap, exact receive validation, poison handling, and explicit close.
 Compatibility features MUST NOT weaken new guarantees or appear in vNext
@@ -945,7 +1010,8 @@ vNext is done only when:
 4. every MUST has positive and negative traceability tests;
 5. fault/resource-cycle gates return to baseline;
 6. real-time negative properties are instrumented and pass;
-7. docs accurately limit sealing, integrity, revocation, and atomicity claims;
+7. docs accurately limit sealing, integrity, revocation, atomicity, and
+   platform execute-authority claims;
 8. exact-release adversarial review has no unresolved critical/high issue;
 9. medium findings are fixed or explicitly accepted with rationale; and
 10. packaged crates are retested before publication.

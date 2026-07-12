@@ -129,7 +129,10 @@ pub struct PrivateRegion {
 unsafe impl Send for PrivateRegion {}
 
 impl PrivateRegion {
-    /// Allocates zeroed anonymous non-executable native memory.
+    /// Allocates zeroed anonymous memory with a non-executable library view.
+    ///
+    /// Delegated native authority follows the documented target policy; on
+    /// Linux, a malicious memfd holder may create a separate executable alias.
     pub fn allocate(options: RegionOptions) -> Result<Self, RegionError> {
         if options.guard == GuardPolicy::Require {
             return Err(RegionError::GuardUnavailable);

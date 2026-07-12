@@ -5,7 +5,7 @@ safe-code ownership, kernel authority, authenticated-peer assumptions, and
 claims that cannot be made. Native proof still requires execution on every
 release target; this document is design evidence, not native conformance.
 
-## Linux 6.3+ non-executable memfds — blocked contradiction
+## Linux 6.3+ execute mitigation — accepted direction-specific limit
 
 `memfd_create(MFD_CLOEXEC | MFD_NOEXEC_SEAL)` creates the memfd with executable
 mode bits clear, installs `F_SEAL_EXEC`, and implies `MFD_ALLOW_SEALING`. Native
@@ -21,25 +21,28 @@ MDWE denied only the existing RW-to-RWX upgrade. The mode/seal policy, even
 combined with MDWE, therefore does not provide object-level maximum VM
 protection against dual RW/RX aliases.
 
-Those results contradict the vNext requirement for both directions. A peer
-reader can create a new executable view of a coordinator-writer object, while
-receiver-writer ordering necessarily creates its writable mapping before
-`F_SEAL_FUTURE_WRITE` and the receiver can subsequently make that mapping
-executable. Safe-code ownership is sufficient for the trusted coordinator's
-own access discipline, but no specified kernel authority constrains the
-malicious receiver. `F_SEAL_EXEC` is therefore not a maximum-VM-protection
-mechanism analogous to Mach memory-entry maximum rights.
+Those results define the strongest feasible vNext contract for both directions.
+A peer reader can create a new executable view of a coordinator-writer object.
+For a receiver-writer object, irreversible MDWE prevents mappings in the
+receiver's inheriting process tree from gaining execute, but the receiver can
+create a distinct RX alias while retaining RW. It can also delegate the
+pre-future-write-seal fd to an unrelated non-MDWE process, which can retain an
+RW view and later upgrade it. Every delegate remains part of the malicious
+receiver authority principal, so this does not grant store authority to the
+coordinator or a second principal. Safe-code ownership remains sufficient for
+the trusted coordinator's access discipline. `F_SEAL_EXEC` plus MDWE is not a
+maximum-VM-protection mechanism analogous to Mach memory-entry maximum rights.
 
-The private vNext Linux preparation now rejects the mechanism without probing
-or making the real payload executable. Disposable isolated helper processes
-characterize both kernel paths, with process teardown as their cleanup
-backstop. The fail-closed correction passed both Linux architectures and ASan
-in [Actions 29179459798](https://github.com/ro-ag/native-ipc-rs/actions/runs/29179459798).
-Capability preparation fails closed in either direction. Linux release is blocked;
-the MUST cannot be weakened to cover only new executable mappings. Resolution
-requires either a normative threat/guarantee change or a separately proven
-mandatory containment mechanism that a malicious receiver cannot remove or
-bypass. No such unprivileged mechanism is currently specified.
+Disposable isolated helper processes characterize both kernel paths, with
+process teardown as their cleanup backstop. Production never probes or makes a
+real payload executable. The trusted pre-exec path must install inherited
+irreversible MDWE and propagate failure before capability transfer; security
+relies on kernel inheritance and irreversibility, not a malicious receiver's
+assertion. Preparation remains fail-closed until that process fact is
+structurally bound to the session. The accepted residual authority is precise:
+library views exclude execute and memfd mode cannot gain execute; MDWE-tree
+mappings cannot gain execute or become RWX; RX aliases remain possible; and an
+unrelated receiver-writer delegate may retain then upgrade a pre-seal RW view.
 
 Primary sources:
 <https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html> and
@@ -47,9 +50,8 @@ Primary sources:
 
 ## Linux peer-writer seal order
 
-The future-write ordering is feasible as a bounded preparation subprotocol,
-but the complete receiver-writer contract is blocked by the executable-upgrade
-contradiction above. Size and execute seals precede
+The future-write ordering is feasible as a bounded preparation subprotocol
+under the accepted authority boundary. Size and execute seals precede
 escape. For receiver-writer entries the coordinator destroys its writable
 view, transfers the still-future-write-unsealed fd, waits for exact
 manifest-bound `IMPORTED`, installs `F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`, sends
@@ -184,9 +186,9 @@ apparent tensions resolve as follows:
    capability delivery. Ambiguous post-escape failures poison and contain.
 3. `F_SEAL_FUTURE_WRITE` is compatible with an already-created designated
    writer mapping; it forbids future writer mappings rather than revoking the
-   existing one. Native execution additionally proved that `F_SEAL_EXEC` does
-   not stop that existing mapping from gaining execute through `mprotect`, so
-   Linux receiver-writer NX remains a genuine unresolved contradiction.
+   existing one. `F_SEAL_EXEC` alone does not stop executable upgrade;
+   inherited irreversible MDWE closes that path inside its process tree but
+   not dual RW/RX aliases or the outside-tree receiver-writer delegation case.
 4. Windows remote cleanup is containment/process teardown, not unsafe numeric
    remote-handle closure after resume.
 5. Unix process-group cleanup covers the direct child and ordinary descendants
@@ -196,7 +198,6 @@ apparent tensions resolve as follows:
    reap when a task is stuck in an uninterruptible kernel wait; the cleanup
    ledger retains ownership and reports this exact incomplete state.
 
-The mechanisms no longer have a wholly paper-feasible design: Linux
-receiver-writer NX is blocked by native kernel behavior. Phase 0 and release
-remain blocked until the normative contract or mechanism is changed explicitly,
-in addition to the remaining implementation and five-target release evidence.
+The mechanism design is feasible under the explicit Linux kernel limit above.
+Phase 0's execute-authority contradiction is resolved normatively; release
+remains blocked on implementation and exact five-target evidence.

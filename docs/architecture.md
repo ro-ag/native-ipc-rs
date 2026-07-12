@@ -9,8 +9,12 @@ nothing about native handles or application message meanings.
 
 `native-ipc-platform` turns OS objects into least-authority mapping witnesses.
 The negotiated capability size includes page rounding; bytes outside the
-logical layout are zeroed and validated. Native code excludes execute from
-current and maximum protection and fails closed on weaker rights.
+logical layout are zeroed and validated. Native code never creates executable
+shared-memory views and fails closed on weaker-than-documented rights. macOS
+and Windows exclude execute from maximum rights. Linux combines noexec memfds,
+seals, and inherited irreversible MDWE, while explicitly retaining the kernel's
+direction-specific limits: peer RX aliases and a receiver-writer fd delegate
+outside the MDWE tree retaining then upgrading a pre-seal RW view.
 
 Core owns the audited conversion from checked ranges and consumed platform
 witnesses to atomic slot and acknowledgement capabilities.
@@ -81,8 +85,13 @@ kernel's native mechanism:
   with a read-only peer entry or a remote writer with a read-write peer entry
   after permanently downgrading the local mapping. Current and maximum
   permissions exclude execute.
-- Linux uses sealed anonymous `memfd` objects, exact private `SCM_RIGHTS`
-  transfer, `SO_PEERCRED`, `pidfd`, and parent-owned helper cleanup.
+- Linux uses sealed anonymous `memfd` objects, inherited irreversible MDWE,
+  exact private `SCM_RIGHTS` transfer, `SO_PEERCRED`, `pidfd`, and parent-owned
+  helper cleanup. Inside the MDWE-inheriting process tree, MDWE blocks
+  permission upgrades and a single RWX view. The kernel still permits RX
+  aliases; for receiver-writer setup, an unrelated process receiving the fd
+  before future-write sealing can retain RW and later upgrade it. Every such
+  delegate remains part of the malicious receiver authority principal.
 - Windows uses unnamed sections with least-rights duplicated handles,
   per-launch private PID-checked named pipes, suspended process creation, and
   kill-on-close Job Objects.
