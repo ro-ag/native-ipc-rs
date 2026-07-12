@@ -115,6 +115,14 @@ implementation must:
 - transfer every incompletely reaped child and pidfd into a durable reaper or
   containment owner that survives returned errors and Drop.
 
+The private `HeldExecutable`/`VerifiedExecutable` scaffold now implements the
+absolute native-ELF `openat2` policy, held device/inode, immediate pidfd, and
+post-spawn `/proc/PID/exe` comparison. It rejects relative paths,
+symlink/magic-link resolution, nonfiles, non-executables, non-ELF artifacts,
+and wrong spawned images. It does not yet execute the held artifact or mint an
+`ImageIdentityReceipt`; those require the inherited bootstrap, authenticated
+channel, and bounded process owner below.
+
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;
 PID/path checks or a leak-prone probe are not substitutes.
