@@ -242,6 +242,9 @@ impl<T: OwnedChildControl> AuthenticatedNativeEndpoint<T> {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) mod linux;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+mod linux_vnext;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) mod macos;
