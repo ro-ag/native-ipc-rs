@@ -108,13 +108,6 @@ fn wait_until_expired(deadline: AbsoluteDeadline) {
     }
 }
 
-fn open_map_count() -> usize {
-    std::fs::read_to_string("/proc/self/maps")
-        .unwrap()
-        .lines()
-        .count()
-}
-
 fn direct_child_is_absent(pid: libc::pid_t) -> bool {
     !std::fs::read_to_string("/proc/thread-self/children")
         .unwrap()
@@ -869,7 +862,6 @@ fn isolated_linux_atomic_capabilities_match_native_publication() {
     const ACK_U64: u64 = 0xa11c_0064_a11c_0064;
 
     let before_fds = open_fd_count();
-    let before_maps = open_map_count();
     let capabilities = discover_atomic_capabilities().unwrap();
     // SAFETY: scalar sysconf selectors have no pointer arguments.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -1001,9 +993,37 @@ fn isolated_linux_atomic_capabilities_match_native_publication() {
         io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
     );
+    let mapping_address = mapping.address;
+    let mapping_length = mapping.length;
     drop(mapping);
+    // Reserve the exact former range without replacing anything. Unlike a
+    // process-wide VMA count, this remains a stable ownership oracle when a
+    // sanitizer runtime lazily adds unrelated mappings.
+    // SAFETY: MAP_FIXED_NOREPLACE either reserves this page-aligned range or
+    // fails without modifying an existing mapping.
+    let sentinel_address = unsafe {
+        libc::mmap(
+            mapping_address,
+            mapping_length,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        sentinel_address,
+        libc::MAP_FAILED,
+        "failed to reserve former atomic probe range: {}",
+        io::Error::last_os_error()
+    );
+    let sentinel = AtomicProbeMapping {
+        address: sentinel_address,
+        length: mapping_length,
+    };
+    assert_eq!(sentinel.address, mapping_address);
+    drop(sentinel);
     assert_eq!(open_fd_count(), before_fds);
-    assert_eq!(open_map_count(), before_maps);
 }
 
 #[test]
