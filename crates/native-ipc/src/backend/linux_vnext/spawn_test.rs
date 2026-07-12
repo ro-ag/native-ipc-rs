@@ -232,12 +232,21 @@ fn isolated_atomic_spawn_success_and_failures_restore_baseline() {
         ),
         (SpawnFault::Partial, LinuxSpawnError::MalformedChildError),
         (SpawnFault::Malformed, LinuxSpawnError::MalformedChildError),
-        (
-            SpawnFault::SilentExit,
-            LinuxSpawnError::ExitedBeforeConfirmation,
-        ),
     ] {
         assert_eq!(spawn(fault, deadline()).err().unwrap(), expected);
+        let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+        assert!(pid > 0);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    // A silent child can disappear from /proc before pidfd readiness becomes
+    // observable, or readiness can win first. Both are exact fail-closed
+    // terminal observations of the same owned child.
+    for _ in 0..16 {
+        assert!(matches!(
+            spawn(SpawnFault::SilentExit, deadline()).err().unwrap(),
+            LinuxSpawnError::ExitedBeforeConfirmation | LinuxSpawnError::WrongExecutable
+        ));
         let pid = LAST_SPAWN_PID.with(|slot| slot.get());
         assert!(pid > 0);
         wait_for_baseline(before_fds, before_tasks, pid, deadline());
