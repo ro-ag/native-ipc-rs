@@ -130,6 +130,16 @@ production completion operation and its destruction persistently poisons the
 session. This is a terminal provenance/transport ownership checkpoint, not an
 active batch.
 
+The private Linux G1d checkpoint also binds one exact native-authority profile
+into the canonical capability transcript. Only the role-scoped accepted Linux
+evidence owners select `LinuxMdweV1`; ordinary transaction callers cannot
+provide or replace it. The profile records inherited irreversible MDWE,
+non-executable library views, and the accepted Linux RX-alias and pre-seal
+receiver-writer delegation limitations. The accepted dispatcher rejects the
+legacy zero profile before native I/O, and exact frame comparison rejects peer
+profile substitution. This session policy fact is not proof that any individual
+memfd has completed import, final sealing, mapping, READY, or COMMIT.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

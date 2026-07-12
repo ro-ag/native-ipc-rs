@@ -578,6 +578,31 @@ validation, receiver-writer preparation, full-manifest barriers, runtime
 activation, public APIs, native-host/physical Arm64, packaged-crate, release,
 and whole-vNext evidence remain outstanding.
 
+Phase 5i-G1d fills the remaining session-wide native-authority field in the
+canonical capability transcript before memory preparation. The profile value
+`LinuxMdweV1` means the trusted pre-exec path installed inherited irreversible
+`PR_MDWE_REFUSE_EXEC_GAIN`, library-created views never request execute, fresh
+RX aliases remain possible, and a receiver-writer may delegate its pre-seal fd
+outside the MDWE tree and retain an upgradeable RW view. Those limitations are
+part of the accepted Linux authority contract, not stronger protection claims.
+
+Only the role-scoped accepted Linux evidence owners attach this profile while
+they consume into the inseparable dispatcher. Batch/transaction callers cannot
+select it. The dispatcher rejects the legacy zero profile before native I/O and
+mints the profile into bytes 76..80 of every canonical capability frame.
+Exact-frame validation therefore rejects profile replay or substitution along
+with every other session and transaction field. Landed pre-vNext helpers retain
+the zero compatibility profile and their existing wire bytes.
+
+G1d remains a policy/provenance checkpoint. It does not validate any individual
+memfd, prove final seals, create mappings, implement IMPORTED/SEALED, or add a
+production completion/READY/COMMIT path. Exact implementation commit
+`a48a051abbce0414fbe6bf00d26888ceba3e6f2b` is green across all ten jobs in
+[Actions 29207032792](https://github.com/ro-ag/native-ipc-rs/actions/runs/29207032792).
+Local macOS Rust 1.97 and privileged seccomp-unconfined Arm64 Docker full gates
+pass; Docker remains container/emulation characterization only. Independent
+adversarial review reports no P1/P2/P3.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
