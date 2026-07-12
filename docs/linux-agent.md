@@ -14,6 +14,11 @@ Use `codex/native-ipc-vnext` as the baseline, but create a separate branch such
 as `codex/linux-native-debug` before editing. Do not commit directly to the
 baseline branch, merge, tag, publish, or weaken a normative requirement.
 
+The 2026-07-12 execution record for this handoff is
+[`linux-native-report.md`](linux-native-report.md). It records the exact
+implementation SHA, direct-host evidence, hosted-runner classification, pushed
+commits, fixed defects, accepted kernel limits, and remaining release blockers.
+
 ## Required reading
 
 Before acting, read completely:

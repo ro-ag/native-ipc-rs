@@ -43,13 +43,21 @@ structurally bound to the session. The accepted residual authority is precise:
 library views exclude execute and memfd mode cannot gain execute; MDWE-tree
 mappings cannot gain execute or become RWX; RX aliases remain possible; and an
 unrelated receiver-writer delegate may retain then upgrade a pre-seal RW view.
+At source-tree commit `e904e35`, a bare-metal AMD64 test created that unrelated
+delegate before enabling MDWE in the parent, transferred the real pre-seal fd
+with `SCM_RIGHTS`, retained the delegate's RW mapping through final sealing,
+then demonstrated RW-to-RWX upgrade and immediately restored RW without
+executing payload bytes. This is characterization of the accepted limit, not
+an authenticated import or permission receipt.
 
 The private pre-exec hook installs the exact inherited mask and propagates
 setup failure through `Command`'s exec-error path. Controlled helpers verify
 exact post-exec state, irreversibility, and fork-plus-exec inheritance. The hook
 mints no witness and is not accepted by memory preparation; it must first be
-integrated with exact-image/authenticated-channel receipts, a retained pidfd,
-and deadline-bounded cleanup ownership for the same session.
+integrated with exact-image/authenticated-channel receipts and the retained
+exact-child lifecycle for the same session. A private deadline-bounded cleanup
+owner now exists, but it is intentionally not composed with an authenticated
+channel or memory preparation.
 The hook checkpoint passed both native Linux architectures and ASan in
 [Actions 29180257562](https://github.com/ro-ag/native-ipc-rs/actions/runs/29180257562).
 
@@ -94,6 +102,14 @@ does not prevent the authenticated malicious receiver from delegating a
 capability after receipt. The original draft's requirement that every packet
 match the spawned child was impossible for child-received parent packets and
 has been corrected in the normative spec.
+
+At source-tree commit `e904e35`, the parser additionally adopts every complete
+nonnegative descriptor word in every structurally reachable `SCM_RIGHTS`
+record before reporting malformed payload, truncation, wrong credentials, or
+wrong descriptor count. A complete descriptor followed by trailing
+non-descriptor bytes is therefore closed on rejection rather than leaked. This
+does not claim recovery of descriptors hidden behind an untraversable kernel
+control header.
 
 Primary sources: Linux `unix(7)`, `recvmsg(2)`, and `pidfd_open(2)` man-pages.
 
@@ -163,21 +179,42 @@ bind authenticated HELLO. Parent parsing uses the error pipe plus pidfd and one
 absolute deadline. Isolated tests cover silent pre-exec death, held-path
 replacement, post-exec MDWE and held-fd
 CLOEXEC, injected MDWE/exec errors, partial/malformed records, deadline expiry,
-pidfd readiness, and fd/process baselines. This remains test-only because the
-crate still lacks a durable nonblocking Drop/reaper handoff for an incompletely
-cleaned child; it therefore mints no image, channel, session, or memory
-authority. Future bootstrap-fd collision policy and native AMD64/Arm64 evidence
-also remain required.
+pidfd readiness, and fd/process baselines. The exact execution path remains
+private and mints no image, channel, session, or memory authority.
+
+An adjacent private `PreparedExactChildLifecycle`/`ExactChildLifecycle` now
+provides durable ownership for that sole clone-time pidfd. Its cleanup worker
+is created before clone; `Drop` only stores an atomic termination request and
+unparks the worker. Explicit wait and terminate operations share one absolute
+deadline. The worker uses `pidfd_send_signal`, pidfd polling, and
+`waitid(P_PIDFD)`, treats process-global auto-reap or a broad waiter as
+`AlreadyReaped`, and reports a terminal cleanup fault once before parking
+forever while retaining the exact pidfd. It neither blocks in Drop nor retries
+a permanent fault. Isolated tests cover live/stalled Drop, cancellation,
+exact-child SIGKILL/reap, incomplete explicit cleanup followed by durable
+cleanup, `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, a broad waiter, and persistent
+signal/poll/reap failures. Future bootstrap-fd collision policy, authenticated
+HELLO composition, a fresh process group, and physical Arm64 release evidence
+remain required.
 
 The extended scaffold passed native Linux AMD64/Arm64 and Linux AMD64 ASan at
 commit `cd38c26` in CI run
 [`29182825256`](https://github.com/ro-ag/native-ipc-rs/actions/runs/29182825256).
 That evidence validates this private mechanism checkpoint only; it does not
-remove the production lifecycle, authenticated HELLO, or bootstrap-fd blockers.
+remove the authenticated HELLO or bootstrap-fd blockers. The durable lifecycle
+extension and a focused direct-host syscall trace passed on bare-metal AMD64 at
+source-tree commit `e904e35`; the full workflow is
+[Actions 29186489332](https://github.com/ro-ag/native-ipc-rs/actions/runs/29186489332),
+where all jobs passed and both hosted Linux runners identified themselves as
+Azure VMs. That hosted execution is characterization rather than physical
+Arm64 release evidence.
 
-Until that durable lifecycle owner exists, Linux image identity cannot mint the
-final authenticated-endpoint receipt. This blocks the safe session constructor;
-PID/path checks or a leak-prone probe are not substitutes.
+The durable owner removes the leak-prone cleanup blocker in isolation. Linux
+image identity still cannot mint the final authenticated-endpoint receipt until
+that owner is composed with the collision-safe inherited bootstrap fd,
+authenticated nonce-bound HELLO, exact packet credentials, and fresh process
+group for the same child. This still blocks the safe session constructor;
+PID/path checks or a standalone private probe are not substitutes.
 
 Primary sources: Linux man-pages for [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html),
 [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html),
