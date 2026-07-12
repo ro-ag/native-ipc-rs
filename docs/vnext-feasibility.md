@@ -55,6 +55,37 @@ has been corrected in the normative spec.
 
 Primary sources: Linux `unix(7)`, `recvmsg(2)`, and `pidfd_open(2)` man-pages.
 
+### Linux executable-identity implementation constraint
+
+Adversarial implementation probes ruled out a split `canonicalize` then `open`,
+an unreserved fixed inherited descriptor number, sleep-based post-exec
+observation, and best-effort `kill`/blocking `wait` cleanup. The conforming
+implementation must:
+
+- accept an already-resolved absolute native ELF path and acquire it with one
+  `openat2` resolution that rejects symlink and magic-link components;
+- validate the held inode against the caller's identity policy and execute that
+  held artifact, then compare `/proc/PID/exe` device/inode while the child is
+  held in a nonce-bound inherited bootstrap handshake;
+- dynamically allocate a collision-free inherited descriptor and clear `FD_CLOEXEC` only
+  in the child between fork and exec;
+- open and retain the pidfd immediately; recompute/check the one absolute
+  deadline before every blocking I/O, process poll, and retry; and poll the
+  pidfd rather than spin or use blocking wait; and
+- transfer every incompletely reaped child and pidfd into a durable reaper or
+  containment owner that survives returned errors and Drop.
+
+Until that durable lifecycle owner exists, Linux image identity cannot mint the
+final authenticated-endpoint receipt. This blocks the safe session constructor;
+PID/path checks or a leak-prone probe are not substitutes.
+
+Primary sources: Linux man-pages for [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html),
+[`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html),
+[`execveat(2)`](https://man7.org/linux/man-pages/man2/execveat.2.html),
+[`proc_pid_exe(5)`](https://man7.org/linux/man-pages/man5/proc_pid_exe.5.html),
+[`pidfd_open(2)`](https://man7.org/linux/man-pages/man2/pidfd_open.2.html), and
+[`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html).
+
 ## Windows remote duplicate cleanup
 
 Feasible only with the spec's containment interpretation. `DuplicateHandle`
