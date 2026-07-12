@@ -4,8 +4,16 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem::{forget, zeroed};
 use core::ptr::NonNull;
+use core::sync::atomic::{Ordering, compiler_fence};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+
+use crate::backend::linux::QuiescentRegion;
+use crate::batch::TransferBatch;
+use crate::memory::CleanupPolicy;
+use crate::protocol::{ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess};
+use crate::region::WriterEndpoint;
+use crate::session::AbsoluteDeadline;
 
 const MFD_NOEXEC_SEAL: libc::c_uint = 0x0008;
 const F_SEAL_EXEC: libc::c_int = 0x0020;
@@ -14,8 +22,12 @@ const FINAL_SEALS: libc::c_int = PREFIX_SEALS | libc::F_SEAL_FUTURE_WRITE | libc
 const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MemfdError {
+pub(crate) enum MemfdError {
     InvalidSize,
+    InvalidBatch,
+    UnsupportedDirection,
+    DeadlineExpired,
+    DeadlineMismatch,
     InvalidObject,
     WrongObject,
     WrongProvenance,
@@ -51,6 +63,7 @@ struct CoordinatorWriterPrepared {
     fd: OwnedFd,
     mapping: VmMapping,
     reader_capability: OwnedFd,
+    key: ObjectKey,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -93,6 +106,17 @@ struct CoordinatorReaderPrepared {
 struct VmMapping {
     base: NonNull<u8>,
     len: usize,
+    clear_on_drop: bool,
+}
+
+pub(crate) struct LinuxCoordinatorWriterBatch {
+    entries: Vec<LinuxCoordinatorWriterEntry>,
+    deadline: AbsoluteDeadline,
+}
+
+struct LinuxCoordinatorWriterEntry {
+    native: NativeRegionSpec,
+    prepared: CoordinatorWriterPrepared,
 }
 
 // SAFETY: VmMapping uniquely owns one local VM range. Moving that owner to a
@@ -164,6 +188,48 @@ impl PrivateMemfd {
         })
     }
 
+    fn from_quiescent(
+        mut region: QuiescentRegion,
+        cleanup: CleanupPolicy,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        let logical_len = region.logical_len();
+        let mapped_len = region.len();
+        let mapping = match VmMapping::map_with_clear(
+            region.as_raw_fd_for_vnext(),
+            mapped_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            cleanup == CleanupPolicy::ClearThenRelease,
+        ) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                if cleanup == CleanupPolicy::ClearThenRelease {
+                    for byte in region.as_bytes_mut() {
+                        // SAFETY: the still-private quiescent mapping is live
+                        // and exclusively borrowed for this clearing pass.
+                        unsafe { core::ptr::write_volatile(byte, 0) };
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+        };
+        check_deadline(deadline)?;
+        let (fd, original_logical_len, original_mapped_len) = region.into_vnext_unmapped_parts();
+        debug_assert_eq!(logical_len, original_logical_len);
+        debug_assert_eq!(mapped_len, original_mapped_len);
+        let validation = validate_object(fd.as_raw_fd(), mapped_len, F_SEAL_EXEC);
+        check_deadline(deadline)?;
+        validation?;
+        Ok(Self {
+            fd,
+            mapping: Some(mapping),
+            logical_len,
+            not_sync: PhantomData,
+        })
+    }
+
     fn initialize(&mut self, operation: impl FnOnce(&mut [u8])) {
         let mapping = self.mapping.as_mut().expect("private mapping is live");
         // SAFETY: private typestate and exclusive self provide unique bytes.
@@ -182,12 +248,42 @@ impl PrivateMemfd {
     ) -> Result<CoordinatorWriterPrepared, MemfdError> {
         add_seals(self.fd.as_raw_fd(), FINAL_SEALS & !F_SEAL_EXEC)?;
         let mapping = self.mapping.take().expect("private mapping is live");
-        validate_object(self.fd.as_raw_fd(), mapping.len, FINAL_SEALS)?;
+        let key = validate_object(self.fd.as_raw_fd(), mapping.len, FINAL_SEALS)?;
         let reader_capability = duplicate(&self.fd)?;
+        if validate_object(reader_capability.as_raw_fd(), mapping.len, FINAL_SEALS)? != key {
+            return Err(MemfdError::WrongObject);
+        }
         Ok(CoordinatorWriterPrepared {
             fd: self.fd,
             mapping,
             reader_capability,
+            key,
+            not_sync: PhantomData,
+        })
+    }
+
+    fn prepare_coordinator_writer_for_batch(
+        mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CoordinatorWriterPrepared, MemfdError> {
+        check_deadline(deadline)?;
+        add_seals(self.fd.as_raw_fd(), FINAL_SEALS & !F_SEAL_EXEC)?;
+        check_deadline(deadline)?;
+        let mapping = self.mapping.take().expect("private mapping is live");
+        let key = validate_object(self.fd.as_raw_fd(), mapping.len, FINAL_SEALS)?;
+        check_deadline(deadline)?;
+        let reader_capability = duplicate(&self.fd)?;
+        check_deadline(deadline)?;
+        let exported = validate_object(reader_capability.as_raw_fd(), mapping.len, FINAL_SEALS)?;
+        check_deadline(deadline)?;
+        if exported != key {
+            return Err(MemfdError::WrongObject);
+        }
+        Ok(CoordinatorWriterPrepared {
+            fd: self.fd,
+            mapping,
+            reader_capability,
+            key,
             not_sync: PhantomData,
         })
     }
@@ -209,10 +305,9 @@ impl PrivateMemfd {
         let key = validate_object(self.fd.as_raw_fd(), mapped_len, PREFIX_SEALS)?;
         // The trusted coordinator destroys its only writable view before any
         // receiver capability can be duplicated or escape.
-        self.mapping
-            .take()
-            .expect("private mapping is live")
-            .unmap()?;
+        let mut mapping = self.mapping.take().expect("private mapping is live");
+        mapping.clear_on_drop = false;
+        mapping.unmap()?;
         Ok(ReceiverWriterPrepared {
             fd: self.fd,
             key,
@@ -231,6 +326,86 @@ impl CoordinatorWriterPrepared {
 
     fn reader_capability(&self) -> Result<OwnedFd, MemfdError> {
         duplicate(&self.reader_capability)
+    }
+
+    fn capability(&self) -> BorrowedFd<'_> {
+        self.reader_capability.as_fd()
+    }
+
+    fn revalidate(&self, deadline: AbsoluteDeadline) -> Result<(), MemfdError> {
+        check_deadline(deadline)?;
+        let original = validate_object(self.fd.as_raw_fd(), self.mapping.len, FINAL_SEALS)?;
+        check_deadline(deadline)?;
+        let exported = validate_object(
+            self.reader_capability.as_raw_fd(),
+            self.mapping.len,
+            FINAL_SEALS,
+        )?;
+        check_deadline(deadline)?;
+        if original != self.key || exported != self.key {
+            return Err(MemfdError::WrongObject);
+        }
+        Ok(())
+    }
+}
+
+impl LinuxCoordinatorWriterBatch {
+    pub(crate) fn prepare(
+        batch: TransferBatch,
+        authority_profile: NativeAuthorityProfile,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if authority_profile != NativeAuthorityProfile::LinuxMdweV1 {
+            return Err(MemfdError::WrongProvenance);
+        }
+        let mut pending = batch.into_pending().map_err(|_| MemfdError::InvalidBatch)?;
+        pending
+            .regions
+            .sort_unstable_by_key(|region| region.spec().id);
+        let mut entries = Vec::with_capacity(pending.regions.len());
+        for region in pending.regions {
+            check_deadline(deadline)?;
+            let (request, spec, _) = region.into_linux_transfer_parts();
+            if spec.writer != WriterEndpoint::Coordinator {
+                return Err(MemfdError::UnsupportedDirection);
+            }
+            let native = request
+                .native_spec(spec.id.get())
+                .ok_or(MemfdError::InvalidBatch)?;
+            let (region, cleanup) = request.into_linux_quiescent();
+            let prepared = PrivateMemfd::from_quiescent(region, cleanup, deadline)?
+                .prepare_coordinator_writer_for_batch(deadline)?;
+            entries.push(LinuxCoordinatorWriterEntry { native, prepared });
+        }
+        check_deadline(deadline)?;
+        Ok(Self { entries, deadline })
+    }
+
+    pub(crate) fn manifest_entries(&self) -> Vec<ManifestEntry> {
+        self.entries
+            .iter()
+            .map(|entry| ManifestEntry::from_native(entry.native, PeerAccess::ReadOnly))
+            .collect()
+    }
+
+    pub(crate) fn capabilities(&self) -> Vec<BorrowedFd<'_>> {
+        self.entries
+            .iter()
+            .map(|entry| entry.prepared.capability())
+            .collect()
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), MemfdError> {
+        check_deadline(self.deadline)?;
+        self.entries.iter().try_for_each(|entry| {
+            entry.prepared.revalidate(self.deadline)?;
+            check_deadline(self.deadline)
+        })
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
     }
 }
 
@@ -334,6 +509,15 @@ impl CoordinatorReaderPrepared {
 
 impl VmMapping {
     fn map(fd: RawFd, len: usize, protection: libc::c_int) -> Result<Self, MemfdError> {
+        Self::map_with_clear(fd, len, protection, false)
+    }
+
+    fn map_with_clear(
+        fd: RawFd,
+        len: usize,
+        protection: libc::c_int,
+        clear_on_drop: bool,
+    ) -> Result<Self, MemfdError> {
         // SAFETY: arguments describe a checked shared memfd range.
         let pointer = unsafe {
             libc::mmap(
@@ -349,7 +533,11 @@ impl VmMapping {
             return Err(last_native());
         }
         let base = NonNull::new(pointer.cast()).ok_or(MemfdError::InvalidObject)?;
-        let mapping = Self { base, len };
+        let mapping = Self {
+            base,
+            len,
+            clear_on_drop,
+        };
         for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
             // SAFETY: the complete mapping remains live for this call.
             if unsafe { libc::madvise(mapping.base.as_ptr().cast(), mapping.len, advice) } != 0 {
@@ -376,6 +564,14 @@ fn reject_unsupported_linux_nx() -> Result<(), MemfdError> {
 
 impl Drop for VmMapping {
     fn drop(&mut self) {
+        if self.clear_on_drop {
+            for offset in 0..self.len {
+                // SAFETY: this mapping is writable and uniquely owned by the
+                // pending coordinator typestate until destruction.
+                unsafe { core::ptr::write_volatile(self.base.as_ptr().add(offset), 0) };
+            }
+            compiler_fence(Ordering::SeqCst);
+        }
         // SAFETY: this value uniquely owns this local mapping.
         let _ = unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
     }
@@ -454,6 +650,14 @@ fn page_align(size: usize) -> Result<usize, MemfdError> {
 
 fn last_native() -> MemfdError {
     MemfdError::Native(io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+}
+
+fn check_deadline(deadline: AbsoluteDeadline) -> Result<(), MemfdError> {
+    if deadline.is_expired() {
+        Err(MemfdError::DeadlineExpired)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

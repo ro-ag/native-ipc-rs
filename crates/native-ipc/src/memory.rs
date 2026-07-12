@@ -599,6 +599,17 @@ impl NativeShareRequest {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_linux_quiescent(
+        mut self,
+    ) -> (crate::backend::linux::QuiescentRegion, CleanupPolicy) {
+        let inner = self
+            .inner
+            .take()
+            .expect("share request always owns its mapping");
+        (inner, self.cleanup)
+    }
+
     /// Clears and releases a prepared request without sharing it.
     pub fn destroy(mut self) {
         if let Some(inner) = self.inner.as_mut() {

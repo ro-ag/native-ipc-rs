@@ -173,7 +173,7 @@ impl PrivateRegion {
                 installed: false,
             },
             #[cfg(test)]
-            drop_events: None,
+            drop_observer: PreparedDropObserver(None),
             _not_sync: PhantomData,
         })
     }
@@ -188,15 +188,27 @@ impl PrivateRegion {
 /// fn access(pending: &PreparedRegion) { let _ = pending.read_into(0, &mut []); }
 /// ```
 pub struct PreparedRegion {
+    #[cfg(test)]
+    drop_observer: PreparedDropObserver,
     #[allow(dead_code)]
     pub(crate) request: memory::NativeShareRequest,
     #[allow(dead_code)]
     pub(crate) spec: RegionSpec,
     #[allow(dead_code)]
     pub(crate) guard: GuardCapability,
-    #[cfg(test)]
-    drop_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
     _not_sync: PhantomData<Cell<()>>,
+}
+
+#[cfg(test)]
+struct PreparedDropObserver(Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>);
+
+#[cfg(test)]
+impl Drop for PreparedDropObserver {
+    fn drop(&mut self) {
+        if let Some(events) = &self.0 {
+            events.lock().unwrap().push("prepared-drop");
+        }
+    }
 }
 
 // SAFETY: preparation retains unique ownership and exposes no shared access.
@@ -227,17 +239,23 @@ impl PreparedRegion {
         mut self,
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     ) -> Self {
-        self.drop_events = Some(events);
+        self.drop_observer.0 = Some(events);
         self
     }
-}
 
-#[cfg(test)]
-impl Drop for PreparedRegion {
-    fn drop(&mut self) {
-        if let Some(events) = &self.drop_events {
-            events.lock().unwrap().push("prepared-drop");
-        }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_linux_transfer_parts(
+        self,
+    ) -> (memory::NativeShareRequest, RegionSpec, GuardCapability) {
+        let Self {
+            #[cfg(test)]
+                drop_observer: _,
+            request,
+            spec,
+            guard,
+            _not_sync: _,
+        } = self;
+        (request, spec, guard)
     }
 }
 
