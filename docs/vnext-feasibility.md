@@ -417,6 +417,40 @@ delegated authority. Physical user-owned Arm64, macOS/Windows Phase 5i-F,
 packaged-crate conformance, whole-vNext completion, and release completion all
 remain unverified.
 
+Phase 5i-G0 adds a private, role-neutral `AcceptedControlDispatcher` scaffold.
+It inseparably owns the portable accepted control sequence, transaction state,
+zero-rights record transport, and persistent poison state. Receive asks the
+transport for one independently bounded complete record, validates the fixed
+72-byte header before payload exposure or any second allocation derived from
+peer fields, and reuses that owned record allocation for the returned payload.
+Send and receive sequences remain independent. Transaction interleaving,
+ambiguous post-encode or receive I/O, hostile framing, an oversized successful
+transport return, and peer-poll errors poison both layers without retry.
+
+Linux now caps each local HELLO offer before either canonical HELLO or the
+accepted transcript is constructed. Its maximum application-control payload is
+65,464 bytes: the verified 65,536-byte single-packet ceiling minus the 72-byte
+application-control header. Lower nonzero offers remain unchanged and zero
+still fails closed. This is the truthful negotiated transport limit rather than
+the portable 16 MiB field hard maximum. It does not change the one bounded
+`recvmsg`, no-`MSG_PEEK`, adopt-then-close-ancillary design required of the
+future Linux adapter.
+
+Exact implementation commit `9eae30f6f2e1a6083459fd6e34bec537387540e0`
+is green across all ten jobs in
+[Actions 29203533427](https://github.com/ro-ag/native-ipc-rs/actions/runs/29203533427),
+including native hosted Linux AMD64/Arm64 and ASan plus the non-Linux and
+auxiliary gates. The hosted Linux Arm64 job is an Azure VM/native runner, not
+physical user-owned Arm64 evidence. Local macOS Rust 1.97 all-feature/no-default
+tests, doctests, and strict Clippy are green. Privileged, seccomp-unconfined
+Arm64 Docker passes the corresponding proportional gates but remains
+emulation/characterization only; it is not a native-host, physical Arm64, or
+release proof. This checkpoint does not wire either Linux accepted evidence
+owner to a native application-control adapter, transfer `SCM_RIGHTS`, or expose
+a public `Ready`, session, or control API. It creates no batch, mapping, or
+memory authority. Packaged-crate, physical Arm64, exact-release-commit, and
+whole-vNext release evidence remain unverified.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
