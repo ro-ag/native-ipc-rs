@@ -516,7 +516,8 @@ fn isolated_mdwe_receiver_delegates_preseal_writer_outside_tree_helper() {
         .env(ENV_DELEGATE_PARENT_UID, parent.uid.to_string())
         .env(ENV_DELEGATE_PARENT_GID, parent.gid.to_string());
     let expected_parent_pid = parent.pid as libc::pid_t;
-    // SAFETY: only raw Linux syscalls run between fork and exec.
+    // SAFETY: the callback performs only scalar syscalls and constructs errors
+    // directly from errno values, without formatted or allocated messages.
     unsafe {
         command.pre_exec(move || {
             if libc::fcntl(source, libc::F_SETFD, 0) != 0 {
@@ -526,10 +527,7 @@ fn isolated_mdwe_receiver_delegates_preseal_writer_outside_tree_helper() {
                 return Err(io::Error::last_os_error());
             }
             if libc::getppid() != expected_parent_pid {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "receiver exited before delegate exec",
-                ));
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
             }
             Ok(())
         });

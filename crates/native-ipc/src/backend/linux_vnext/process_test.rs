@@ -1233,11 +1233,70 @@ fn isolated_exact_child_lifecycle_drop_and_reap_helper() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    // Registration is the only fallible lifecycle setup and must complete
+    // before clone. Injecting its failure proves that no child can exist when
+    // the coordinator cannot first establish a durable cleanup worker.
+    let registration = PreparedExactChildLifecycle::new_with_worker(|_| {
+        Err(io::Error::from_raw_os_error(libc::EAGAIN))
+    });
+    assert!(matches!(
+        registration,
+        Err(SpawnPolicyError::Native(libc::EAGAIN))
+    ));
+    assert_eq!(open_fd_count(), expected_fds);
+    assert_eq!(open_task_count(), expected_tasks);
+    // SAFETY: this isolated helper has not cloned a child yet; WNOHANG cannot
+    // block and ECHILD proves registration failure acquired no child.
+    assert_eq!(
+        unsafe { libc::waitpid(-1, core::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+
     let child = lifecycle_child(deadline());
     let pid = child.pid();
     assert_eq!(pidfd_reported_pid(child.pidfd()), i64::from(pid));
     assert_drop_returns(child);
     wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    let child = lifecycle_child(deadline());
+    let pid = child.pid();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _owned_until_unwind = child;
+        panic!("injected lifecycle owner panic");
+    }));
+    assert!(unwind.is_err());
+    wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+
+    const CONCURRENT_DROPS: usize = 16;
+    let mut children = Vec::with_capacity(CONCURRENT_DROPS);
+    let mut pids = Vec::with_capacity(CONCURRENT_DROPS);
+    for _ in 0..CONCURRENT_DROPS {
+        let child = lifecycle_child(deadline());
+        pids.push(child.pid());
+        children.push(child);
+    }
+    let start = std::sync::Arc::new(std::sync::Barrier::new(CONCURRENT_DROPS + 1));
+    let droppers: Vec<_> = children
+        .into_iter()
+        .map(|child| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                drop(child);
+            })
+        })
+        .collect();
+    start.wait();
+    for dropper in droppers {
+        dropper.join().unwrap();
+    }
+    for pid in pids {
+        wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
+    }
 
     let executable = std::env::current_exe().unwrap();
     let held = HeldExecutable::open(&executable).unwrap();
@@ -1309,7 +1368,7 @@ fn isolated_exact_child_lifecycle_drop_and_reap_helper() {
     // still owns the atomic pidfd and eventually exhausts retryable EINTR.
     wait_for_child_baseline(expected_fds, expected_tasks, pid, deadline());
 
-    for cycle in 0..16 {
+    for cycle in 0..32 {
         let child = lifecycle_child(deadline());
         let pid = child.pid();
         if cycle % 2 == 0 {

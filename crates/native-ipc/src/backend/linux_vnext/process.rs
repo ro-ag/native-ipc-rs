@@ -316,6 +316,19 @@ struct ExactChildLifecycle {
 
 impl PreparedExactChildLifecycle {
     fn new() -> Result<Self, SpawnPolicyError> {
+        Self::new_with_worker(|worker_shared| {
+            let worker = std::thread::Builder::new()
+                .name("native-ipc-child-reaper".into())
+                .spawn(move || exact_child_reaper(worker_shared))?;
+            let worker_thread = worker.thread().clone();
+            drop(worker);
+            Ok(worker_thread)
+        })
+    }
+
+    fn new_with_worker(
+        spawn_worker: impl FnOnce(Arc<LifecycleShared>) -> io::Result<Thread>,
+    ) -> Result<Self, SpawnPolicyError> {
         let shared = Arc::new(LifecycleShared {
             task: Mutex::new(None),
             task_ready: Condvar::new(),
@@ -335,16 +348,10 @@ impl PreparedExactChildLifecycle {
             #[cfg(test)]
             reap_failure: AtomicI32::new(0),
         });
-        let worker_shared = Arc::clone(&shared);
-        let worker = std::thread::Builder::new()
-            .name("native-ipc-child-reaper".into())
-            .spawn(move || exact_child_reaper(worker_shared))
-            .map_err(native_error)?;
-        let worker_thread = worker.thread().clone();
-        drop(worker);
+        let worker = spawn_worker(Arc::clone(&shared)).map_err(native_error)?;
         Ok(Self {
             shared,
-            worker: worker_thread,
+            worker,
             armed: false,
         })
     }

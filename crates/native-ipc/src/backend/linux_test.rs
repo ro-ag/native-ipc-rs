@@ -411,29 +411,91 @@ fn expired_accept_deadline_never_attempts_accept() {
 
 #[test]
 fn continuous_wrong_peer_accepts_cannot_extend_original_deadline() {
-    let (wrong_peer, _other_end) = UnixStream::pair().unwrap();
-    let actual = peer_credentials(&wrong_peer).unwrap();
+    let _serial = BOOTSTRAP_DIR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir =
+        std::env::temp_dir().join(format!("native-ipc-wrong-peer-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    create_private_bootstrap_dir(&dir).unwrap();
+    let socket_path = dir.join("control.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let executable = std::env::current_exe().unwrap();
+    let mut wrong_peer = Command::new(executable)
+        .args([
+            "--exact",
+            "backend::linux::tests::wrong_peer_pressure_helper_entry",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("NATIVE_IPC_WRONG_PEER_SOCKET", &socket_path)
+        .spawn()
+        .unwrap();
+    let wrong_pid = wrong_peer.id();
     let expected = PeerCredentials {
-        pid: actual.pid.wrapping_add(1),
-        ..actual
+        pid: std::process::id(),
+        // SAFETY: scalar identity syscalls have no preconditions.
+        uid: unsafe { libc::geteuid() },
+        // SAFETY: scalar identity syscalls have no preconditions.
+        gid: unsafe { libc::getegid() },
     };
-    let mut accepts = 0;
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut accepted = 0_usize;
+    let mut attempts_after_deadline = 0_usize;
+    let mut observed_pids = std::collections::BTreeSet::new();
+    let started = Instant::now();
+    let timeout = Duration::from_millis(100);
+    let deadline = started + timeout;
     let result = accept_expected_peer(
         || {
-            accepts += 1;
-            if accepts == 16 {
-                while Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
+            if Instant::now() >= deadline {
+                attempts_after_deadline += 1;
             }
-            wrong_peer.try_clone()
+            match listener.accept() {
+                Ok((stream, _address)) => {
+                    accepted += 1;
+                    observed_pids.insert(peer_credentials(&stream).unwrap().pid);
+                    Ok(stream)
+                }
+                Err(error) => Err(error),
+            }
         },
         expected,
         deadline,
     );
+
+    let elapsed = started.elapsed();
+    let _ = wrong_peer.kill();
+    wrong_peer.wait().unwrap();
+    drop(listener);
+    std::fs::remove_dir_all(&dir).unwrap();
+
     assert!(matches!(result, Err(LinuxError::Bootstrap)));
-    assert_eq!(accepts, 16);
+    assert!(elapsed >= timeout);
+    assert!(elapsed < Duration::from_secs(2));
+    assert!(
+        accepted >= 2,
+        "hostile child did not sustain connection pressure"
+    );
+    assert_eq!(observed_pids, [wrong_pid].into_iter().collect());
+    assert_eq!(attempts_after_deadline, 0);
+}
+
+#[test]
+#[ignore = "spawned only by the wrong-peer deadline integration test"]
+fn wrong_peer_pressure_helper_entry() {
+    let socket_path = std::env::var_os("NATIVE_IPC_WRONG_PEER_SOCKET").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut connections = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok(stream) = UnixStream::connect(&socket_path) {
+            connections.push(stream);
+            if connections.len() > 64 {
+                connections.remove(0);
+            }
+        }
+    }
 }
 
 #[test]
