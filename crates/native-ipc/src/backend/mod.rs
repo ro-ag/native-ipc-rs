@@ -1,35 +1,35 @@
 //! Private native backend implementations.
 #![allow(
     dead_code,
-    reason = "phase-4c receipt facade remains unreachable until native image identity is proven"
+    reason = "private role-scoped evidence remains unreachable until native session composition"
 )]
 
+use crate::negotiation::AcceptedTranscriptFacts;
 use crate::session::AbsoluteDeadline;
 use core::cell::Cell;
 use core::marker::PhantomData;
 
-/// Authenticated endpoint role in the asymmetric spawned-child session.
+/// Exact spawned-pair identities shared by role-scoped evidence constructors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EndpointRole {
-    Coordinator,
-    Receiver,
-}
-
-/// Opaque, platform-neutral identity facts retained after endpoint authentication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PeerFacts {
+pub(crate) struct SpawnIdentityFacts {
     parent_pid: u32,
     child_pid: u32,
+    parent_uid: u32,
+    parent_gid: u32,
+    child_uid: u32,
+    child_gid: u32,
     nonce: [u8; 32],
-    local_role: EndpointRole,
 }
 
-impl PeerFacts {
+impl SpawnIdentityFacts {
     fn new(
         parent_pid: u32,
         child_pid: u32,
+        parent_uid: u32,
+        parent_gid: u32,
+        child_uid: u32,
+        child_gid: u32,
         nonce: [u8; 32],
-        local_role: EndpointRole,
     ) -> Option<Self> {
         if parent_pid == 0 || child_pid == 0 || parent_pid == child_pid || nonce == [0; 32] {
             return None;
@@ -37,8 +37,11 @@ impl PeerFacts {
         Some(Self {
             parent_pid,
             child_pid,
+            parent_uid,
+            parent_gid,
+            child_uid,
+            child_gid,
             nonce,
-            local_role,
         })
     }
 
@@ -50,93 +53,115 @@ impl PeerFacts {
         self.child_pid
     }
 
+    pub(crate) const fn parent_uid(self) -> u32 {
+        self.parent_uid
+    }
+
+    pub(crate) const fn parent_gid(self) -> u32 {
+        self.parent_gid
+    }
+
+    pub(crate) const fn child_uid(self) -> u32 {
+        self.child_uid
+    }
+
+    pub(crate) const fn child_gid(self) -> u32 {
+        self.child_gid
+    }
+
     pub(crate) const fn nonce(self) -> [u8; 32] {
         self.nonce
     }
-
-    pub(crate) const fn local_role(self) -> EndpointRole {
-        self.local_role
-    }
 }
 
-/// Evidence produced only by a backend after kernel endpoint authentication
-/// and exact bootstrap nonce validation.
-pub(crate) struct ChannelPeerReceipt {
-    facts: PeerFacts,
+/// Coordinator-only evidence of the exact child-channel authentication flow.
+pub(crate) struct CoordinatorChildChannelReceipt {
+    facts: SpawnIdentityFacts,
 }
 
-impl ChannelPeerReceipt {
+impl CoordinatorChildChannelReceipt {
     /// # Safety
     ///
     /// `facts` must have been established by the backend's complete kernel
     /// endpoint-authentication and bootstrap-nonce state machine.
-    unsafe fn from_verified_native(facts: PeerFacts) -> Self {
+    unsafe fn from_verified_native(facts: SpawnIdentityFacts) -> Self {
         Self { facts }
     }
 }
 
-/// Evidence produced only after the normative executable image-identity policy
-/// has been checked before and after spawn while race-resistant native state is held.
-pub(crate) struct ImageIdentityReceipt {
-    facts: PeerFacts,
+/// Coordinator-only evidence retaining the exact spawned child image owner.
+pub(crate) struct CoordinatorChildImageReceipt {
+    facts: SpawnIdentityFacts,
 }
 
-impl ImageIdentityReceipt {
+impl CoordinatorChildImageReceipt {
     /// # Safety
     ///
     /// The normative pre/post-spawn image identity must have been verified and
     /// its race-resistant native state must remain owned by the endpoint.
-    unsafe fn from_verified_native(facts: PeerFacts) -> Self {
+    unsafe fn from_verified_native(facts: SpawnIdentityFacts) -> Self {
         Self { facts }
     }
 }
 
-/// Combined endpoint and image evidence. No current backend may construct this
-/// until its image-identity state machine is implemented.
-pub(crate) struct AuthenticatedPeerReceipt {
-    facts: PeerFacts,
+/// Coordinator evidence after exact child channel, image, and bilateral ACCEPT.
+pub(crate) struct CoordinatorAcceptedEvidence {
+    facts: SpawnIdentityFacts,
+    transcript: AcceptedTranscriptFacts,
+    not_sync: PhantomData<Cell<()>>,
 }
 
-impl AuthenticatedPeerReceipt {
+impl CoordinatorAcceptedEvidence {
     fn combine(
-        channel: ChannelPeerReceipt,
-        image: ImageIdentityReceipt,
+        channel: CoordinatorChildChannelReceipt,
+        image: CoordinatorChildImageReceipt,
+        transcript: AcceptedTranscriptFacts,
     ) -> Result<Self, SessionTransportError> {
-        if channel.facts != image.facts {
+        if channel.facts != image.facts || channel.facts.nonce != transcript.nonce() {
             return Err(SessionTransportError::IdentityMismatch);
         }
         Ok(Self {
             facts: channel.facts,
+            transcript,
+            not_sync: PhantomData,
         })
     }
 
-    pub(crate) const fn facts(&self) -> PeerFacts {
+    pub(crate) const fn facts(&self) -> SpawnIdentityFacts {
         self.facts
     }
 }
 
-/// A native transport that cannot be separated from its authentication evidence.
-pub(crate) struct AuthenticatedNativeEndpoint<T> {
-    transport: T,
-    receipt: AuthenticatedPeerReceipt,
+/// Receiver-only evidence of the authenticated trusted spawning coordinator.
+///
+/// This deliberately carries no coordinator-owned child-image or pidfd proof.
+pub(crate) struct ReceiverSpawnerEvidence {
+    facts: SpawnIdentityFacts,
+    transcript: AcceptedTranscriptFacts,
     not_sync: PhantomData<Cell<()>>,
 }
 
-impl<T> AuthenticatedNativeEndpoint<T> {
+impl ReceiverSpawnerEvidence {
     /// # Safety
     ///
-    /// `transport` must be the exact native owner that produced and continues
-    /// to retain every resource represented by `receipt`.
-    unsafe fn from_verified_native(transport: T, receipt: AuthenticatedPeerReceipt) -> Self {
-        Self {
-            transport,
-            receipt,
-            not_sync: PhantomData,
+    /// `facts` must come from the exact inherited endpoint's validated spawning
+    /// parent credentials and the local child identity captured during HELLO.
+    unsafe fn from_verified_native(
+        facts: SpawnIdentityFacts,
+        transcript: AcceptedTranscriptFacts,
+    ) -> Result<Self, SessionTransportError> {
+        if facts.nonce != transcript.nonce() {
+            return Err(SessionTransportError::IdentityMismatch);
         }
+        Ok(Self {
+            facts,
+            transcript,
+            not_sync: PhantomData,
+        })
     }
 
-    pub(crate) const fn peer_facts(&self) -> PeerFacts {
-        self.receipt.facts()
+    pub(crate) const fn facts(&self) -> SpawnIdentityFacts {
+        self.facts
     }
 }
 
@@ -194,49 +219,6 @@ trait OwnedChildControl: AuthenticatedControl {
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionTransportError>;
-}
-
-#[allow(
-    private_bounds,
-    reason = "only the receipt-gated endpoint is crate-visible; raw transport traits stay backend-private"
-)]
-impl<T: AuthenticatedControl> AuthenticatedNativeEndpoint<T> {
-    pub(crate) fn send_record(
-        &mut self,
-        bytes: &[u8],
-        deadline: AbsoluteDeadline,
-    ) -> Result<(), SessionTransportError> {
-        self.transport.send_record(bytes, deadline)
-    }
-
-    pub(crate) fn receive_record(
-        &mut self,
-        maximum: usize,
-        deadline: AbsoluteDeadline,
-    ) -> Result<Vec<u8>, SessionTransportError> {
-        self.transport.receive_record(maximum, deadline)
-    }
-
-    pub(crate) fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
-        self.transport.try_poll_peer()
-    }
-
-    pub(crate) fn poison(&mut self) {
-        self.transport.poison();
-    }
-}
-
-#[allow(
-    private_bounds,
-    reason = "coordinator child control is reachable only through the receipt-gated endpoint"
-)]
-impl<T: OwnedChildControl> AuthenticatedNativeEndpoint<T> {
-    pub(crate) fn terminate_and_reap(
-        &mut self,
-        deadline: AbsoluteDeadline,
-    ) -> Result<(), SessionTransportError> {
-        self.transport.terminate_and_reap(deadline)
-    }
 }
 
 #[cfg(target_os = "linux")]

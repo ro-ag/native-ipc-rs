@@ -21,6 +21,10 @@ assert_impl_all!(ReceiverDecisionPending: Send);
 assert_not_impl_any!(ReceiverDecisionPending: Sync, Clone);
 assert_impl_all!(RejectedLinuxReceiver: Send);
 assert_not_impl_any!(RejectedLinuxReceiver: Sync, Clone);
+assert_impl_all!(CoordinatorAcceptedEvidenceOwner: Send);
+assert_not_impl_any!(CoordinatorAcceptedEvidenceOwner: Sync, Clone);
+assert_impl_all!(ReceiverAcceptedEvidenceOwner: Send);
+assert_not_impl_any!(ReceiverAcceptedEvidenceOwner: Sync, Clone);
 
 fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
@@ -84,6 +88,43 @@ fn wait_for_baseline(fds: usize, tasks: usize, child_pid: libc::pid_t, deadline:
         io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
     );
+}
+
+fn assert_immediate_child_and_fd_cleanup(
+    fds: usize,
+    tasks: usize,
+    child_pid: libc::pid_t,
+    task_deadline: AbsoluteDeadline,
+) {
+    let children = std::fs::read_to_string("/proc/thread-self/children").unwrap();
+    assert!(
+        !children
+            .split_ascii_whitespace()
+            .any(|value| value.parse::<libc::pid_t>() == Ok(child_pid)),
+        "evidence-construction error returned before the exact child was reaped"
+    );
+    assert_eq!(open_fd_count(), fds);
+    // SAFETY: WNOHANG cannot block. ECHILD proves the failure path consumed
+    // every waitable status for this exact clone-time child before returning.
+    assert_eq!(
+        unsafe { libc::waitpid(child_pid, core::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    // The detached reaper publishes exact child completion before its own
+    // thread can cease to exist. Its transient task is not child authority;
+    // wait only to isolate the next fixture after the child/ECHILD/fd facts
+    // above have already proved synchronous malicious-child cleanup.
+    while open_task_count() != tasks {
+        assert!(
+            !task_deadline.is_expired(),
+            "exact-child reaper task did not exit"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn spawn(
@@ -200,7 +241,7 @@ fn spawn_helper() {
                 .await_coordinator_decision()
                 .expect("coordinator decision")
             {
-                CoordinatorDecisionOutcome::Pending(pending) => pending,
+                CoordinatorDecisionOutcome::Pending(pending) => *pending,
                 CoordinatorDecisionOutcome::Rejected { state, .. } => {
                     let _state = state;
                     loop {
@@ -210,10 +251,28 @@ fn spawn_helper() {
                 }
             };
             match pending.decide(decision).expect("receiver decision") {
-                DecisionOutcome::Accepted(_accepted) => loop {
-                    // SAFETY: keep Accepted state alive until coordinator cleanup.
-                    unsafe { libc::pause() };
-                },
+                DecisionOutcome::Accepted(accepted) => {
+                    let evidence = accepted.into_evidence().unwrap();
+                    let facts = evidence.facts();
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.parent_pid(), unsafe { libc::getppid() } as u32);
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.child_pid(), unsafe { libc::getpid() } as u32);
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.parent_uid(), unsafe { libc::getuid() });
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.parent_gid(), unsafe { libc::getgid() });
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.child_uid(), unsafe { libc::getuid() });
+                    // SAFETY: scalar process/credential queries have no pointers.
+                    assert_eq!(facts.child_gid(), unsafe { libc::getgid() });
+                    assert_ne!(facts.nonce(), [0; NONCE_LEN]);
+                    let _evidence = evidence;
+                    loop {
+                        // SAFETY: keep evidence state alive until coordinator cleanup.
+                        unsafe { libc::pause() };
+                    }
+                }
                 DecisionOutcome::Rejected { .. } => loop {
                     // SAFETY: coordinator clean rejection terminates this helper.
                     unsafe { libc::pause() };
@@ -440,9 +499,43 @@ fn isolated_bilateral_decisions_and_rejections_restore_baselines() {
             DecisionOutcome::Rejected { .. } => panic!("bilateral ACCEPT rejected"),
         };
         assert_eq!(accepted.pid(), pid);
-        accepted.terminate_and_reap(deadline());
+        let evidence = accepted.into_evidence().unwrap();
+        assert_eq!(evidence.pid(), pid);
+        let facts = evidence.facts();
+        assert_eq!(facts.parent_pid(), std::process::id());
+        assert_eq!(facts.child_pid(), pid as u32);
+        // SAFETY: scalar credential queries have no pointer arguments.
+        assert_eq!(facts.parent_uid(), unsafe { libc::getuid() });
+        // SAFETY: scalar credential queries have no pointer arguments.
+        assert_eq!(facts.parent_gid(), unsafe { libc::getgid() });
+        // SAFETY: scalar credential queries have no pointer arguments.
+        assert_eq!(facts.child_uid(), unsafe { libc::getuid() });
+        // SAFETY: scalar credential queries have no pointer arguments.
+        assert_eq!(facts.child_gid(), unsafe { libc::getgid() });
+        assert_ne!(facts.nonce(), [0; NONCE_LEN]);
+        evidence.terminate_and_reap(deadline());
         wait_for_baseline(before_fds, before_tasks, pid, deadline());
     }
+
+    let owner = spawn_negotiating(
+        &executable,
+        &arguments,
+        &decision_environment(1, 1, "accept"),
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = owner.pid();
+    let mut accepted = match owner.decide(ApplicationDecision::Accept).unwrap() {
+        DecisionOutcome::Accepted(accepted) => accepted,
+        DecisionOutcome::Rejected { .. } => panic!("bilateral ACCEPT rejected"),
+    };
+    accepted.nonce = [0; NONCE_LEN];
+    assert_eq!(
+        accepted.into_evidence().err().unwrap(),
+        LinuxSpawnError::InvalidInput
+    );
+    assert_immediate_child_and_fd_cleanup(before_fds, before_tasks, pid, deadline());
 
     let coordinator_reject = spawn_negotiating(
         &executable,

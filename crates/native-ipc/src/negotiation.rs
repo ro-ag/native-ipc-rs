@@ -198,6 +198,26 @@ pub(crate) struct NegotiatedTranscript {
     accepted_roles: u8,
 }
 
+/// Non-forgeable terminal facts extracted once after exact bilateral ACCEPT.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedTranscriptFacts {
+    nonce: [u8; 32],
+    selected_features: FeatureBits,
+    effective_limits: SessionLimits,
+    effective_atomics: AtomicOffer,
+    target: TargetFacts,
+    wire_major: u16,
+    wire_minor: u16,
+    hello_digest: [u8; 32],
+    decision_challenge: DecisionChallenge,
+}
+
+impl AcceptedTranscriptFacts {
+    pub(crate) const fn nonce(&self) -> [u8; 32] {
+        self.nonce
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptFrame {
     pub(crate) role: SenderRole,
@@ -308,6 +328,30 @@ impl NegotiationFrame {
 }
 
 impl NegotiatedTranscript {
+    pub(crate) fn take_accepted_facts(
+        &mut self,
+    ) -> Result<AcceptedTranscriptFacts, NegotiationWireError> {
+        if self.accepted_roles != 3 {
+            self.accepted_roles = u8::MAX;
+            return Err(NegotiationWireError::DecisionReplayOrOrder);
+        }
+        let decision_challenge = self
+            .decision_challenge
+            .ok_or(NegotiationWireError::DecisionReplayOrOrder)?;
+        self.accepted_roles = u8::MAX;
+        Ok(AcceptedTranscriptFacts {
+            nonce: self.nonce,
+            selected_features: self.selected_features,
+            effective_limits: self.effective_limits,
+            effective_atomics: self.effective_atomics,
+            target: self.target,
+            wire_major: self.wire_major,
+            wire_minor: self.wire_minor,
+            hello_digest: self.hello_digest,
+            decision_challenge,
+        })
+    }
+
     pub(crate) fn from_hellos(
         hellos: HelloPair,
         verified_local_atomics: AtomicCapabilities,

@@ -9,6 +9,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::backend::{
+    CoordinatorAcceptedEvidence, CoordinatorChildChannelReceipt, CoordinatorChildImageReceipt,
+    ReceiverSpawnerEvidence, SpawnIdentityFacts,
+};
 use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
@@ -124,6 +128,7 @@ struct ReceiverNegotiatingState {
     transcript: NegotiatedTranscript,
     nonce: [u8; NONCE_LEN],
     peer: PacketCredentials,
+    local: PacketCredentials,
     deadline: AbsoluteDeadline,
     _peer_application_payload: Vec<u8>,
     not_sync: PhantomData<Cell<()>>,
@@ -131,15 +136,35 @@ struct ReceiverNegotiatingState {
 
 struct AcceptedLinuxSpawn {
     lifecycle: Option<ExactChildLifecycle>,
-    _endpoint: SeqPacketEndpoint,
-    _executable: HeldExecutable,
-    _transcript: NegotiatedTranscript,
+    endpoint: SeqPacketEndpoint,
+    executable: HeldExecutable,
+    transcript: NegotiatedTranscript,
+    nonce: [u8; NONCE_LEN],
+    child: PacketCredentials,
+    deadline: AbsoluteDeadline,
     not_sync: PhantomData<Cell<()>>,
 }
 
 struct AcceptedLinuxReceiver {
+    endpoint: SeqPacketEndpoint,
+    transcript: NegotiatedTranscript,
+    nonce: [u8; NONCE_LEN],
+    parent: PacketCredentials,
+    child: PacketCredentials,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct CoordinatorAcceptedEvidenceOwner {
+    lifecycle: Option<ExactChildLifecycle>,
     _endpoint: SeqPacketEndpoint,
-    _transcript: NegotiatedTranscript,
+    _executable: HeldExecutable,
+    _evidence: CoordinatorAcceptedEvidence,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct ReceiverAcceptedEvidenceOwner {
+    _endpoint: SeqPacketEndpoint,
+    _evidence: ReceiverSpawnerEvidence,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -147,6 +172,9 @@ struct ReceiverDecisionPending {
     endpoint: SeqPacketEndpoint,
     transcript: NegotiatedTranscript,
     deadline: AbsoluteDeadline,
+    nonce: [u8; NONCE_LEN],
+    parent: PacketCredentials,
+    child: PacketCredentials,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -156,7 +184,7 @@ struct RejectedLinuxReceiver {
 }
 
 enum CoordinatorDecisionOutcome {
-    Pending(ReceiverDecisionPending),
+    Pending(Box<ReceiverDecisionPending>),
     Rejected {
         reason: NonZeroU32,
         state: RejectedLinuxReceiver,
@@ -313,15 +341,19 @@ impl NegotiatingLinuxSpawn {
                 return Err(LinuxSpawnError::WrongExecutable);
             }
             ensure_live(self.pidfd(), deadline)?;
-            Ok(DecisionOutcome::Accepted(()))
+            let child = exact_child_credentials(&self)?;
+            Ok(DecisionOutcome::Accepted(child))
         })();
         match result {
-            Ok(DecisionOutcome::Accepted(())) => {
+            Ok(DecisionOutcome::Accepted(child)) => {
                 Ok(DecisionOutcome::Accepted(AcceptedLinuxSpawn {
                     lifecycle: self.lifecycle.take(),
-                    _endpoint: self.endpoint,
-                    _executable: self.executable,
-                    _transcript: self.transcript,
+                    endpoint: self.endpoint,
+                    executable: self.executable,
+                    transcript: self.transcript,
+                    nonce: self.nonce,
+                    child,
+                    deadline,
                     not_sync: PhantomData,
                 }))
             }
@@ -378,14 +410,17 @@ impl ReceiverNegotiatingState {
                 return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
             }
         }
-        Ok(CoordinatorDecisionOutcome::Pending(
+        Ok(CoordinatorDecisionOutcome::Pending(Box::new(
             ReceiverDecisionPending {
                 endpoint: self.endpoint,
                 transcript: self.transcript,
                 deadline: self.deadline,
+                nonce: self.nonce,
+                parent: self.peer,
+                child: self.local,
                 not_sync: PhantomData,
             },
-        ))
+        )))
     }
 }
 
@@ -424,8 +459,11 @@ impl ReceiverDecisionPending {
                 let encoded = encode_negotiation_frame(&NegotiationFrame::Accept(accept))?;
                 send_socket_before(&mut self.endpoint, &encoded, self.deadline)?;
                 Ok(DecisionOutcome::Accepted(AcceptedLinuxReceiver {
-                    _endpoint: self.endpoint,
-                    _transcript: self.transcript,
+                    endpoint: self.endpoint,
+                    transcript: self.transcript,
+                    nonce: self.nonce,
+                    parent: self.parent,
+                    child: self.child,
                     not_sync: PhantomData,
                 }))
             }
@@ -442,6 +480,104 @@ impl AcceptedLinuxSpawn {
         if let Some(lifecycle) = self.lifecycle.take() {
             let _ = lifecycle.terminate_and_reap(deadline);
         }
+    }
+
+    fn into_evidence(mut self) -> Result<CoordinatorAcceptedEvidenceOwner, LinuxSpawnError> {
+        let evidence = (|| {
+            let transcript = self
+                .transcript
+                .take_accepted_facts()
+                .map_err(LinuxSpawnError::Negotiation)?;
+            // SAFETY: scalar identity queries have no pointer arguments.
+            let parent_pid = unsafe { libc::getpid() } as u32;
+            // SAFETY: scalar identity queries have no pointer arguments.
+            let parent_uid = unsafe { libc::getuid() };
+            // SAFETY: scalar identity queries have no pointer arguments.
+            let parent_gid = unsafe { libc::getgid() };
+            let facts = SpawnIdentityFacts::new(
+                parent_pid,
+                self.child.pid,
+                parent_uid,
+                parent_gid,
+                self.child.uid,
+                self.child.gid,
+                self.nonce,
+            )
+            .ok_or(LinuxSpawnError::InvalidInput)?;
+            // SAFETY: this owner retains the exact accepted child socket and its
+            // per-message credentials for these facts.
+            let channel = unsafe { CoordinatorChildChannelReceipt::from_verified_native(facts) };
+            // SAFETY: this owner retains the held image and sole clone-time pidfd
+            // that passed the final live/image/live sandwich for these facts.
+            let image = unsafe { CoordinatorChildImageReceipt::from_verified_native(facts) };
+            CoordinatorAcceptedEvidence::combine(channel, image, transcript)
+                .map_err(|_| LinuxSpawnError::InvalidInput)
+        })();
+        let evidence = match evidence {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let deadline = self.deadline;
+                self.terminate_and_reap(deadline);
+                return Err(error);
+            }
+        };
+        Ok(CoordinatorAcceptedEvidenceOwner {
+            lifecycle: self.lifecycle.take(),
+            _endpoint: self.endpoint,
+            _executable: self.executable,
+            _evidence: evidence,
+            not_sync: PhantomData,
+        })
+    }
+}
+
+impl AcceptedLinuxReceiver {
+    fn into_evidence(mut self) -> Result<ReceiverAcceptedEvidenceOwner, LinuxSpawnError> {
+        let transcript = self
+            .transcript
+            .take_accepted_facts()
+            .map_err(LinuxSpawnError::Negotiation)?;
+        let facts = SpawnIdentityFacts::new(
+            self.parent.pid,
+            self.child.pid,
+            self.parent.uid,
+            self.parent.gid,
+            self.child.uid,
+            self.child.gid,
+            self.nonce,
+        )
+        .ok_or(LinuxSpawnError::InvalidInput)?;
+        // SAFETY: these facts were captured from the validated inherited
+        // parent packet and local child identity during the exact HELLO flow.
+        let evidence = unsafe { ReceiverSpawnerEvidence::from_verified_native(facts, transcript) }
+            .map_err(|_| LinuxSpawnError::InvalidInput)?;
+        Ok(ReceiverAcceptedEvidenceOwner {
+            _endpoint: self.endpoint,
+            _evidence: evidence,
+            not_sync: PhantomData,
+        })
+    }
+}
+
+impl CoordinatorAcceptedEvidenceOwner {
+    fn pid(&self) -> libc::pid_t {
+        self.lifecycle.as_ref().expect("live evidence owner").pid()
+    }
+
+    fn facts(&self) -> SpawnIdentityFacts {
+        self._evidence.facts()
+    }
+
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            let _ = lifecycle.terminate_and_reap(deadline);
+        }
+    }
+}
+
+impl ReceiverAcceptedEvidenceOwner {
+    fn facts(&self) -> SpawnIdentityFacts {
+        self._evidence.facts()
     }
 }
 
@@ -584,6 +720,14 @@ fn receive_inherited_hello(
         // SAFETY: scalar credential query has no pointer arguments.
         gid: unsafe { libc::getgid() },
     };
+    let local_child = PacketCredentials {
+        // SAFETY: scalar process/credential queries have no pointer arguments.
+        pid: unsafe { libc::getpid() } as u32,
+        // SAFETY: automatic SCM_CREDENTIALS carries real IDs.
+        uid: unsafe { libc::getuid() },
+        // SAFETY: automatic SCM_CREDENTIALS carries real IDs.
+        gid: unsafe { libc::getgid() },
+    };
     let packet = receive_socket_before(&mut endpoint, expected_parent, deadline)?;
     let nonce = authenticated_nonce(&packet.bytes)?;
     let coordinator = match decode_frame(
@@ -611,6 +755,7 @@ fn receive_inherited_hello(
         transcript,
         nonce,
         peer: expected_parent,
+        local: local_child,
         deadline,
         _peer_application_payload: peer_application_payload,
         not_sync: PhantomData,

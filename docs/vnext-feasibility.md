@@ -173,8 +173,9 @@ symlink/magic-link resolution, nonfiles, non-executables, non-ELF artifacts,
 foreign-class/machine ELF, wrong spawned images, and already-reaped children.
 Native tests execute through the held descriptor after replacing its original
 path and prove that CLOEXEC removes the descriptor in the new image. The
-scaffold does not mint an `ImageIdentityReceipt`; that still requires the
-inherited bootstrap, authenticated channel, and bounded process owner below.
+scaffold alone does not establish role-asymmetric coordinator child-image
+evidence; that requires the inherited bootstrap, authenticated channel, and
+bounded process owner described below.
 The deterministic held-exec checkpoint passed native Linux AMD64/Arm64, ASan,
 and all auxiliary gates in
 [Actions 29180802767](https://github.com/ro-ag/native-ipc-rs/actions/runs/29180802767).
@@ -427,11 +428,12 @@ Arm64 release evidence.
 
 The durable owner removes the leak-prone exact direct-child cleanup blocker in
 isolation. The fresh-session checkpoint characterizes grouping but cannot
-provide race-resistant descendant teardown. Linux
-image identity still cannot mint the final authenticated-endpoint receipt until
-the new collision-safe pre-authentication owner completes authenticated
-nonce-bound HELLO and exact per-message packet credentials for the same child.
-This still blocks the safe session constructor;
+provide race-resistant descendant teardown. At this checkpoint, the Linux
+image owner alone could not establish later role-scoped coordinator
+child-channel, child-image, and accepted-transcript evidence; that also
+required the collision-safe pre-authentication owner, authenticated nonce-bound
+HELLO, exact per-message credentials, and bilateral acceptance for the same
+child. Even that private evidence does not construct the public safe session;
 PID/path checks or a standalone private probe are not substitutes.
 
 Primary sources: Linux man-pages for [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html),

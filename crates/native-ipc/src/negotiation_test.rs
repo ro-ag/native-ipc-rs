@@ -4,6 +4,7 @@ use static_assertions::assert_not_impl_any;
 assert_not_impl_any!(HelloFrame: Clone);
 assert_not_impl_any!(HelloPair: Clone);
 assert_not_impl_any!(NegotiatedTranscript: Clone);
+assert_not_impl_any!(AcceptedTranscriptFacts: Clone);
 
 const NONCE: [u8; 32] = [0x5a; 32];
 const CHALLENGE_BYTES: [u8; 16] = [0xa5; 16];
@@ -774,6 +775,92 @@ fn reject_constructors_are_challenge_bound_ordered_and_terminal() {
     );
     assert_eq!(
         wrong_nonce_peer.validate_reject(reject, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+}
+
+#[test]
+fn accepted_facts_are_terminal_bilateral_and_single_use() {
+    let verified = AtomicCapabilities::from_verified_native(4096, 128, true, true).unwrap();
+    let mut coordinator = match hello(b"") {
+        NegotiationFrame::Hello(frame) => frame,
+        _ => unreachable!(),
+    };
+    coordinator.supported_features = FeatureBits([3, 0]);
+    coordinator.required_features = FeatureBits::default();
+    let mut receiver = duplicate_hello(&coordinator);
+    receiver.role = SenderRole::Receiver;
+    let new_transcript = || negotiate(&coordinator, &receiver, verified).unwrap();
+
+    let mut unaccepted = new_transcript();
+    assert_eq!(
+        unaccepted.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        unaccepted.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut coordinator_only = new_transcript();
+    let coordinator_accept = coordinator_only.coordinator_accept(challenge()).unwrap();
+    coordinator_only
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    assert_eq!(
+        coordinator_only.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut coordinator_rejected = new_transcript();
+    coordinator_rejected
+        .coordinator_reject(challenge(), reason(23))
+        .unwrap();
+    assert_eq!(
+        coordinator_rejected.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        coordinator_rejected.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut malformed_decision = new_transcript();
+    let mut malformed_accept = malformed_decision.coordinator_accept(challenge()).unwrap();
+    malformed_accept.nonce[0] ^= 1;
+    assert_eq!(
+        malformed_decision.validate_accept(malformed_accept, SenderRole::Coordinator),
+        Err(NegotiationWireError::EffectiveMismatch)
+    );
+    assert_eq!(
+        malformed_decision.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        malformed_decision.take_accepted_facts(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut accepted = new_transcript();
+    let coordinator_accept = accepted.coordinator_accept(challenge()).unwrap();
+    accepted
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    let receiver_accept = accepted.receiver_accept().unwrap();
+    accepted
+        .validate_accept(receiver_accept, SenderRole::Receiver)
+        .unwrap();
+    let facts = accepted.take_accepted_facts().unwrap();
+    assert_eq!(facts.nonce(), NONCE);
+    assert_eq!(facts.selected_features, FeatureBits([3, 0]));
+    assert_eq!(facts.effective_limits, SessionLimits::default());
+    assert_eq!(facts.effective_atomics, atomics());
+    assert_eq!(facts.target, TargetFacts::current());
+    assert_eq!((facts.wire_major, facts.wire_minor), (1, 0));
+    assert_ne!(facts.hello_digest, [0; 32]);
+    assert_eq!(facts.decision_challenge, challenge());
+    assert_eq!(
+        accepted.take_accepted_facts(),
         Err(NegotiationWireError::DecisionReplayOrOrder)
     );
 }
