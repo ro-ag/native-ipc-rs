@@ -344,17 +344,36 @@ re-exec between HELLO and ACCEPT is rejected. This is exact authenticated
 launch/bootstrap-principal evidence, not immutable ongoing image attestation;
 a malicious receiver may later re-exec or delegate already received authority.
 
-Rust 1.97 privileged, seccomp-unconfined Arm64 Docker covers ACCEPT with
+Local Rust 1.97 privileged, seccomp-unconfined Arm64 Docker covers ACCEPT with
 empty/one/exact-65,312-byte HELLO payloads, both clean Reject paths, fresh
 challenge entropy faults and EINTR, application delay through the original
 deadline, prequeued decisions, every effective-field/challenge mutation,
 malformed flood, duplicate HELLO, SCM_RIGHTS, silence, exit, re-exec, and exact
 fd/task/child/ECHILD baselines. Full all-feature and no-default workspace
-tests/doctests plus strict Clippy pass locally. This is emulated/VM
-characterization only; exact hosted native AMD64/Arm64/ASan, physical Arm64,
-packaged-crate, and exact release-commit evidence remain pending. A duplicate
-decision queued after a valid final ACCEPT remains for the future common
-accepted-state dispatcher to reject and is not overclaimed here.
+tests/doctests plus strict Clippy pass locally. This remains emulated/VM
+characterization only and is not native-host or release proof.
+
+The Phase 5i-E protocol implementation commit is `2801b47`, but exact native
+evidence belongs to final evidence SHA
+`b768979ce74be7a2063914cf9b27e17deb520d6f`. All ten jobs are green in
+[Actions 29201467797](https://github.com/ro-ag/native-ipc-rs/actions/runs/29201467797),
+including Rust 1.97 native Linux AMD64/Arm64 all-feature, no-default, and native
+permission tests; Linux AMD64 ASan; macOS Arm64 and Windows AMD64/Arm64 checks;
+and Miri, fuzz, dependency/policy, and quality gates. The final SHA includes
+the mapping-specific ASan oracle correction `a6df424` and the
+pidfd-before-completion publication correction at `b768979`.
+
+Two intermediate failures are explicitly not evidence. Run
+[29201058759](https://github.com/ro-ag/native-ipc-rs/actions/runs/29201058759)
+at `2801b47` failed the ASan job because a process-global VMA-count test oracle
+observed sanitizer-lazy mappings rather than an owned mapping leak. Run
+[29201262157](https://github.com/ro-ag/native-ipc-rs/actions/runs/29201262157)
+at `a6df424` exposed a transient native AMD64 pidfd publication race. Both are
+superseded by the all-green final SHA above. A duplicate decision queued after
+a valid final ACCEPT remains for the future common accepted-state dispatcher
+to reject and is not overclaimed here. Packaged-crate conformance, physical
+user-owned Arm64 hardware, public Ready/session/receipt authority, and whole
+vNext release completion remain unverified.
 
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
