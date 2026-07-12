@@ -28,6 +28,8 @@ pub mod region;
 pub mod session;
 
 mod backend;
+#[allow(dead_code)]
+mod negotiation;
 mod protocol;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
