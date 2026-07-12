@@ -892,6 +892,9 @@ fn process_resource_baseline() -> (usize, usize) {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .unwrap()
         .lines()
+        // Sanitizer runtimes may lazily add unrelated process mappings. This
+        // baseline is specifically responsible for vNext memfd VM ownership.
+        .filter(|line| line.contains("native-ipc-vnext"))
         .count();
     (fds, maps)
 }
