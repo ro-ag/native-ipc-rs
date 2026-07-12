@@ -1,6 +1,8 @@
 //! Platform-neutral private and prepared shared-memory regions.
 
+use core::cell::Cell;
 use core::fmt;
+use core::marker::PhantomData;
 
 use crate::memory;
 
@@ -119,6 +121,7 @@ impl From<memory::MemoryError> for RegionError {
 pub struct PrivateRegion {
     inner: memory::NativeRegion,
     guard: GuardPolicy,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 // SAFETY: the value uniquely owns its mapping and exposes mutation only through
@@ -143,6 +146,7 @@ impl PrivateRegion {
         Ok(Self {
             inner: memory::NativeRegion::allocate(native)?,
             guard: options.guard,
+            _not_sync: PhantomData,
         })
     }
 
@@ -165,6 +169,7 @@ impl PrivateRegion {
                 requested: self.guard,
                 installed: false,
             },
+            _not_sync: PhantomData,
         })
     }
 }
@@ -172,6 +177,11 @@ impl PrivateRegion {
 /// Opaque prepared native object awaiting ownership by one transfer batch.
 ///
 /// This state has no payload access, cloning, or raw native-parts operation.
+///
+/// ```compile_fail
+/// use native_ipc::region::PreparedRegion;
+/// fn access(pending: &PreparedRegion) { let _ = pending.read_into(0, &mut []); }
+/// ```
 pub struct PreparedRegion {
     #[allow(dead_code)]
     pub(crate) request: memory::NativeShareRequest,
@@ -179,6 +189,7 @@ pub struct PreparedRegion {
     pub(crate) spec: RegionSpec,
     #[allow(dead_code)]
     pub(crate) guard: GuardCapability,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 // SAFETY: preparation retains unique ownership and exposes no shared access.

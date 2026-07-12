@@ -33,9 +33,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[build-dependencies]
+cc = "1.2"
+
 [features]
 default = ["std"]
 std = ["native-ipc-core/std"]
+raw-pointer = []
 
 [lints]
 workspace = true

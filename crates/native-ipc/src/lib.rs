@@ -16,6 +16,8 @@ compile_error!("native-ipc supports Linux and Windows on aarch64/x86_64, and mac
 /// Platform-neutral wire, layout, and sequencing primitives.
 pub use native_ipc_core as core;
 
+/// Checked allocation-free runtime access after batch commit.
+pub mod active;
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
 /// Platform-neutral consuming region ownership states.

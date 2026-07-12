@@ -102,6 +102,7 @@ Target abbreviations: `Lx` = Linux GNU AMD64/Arm64, `Ma` = macOS Arm64,
 | --- | --- | --- | --- | --- |
 | 0 | Feasibility, claim boundaries, MUST inventory, and ordered plan | macOS Arm64 0.4 baseline plus primary-source mechanism review | no unresolved finding | implemented; native vNext probes unverified |
 | 1 | Private facade backends, required crate direction, application-neutral manifest, no safe native-parts escape | host fmt, strict Clippy, all-feature/no-default tests, compile-fail docs, warning-free rustdoc, four cross-target checks, retained 0.4 package tests | no unresolved finding after three review rounds | implemented locally; exact native targets unverified |
+| 2a | Public private/prepared ownership states and guarded runtime access boundary | host strict Clippy/tests, default/all-feature compile-fail docs, C volatile FFI tests; local Miri unavailable | no unresolved finding after pedantic unsafe review | implemented locally; native activation remains batch-gated |
 
 ## Native release evidence ledger
 

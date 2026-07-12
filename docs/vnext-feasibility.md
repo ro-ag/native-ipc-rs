@@ -72,27 +72,25 @@ and <https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects>.
 ## Concurrent peer-memory copy soundness
 
 The selected design is one narrowly audited unsafe external-memory boundary.
-Active safe APIs validate owned logical ranges and copy byte-by-byte with
-volatile operations (or replace that boundary with an equivalently audited
-platform FFI primitive), never form an ordinary persistent shared
-slice/reference, and return only caller-owned bytes. Rust documents volatile
-operations as externally observable non-atomic accesses; volatile is not
+Active safe APIs validate owned logical ranges in Rust and call a tiny C FFI
+module whose source/destination mapping pointers are volatile-qualified. They
+never form an ordinary persistent Rust shared slice/reference over active
+memory and return reads only into caller-owned bytes. Volatile is not
 synchronization and does not make a coherent snapshot. That is acceptable for
 memory safety because every `u8` bit pattern is valid, owned range/lifetime are
 checked independently, and the API promises torn hostile bytes rather than
 integrity. Writer methods require exclusive `&mut self`; the complementary
-kernel capability is read-only. The current 0.4 core uses ordinary
-`copy_nonoverlapping`, so it must not be retained for vNext active
-peer-mutated memory.
+kernel capability is read-only. The 0.4 core's ordinary `copy_nonoverlapping`
+path is not used for vNext active peer-mutated memory.
 
 Primary semantics: <https://doc.rust-lang.org/core/ptr/fn.read_volatile.html>
 and <https://doc.rust-lang.org/core/ptr/fn.write_volatile.html>.
 
-This is the proposed safe-code memory-safety argument, not a kernel snapshot
-guarantee. The traceability requirement remains unverified until the concrete
-boundary exists, its pointer provenance/lifetime/alignment argument is audited
-independently, Miri covers portable typestate/range code, and native hostile
-mutation tests pass. Paper feasibility does not itself satisfy R5.13.
+This remains a memory-safety argument, not a kernel snapshot guarantee. The
+concrete boundary and its pointer lifetime/alignment contracts have independent
+diff review and local tests; R5.13 remains release-unverified until native
+hostile mutation, Miri-covered portable range code, and exact-target
+conformance pass.
 
 ## Process containment
 
