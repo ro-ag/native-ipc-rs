@@ -1,7 +1,7 @@
 use super::super::memory::{LinuxCoordinatorWriterBatch, MemfdError};
 use super::*;
 use crate::backend::accepted_control::{AcceptedControlError, LinuxCapabilityBatchError};
-use crate::batch::TransferBatch;
+use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState};
 use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
 use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
@@ -103,37 +103,25 @@ fn portable_coordinator_writer_batch(count: usize) -> TransferBatch {
     batch
 }
 
-fn encode_test_batch_entries(entries: &[ManifestEntry]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(2 + entries.len() * 52);
-    bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    for entry in entries {
-        bytes.extend_from_slice(&entry.region_id.to_le_bytes());
-        bytes.extend_from_slice(&entry.incarnation);
-        bytes.extend_from_slice(&entry.writer.to_le_bytes());
-        bytes.extend_from_slice(&entry.logical_len.to_le_bytes());
-        bytes.extend_from_slice(&entry.mapped_len.to_le_bytes());
-    }
-    bytes
+fn expected_coordinator_writer_batch(count: usize) -> ExpectedBatch {
+    expected_coordinator_writer_batch_with_first_delta(count, 0)
 }
 
-fn decode_test_batch_entries(bytes: &[u8]) -> Vec<ManifestEntry> {
-    assert!(bytes.len() >= 2);
-    let count = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as usize;
-    assert_eq!(bytes.len(), 2 + count * 52);
-    bytes[2..]
-        .chunks_exact(52)
-        .map(|entry| {
-            let native = NativeRegionSpec::new(
-                u128::from_le_bytes(entry[..16].try_into().unwrap()),
-                entry[16..32].try_into().unwrap(),
-                u32::from_le_bytes(entry[32..36].try_into().unwrap()),
-                u64::from_le_bytes(entry[36..44].try_into().unwrap()) as usize,
-                u64::from_le_bytes(entry[44..52].try_into().unwrap()) as usize,
-            )
-            .unwrap();
-            ManifestEntry::from_native(native, PeerAccess::ReadOnly)
-        })
-        .collect()
+fn expected_coordinator_writer_batch_with_first_delta(
+    count: usize,
+    first_delta: usize,
+) -> ExpectedBatch {
+    ExpectedBatch::try_from_specs(
+        (1..=count)
+            .rev()
+            .map(|id| ExpectedRegion {
+                id: RegionId::new(id as u128).unwrap(),
+                writer: WriterEndpoint::Coordinator,
+                logical_len: id * 17 + usize::from(id == 1) * first_delta,
+            })
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn local_packet_credentials() -> PacketCredentials {
@@ -225,7 +213,8 @@ fn linux_control_limit_is_capped_before_both_hellos_and_transcript() {
 }
 
 #[test]
-fn accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds() {
+#[ignore = "spawned alone by accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds"]
+fn isolated_accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds() {
     let credentials = local_packet_credentials();
     let file = std::fs::File::open("/dev/null").unwrap();
 
@@ -333,6 +322,13 @@ fn accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds(
         Err(SessionTransportError::IdentityMismatch)
     ));
     assert_eq!(open_fd_count(), before_receive);
+}
+
+#[test]
+fn accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_accepted_capability_record_transport_is_exact_bounded_and_owns_installed_fds",
+    );
 }
 
 fn open_fd_count() -> usize {
@@ -633,8 +629,21 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 unsafe { libc::pause() };
             }
         }
-        "coordinator-writer-batch" => {
+        "coordinator-writer-batch"
+        | "coordinator-writer-batch-wrong-logical"
+        | "coordinator-writer-batch-invalid-object"
+        | "coordinator-writer-batch-advice-failure" => {
+            let count = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let expected = expected_coordinator_writer_batch_with_first_delta(
+                count,
+                usize::from(mode.ends_with("wrong-logical")),
+            );
+            let events = Arc::new(Mutex::new(Vec::new()));
             let mut control = evidence.into_control().unwrap();
+            control.observe_linux_receiver_poison_for_test(events.clone());
             control
                 .send(
                     &ControlFrame {
@@ -644,46 +653,97 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     deadline(),
                 )
                 .unwrap();
-            let metadata = control.receive(deadline()).unwrap();
-            let expected = decode_test_batch_entries(&metadata.payload);
-            let expected_copy = expected.clone();
             let mut transaction = control
-                .await_capability_transaction(expected, deadline())
+                .begin_linux_expected_coordinator_writer_batch(expected, deadline())
                 .unwrap();
-            let received = transaction.receive().unwrap();
-            assert_eq!(received.descriptors.len(), expected_copy.len());
+            transaction.observe_import_drop_for_test(events.clone());
+            if mode.ends_with("advice-failure") {
+                let failure = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.fail_import_advice_at_for_test(failure);
+            }
+            let received = transaction.receive();
+            if mode.ends_with("wrong-logical") {
+                assert!(matches!(
+                    received,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(ControlError::NonCanonical)
+                    ))
+                ));
+                drop(transaction);
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.ends_with("invalid-object") {
+                assert!(matches!(
+                    received,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::InvalidObject))
+                ));
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "failed-import-drop"]
+                );
+                drop(transaction);
+                assert_eq!(
+                    control.send(
+                        &ControlFrame {
+                            kind: APPLICATION_CONTROL_KIND,
+                            payload: Vec::new(),
+                        },
+                        deadline(),
+                    ),
+                    Err(AcceptedControlError::Control(ControlError::Poisoned))
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.ends_with("advice-failure") {
+                assert!(matches!(
+                    received,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                        libc::EIO
+                    )))
+                ));
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "failed-import-drop"]
+                );
+                drop(transaction);
+                assert_eq!(
+                    control.send(
+                        &ControlFrame {
+                            kind: APPLICATION_CONTROL_KIND,
+                            payload: Vec::new(),
+                        },
+                        deadline(),
+                    ),
+                    Err(AcceptedControlError::Control(ControlError::Poisoned))
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            received.unwrap();
+            let imported = transaction.imported_for_test();
+            assert_eq!(imported.len(), count);
             let final_seals = 0x20
                 | libc::F_SEAL_GROW
                 | libc::F_SEAL_SHRINK
                 | libc::F_SEAL_FUTURE_WRITE
                 | libc::F_SEAL_SEAL;
-            for (descriptor, entry) in received.descriptors.iter().zip(&expected_copy) {
+            for ordinal in 0..count {
+                let descriptor = imported.descriptor_for_test(ordinal);
+                let region_id = ordinal + 1;
                 // SAFETY: scalar fcntl query on a live received descriptor.
                 assert_eq!(
                     unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) },
                     final_seals
                 );
-                let len = entry.mapped_len as usize;
-                // SAFETY: the exact received memfd and manifest length describe
-                // one read-only shared mapping.
-                let reader = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        len,
-                        libc::PROT_READ,
-                        libc::MAP_SHARED,
-                        descriptor.as_raw_fd(),
-                        0,
-                    )
-                };
-                assert_ne!(reader, libc::MAP_FAILED);
-                // SAFETY: the live mapping contains at least one logical byte.
-                assert_eq!(
-                    unsafe { core::ptr::read_volatile(reader.cast::<u8>()) },
-                    entry.region_id as u8
-                );
-                // SAFETY: the mapping is live for this exact range.
-                assert_eq!(unsafe { libc::munmap(reader, len) }, 0);
+                for offset in 0..region_id * 17 {
+                    assert_eq!(imported.read_for_test(ordinal, offset), region_id as u8);
+                }
+                let (_, _, len) = imported.object_key_for_test(ordinal);
                 // SAFETY: final future-write seals must reject this mapping.
                 let writer = unsafe {
                     libc::mmap(
@@ -698,8 +758,51 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 assert_eq!(writer, libc::MAP_FAILED);
             }
             drop(transaction);
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                &["poison", "imported-batch-drop"]
+            );
+            assert_eq!(
+                control.send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: Vec::new(),
+                    },
+                    deadline(),
+                ),
+                Err(AcceptedControlError::Control(ControlError::Poisoned))
+            );
             drop(control);
             std::process::exit(0);
+        }
+        "coordinator-writer-batch-local-reject" => {
+            let mut control = evidence.into_control().unwrap();
+            let expected = ExpectedBatch::try_from_specs(vec![ExpectedRegion {
+                id: RegionId::new(1).unwrap(),
+                writer: WriterEndpoint::Receiver,
+                logical_len: 17,
+            }])
+            .unwrap();
+            assert!(matches!(
+                control.begin_linux_expected_coordinator_writer_batch(expected, deadline()),
+                Err(LinuxCapabilityBatchError::Memory(
+                    MemfdError::UnsupportedDirection
+                ))
+            ));
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"local-rejected".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            loop {
+                let _control = &control;
+                // SAFETY: coordinator exact-child cleanup terminates this helper.
+                unsafe { libc::pause() };
+            }
         }
         "rights" => {
             let bytes = raw_frame(1);
@@ -1134,8 +1237,12 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
 
     for count in [1, 2, 4, 16] {
-        let (mut control, pid) =
-            accepted_control("coordinator-writer-batch", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+        let (mut control, pid) = accepted_control(
+            "coordinator-writer-batch",
+            0,
+            count,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
         assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
         let operation_deadline = deadline();
         let prepared = LinuxCoordinatorWriterBatch::prepare(
@@ -1144,16 +1251,6 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
             operation_deadline,
         )
         .unwrap();
-        let metadata = encode_test_batch_entries(&prepared.manifest_entries());
-        control
-            .send(
-                &ControlFrame {
-                    kind: APPLICATION_CONTROL_KIND,
-                    payload: metadata,
-                },
-                operation_deadline,
-            )
-            .unwrap();
         {
             let mut transaction = control
                 .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
@@ -1174,6 +1271,106 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
         drop(control);
         wait_for_baseline(before_fds, before_tasks, pid, deadline());
     }
+
+    let (mut mismatch, pid) = accepted_control(
+        "coordinator-writer-batch-wrong-logical",
+        0,
+        2,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(mismatch.receive(deadline()).unwrap().payload, b"ready");
+    let operation_deadline = deadline();
+    let prepared = LinuxCoordinatorWriterBatch::prepare(
+        portable_coordinator_writer_batch(2),
+        mismatch.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    {
+        let mut transaction = mismatch
+            .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
+            .unwrap();
+        transaction.send().unwrap();
+    }
+    mismatch.terminate_and_reap(deadline()).unwrap();
+    drop(mismatch);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    for failure in [1, 2, 4, 16] {
+        let (mut invalid, pid) = accepted_control(
+            "coordinator-writer-batch-invalid-object",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(invalid.receive(deadline()).unwrap().payload, b"ready");
+        let operation_deadline = deadline();
+        let mut prepared = LinuxCoordinatorWriterBatch::prepare(
+            portable_coordinator_writer_batch(16),
+            invalid.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.replace_export_with_invalid_file_for_test(failure - 1);
+        {
+            let mut transaction = invalid
+                .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.send_without_revalidation_for_test().unwrap();
+        }
+        invalid.terminate_and_reap(deadline()).unwrap();
+        drop(invalid);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 17, 32] {
+        let (mut faulted, pid) = accepted_control(
+            "coordinator-writer-batch-advice-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(faulted.receive(deadline()).unwrap().payload, b"ready");
+        let operation_deadline = deadline();
+        let prepared = LinuxCoordinatorWriterBatch::prepare(
+            portable_coordinator_writer_batch(16),
+            faulted.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        {
+            let mut transaction = faulted
+                .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.send().unwrap();
+        }
+        faulted.terminate_and_reap(deadline()).unwrap();
+        drop(faulted);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let (mut local_reject, pid) = accepted_control(
+        "coordinator-writer-batch-local-reject",
+        0,
+        0,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(
+        local_reject.receive(deadline()).unwrap().payload,
+        b"local-rejected"
+    );
+    local_reject
+        .send(
+            &ControlFrame {
+                kind: APPLICATION_CONTROL_KIND,
+                payload: Vec::new(),
+            },
+            deadline(),
+        )
+        .unwrap();
+    local_reject.terminate_and_reap(deadline()).unwrap();
+    drop(local_reject);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
 }
 
 #[test]

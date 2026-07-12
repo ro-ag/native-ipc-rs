@@ -189,16 +189,23 @@ pub(crate) struct CoordinatorLinuxControlTransport {
     not_sync: PhantomData<Cell<()>>,
 }
 
-struct ReceiverLinuxControlTransport {
+pub(crate) struct ReceiverLinuxControlTransport {
     endpoint: SeqPacketEndpoint,
     _evidence: ReceiverSpawnerEvidence,
     peer: PacketCredentials,
     poisoned: bool,
+    #[cfg(test)]
+    poison_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
     not_sync: PhantomData<Cell<()>>,
 }
 
-struct LinuxReceivedCapabilities {
+pub(crate) struct LinuxReceivedCapabilities {
     descriptors: Vec<OwnedFd>,
+}
+
+pub(crate) struct LinuxReceivedCapabilityRecord {
+    pub(crate) frame: Vec<u8>,
+    pub(crate) descriptors: Vec<OwnedFd>,
 }
 
 impl LinuxReceivedCapabilities {
@@ -666,6 +673,8 @@ impl ReceiverAcceptedEvidenceOwner {
                 gid: facts.parent_gid(),
             },
             poisoned: false,
+            #[cfg(test)]
+            poison_observer: None,
             not_sync: PhantomData,
         };
         AcceptedControlDispatcher::new(transport, parameters)
@@ -836,6 +845,10 @@ impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
 
     fn poison(&mut self) {
         self.poisoned = true;
+        #[cfg(test)]
+        if let Some(observer) = &self.poison_observer {
+            observer.lock().unwrap().push("poison");
+        }
     }
 }
 
@@ -853,6 +866,28 @@ impl ReceiverCapabilityTransport for ReceiverLinuxControlTransport {
             self.peer,
             &mut self.poisoned,
             expected,
+            deadline,
+        )
+    }
+}
+
+impl ReceiverLinuxControlTransport {
+    #[cfg(test)]
+    pub(crate) fn observe_poison_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.poison_observer = Some(observer);
+    }
+
+    pub(crate) fn receive_candidate_capability_record(
+        &mut self,
+        expected_descriptors: usize,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxReceivedCapabilityRecord, SessionTransportError> {
+        receive_candidate_capability_record(
+            &mut self.endpoint,
+            None,
+            self.peer,
+            &mut self.poisoned,
+            expected_descriptors,
             deadline,
         )
     }
@@ -991,10 +1026,34 @@ fn receive_accepted_capability_record(
     expected: &CapabilityFrame,
     deadline: AbsoluteDeadline,
 ) -> Result<LinuxReceivedCapabilities, SessionTransportError> {
+    let record = receive_candidate_capability_record(
+        endpoint,
+        peer_pidfd,
+        peer,
+        poisoned,
+        expected.capability_count(),
+        deadline,
+    )?;
+    if record.frame.as_slice() != expected.as_bytes() {
+        return Err(SessionTransportError::MalformedRecord);
+    }
+    Ok(LinuxReceivedCapabilities {
+        descriptors: record.descriptors,
+    })
+}
+
+fn receive_candidate_capability_record(
+    endpoint: &mut SeqPacketEndpoint,
+    peer_pidfd: Option<RawFd>,
+    peer: PacketCredentials,
+    poisoned: &mut bool,
+    expected_descriptors: usize,
+    deadline: AbsoluteDeadline,
+) -> Result<LinuxReceivedCapabilityRecord, SessionTransportError> {
     if *poisoned {
         return Err(SessionTransportError::Native);
     }
-    if !(1..=super::MAX_PACKET_FDS).contains(&expected.capability_count()) {
+    if !(1..=super::MAX_PACKET_FDS).contains(&expected_descriptors) {
         return Err(SessionTransportError::MalformedRecord);
     }
     loop {
@@ -1003,18 +1062,16 @@ fn receive_accepted_capability_record(
         } else if deadline.is_expired() {
             return Err(SessionTransportError::DeadlineExpired);
         }
-        match endpoint.receive(CONTROL_FRAME_LEN, peer, expected.capability_count()) {
+        match endpoint.receive(CONTROL_FRAME_LEN, peer, expected_descriptors) {
             Ok(packet) => {
                 if deadline.is_expired() {
                     *poisoned = true;
                     return Err(SessionTransportError::DeadlineExpired);
                 }
-                if packet.bytes.as_slice() != expected.as_bytes() {
-                    return Err(SessionTransportError::MalformedRecord);
-                }
                 debug_assert_eq!(packet.credentials, peer);
-                debug_assert_eq!(packet.descriptors.len(), expected.capability_count());
-                return Ok(LinuxReceivedCapabilities {
+                debug_assert_eq!(packet.descriptors.len(), expected_descriptors);
+                return Ok(LinuxReceivedCapabilityRecord {
+                    frame: packet.bytes,
                     descriptors: packet.descriptors,
                 });
             }

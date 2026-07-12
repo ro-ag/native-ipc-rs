@@ -1,6 +1,12 @@
+#[cfg(target_os = "linux")]
+use super::accepted_control::linux_received_manifest_matches;
 use super::accepted_control::{AcceptedControlDispatcher, AcceptedControlError};
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::backend::linux_vnext::memory::LinuxExpectedCoordinatorWriterBatch;
 use crate::batch::TransferBatch;
+#[cfg(target_os = "linux")]
+use crate::batch::{ExpectedBatch, ExpectedRegion};
 use crate::control::{CONTROL_HEADER_LEN, ControlError, ControlFrame, ControlState};
 use crate::protocol::{
     CapabilityFrame, ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess,
@@ -243,6 +249,142 @@ fn manifest_entries(count: usize) -> Vec<ManifestEntry> {
             ManifestEntry::from_native(native, PeerAccess::ReadOnly)
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receiver_expectation_rejects_session_transaction_and_entry_substitution() {
+    let parameters = parameters(NONCE, MAXIMUM, 8);
+    let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+        ExpectedBatch::try_from_specs(vec![ExpectedRegion {
+            id: RegionId::new(1).unwrap(),
+            writer: WriterEndpoint::Coordinator,
+            logical_len: 1,
+        }])
+        .unwrap(),
+        parameters.limits(),
+        deadline(),
+    )
+    .unwrap();
+    let manifest = |nonce, parent, child, transaction, profile, entry| {
+        TransferManifest::new_with_authority(
+            nonce,
+            parent,
+            child,
+            transaction,
+            profile,
+            vec![entry],
+        )
+        .unwrap()
+    };
+    let entry = |id, writer, access, logical, mapped| {
+        ManifestEntry::from_native(
+            NativeRegionSpec::new(id, [1; 16], writer, logical, mapped).unwrap(),
+            access,
+        )
+    };
+    let exact = manifest(
+        NONCE,
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+    );
+    assert!(linux_received_manifest_matches(
+        parameters, 1, &expected, &exact
+    ));
+
+    let substitutions = [
+        manifest(
+            [0x55; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            12,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            12,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            2,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::Legacy,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(2, 0, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 1, PeerAccess::ReadOnly, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::SoleWriter, 1, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 2, 4096),
+        ),
+        manifest(
+            NONCE,
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            entry(1, 0, PeerAccess::ReadOnly, 1, 8192),
+        ),
+    ];
+    for substitution in substitutions {
+        assert!(!linux_received_manifest_matches(
+            parameters,
+            1,
+            &expected,
+            &substitution
+        ));
+    }
 }
 
 fn prepared_batch(regions: &[(u128, WriterEndpoint)]) -> TransferBatch {

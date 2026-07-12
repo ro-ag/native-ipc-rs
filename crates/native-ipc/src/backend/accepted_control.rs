@@ -2,6 +2,8 @@ use super::{
     AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
+#[cfg(target_os = "linux")]
+use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
@@ -10,8 +12,11 @@ use crate::session::AbsoluteDeadline;
 
 #[cfg(target_os = "linux")]
 use super::linux_vnext::{
-    memory::{LinuxCoordinatorWriterBatch, MemfdError},
-    spawn::CoordinatorLinuxControlTransport,
+    memory::{
+        LinuxCoordinatorWriterBatch, LinuxExpectedCoordinatorWriterBatch,
+        LinuxImportedCoordinatorWriterBatch, MemfdError,
+    },
+    spawn::{CoordinatorLinuxControlTransport, ReceiverLinuxControlTransport},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +76,7 @@ pub(crate) enum LinuxCapabilityBatchError {
 /// Installed capabilities cannot leave this guard in G1b. A later complete
 /// import state machine may consume them without exposing the accepted native
 /// endpoint or independent pending tokens.
+#[cfg(test)]
 pub(crate) struct ReceiverCapabilityTransaction<'a, T: ReceiverCapabilityTransport> {
     dispatcher: &'a mut AcceptedControlDispatcher<T>,
     frame: CapabilityFrame,
@@ -78,6 +84,19 @@ pub(crate) struct ReceiverCapabilityTransaction<'a, T: ReceiverCapabilityTranspo
     received: Option<T::ReceivedCapabilities>,
     attempted: bool,
     already_poisoned: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxReceiverCoordinatorWriterTransaction<'a> {
+    dispatcher: &'a mut AcceptedControlDispatcher<ReceiverLinuxControlTransport>,
+    expected: Option<LinuxExpectedCoordinatorWriterBatch>,
+    imported: Option<LinuxImportedCoordinatorWriterBatch>,
+    deadline: AbsoluteDeadline,
+    transaction_id: u64,
+    attempted: bool,
+    already_poisoned: bool,
+    #[cfg(test)]
+    import_drop_observer: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
@@ -303,6 +322,51 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
 }
 
 #[cfg(target_os = "linux")]
+impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
+    #[cfg(test)]
+    pub(crate) fn observe_linux_receiver_poison_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.transport.observe_poison_for_test(observer);
+    }
+
+    pub(crate) fn begin_linux_expected_coordinator_writer_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxReceiverCoordinatorWriterTransaction<'_>, LinuxCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+        {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::WrongProvenance,
+            ));
+        }
+        let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected,
+            self.parameters.limits(),
+            deadline,
+        )
+        .map_err(LinuxCapabilityBatchError::Memory)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        Ok(LinuxReceiverCoordinatorWriterTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            import_drop_observer: None,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl LinuxCoordinatorWriterTransaction<'_> {
     pub(crate) fn send(&mut self) -> Result<(), LinuxCapabilityBatchError> {
         if let Err(error) = self._batch.revalidate() {
@@ -314,11 +378,153 @@ impl LinuxCoordinatorWriterTransaction<'_> {
             .send(&capabilities)
             .map_err(LinuxCapabilityBatchError::Control)
     }
+
+    #[cfg(test)]
+    pub(crate) fn send_without_revalidation_for_test(
+        &mut self,
+    ) -> Result<(), LinuxCapabilityBatchError> {
+        let capabilities = self._batch.capabilities();
+        self.transaction
+            .send(&capabilities)
+            .map_err(LinuxCapabilityBatchError::Control)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxReceiverCoordinatorWriterTransaction<'_> {
+    pub(crate) fn receive(&mut self) -> Result<(), LinuxCapabilityBatchError> {
+        if self.attempted {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        let expected = self
+            .expected
+            .as_ref()
+            .expect("receiver expectation remains transaction-owned");
+        debug_assert_eq!(expected.deadline(), self.deadline);
+        let record = match self
+            .dispatcher
+            .transport
+            .receive_candidate_capability_record(expected.len(), self.deadline)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((_, manifest)) = CapabilityFrame::decode(&record.frame) else {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !linux_received_manifest_matches(
+            self.dispatcher.parameters,
+            self.transaction_id,
+            expected,
+            &manifest,
+        ) {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let expected = self
+            .expected
+            .take()
+            .expect("validated expectation is consumed once");
+        let imported = match expected.import(&manifest, record.descriptors) {
+            Ok(imported) => imported,
+            Err(failure) => {
+                #[cfg(test)]
+                let mut failure = failure;
+                let error = failure.error();
+                #[cfg(test)]
+                if let Some(observer) = &self.import_drop_observer {
+                    failure.observe_drop_for_test(observer.clone());
+                }
+                self.poison();
+                drop(failure);
+                return Err(LinuxCapabilityBatchError::Memory(error));
+            }
+        };
+        #[cfg(test)]
+        let imported = {
+            let mut imported = imported;
+            if let Some(observer) = &self.import_drop_observer {
+                imported.observe_drop_for_test(observer.clone());
+            }
+            imported
+        };
+        self.imported = Some(imported);
+        Ok(())
+    }
+
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn imported_for_test(&self) -> &LinuxImportedCoordinatorWriterBatch {
+        self.imported
+            .as_ref()
+            .expect("test observation follows successful import")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_import_drop_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.import_drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_import_advice_at_for_test(&mut self, operation: usize) {
+        self.expected
+            .as_mut()
+            .expect("test fault precedes the only receive attempt")
+            .fail_advice_at_for_test(operation);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_received_manifest_matches(
+    parameters: AcceptedSessionParameters,
+    transaction_id: u64,
+    expected: &LinuxExpectedCoordinatorWriterBatch,
+    manifest: &TransferManifest,
+) -> bool {
+    let facts = parameters.facts();
+    manifest.nonce == facts.nonce()
+        && manifest.parent_pid == facts.parent_pid()
+        && manifest.child_pid == facts.child_pid()
+        && manifest.transfer_id == transaction_id
+        && manifest.authority_profile() == parameters.authority_profile()
+        && manifest.fits_limits(parameters.limits())
+        && expected.matches_manifest(manifest)
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxReceiverCoordinatorWriterTransaction<'_> {
+    fn drop(&mut self) {
+        self.poison();
+    }
 }
 
 impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
     /// Awaits a coordinator-initiated native transaction without sending any
     /// receiver-originated start record.
+    #[cfg(test)]
     pub(crate) fn await_capability_transaction(
         &mut self,
         expected_entries: Vec<ManifestEntry>,
@@ -371,6 +577,30 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         if !manifest.fits_limits(limits) {
             return Err(AcceptedControlError::Control(ControlError::PayloadTooLarge));
         }
+        let transaction_id = self.enter_native_transaction(deadline)?;
+        debug_assert_eq!(transaction_id, manifest.transfer_id);
+        Ok(CapabilityFrame::from_manifest(&manifest))
+    }
+
+    fn enter_native_transaction(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<u64, AcceptedControlError> {
+        if self.state.is_poisoned() {
+            return Err(AcceptedControlError::Control(ControlError::Poisoned));
+        }
+        if deadline.is_expired() {
+            return Err(AcceptedControlError::Transport(
+                SessionTransportError::DeadlineExpired,
+            ));
+        }
+        let limits = self.parameters.limits();
+        if self.next_transaction > limits.max_transactions {
+            self.poison_both();
+            return Err(AcceptedControlError::Control(
+                ControlError::SequenceExhausted,
+            ));
+        }
         match self.state.begin_transaction() {
             Ok(()) => {}
             Err(error) => {
@@ -380,11 +610,12 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
                 return Err(AcceptedControlError::Control(error));
             }
         }
+        let transaction_id = self.next_transaction;
         self.next_transaction = self
             .next_transaction
             .checked_add(1)
             .expect("negotiated transaction maximum cannot approach u64 overflow");
-        Ok(CapabilityFrame::from_manifest(&manifest))
+        Ok(transaction_id)
     }
 }
 
@@ -436,6 +667,7 @@ impl<T: CoordinatorCapabilityTransport> Drop for CoordinatorCapabilityTransactio
     }
 }
 
+#[cfg(test)]
 impl<T: ReceiverCapabilityTransport> ReceiverCapabilityTransaction<'_, T> {
     pub(crate) fn receive(&mut self) -> Result<&T::ReceivedCapabilities, AcceptedControlError> {
         if self.attempted {
@@ -469,6 +701,7 @@ impl<T: ReceiverCapabilityTransport> ReceiverCapabilityTransaction<'_, T> {
     }
 }
 
+#[cfg(test)]
 impl<T: ReceiverCapabilityTransport> Drop for ReceiverCapabilityTransaction<'_, T> {
     fn drop(&mut self) {
         self.poison();

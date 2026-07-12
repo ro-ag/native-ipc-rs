@@ -1,5 +1,6 @@
 use super::super::{PacketCredentials, PacketError, ReceivedPacket, SeqPacketEndpoint};
 use super::*;
+use crate::batch::{ExpectedBatch, ExpectedRegion};
 use crate::protocol::{CAPABILITY_MAGIC, TransferManifest};
 use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
@@ -201,6 +202,10 @@ assert_impl_all!(CoordinatorReaderPrepared: Send);
 assert_not_impl_any!(CoordinatorReaderPrepared: Sync, Clone);
 assert_impl_all!(LinuxCoordinatorWriterBatch: Send);
 assert_not_impl_any!(LinuxCoordinatorWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxExpectedCoordinatorWriterBatch: Send);
+assert_not_impl_any!(LinuxExpectedCoordinatorWriterBatch: Clone);
+assert_impl_all!(LinuxImportedCoordinatorWriterBatch: Send);
+assert_not_impl_any!(LinuxImportedCoordinatorWriterBatch: Sync, Clone);
 
 fn binding(seed: u8) -> TransferBinding {
     TransferBinding::new(
@@ -252,6 +257,20 @@ fn portable_batch(regions: &[(u128, WriterEndpoint, usize)]) -> TransferBatch {
             .unwrap();
     }
     batch
+}
+
+fn expected_batch(regions: &[(u128, WriterEndpoint, usize)]) -> ExpectedBatch {
+    ExpectedBatch::try_from_specs(
+        regions
+            .iter()
+            .map(|&(id, writer, logical_len)| ExpectedRegion {
+                id: RegionId::new(id).unwrap(),
+                writer,
+                logical_len,
+            })
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn batch_deadline() -> AbsoluteDeadline {
@@ -833,6 +852,135 @@ fn coordinator_writer_batch_rejects_profile_direction_and_object_substitution() 
 }
 
 #[test]
+fn receiver_expectation_rejects_direction_limits_and_expired_deadline_locally() {
+    let limits = SessionLimits {
+        max_regions_per_batch: 2,
+        max_region_bytes: 4096,
+        max_batch_bytes: 8192,
+        ..SessionLimits::default()
+    };
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Receiver, 1)]),
+            limits,
+            batch_deadline(),
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 4097)]),
+            limits,
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[
+                (1, WriterEndpoint::Coordinator, 1),
+                (2, WriterEndpoint::Coordinator, 1),
+            ]),
+            SessionLimits {
+                max_active_regions: 1,
+                ..limits
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            SessionLimits {
+                max_active_bytes: 4095,
+                ..limits
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        core::hint::spin_loop();
+    }
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            limits,
+            expired,
+        ),
+        Err(MemfdError::DeadlineExpired)
+    ));
+}
+
+#[test]
+fn receiver_imports_exact_final_sealed_objects_and_rejects_ordinal_substitution() {
+    let regions = [
+        (1, WriterEndpoint::Coordinator, 17),
+        (2, WriterEndpoint::Coordinator, 8193),
+    ];
+    let deadline = batch_deadline();
+    let coordinator = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x61; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    assert!(expected.matches_manifest(&manifest));
+    let descriptors = coordinator
+        .entries
+        .iter()
+        .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+        .collect();
+    let imported = expected.import(&manifest, descriptors).unwrap();
+    assert_eq!(imported.len(), 2);
+    for (ordinal, (id, _, logical_len)) in regions.into_iter().enumerate() {
+        for offset in 0..logical_len {
+            assert_eq!(imported.read_for_test(ordinal, offset), id as u8);
+        }
+        let (_, _, mapped_len) = imported.object_key_for_test(ordinal);
+        assert!(mapping_fails(
+            imported.descriptor_for_test(ordinal).as_raw_fd(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            mapped_len,
+        ));
+    }
+
+    let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let descriptors = coordinator
+        .entries
+        .iter()
+        .rev()
+        .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+        .collect();
+    assert!(matches!(
+        expected.import(&manifest, descriptors),
+        Err(failure) if failure.error() == MemfdError::InvalidObject
+    ));
+}
+
+#[test]
 #[ignore = "spawned alone by coordinator_writer_batch_rejects_expired_deadline_before_native_conversion"]
 fn isolated_coordinator_writer_batch_rejects_expired_deadline_before_native_conversion() {
     let baseline = process_resource_baseline();
@@ -932,6 +1080,64 @@ fn coordinator_writer_batch_nth_failure_restores_resources() {
         .args([
             "--exact",
             "backend::linux_vnext::memory::tests::isolated_coordinator_writer_batch_nth_failure_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "spawned alone by receiver_import_nth_failure_restores_resources"]
+fn isolated_receiver_import_nth_failure_helper() {
+    let regions: Vec<_> = (1..=16)
+        .map(|id| (id as u128, WriterEndpoint::Coordinator, id * 17))
+        .collect();
+    let deadline = batch_deadline();
+    let coordinator = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x62; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let baseline = process_resource_baseline();
+    for failure in [1, 2, 4, 16] {
+        let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&regions),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        let mut descriptors: Vec<OwnedFd> = coordinator
+            .entries
+            .iter()
+            .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+            .collect();
+        descriptors[failure - 1] = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(matches!(
+            expected.import(&manifest, descriptors),
+            Err(failure) if failure.error() == MemfdError::InvalidObject
+        ));
+        assert_eq!(process_resource_baseline(), baseline, "failure {failure}");
+    }
+}
+
+#[test]
+fn receiver_import_nth_failure_restores_resources() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_receiver_import_nth_failure_helper",
             "--ignored",
             "--nocapture",
         ])

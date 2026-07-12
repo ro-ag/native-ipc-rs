@@ -11,11 +11,13 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::linux::QuiescentRegion;
-use crate::batch::TransferBatch;
+use crate::batch::{ExpectedBatch, TransferBatch};
 use crate::memory::CleanupPolicy;
-use crate::protocol::{ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess};
+use crate::protocol::{
+    ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess, TransferManifest,
+};
 use crate::region::WriterEndpoint;
-use crate::session::AbsoluteDeadline;
+use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const MFD_NOEXEC_SEAL: libc::c_uint = 0x0008;
 const F_SEAL_EXEC: libc::c_int = 0x0020;
@@ -111,6 +113,14 @@ struct VmMapping {
     clear_on_drop: bool,
 }
 
+/// Owns a successful `mmap` before the address has been validated and the
+/// fallible mapping advice has completed.
+struct PendingVmMapping {
+    base: *mut libc::c_void,
+    len: usize,
+    clear_on_drop: bool,
+}
+
 pub(crate) struct LinuxCoordinatorWriterBatch {
     entries: Vec<LinuxCoordinatorWriterEntry>,
     deadline: AbsoluteDeadline,
@@ -118,6 +128,54 @@ pub(crate) struct LinuxCoordinatorWriterBatch {
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
     #[cfg(test)]
     revalidation_fault: bool,
+}
+
+pub(crate) struct LinuxExpectedCoordinatorWriterBatch {
+    entries: Vec<LinuxExpectedCoordinatorWriterEntry>,
+    total_logical: u64,
+    total_mapped: u64,
+    deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct LinuxExpectedCoordinatorWriterEntry {
+    region_id: u128,
+    logical_len: u64,
+    mapped_len: u64,
+}
+
+pub(crate) struct LinuxImportedCoordinatorWriterBatch {
+    entries: Vec<LinuxImportedCoordinatorWriterEntry>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+pub(crate) struct LinuxImportFailure {
+    error: MemfdError,
+    _partial: Vec<LinuxImportedCoordinatorWriterEntry>,
+    _current_fd: Option<OwnedFd>,
+    _current_mapping: Option<PendingVmMapping>,
+    _remaining: std::vec::IntoIter<OwnedFd>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+impl core::fmt::Debug for LinuxImportFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("LinuxImportFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+struct LinuxImportedCoordinatorWriterEntry {
+    manifest: ManifestEntry,
+    fd: OwnedFd,
+    mapping: VmMapping,
+    key: ObjectKey,
 }
 
 struct LinuxCoordinatorWriterEntry {
@@ -128,6 +186,10 @@ struct LinuxCoordinatorWriterEntry {
 // SAFETY: VmMapping uniquely owns one local VM range. Moving that owner to a
 // different thread neither duplicates the mapping nor creates Rust references.
 unsafe impl Send for VmMapping {}
+
+// SAFETY: PendingVmMapping uniquely owns one local VM range. Moving that owner
+// neither duplicates the mapping nor creates Rust references to its address.
+unsafe impl Send for PendingVmMapping {}
 
 impl TransferBinding {
     fn new(
@@ -434,6 +496,250 @@ impl LinuxCoordinatorWriterBatch {
     pub(crate) fn fail_revalidation_for_test(&mut self) {
         self.revalidation_fault = true;
     }
+
+    #[cfg(test)]
+    pub(crate) fn replace_export_with_invalid_file_for_test(&mut self, ordinal: usize) {
+        self.entries[ordinal].prepared.reader_capability =
+            std::fs::File::open("/dev/null").unwrap().into();
+    }
+}
+
+impl LinuxExpectedCoordinatorWriterBatch {
+    pub(crate) fn prepare(
+        expected: ExpectedBatch,
+        limits: SessionLimits,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if expected.len() > usize::from(limits.max_regions_per_batch)
+            || expected.len() as u64 > u64::from(limits.max_active_regions)
+            || expected.total_logical > limits.max_batch_bytes
+        {
+            return Err(MemfdError::InvalidBatch);
+        }
+        let mut total_mapped = 0_u64;
+        let mut entries = Vec::with_capacity(expected.len());
+        for region in expected.regions {
+            check_deadline(deadline)?;
+            if region.writer != WriterEndpoint::Coordinator {
+                return Err(MemfdError::UnsupportedDirection);
+            }
+            let logical_len = u64::try_from(region.logical_len)
+                .ok()
+                .filter(|logical| *logical <= limits.max_region_bytes)
+                .ok_or(MemfdError::InvalidBatch)?;
+            let mapped_len = u64::try_from(page_align(region.logical_len)?)
+                .map_err(|_| MemfdError::InvalidSize)?;
+            total_mapped = total_mapped
+                .checked_add(mapped_len)
+                .filter(|total| {
+                    *total <= limits.max_batch_bytes && *total <= limits.max_active_bytes
+                })
+                .ok_or(MemfdError::InvalidBatch)?;
+            entries.push(LinuxExpectedCoordinatorWriterEntry {
+                region_id: region.id.get(),
+                logical_len,
+                mapped_len,
+            });
+        }
+        Ok(Self {
+            entries,
+            total_logical: expected.total_logical,
+            total_mapped,
+            deadline,
+            #[cfg(test)]
+            advice_failure_at: None,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+
+    pub(crate) fn matches_manifest(&self, manifest: &TransferManifest) -> bool {
+        manifest.entries().len() == self.entries.len()
+            && manifest.total_logical() == self.total_logical
+            && manifest.total_mapped() == self.total_mapped
+            && self.entries.iter().zip(manifest.entries()).enumerate().all(
+                |(ordinal, (expected, received))| {
+                    received.region_id == expected.region_id
+                        && received.writer == 0
+                        && received.access == PeerAccess::ReadOnly
+                        && received.logical_len == expected.logical_len
+                        && received.mapped_len == expected.mapped_len
+                        && received.ordinal as usize == ordinal
+                },
+            )
+    }
+
+    pub(crate) fn import(
+        self,
+        manifest: &TransferManifest,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<LinuxImportedCoordinatorWriterBatch, LinuxImportFailure> {
+        let mut descriptors = descriptors.into_iter();
+        let mut imported = Vec::with_capacity(self.entries.len());
+        macro_rules! fail {
+            ($error:expr, $current_fd:expr, $current_mapping:expr) => {
+                return Err(LinuxImportFailure {
+                    error: $error,
+                    _partial: imported,
+                    _current_fd: $current_fd,
+                    _current_mapping: $current_mapping,
+                    _remaining: descriptors,
+                    #[cfg(test)]
+                    drop_observer: None,
+                })
+            };
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        if descriptors.len() != self.entries.len() || !self.matches_manifest(manifest) {
+            fail!(MemfdError::WrongProvenance, None, None);
+        }
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for entry in manifest.entries().iter().copied() {
+            let fd = descriptors
+                .next()
+                .expect("validated descriptor count matches manifest");
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let mapped_len = match usize::try_from(entry.mapped_len) {
+                Ok(mapped_len) => mapped_len,
+                Err(_) => fail!(MemfdError::InvalidSize, Some(fd), None),
+            };
+            let key = match validate_object(fd.as_raw_fd(), mapped_len, FINAL_SEALS) {
+                Ok(key) => key,
+                Err(error) => fail!(error, Some(fd), None),
+            };
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let pending =
+                match PendingVmMapping::map(fd.as_raw_fd(), mapped_len, libc::PROT_READ, false) {
+                    Ok(mapping) => mapping,
+                    Err(error) => fail!(error, Some(fd), None),
+                };
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), Some(pending));
+            }
+            for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                #[cfg(test)]
+                {
+                    advice_operation += 1;
+                    if self.advice_failure_at == Some(advice_operation) {
+                        fail!(MemfdError::Native(libc::EIO), Some(fd), Some(pending));
+                    }
+                }
+                if let Err(error) = pending.advise(advice) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+                if let Err(error) = check_deadline(self.deadline) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+            }
+            let mapping = match pending.into_mapping() {
+                Ok(mapping) => mapping,
+                Err((error, pending)) => fail!(error, Some(fd), Some(pending)),
+            };
+            imported.push(LinuxImportedCoordinatorWriterEntry {
+                manifest: entry,
+                fd,
+                mapping,
+                key,
+            });
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, None, None);
+            }
+            let retained = imported.last().expect("current import is retained");
+            match validate_object(retained.fd.as_raw_fd(), mapped_len, FINAL_SEALS) {
+                Ok(validated) if validated == key => {}
+                Ok(_) => fail!(MemfdError::WrongObject, None, None),
+                Err(error) => fail!(error, None, None),
+            }
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        Ok(LinuxImportedCoordinatorWriterBatch {
+            entries: imported,
+            #[cfg(test)]
+            drop_observer: None,
+        })
+    }
+}
+
+impl LinuxImportFailure {
+    pub(crate) const fn error(&self) -> MemfdError {
+        self.error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
+impl Drop for LinuxImportFailure {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("failed-import-drop");
+        }
+    }
+}
+
+impl LinuxImportedCoordinatorWriterBatch {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        let entry = &self.entries[ordinal];
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: the imported mapping is live and read-only for this access.
+        unsafe { core::ptr::read_volatile(entry.mapping.base.as_ptr().add(offset)) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_for_test(&self, ordinal: usize) -> BorrowedFd<'_> {
+        self.entries[ordinal].fd.as_fd()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn object_key_for_test(&self, ordinal: usize) -> (u64, u64, usize) {
+        let key = self.entries[ordinal].key;
+        (key.device, key.inode, key.mapped_len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
+impl Drop for LinuxImportedCoordinatorWriterBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("imported-batch-drop");
+        }
+    }
 }
 
 impl Drop for LinuxCoordinatorWriterBatch {
@@ -554,33 +860,11 @@ impl VmMapping {
         protection: libc::c_int,
         clear_on_drop: bool,
     ) -> Result<Self, MemfdError> {
-        // SAFETY: arguments describe a checked shared memfd range.
-        let pointer = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                len,
-                protection,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if pointer == libc::MAP_FAILED {
-            return Err(last_native());
-        }
-        let base = NonNull::new(pointer.cast()).ok_or(MemfdError::InvalidObject)?;
-        let mapping = Self {
-            base,
-            len,
-            clear_on_drop,
-        };
+        let pending = PendingVmMapping::map(fd, len, protection, clear_on_drop)?;
         for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
-            // SAFETY: the complete mapping remains live for this call.
-            if unsafe { libc::madvise(mapping.base.as_ptr().cast(), mapping.len, advice) } != 0 {
-                return Err(last_native());
-            }
+            pending.advise(advice)?;
         }
-        Ok(mapping)
+        pending.into_mapping().map_err(|(error, _mapping)| error)
     }
 
     fn unmap(self) -> Result<(), MemfdError> {
@@ -591,6 +875,56 @@ impl VmMapping {
         // Successful munmap discharged the destructor's native obligation.
         forget(self);
         Ok(())
+    }
+}
+
+impl PendingVmMapping {
+    fn map(
+        fd: RawFd,
+        len: usize,
+        protection: libc::c_int,
+        clear_on_drop: bool,
+    ) -> Result<Self, MemfdError> {
+        // SAFETY: arguments describe a checked shared memfd range.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                protection,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(last_native());
+        }
+        Ok(Self {
+            base,
+            len,
+            clear_on_drop,
+        })
+    }
+
+    fn advise(&self, advice: libc::c_int) -> Result<(), MemfdError> {
+        // SAFETY: this owner retains the complete live mapping for the call.
+        if unsafe { libc::madvise(self.base, self.len, advice) } != 0 {
+            return Err(last_native());
+        }
+        Ok(())
+    }
+
+    fn into_mapping(self) -> Result<VmMapping, (MemfdError, Self)> {
+        let Some(base) = NonNull::new(self.base.cast()) else {
+            return Err((MemfdError::InvalidObject, self));
+        };
+        let mapping = VmMapping {
+            base,
+            len: self.len,
+            clear_on_drop: self.clear_on_drop,
+        };
+        forget(self);
+        Ok(mapping)
     }
 }
 
@@ -610,6 +944,23 @@ impl Drop for VmMapping {
         }
         // SAFETY: this value uniquely owns this local mapping.
         let _ = unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+    }
+}
+
+impl Drop for PendingVmMapping {
+    fn drop(&mut self) {
+        if self.clear_on_drop && !self.base.is_null() {
+            // A null mapping is rejected before it can be used as a Rust byte
+            // range. It remains owned for munmap, but must not be dereferenced.
+            for offset in 0..self.len {
+                // SAFETY: a non-null pending writable mapping covers this range.
+                unsafe { core::ptr::write_volatile(self.base.cast::<u8>().add(offset), 0) };
+            }
+            compiler_fence(Ordering::SeqCst);
+        }
+        // SAFETY: this owner uniquely retains the successful mmap result,
+        // including the address-zero case.
+        let _ = unsafe { libc::munmap(self.base, self.len) };
     }
 }
 
