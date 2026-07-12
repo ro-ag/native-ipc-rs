@@ -74,6 +74,22 @@ jobs:
         with:
           toolchain: 1.97.0
           targets: ${{ matrix.target }}
+      - name: Record Linux host facts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          uname -a
+          uname -m
+          cat /etc/os-release
+          getconf GNU_LIBC_VERSION
+          rustc --version --verbose
+          cargo --version
+          git rev-parse HEAD
+          git status --short
+          systemd-detect-virt || true
+          systemd-detect-virt --container || true
+          systemd-detect-virt --vm || true
+          findmnt -no SOURCE,FSTYPE,OPTIONS /
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
