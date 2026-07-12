@@ -524,7 +524,9 @@ fn spawn_helper() {
 }
 
 fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mode: &str) -> ! {
-    let parameters = evidence.evidence.session_parameters();
+    let parameters = evidence
+        .evidence
+        .session_parameters(NativeAuthorityProfile::LinuxMdweV1);
     let nonce = parameters.facts().nonce();
     let maximum = parameters.limits().max_control_payload_bytes;
     let raw_frame = |payload_len: usize| {

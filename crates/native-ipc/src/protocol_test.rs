@@ -51,6 +51,25 @@ fn capability_frame_has_the_only_native_capability_magic() {
 }
 
 #[test]
+fn vnext_authority_profile_is_exactly_transcript_bound() {
+    let legacy = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
+    let linux = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1)],
+    )
+    .unwrap();
+    let legacy = legacy.encode(CAPABILITY_MAGIC);
+    let linux = linux.encode(CAPABILITY_MAGIC);
+    assert_eq!(u32::from_le_bytes(legacy[76..80].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(linux[76..80].try_into().unwrap()), 1);
+    assert_ne!(legacy, linux);
+}
+
+#[test]
 fn manifest_checks_negotiated_count_region_and_batch_limits() {
     let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1), entry(2)]).unwrap();
     let limits = SessionLimits {
@@ -101,7 +120,7 @@ fn exact_frame_rejects_every_transcript_field_and_size_change() {
     let magic = *b"NIPCTEST";
     let frame = manifest.encode(magic);
     for offset in [
-        0, 8, 12, 16, 48, 52, 56, 96, 112, 128, 136, 144, 148, 152, 154,
+        0, 8, 12, 16, 48, 52, 56, 76, 96, 112, 128, 136, 144, 148, 152, 154,
     ] {
         let mut wrong = frame;
         wrong[offset] ^= 1;

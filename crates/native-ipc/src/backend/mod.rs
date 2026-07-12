@@ -5,7 +5,7 @@
 )]
 
 use crate::negotiation::AcceptedTranscriptFacts;
-use crate::protocol::CapabilityFrame;
+use crate::protocol::{CapabilityFrame, NativeAuthorityProfile};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -28,6 +28,7 @@ pub(crate) struct SpawnIdentityFacts {
 pub(crate) struct AcceptedSessionParameters {
     facts: SpawnIdentityFacts,
     limits: SessionLimits,
+    authority_profile: NativeAuthorityProfile,
 }
 
 impl AcceptedSessionParameters {
@@ -37,6 +38,10 @@ impl AcceptedSessionParameters {
 
     pub(crate) const fn limits(self) -> SessionLimits {
         self.limits
+    }
+
+    pub(crate) const fn authority_profile(self) -> NativeAuthorityProfile {
+        self.authority_profile
     }
 }
 
@@ -150,10 +155,14 @@ impl CoordinatorAcceptedEvidence {
         self.facts
     }
 
-    pub(crate) const fn session_parameters(&self) -> AcceptedSessionParameters {
+    pub(crate) const fn session_parameters(
+        &self,
+        authority_profile: NativeAuthorityProfile,
+    ) -> AcceptedSessionParameters {
         AcceptedSessionParameters {
             facts: self.facts,
             limits: self.transcript.effective_limits(),
+            authority_profile,
         }
     }
 }
@@ -190,10 +199,14 @@ impl ReceiverSpawnerEvidence {
         self.facts
     }
 
-    pub(crate) const fn session_parameters(&self) -> AcceptedSessionParameters {
+    pub(crate) const fn session_parameters(
+        &self,
+        authority_profile: NativeAuthorityProfile,
+    ) -> AcceptedSessionParameters {
         AcceptedSessionParameters {
             facts: self.facts,
             limits: self.transcript.effective_limits(),
+            authority_profile,
         }
     }
 }

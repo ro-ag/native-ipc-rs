@@ -22,7 +22,7 @@ use crate::negotiation::{
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
     decode_frame,
 };
-use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame};
+use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame, NativeAuthorityProfile};
 use crate::session::{AbsoluteDeadline, NegotiationError, SessionLimits};
 
 use super::process::{ExactChildLifecycle, HeldExecutable, PreparedExactChildLifecycle};
@@ -615,7 +615,9 @@ impl CoordinatorAcceptedEvidenceOwner {
 
     fn into_control(self) -> Result<CoordinatorAcceptedControl, LinuxSpawnError> {
         let facts = self.evidence.facts();
-        let parameters = self.evidence.session_parameters();
+        let parameters = self
+            .evidence
+            .session_parameters(NativeAuthorityProfile::LinuxMdweV1);
         let transport = CoordinatorLinuxControlTransport {
             lifecycle: self.lifecycle,
             endpoint: self.endpoint,
@@ -646,7 +648,9 @@ impl ReceiverAcceptedEvidenceOwner {
 
     fn into_control(self) -> Result<ReceiverAcceptedControl, LinuxSpawnError> {
         let facts = self.evidence.facts();
-        let parameters = self.evidence.session_parameters();
+        let parameters = self
+            .evidence
+            .session_parameters(NativeAuthorityProfile::LinuxMdweV1);
         let transport = ReceiverLinuxControlTransport {
             endpoint: self.endpoint,
             _evidence: self.evidence,

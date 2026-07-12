@@ -14,6 +14,29 @@ const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
 const REQUIRED_ENTRY_FLAGS: u16 = ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE | ENTRY_FLAG_SIZE_FROZEN;
 
+/// Exact backend authority policy and accepted residual limitations bound into
+/// a vNext transfer transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub(crate) enum NativeAuthorityProfile {
+    /// Compatibility profile used only by the landed pre-vNext native helpers.
+    Legacy = 0,
+    /// Linux library views are non-executable, inherited MDWE refuses execute
+    /// gain, RX aliases remain possible, and a receiver-writer may delegate its
+    /// pre-seal fd outside the MDWE tree.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "Linux accepted-session profile")
+    )]
+    LinuxMdweV1 = 1,
+}
+
+impl NativeAuthorityProfile {
+    pub(crate) const fn is_vnext(self) -> bool {
+        !matches!(self, Self::Legacy)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 #[allow(dead_code)] // Each target uses the access modes its native backend supports.
@@ -90,6 +113,7 @@ pub(crate) struct TransferManifest {
     pub(crate) parent_pid: u32,
     pub(crate) child_pid: u32,
     pub(crate) transfer_id: u64,
+    authority_profile: NativeAuthorityProfile,
     total_logical: u64,
     total_mapped: u64,
     entries: Vec<ManifestEntry>,
@@ -135,6 +159,24 @@ impl TransferManifest {
         parent_pid: u32,
         child_pid: u32,
         transfer_id: u64,
+        entries: Vec<ManifestEntry>,
+    ) -> Option<Self> {
+        Self::new_with_authority(
+            nonce,
+            parent_pid,
+            child_pid,
+            transfer_id,
+            NativeAuthorityProfile::Legacy,
+            entries,
+        )
+    }
+
+    pub(crate) fn new_with_authority(
+        nonce: [u8; 32],
+        parent_pid: u32,
+        child_pid: u32,
+        transfer_id: u64,
+        authority_profile: NativeAuthorityProfile,
         mut entries: Vec<ManifestEntry>,
     ) -> Option<Self> {
         if nonce == [0; 32]
@@ -184,6 +226,7 @@ impl TransferManifest {
             parent_pid,
             child_pid,
             transfer_id,
+            authority_profile,
             total_logical,
             total_mapped,
             entries,
@@ -203,6 +246,7 @@ impl TransferManifest {
         frame[64..68].copy_from_slice(&frame_kind.to_le_bytes());
         frame[68..72].copy_from_slice(&MANIFEST_FLAG_CANONICAL.to_le_bytes());
         frame[72..76].copy_from_slice(&(CONTROL_FRAME_LEN as u32).to_le_bytes());
+        frame[76..80].copy_from_slice(&(self.authority_profile as u32).to_le_bytes());
         frame[80..88].copy_from_slice(&self.total_logical.to_le_bytes());
         frame[88..96].copy_from_slice(&self.total_mapped.to_le_bytes());
         for (index, entry) in self.entries.iter().enumerate() {

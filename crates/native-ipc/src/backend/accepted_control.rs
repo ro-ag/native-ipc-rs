@@ -57,7 +57,7 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         let limits = parameters.limits();
         let nonce = facts.nonce();
         let maximum_payload = limits.max_control_payload_bytes;
-        if limits.validate().is_err() {
+        if limits.validate().is_err() || !parameters.authority_profile().is_vnext() {
             return Err(transport);
         }
         let Some(maximum_wire_len) = usize::try_from(maximum_payload)
@@ -227,11 +227,12 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
             ));
         }
         let facts = self.parameters.facts();
-        let Some(manifest) = TransferManifest::new(
+        let Some(manifest) = TransferManifest::new_with_authority(
             facts.nonce(),
             facts.parent_pid(),
             facts.child_pid(),
             self.next_transaction,
+            self.parameters.authority_profile(),
             entries,
         ) else {
             return Err(AcceptedControlError::Control(ControlError::NonCanonical));

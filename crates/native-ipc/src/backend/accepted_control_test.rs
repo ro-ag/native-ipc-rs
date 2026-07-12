@@ -2,7 +2,8 @@ use super::accepted_control::{AcceptedControlDispatcher, AcceptedControlError};
 use super::*;
 use crate::control::{CONTROL_HEADER_LEN, ControlError, ControlFrame, ControlState};
 use crate::protocol::{
-    CapabilityFrame, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
+    CapabilityFrame, ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess,
+    TransferManifest,
 };
 use crate::session::SessionLimits;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
@@ -203,6 +204,7 @@ fn parameters(nonce: [u8; 32], maximum: u32, max_transactions: u64) -> AcceptedS
             max_transactions,
             ..SessionLimits::default()
         },
+        authority_profile: NativeAuthorityProfile::LinuxMdweV1,
     }
 }
 
@@ -248,11 +250,30 @@ fn capability_frame_for_identity(
     transaction: u64,
     count: usize,
 ) -> CapabilityFrame {
-    let manifest = TransferManifest::new(
+    capability_frame_for_authority(
         nonce,
         parent_pid,
         child_pid,
         transaction,
+        NativeAuthorityProfile::LinuxMdweV1,
+        count,
+    )
+}
+
+fn capability_frame_for_authority(
+    nonce: [u8; 32],
+    parent_pid: u32,
+    child_pid: u32,
+    transaction: u64,
+    authority_profile: NativeAuthorityProfile,
+    count: usize,
+) -> CapabilityFrame {
+    let manifest = TransferManifest::new_with_authority(
+        nonce,
+        parent_pid,
+        child_pid,
+        transaction,
+        authority_profile,
         manifest_entries(count),
     )
     .unwrap();
@@ -447,6 +468,7 @@ fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
         capability_frame(NONCE, 1, 2),
         capability_frame_for_identity(NONCE, 12, 11, 1, 1),
         capability_frame_for_identity(NONCE, 10, 12, 1, 1),
+        capability_frame_for_authority(NONCE, 10, 11, 1, NativeAuthorityProfile::Legacy, 1),
     ] {
         let (mut receiver, handle) = dispatcher(MAXIMUM);
         let drops = Arc::new(AtomicUsize::new(0));
@@ -615,6 +637,7 @@ fn local_manifest_limit_and_expired_deadline_fail_before_transaction() {
         AcceptedSessionParameters {
             facts: SpawnIdentityFacts::new(10, 11, 1, 1, 1, 1, NONCE).unwrap(),
             limits,
+            authority_profile: NativeAuthorityProfile::LinuxMdweV1,
         },
     )
     .ok()
@@ -673,6 +696,19 @@ fn local_manifest_limit_and_expired_deadline_fail_before_transaction() {
         capability_frame(NONCE, 1, 1).as_bytes()
     );
     coordinator.send(&frame(0, b"ok"), deadline()).unwrap();
+}
+
+#[test]
+fn accepted_owner_rejects_a_legacy_authority_profile_before_io() {
+    let handle = MockHandle::default();
+    let mut parameters = parameters(NONCE, MAXIMUM, 1);
+    parameters.authority_profile = NativeAuthorityProfile::Legacy;
+    assert!(AcceptedControlDispatcher::new(MockTransport(handle.clone()), parameters).is_err());
+    let facts = handle.0.lock().unwrap();
+    assert_eq!(facts.capability_send_calls, 0);
+    assert_eq!(facts.capability_receive_calls, 0);
+    assert_eq!(facts.send_calls, 0);
+    assert_eq!(facts.receive_calls, 0);
 }
 
 #[test]
