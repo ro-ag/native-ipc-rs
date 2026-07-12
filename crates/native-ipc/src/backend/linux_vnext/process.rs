@@ -608,6 +608,11 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
         };
         match reaped {
             Ok(Some(exit)) => {
+                // Release the worker's exact pidfd before publishing completion.
+                // The waiting owner may return as soon as it observes the
+                // notification, so retaining this task until thread return would
+                // make successful cleanup transiently leave one descriptor open.
+                drop(task);
                 *lock_unpoisoned(&shared.completion) = Some(exit);
                 shared.finished.store(true, Ordering::Release);
                 shared.completion_ready.notify_all();
