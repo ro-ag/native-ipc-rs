@@ -202,10 +202,16 @@ assert_impl_all!(CoordinatorReaderPrepared: Send);
 assert_not_impl_any!(CoordinatorReaderPrepared: Sync, Clone);
 assert_impl_all!(LinuxCoordinatorWriterBatch: Send);
 assert_not_impl_any!(LinuxCoordinatorWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxReceiverWriterBatch: Sync, Clone);
 assert_impl_all!(LinuxExpectedCoordinatorWriterBatch: Send);
 assert_not_impl_any!(LinuxExpectedCoordinatorWriterBatch: Clone);
+assert_impl_all!(LinuxExpectedReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxExpectedReceiverWriterBatch: Clone);
 assert_impl_all!(LinuxImportedCoordinatorWriterBatch: Send);
 assert_not_impl_any!(LinuxImportedCoordinatorWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxImportedReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxImportedReceiverWriterBatch: Sync, Clone);
 
 fn binding(seed: u8) -> TransferBinding {
     TransferBinding::new(
@@ -977,6 +983,101 @@ fn receiver_imports_exact_final_sealed_objects_and_rejects_ordinal_substitution(
     assert!(matches!(
         expected.import(&manifest, descriptors),
         Err(failure) if failure.error() == MemfdError::InvalidObject
+    ));
+}
+
+#[test]
+fn receiver_writer_batches_import_before_final_sealing_for_one_to_sixteen() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| (id as u128, WriterEndpoint::Receiver, id * 17))
+            .collect();
+        let deadline = batch_deadline();
+        let mut coordinator = LinuxReceiverWriterBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        coordinator.revalidate_prefix().unwrap();
+        let manifest = TransferManifest::new_with_authority(
+            [0x71; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            coordinator.manifest_entries(),
+        )
+        .unwrap();
+        let canonical: Vec<_> = (1..=count)
+            .map(|id| (id as u128, WriterEndpoint::Receiver, id * 17))
+            .collect();
+        let expected = LinuxExpectedReceiverWriterBatch::prepare(
+            expected_batch(&canonical),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        assert!(expected.matches_manifest(&manifest));
+        let descriptors = coordinator
+            .entries
+            .iter()
+            .map(|entry| duplicate(&entry.fd).unwrap())
+            .collect();
+        let mut imported = expected.import(&manifest, descriptors).unwrap();
+        assert_eq!(imported.len(), count);
+        for entry in &coordinator.entries {
+            assert_eq!(current_seals(entry.fd.as_raw_fd()), PREFIX_SEALS);
+            assert!(!mapping_fails(
+                entry.fd.as_raw_fd(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                entry.key.mapped_len,
+            ));
+        }
+
+        coordinator.seal_after_import().unwrap();
+        imported.verify_final_seals(deadline).unwrap();
+        for ordinal in 0..count {
+            let logical_len = (ordinal + 1) * 17;
+            assert_eq!(
+                current_seals(imported.descriptor_for_test(ordinal).as_raw_fd()),
+                FINAL_SEALS
+            );
+            assert!(mapping_fails(
+                imported.descriptor_for_test(ordinal).as_raw_fd(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                coordinator.entries[ordinal].key.mapped_len,
+            ));
+            for offset in 0..logical_len {
+                imported.write_for_test(ordinal, offset, (ordinal + 1) as u8);
+                assert_eq!(
+                    coordinator.read_for_test(ordinal, offset),
+                    (ordinal + 1) as u8
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn receiver_writer_expectation_and_preparation_reject_wrong_direction_locally() {
+    let deadline = batch_deadline();
+    assert!(matches!(
+        LinuxReceiverWriterBatch::prepare(
+            portable_batch(&[(1, WriterEndpoint::Coordinator, 17)]),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+    assert!(matches!(
+        LinuxExpectedReceiverWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 17)]),
+            SessionLimits::default(),
+            deadline,
+        ),
+        Err(MemfdError::UnsupportedDirection)
     ));
 }
 

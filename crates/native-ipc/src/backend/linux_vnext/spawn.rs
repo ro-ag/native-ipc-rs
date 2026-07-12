@@ -891,6 +891,75 @@ impl ReceiverLinuxControlTransport {
             deadline,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn send_record_with_rights_for_test(
+        &mut self,
+        bytes: &[u8],
+        rights: &[RawFd],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        if self.poisoned || rights.is_empty() || rights.len() > super::MAX_PACKET_FDS {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        loop {
+            if deadline.is_expired() {
+                return Err(SessionTransportError::DeadlineExpired);
+            }
+            match self.endpoint.send(bytes, rights) {
+                Ok(()) => {
+                    if deadline.is_expired() {
+                        self.poisoned = true;
+                        return Err(SessionTransportError::DeadlineExpired);
+                    }
+                    return Ok(());
+                }
+                Err(PacketError::Interrupted) => continue,
+                Err(PacketError::WouldBlock) => poll_accepted_control(
+                    self.endpoint.fd.as_raw_fd(),
+                    None,
+                    libc::POLLOUT,
+                    deadline,
+                )?,
+                Err(error) => return Err(map_packet_transport_error(error)),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_record_from_fork_for_test(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), SessionTransportError> {
+        // SAFETY: the disposable child performs one async-signal-safe sendmsg
+        // through the inherited endpoint and exits without Rust teardown.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return Err(SessionTransportError::Native);
+        }
+        if child == 0 {
+            let status = i32::from(self.endpoint.send_zero_rights(bytes).is_err());
+            // SAFETY: this is the disposable post-fork child.
+            unsafe { libc::_exit(status) }
+        }
+        let mut status = 0;
+        loop {
+            // SAFETY: this process owns the exact disposable child.
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            if waited == child {
+                break;
+            }
+            if waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(SessionTransportError::Native);
+        }
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            Ok(())
+        } else {
+            Err(SessionTransportError::Native)
+        }
+    }
 }
 
 fn send_accepted_control_record(

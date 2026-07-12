@@ -9,6 +9,10 @@ pub(crate) const CONTROL_FRAME_LEN: usize = 96 + MAX_TRANSFER_ENTRIES * ENTRY_LE
     reason = "private G1b capability transport is currently implemented only on Linux"
 )]
 pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const IMPORTED_MAGIC: [u8; 8] = *b"NIPCIMP1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
@@ -132,6 +136,21 @@ pub(crate) struct CapabilityFrame {
     capability_count: usize,
 }
 
+/// Exact full-manifest Linux preparation receipt kind.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationFrameKind {
+    Imported,
+    Sealed,
+}
+
+/// Zero-rights preparation frame derived only from a canonical capability
+/// frame retained by the accepted transaction owner.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct PreparationFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+}
+
 #[allow(
     dead_code,
     reason = "private G1b capability transport is currently implemented only on Linux"
@@ -155,6 +174,28 @@ impl CapabilityFrame {
     pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, TransferManifest)> {
         let manifest = TransferManifest::decode(CAPABILITY_MAGIC, bytes)?;
         Some((Self::from_manifest(&manifest), manifest))
+    }
+
+    pub(crate) fn preparation_frame(&self, kind: PreparationFrameKind) -> PreparationFrame {
+        let (_, manifest) = Self::decode(&self.bytes)
+            .expect("capability frames are constructed from canonical manifests");
+        PreparationFrame {
+            bytes: manifest.encode(match kind {
+                PreparationFrameKind::Imported => IMPORTED_MAGIC,
+                PreparationFrameKind::Sealed => SEALED_MAGIC,
+            }),
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PreparationFrame {
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        bytes == self.bytes
     }
 }
 

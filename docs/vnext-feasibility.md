@@ -721,6 +721,37 @@ G1g remains a terminal import checkpoint. It does not implement an ongoing
 active-resource charge/lease, receiver-writer preparation, IMPORTED/SEALED,
 READY/COMMIT, activation, public `ExpectedBatch`/session APIs, or release proof.
 
+Phase 5i-G1h implements the bounded Linux receiver-writer preparation ordering
+for homogeneous 1..=16-region batches inside the same accepted-session owner.
+Before capability escape the coordinator retains only prefix-sealed memfds and
+has destroyed every local writable mapping. The receiver verifies exact
+pre-receipt expectations and prefix seals, establishes every RW mapping, and
+sends an internally derived exact-full-manifest `NIPCIMP1` record with zero
+rights. The coordinator accepts only that exact credential-bound receipt,
+immediately installs `F_SEAL_FUTURE_WRITE | F_SEAL_SEAL` across the complete
+batch, continuing best-effort attenuation of remaining fds after an individual
+seal error. Only a completely final-sealed batch proceeds to read-only pending
+mappings and internally derived `NIPCSEA1`. The receiver revalidates final
+seals before its terminal pending owner can be observed even by tests.
+
+The adjacent corpus covers full-byte 1/2/4/16 transfer, new writable-map denial
+after final sealing, exact receipt kind/transcript substitution, application
+frame interleaving, wrong directional credentials, injected 1/2/16 rights,
+every IMPORTED/SEALED truncation, silence under one absolute deadline, replay
+of the terminal prepare operation plus stale/duplicate IMPORTED and duplicate
+SEALED wire records, continuous wrong-kind traffic, invalid objects at ordinals
+1/2/4/16, Nth final-seal failure at 1/2/4/16, first/middle/final receiver and
+coordinator post-`mmap` advisory failures, receiver final-seal revalidation
+failure, persistent poison, poison-before-native-cleanup, and fd/map/child/task
+baselines. The independent final adversarial review reports no P1/P2/P3.
+Exact implementation SHA and hosted CI evidence are pending.
+
+G1h is not READY or COMMIT. It supports receiver-writer-only batches in this
+checkpoint; mixed-direction composition, the single full-batch READY/COMMIT
+reducer, active resource leases, runtime exposure, public session/control APIs,
+physical Arm64, packaged-crate, release, and whole-vNext evidence remain
+outstanding.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

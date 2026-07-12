@@ -191,6 +191,25 @@ remaining installed fds until after session poison. G1g does not yet charge an
 ongoing active-resource ledger, activate mappings, support receiver-writer
 entries, or implement IMPORTED/SEALED/READY/COMMIT or public receiver APIs.
 
+Linux G1h adds the receiver-writer-only preparation subprotocol without
+activating a batch. The coordinator consumes and canonicalizes the complete
+portable batch, installs and verifies execute/grow/shrink seals, and destroys
+every coordinator writable mapping before its accepted owner can send the
+capabilities. The receiver validates the exact expected batch under prefix
+seals, creates all RW mappings, and sends `NIPCIMP1` carrying the exact full
+manifest with zero rights. Only the accepted coordinator owner can consume that
+receipt; it immediately installs and verifies future-write plus final seals,
+continuing best-effort attenuation across every remaining escaped fd if one
+seal step fails. Only after the complete batch is final-sealed does it create
+read-only pending mappings and send exact zero-rights `NIPCSEA1`. The
+receiver revalidates every final seal before retaining the still-pending batch.
+Both preparation frames are derived internally from the transaction's canonical
+capability frame, use the same caller deadline, and cannot be replaced with
+application control. Every success and failure remains terminal and poisons on
+guard destruction. G1h does not combine writer directions, end the transaction,
+charge ongoing active leases, expose mappings, or implement batch READY/COMMIT
+or public APIs.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

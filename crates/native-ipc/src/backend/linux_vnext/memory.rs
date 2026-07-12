@@ -130,7 +130,27 @@ pub(crate) struct LinuxCoordinatorWriterBatch {
     revalidation_fault: bool,
 }
 
+pub(crate) struct LinuxReceiverWriterBatch {
+    entries: Vec<LinuxReceiverWriterEntry>,
+    deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    seal_failure_at: Option<usize>,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
+}
+
 pub(crate) struct LinuxExpectedCoordinatorWriterBatch {
+    entries: Vec<LinuxExpectedCoordinatorWriterEntry>,
+    total_logical: u64,
+    total_mapped: u64,
+    deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
+}
+
+pub(crate) struct LinuxExpectedReceiverWriterBatch {
     entries: Vec<LinuxExpectedCoordinatorWriterEntry>,
     total_logical: u64,
     total_mapped: u64,
@@ -152,9 +172,26 @@ pub(crate) struct LinuxImportedCoordinatorWriterBatch {
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
+pub(crate) struct LinuxImportedReceiverWriterBatch {
+    entries: Vec<LinuxImportedReceiverWriterEntry>,
+    sealed_verified: bool,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
 pub(crate) struct LinuxImportFailure {
     error: MemfdError,
     _partial: Vec<LinuxImportedCoordinatorWriterEntry>,
+    _current_fd: Option<OwnedFd>,
+    _current_mapping: Option<PendingVmMapping>,
+    _remaining: std::vec::IntoIter<OwnedFd>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+pub(crate) struct LinuxReceiverWriterImportFailure {
+    error: MemfdError,
+    _partial: Vec<LinuxImportedReceiverWriterEntry>,
     _current_fd: Option<OwnedFd>,
     _current_mapping: Option<PendingVmMapping>,
     _remaining: std::vec::IntoIter<OwnedFd>,
@@ -178,9 +215,26 @@ struct LinuxImportedCoordinatorWriterEntry {
     key: ObjectKey,
 }
 
+struct LinuxImportedReceiverWriterEntry {
+    manifest: ManifestEntry,
+    fd: OwnedFd,
+    mapping: VmMapping,
+    key: ObjectKey,
+}
+
 struct LinuxCoordinatorWriterEntry {
     native: NativeRegionSpec,
     prepared: CoordinatorWriterPrepared,
+}
+
+struct LinuxReceiverWriterEntry {
+    native: NativeRegionSpec,
+    fd: OwnedFd,
+    key: ObjectKey,
+    mapping: Option<VmMapping>,
+    pending_mapping: Option<PendingVmMapping>,
+    #[cfg(test)]
+    capability_override: Option<OwnedFd>,
 }
 
 // SAFETY: VmMapping uniquely owns one local VM range. Moving that owner to a
@@ -383,6 +437,28 @@ impl PrivateMemfd {
             not_sync: PhantomData,
         })
     }
+
+    fn prepare_receiver_writer_for_batch(
+        mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(OwnedFd, ObjectKey), MemfdError> {
+        check_deadline(deadline)?;
+        add_seals(self.fd.as_raw_fd(), libc::F_SEAL_GROW | libc::F_SEAL_SHRINK)?;
+        check_deadline(deadline)?;
+        let mapped_len = self.mapping.as_ref().expect("private mapping is live").len;
+        let key = validate_object(self.fd.as_raw_fd(), mapped_len, PREFIX_SEALS)?;
+        check_deadline(deadline)?;
+        // No coordinator-owned writable mapping may survive capability escape.
+        let mut mapping = self.mapping.take().expect("private mapping is live");
+        mapping.clear_on_drop = false;
+        mapping.unmap()?;
+        check_deadline(deadline)?;
+        if validate_object(self.fd.as_raw_fd(), mapped_len, PREFIX_SEALS)? != key {
+            return Err(MemfdError::WrongObject);
+        }
+        check_deadline(deadline)?;
+        Ok((self.fd, key))
+    }
 }
 
 impl CoordinatorWriterPrepared {
@@ -501,6 +577,259 @@ impl LinuxCoordinatorWriterBatch {
     pub(crate) fn replace_export_with_invalid_file_for_test(&mut self, ordinal: usize) {
         self.entries[ordinal].prepared.reader_capability =
             std::fs::File::open("/dev/null").unwrap().into();
+    }
+}
+
+impl LinuxReceiverWriterBatch {
+    pub(crate) fn prepare(
+        batch: TransferBatch,
+        authority_profile: NativeAuthorityProfile,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if authority_profile != NativeAuthorityProfile::LinuxMdweV1 {
+            return Err(MemfdError::WrongProvenance);
+        }
+        let mut pending = batch.into_pending().map_err(|_| MemfdError::InvalidBatch)?;
+        pending
+            .regions
+            .sort_unstable_by_key(|region| region.spec().id);
+        let mut entries = Vec::with_capacity(pending.regions.len());
+        for region in pending.regions {
+            check_deadline(deadline)?;
+            let (request, spec, _) = region.into_linux_transfer_parts();
+            if spec.writer != WriterEndpoint::Receiver {
+                return Err(MemfdError::UnsupportedDirection);
+            }
+            let native = request
+                .native_spec(spec.id.get())
+                .ok_or(MemfdError::InvalidBatch)?;
+            let (region, cleanup) = request.into_linux_quiescent();
+            let (fd, key) = PrivateMemfd::from_quiescent(region, cleanup, deadline)?
+                .prepare_receiver_writer_for_batch(deadline)?;
+            entries.push(LinuxReceiverWriterEntry {
+                native,
+                fd,
+                key,
+                mapping: None,
+                pending_mapping: None,
+                #[cfg(test)]
+                capability_override: None,
+            });
+        }
+        check_deadline(deadline)?;
+        Ok(Self {
+            entries,
+            deadline,
+            #[cfg(test)]
+            drop_observer: None,
+            #[cfg(test)]
+            seal_failure_at: None,
+            #[cfg(test)]
+            advice_failure_at: None,
+        })
+    }
+
+    pub(crate) fn manifest_entries(&self) -> Vec<ManifestEntry> {
+        self.entries
+            .iter()
+            .map(|entry| ManifestEntry::from_native(entry.native, PeerAccess::SoleWriter))
+            .collect()
+    }
+
+    pub(crate) fn capabilities(&self) -> Vec<BorrowedFd<'_>> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                #[cfg(test)]
+                if let Some(capability) = &entry.capability_override {
+                    return capability.as_fd();
+                }
+                entry.fd.as_fd()
+            })
+            .collect()
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
+    pub(crate) fn revalidate_prefix(&self) -> Result<(), MemfdError> {
+        check_deadline(self.deadline)?;
+        self.entries.iter().try_for_each(|entry| {
+            if validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, PREFIX_SEALS)?
+                != entry.key
+            {
+                return Err(MemfdError::WrongObject);
+            }
+            check_deadline(self.deadline)
+        })
+    }
+
+    pub(crate) fn seal_after_import(&mut self) -> Result<(), MemfdError> {
+        let mut first_error = check_deadline(self.deadline).err();
+        // Validate the complete prefix-sealed set before attenuation, but do
+        // not let one failure prevent best-effort sealing of every escaped fd.
+        for entry in &self.entries {
+            let validation =
+                validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, PREFIX_SEALS).and_then(
+                    |key| {
+                        if key == entry.key {
+                            Ok(())
+                        } else {
+                            Err(MemfdError::WrongObject)
+                        }
+                    },
+                );
+            if first_error.is_none() {
+                first_error = validation.err();
+            }
+        }
+
+        // Attenuate the complete batch immediately after IMPORTED. Deadline or
+        // per-entry failures are remembered, while remaining fds still receive
+        // best-effort final seals before any unrelated mapping work begins.
+        #[cfg(test)]
+        let mut seal_ordinal = 0_usize;
+        for entry in &mut self.entries {
+            if first_error.is_none() {
+                first_error = check_deadline(self.deadline).err();
+            }
+            #[cfg(test)]
+            {
+                seal_ordinal += 1;
+                if self.seal_failure_at == Some(seal_ordinal) {
+                    if first_error.is_none() {
+                        first_error = Some(MemfdError::Native(libc::EIO));
+                    }
+                    continue;
+                }
+            }
+            if let Err(error) = add_seals(
+                entry.fd.as_raw_fd(),
+                libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL,
+            ) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+            let validation =
+                validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS).and_then(
+                    |key| {
+                        if key == entry.key {
+                            Ok(())
+                        } else {
+                            Err(MemfdError::WrongObject)
+                        }
+                    },
+                );
+            if first_error.is_none() {
+                first_error = validation.err();
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // Only a completely final-sealed batch may acquire coordinator RO
+        // mappings. Any mapping/advice failure leaves every fd attenuated.
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for entry in &mut self.entries {
+            check_deadline(self.deadline)?;
+            let pending = PendingVmMapping::map(
+                entry.fd.as_raw_fd(),
+                entry.key.mapped_len,
+                libc::PROT_READ,
+                false,
+            )?;
+            entry.pending_mapping = Some(pending);
+            check_deadline(self.deadline)?;
+            for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                #[cfg(test)]
+                {
+                    advice_operation += 1;
+                    if self.advice_failure_at == Some(advice_operation) {
+                        return Err(MemfdError::Native(libc::EIO));
+                    }
+                }
+                entry
+                    .pending_mapping
+                    .as_ref()
+                    .expect("pending mapping remains batch-owned")
+                    .advise(advice)?;
+                check_deadline(self.deadline)?;
+            }
+            let pending = entry
+                .pending_mapping
+                .take()
+                .expect("validated pending mapping remains owned");
+            entry.mapping = Some(match pending.into_mapping() {
+                Ok(mapping) => mapping,
+                Err((error, pending)) => {
+                    entry.pending_mapping = Some(pending);
+                    return Err(error);
+                }
+            });
+        }
+        check_deadline(self.deadline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_seal_at_for_test(&mut self, ordinal: usize) {
+        assert!((1..=self.entries.len()).contains(&ordinal));
+        self.seal_failure_at = Some(ordinal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_capability_with_invalid_file_for_test(&mut self, ordinal: usize) {
+        self.entries[ordinal].capability_override =
+            Some(std::fs::File::open("/dev/null").unwrap().into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        let mapping = self.entries[ordinal]
+            .mapping
+            .as_ref()
+            .expect("coordinator read view follows final sealing");
+        assert!(offset < self.entries[ordinal].native.logical_len as usize);
+        // SAFETY: the final-sealed read-only mapping remains batch-owned.
+        unsafe { core::ptr::read_volatile(mapping.base.as_ptr().add(offset)) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_final_sealed_for_test(&self) -> bool {
+        self.entries.iter().all(|entry| {
+            validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS)
+                == Ok(entry.key)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_counts_for_test(&self) -> (usize, usize) {
+        self.entries
+            .iter()
+            .fold((0, 0), |(prefix, final_sealed), entry| {
+                // SAFETY: scalar seal query on a live batch-owned fd.
+                match unsafe { libc::fcntl(entry.fd.as_raw_fd(), libc::F_GET_SEALS) } {
+                    PREFIX_SEALS => (prefix + 1, final_sealed),
+                    FINAL_SEALS => (prefix, final_sealed + 1),
+                    seals => panic!("unexpected seal set {seals:#x}"),
+                }
+            })
     }
 }
 
@@ -682,7 +1011,210 @@ impl LinuxExpectedCoordinatorWriterBatch {
     }
 }
 
+impl LinuxExpectedReceiverWriterBatch {
+    pub(crate) fn prepare(
+        expected: ExpectedBatch,
+        limits: SessionLimits,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if expected.len() > usize::from(limits.max_regions_per_batch)
+            || expected.len() as u64 > u64::from(limits.max_active_regions)
+            || expected.total_logical > limits.max_batch_bytes
+        {
+            return Err(MemfdError::InvalidBatch);
+        }
+        let mut total_mapped = 0_u64;
+        let mut entries = Vec::with_capacity(expected.len());
+        for region in expected.regions {
+            check_deadline(deadline)?;
+            if region.writer != WriterEndpoint::Receiver {
+                return Err(MemfdError::UnsupportedDirection);
+            }
+            let logical_len = u64::try_from(region.logical_len)
+                .ok()
+                .filter(|logical| *logical <= limits.max_region_bytes)
+                .ok_or(MemfdError::InvalidBatch)?;
+            let mapped_len = u64::try_from(page_align(region.logical_len)?)
+                .map_err(|_| MemfdError::InvalidSize)?;
+            total_mapped = total_mapped
+                .checked_add(mapped_len)
+                .filter(|total| {
+                    *total <= limits.max_batch_bytes && *total <= limits.max_active_bytes
+                })
+                .ok_or(MemfdError::InvalidBatch)?;
+            entries.push(LinuxExpectedCoordinatorWriterEntry {
+                region_id: region.id.get(),
+                logical_len,
+                mapped_len,
+            });
+        }
+        Ok(Self {
+            entries,
+            total_logical: expected.total_logical,
+            total_mapped,
+            deadline,
+            #[cfg(test)]
+            advice_failure_at: None,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+
+    pub(crate) fn matches_manifest(&self, manifest: &TransferManifest) -> bool {
+        manifest.entries().len() == self.entries.len()
+            && manifest.total_logical() == self.total_logical
+            && manifest.total_mapped() == self.total_mapped
+            && self.entries.iter().zip(manifest.entries()).enumerate().all(
+                |(ordinal, (expected, received))| {
+                    received.region_id == expected.region_id
+                        && received.writer == 1
+                        && received.access == PeerAccess::SoleWriter
+                        && received.logical_len == expected.logical_len
+                        && received.mapped_len == expected.mapped_len
+                        && received.ordinal as usize == ordinal
+                },
+            )
+    }
+
+    pub(crate) fn import(
+        self,
+        manifest: &TransferManifest,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<LinuxImportedReceiverWriterBatch, LinuxReceiverWriterImportFailure> {
+        let mut descriptors = descriptors.into_iter();
+        let mut imported = Vec::with_capacity(self.entries.len());
+        macro_rules! fail {
+            ($error:expr, $current_fd:expr, $current_mapping:expr) => {
+                return Err(LinuxReceiverWriterImportFailure {
+                    error: $error,
+                    _partial: imported,
+                    _current_fd: $current_fd,
+                    _current_mapping: $current_mapping,
+                    _remaining: descriptors,
+                    #[cfg(test)]
+                    drop_observer: None,
+                })
+            };
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        if descriptors.len() != self.entries.len() || !self.matches_manifest(manifest) {
+            fail!(MemfdError::WrongProvenance, None, None);
+        }
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for entry in manifest.entries().iter().copied() {
+            let fd = descriptors
+                .next()
+                .expect("validated descriptor count matches manifest");
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let mapped_len = match usize::try_from(entry.mapped_len) {
+                Ok(mapped_len) => mapped_len,
+                Err(_) => fail!(MemfdError::InvalidSize, Some(fd), None),
+            };
+            let key = match validate_object(fd.as_raw_fd(), mapped_len, PREFIX_SEALS) {
+                Ok(key) => key,
+                Err(error) => fail!(error, Some(fd), None),
+            };
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let pending = match PendingVmMapping::map(
+                fd.as_raw_fd(),
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                false,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => fail!(error, Some(fd), None),
+            };
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), Some(pending));
+            }
+            for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                #[cfg(test)]
+                {
+                    advice_operation += 1;
+                    if self.advice_failure_at == Some(advice_operation) {
+                        fail!(MemfdError::Native(libc::EIO), Some(fd), Some(pending));
+                    }
+                }
+                if let Err(error) = pending.advise(advice) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+                if let Err(error) = check_deadline(self.deadline) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+            }
+            let mapping = match pending.into_mapping() {
+                Ok(mapping) => mapping,
+                Err((error, pending)) => fail!(error, Some(fd), Some(pending)),
+            };
+            imported.push(LinuxImportedReceiverWriterEntry {
+                manifest: entry,
+                fd,
+                mapping,
+                key,
+            });
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, None, None);
+            }
+            let retained = imported.last().expect("current import is retained");
+            match validate_object(retained.fd.as_raw_fd(), mapped_len, PREFIX_SEALS) {
+                Ok(validated) if validated == key => {}
+                Ok(_) => fail!(MemfdError::WrongObject, None, None),
+                Err(error) => fail!(error, None, None),
+            }
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        Ok(LinuxImportedReceiverWriterBatch {
+            entries: imported,
+            sealed_verified: false,
+            #[cfg(test)]
+            drop_observer: None,
+        })
+    }
+}
+
 impl LinuxImportFailure {
+    pub(crate) const fn error(&self) -> MemfdError {
+        self.error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
+impl core::fmt::Debug for LinuxReceiverWriterImportFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("LinuxReceiverWriterImportFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LinuxReceiverWriterImportFailure {
     pub(crate) const fn error(&self) -> MemfdError {
         self.error
     }
@@ -698,6 +1230,15 @@ impl Drop for LinuxImportFailure {
         #[cfg(test)]
         if let Some(observer) = &self.drop_observer {
             observer.lock().unwrap().push("failed-import-drop");
+        }
+    }
+}
+
+impl Drop for LinuxReceiverWriterImportFailure {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("failed-receiver-import-drop");
         }
     }
 }
@@ -733,6 +1274,50 @@ impl LinuxImportedCoordinatorWriterBatch {
     }
 }
 
+impl LinuxImportedReceiverWriterBatch {
+    pub(crate) fn verify_final_seals(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), MemfdError> {
+        check_deadline(deadline)?;
+        for entry in &self.entries {
+            if validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS)?
+                != entry.key
+            {
+                return Err(MemfdError::WrongObject);
+            }
+            check_deadline(deadline)?;
+        }
+        self.sealed_verified = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_for_test(&mut self, ordinal: usize, offset: usize, value: u8) {
+        assert!(self.sealed_verified);
+        let entry = &mut self.entries[ordinal];
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: this retained mapping was established writable before final
+        // future-write sealing and is the receiver's sole-writer view.
+        unsafe { core::ptr::write_volatile(entry.mapping.base.as_ptr().add(offset), value) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_for_test(&self, ordinal: usize) -> BorrowedFd<'_> {
+        self.entries[ordinal].fd.as_fd()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
 impl Drop for LinuxImportedCoordinatorWriterBatch {
     fn drop(&mut self) {
         #[cfg(test)]
@@ -742,11 +1327,32 @@ impl Drop for LinuxImportedCoordinatorWriterBatch {
     }
 }
 
+impl Drop for LinuxImportedReceiverWriterBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer
+                .lock()
+                .unwrap()
+                .push("imported-receiver-batch-drop");
+        }
+    }
+}
+
 impl Drop for LinuxCoordinatorWriterBatch {
     fn drop(&mut self) {
         #[cfg(test)]
         if let Some(observer) = &self.drop_observer {
             observer.lock().unwrap().push("native-batch-drop");
+        }
+    }
+}
+
+impl Drop for LinuxReceiverWriterBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("receiver-writer-batch-drop");
         }
     }
 }

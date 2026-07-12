@@ -1,4 +1,4 @@
-use super::super::memory::{LinuxCoordinatorWriterBatch, MemfdError};
+use super::super::memory::{LinuxCoordinatorWriterBatch, LinuxReceiverWriterBatch, MemfdError};
 use super::*;
 use crate::backend::accepted_control::{AcceptedControlError, LinuxCapabilityBatchError};
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
@@ -103,8 +103,41 @@ fn portable_coordinator_writer_batch(count: usize) -> TransferBatch {
     batch
 }
 
+fn portable_receiver_writer_batch(count: usize) -> TransferBatch {
+    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    for id in (1..=count).rev() {
+        let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
+        region.initialize(|bytes| bytes.fill(0));
+        batch
+            .add(
+                region
+                    .prepare(RegionSpec {
+                        id: RegionId::new(id as u128).unwrap(),
+                        writer: WriterEndpoint::Receiver,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    batch
+}
+
 fn expected_coordinator_writer_batch(count: usize) -> ExpectedBatch {
     expected_coordinator_writer_batch_with_first_delta(count, 0)
+}
+
+fn expected_receiver_writer_batch(count: usize) -> ExpectedBatch {
+    ExpectedBatch::try_from_specs(
+        (1..=count)
+            .rev()
+            .map(|id| ExpectedRegion {
+                id: RegionId::new(id as u128).unwrap(),
+                writer: WriterEndpoint::Receiver,
+                logical_len: id * 17,
+            })
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn expected_coordinator_writer_batch_with_first_delta(
@@ -337,6 +370,14 @@ fn open_fd_count() -> usize {
 
 fn open_task_count() -> usize {
     std::fs::read_dir("/proc/self/task").unwrap().count()
+}
+
+fn open_vnext_map_count() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("native-ipc-vnext"))
+        .count()
 }
 
 fn wait_for_baseline(fds: usize, tasks: usize, child_pid: libc::pid_t, deadline: AbsoluteDeadline) {
@@ -771,6 +812,195 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     deadline(),
                 ),
                 Err(AcceptedControlError::Control(ControlError::Poisoned))
+            );
+            drop(control);
+            std::process::exit(0);
+        }
+        "receiver-writer-batch"
+        | "receiver-writer-seal-failure"
+        | "receiver-writer-imported-application"
+        | "receiver-writer-sealed-substitution"
+        | "receiver-writer-imported-silence"
+        | "receiver-writer-imported-rights"
+        | "receiver-writer-imported-truncated"
+        | "receiver-writer-imported-wrong-credentials"
+        | "receiver-writer-invalid-object"
+        | "receiver-writer-import-advice-failure"
+        | "receiver-writer-coordinator-advice-failure"
+        | "receiver-writer-final-seal-missing"
+        | "receiver-writer-stale-imported"
+        | "receiver-writer-duplicate-imported"
+        | "receiver-writer-duplicate-sealed"
+        | "receiver-writer-continuous-wrong-imported" => {
+            let count = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut control = evidence.into_control().unwrap();
+            control.observe_linux_receiver_poison_for_test(events.clone());
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"ready".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            let operation_deadline = if mode.ends_with("silence") {
+                AbsoluteDeadline::after(Duration::from_millis(150)).unwrap()
+            } else {
+                deadline()
+            };
+            let mut transaction = control
+                .begin_linux_expected_receiver_writer_batch(
+                    expected_receiver_writer_batch(count),
+                    operation_deadline,
+                )
+                .unwrap();
+            transaction.observe_import_drop_for_test(events.clone());
+            if mode.ends_with("imported-application") {
+                transaction.substitute_imported_with_application_for_test();
+            }
+            if mode.ends_with("silence") {
+                transaction.suppress_imported_for_test();
+            }
+            if mode.ends_with("rights") {
+                let rights = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.inject_imported_rights_for_test(rights);
+            }
+            if mode.ends_with("truncated") {
+                transaction.truncate_imported_for_test();
+            }
+            if mode.ends_with("wrong-credentials") {
+                transaction.use_wrong_imported_credentials_for_test();
+            }
+            if mode.ends_with("import-advice-failure") {
+                let operation = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.fail_receiver_advice_at_for_test(operation);
+            }
+            if mode.ends_with("stale-imported") {
+                transaction.stale_imported_for_test();
+            }
+            if mode.ends_with("duplicate-imported") {
+                transaction.duplicate_imported_for_test();
+            }
+            if mode.ends_with("continuous-wrong-imported") {
+                transaction.continuous_wrong_imported_for_test();
+            }
+            if mode.ends_with("duplicate-sealed") {
+                transaction.expect_duplicate_sealed_replay_for_test();
+            }
+            let prepared = transaction.prepare();
+            if mode.ends_with("invalid-object") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::InvalidObject))
+                );
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "failed-receiver-import-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            } else if mode.ends_with("import-advice-failure") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                        libc::EIO
+                    )))
+                );
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "failed-receiver-import-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            } else if mode.ends_with("final-seal-missing") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::InvalidObject))
+                );
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "imported-receiver-batch-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            } else if mode.ends_with("sealed-substitution") {
+                assert!(matches!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(ControlError::NonCanonical)
+                    ))
+                ));
+            } else if mode.ends_with("duplicate-sealed") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(ControlError::ReplayOrReorder)
+                    ))
+                );
+            } else if !matches!(
+                mode,
+                "receiver-writer-batch" | "receiver-writer-duplicate-imported"
+            ) {
+                assert!(matches!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(
+                            SessionTransportError::PeerExited
+                                | SessionTransportError::Native
+                                | SessionTransportError::DeadlineExpired
+                        )
+                    ))
+                ));
+            }
+            if !matches!(
+                mode,
+                "receiver-writer-batch" | "receiver-writer-duplicate-imported"
+            ) {
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "imported-receiver-batch-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            prepared.unwrap();
+            let imported = transaction.imported_for_test();
+            assert_eq!(imported.len(), count);
+            let final_seals = 0x20
+                | libc::F_SEAL_GROW
+                | libc::F_SEAL_SHRINK
+                | libc::F_SEAL_FUTURE_WRITE
+                | libc::F_SEAL_SEAL;
+            for ordinal in 0..count {
+                let descriptor = imported.descriptor_for_test(ordinal);
+                // SAFETY: scalar seal query on a live transaction-owned fd.
+                assert_eq!(
+                    unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) },
+                    final_seals
+                );
+                for offset in 0..(ordinal + 1) * 17 {
+                    imported.write_for_test(ordinal, offset, (ordinal + 1) as u8);
+                }
+            }
+            drop(transaction);
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                &["poison", "imported-receiver-batch-drop"]
             );
             drop(control);
             std::process::exit(0);
@@ -1324,6 +1554,86 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
     }
 
     for failure in [1, 17, 32] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "receiver-writer-import-advice-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            assert!(matches!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(
+                        SessionTransportError::PeerExited | SessionTransportError::Native
+                    )
+                ))
+            ));
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 17, 32] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "receiver-writer-coordinator-advice-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.fail_coordinator_advice_at_for_test(failure);
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                    libc::EIO
+                )))
+            );
+            assert!(transaction.all_final_sealed_for_test());
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 17, 32] {
         let (mut faulted, pid) = accepted_control(
             "coordinator-writer-batch-advice-failure",
             failure,
@@ -1377,6 +1687,315 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
 fn coordinator_writer_batches_share_the_accepted_owner() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_coordinator_writer_batches_share_the_accepted_owner",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by receiver_writer_batches_complete_imported_sealed_pending"]
+fn isolated_receiver_writer_batches_complete_imported_sealed_pending() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+
+    for count in [1, 2, 4, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) =
+            accepted_control("receiver-writer-batch", 0, count, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(count),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.prepare().unwrap();
+            loop {
+                let complete = (0..count).all(|ordinal| {
+                    (0..(ordinal + 1) * 17).all(|offset| {
+                        transaction.batch_for_test().read_for_test(ordinal, offset)
+                            == (ordinal + 1) as u8
+                    })
+                });
+                if complete {
+                    break;
+                }
+                assert!(!operation_deadline.is_expired());
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::ReplayOrReorder)
+                ))
+            );
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        assert_eq!(
+            control.send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: Vec::new(),
+                },
+                deadline(),
+            ),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 2, 4, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "receiver-writer-invalid-object",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.replace_capability_with_invalid_file_for_test(failure - 1);
+            assert!(matches!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(
+                        SessionTransportError::PeerExited | SessionTransportError::Native
+                    )
+                ))
+            ));
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 2, 4, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "receiver-writer-seal-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.fail_seal_at_for_test(failure);
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                    libc::EIO
+                )))
+            );
+            assert_eq!(transaction.seal_counts_for_test(), (1, 15));
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for mode in [
+        "receiver-writer-imported-application",
+        "receiver-writer-imported-truncated",
+        "receiver-writer-stale-imported",
+        "receiver-writer-duplicate-imported",
+        "receiver-writer-sealed-substitution",
+        "receiver-writer-duplicate-sealed",
+        "receiver-writer-final-seal-missing",
+        "receiver-writer-continuous-wrong-imported",
+        "receiver-writer-imported-silence",
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(mode, 0, 1, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = if mode.ends_with("silence") {
+            AbsoluteDeadline::after(Duration::from_millis(150)).unwrap()
+        } else {
+            deadline()
+        };
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(1),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            if mode.ends_with("sealed-substitution") {
+                transaction.substitute_sealed_for_test();
+                transaction.prepare().unwrap();
+            } else if mode.ends_with("duplicate-sealed") {
+                transaction.duplicate_sealed_for_test();
+                transaction.prepare().unwrap();
+            } else if mode.ends_with("final-seal-missing") {
+                transaction.skip_final_sealing_for_test();
+                transaction.prepare().unwrap();
+            } else if mode.ends_with("duplicate-imported") {
+                transaction.prepare().unwrap();
+            } else if mode.ends_with("silence") {
+                assert_eq!(
+                    transaction.prepare(),
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(SessionTransportError::DeadlineExpired)
+                    ))
+                );
+            } else {
+                assert_eq!(
+                    transaction.prepare(),
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(ControlError::NonCanonical)
+                    ))
+                );
+                if mode.ends_with("continuous-wrong-imported") {
+                    assert!(!operation_deadline.is_expired());
+                }
+            }
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        assert_eq!(
+            control.send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: Vec::new(),
+                },
+                deadline(),
+            ),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for rights in [1, 2, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "receiver-writer-imported-rights",
+            rights,
+            1,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxReceiverWriterBatch::prepare(
+            portable_receiver_writer_batch(1),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(SessionTransportError::MalformedRecord)
+                ))
+            );
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "receiver-writer-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut control, pid) = accepted_control(
+        "receiver-writer-imported-wrong-credentials",
+        0,
+        1,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+    control.observe_linux_poison_for_test(events.clone());
+    let operation_deadline = deadline();
+    let mut prepared = LinuxReceiverWriterBatch::prepare(
+        portable_receiver_writer_batch(1),
+        control.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    prepared.observe_drop_for_test(events.clone());
+    {
+        let mut transaction = control
+            .begin_linux_receiver_writer_batch(prepared, operation_deadline)
+            .unwrap();
+        assert_eq!(
+            transaction.prepare(),
+            Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(SessionTransportError::IdentityMismatch)
+            ))
+        );
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["poison", "receiver-writer-batch-drop"]
+    );
+    control.terminate_and_reap(deadline()).unwrap();
+    drop(control);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn receiver_writer_batches_complete_imported_sealed_pending() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_receiver_writer_batches_complete_imported_sealed_pending",
     );
 }
 

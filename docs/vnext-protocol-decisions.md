@@ -122,6 +122,15 @@ profile, is compared exactly on receive.
 New target profiles require a reviewed wire decision. Reserved bytes outside
 defined fields remain zero.
 
+## Linux preparation frame kinds
+
+Linux receiver-writer preparation uses `NIPCIMP1` for `IMPORTED` and `NIPCSEA1`
+for `SEALED`. Each is the same fixed-size canonical full-manifest encoding as
+`NIPCCAP1`, with only the eight-byte magic/frame-kind changed by library-owned
+construction. Both carry zero rights, exact directional credentials, and no
+application payload. Callers cannot construct them, and neither frame ends a
+transaction or grants READY, COMMIT, activation, or runtime authority.
+
 ## Application control framing
 
 Application control uses magic `NIPCAPP1`, exact wire version 1.0, and a

@@ -90,6 +90,46 @@ fn capability_frame_decode_requires_canonical_structure_and_reserved_bytes() {
 }
 
 #[test]
+fn preparation_frames_are_disjoint_exact_full_manifest_receipts() {
+    let manifest = TransferManifest::new_with_authority(
+        [0x31; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1), entry(2)],
+    )
+    .unwrap();
+    let capability = CapabilityFrame::from_manifest(&manifest);
+    let imported = capability.preparation_frame(PreparationFrameKind::Imported);
+    let sealed = capability.preparation_frame(PreparationFrameKind::Sealed);
+    assert_ne!(capability.as_bytes(), imported.as_bytes());
+    assert_ne!(capability.as_bytes(), sealed.as_bytes());
+    assert_ne!(imported.as_bytes(), sealed.as_bytes());
+    assert!(imported.matches(imported.as_bytes()));
+    assert!(sealed.matches(sealed.as_bytes()));
+
+    for offset in [0, 8, 12, 16, 48, 52, 56, 64, 68, 72, 76, 80, 88, 96, 112] {
+        let mut substituted = *imported.as_bytes();
+        substituted[offset] ^= 1;
+        assert!(!imported.matches(&substituted), "offset {offset}");
+    }
+    for length in 0..CONTROL_FRAME_LEN {
+        assert!(
+            !imported.matches(&imported.as_bytes()[..length]),
+            "truncation {length}"
+        );
+        assert!(
+            !sealed.matches(&sealed.as_bytes()[..length]),
+            "sealed truncation {length}"
+        );
+    }
+    let mut oversized = imported.as_bytes().to_vec();
+    oversized.push(0);
+    assert!(!imported.matches(&oversized));
+}
+
+#[test]
 fn vnext_authority_profile_is_exactly_transcript_bound() {
     let legacy = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
     let linux = TransferManifest::new_with_authority(

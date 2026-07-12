@@ -7,14 +7,22 @@ use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
-use crate::protocol::{CapabilityFrame, ManifestEntry, TransferManifest};
+#[cfg(target_os = "linux")]
+use crate::protocol::PreparationFrameKind;
+use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 use crate::session::AbsoluteDeadline;
+#[cfg(all(target_os = "linux", test))]
+use std::os::fd::AsRawFd;
+
+#[cfg(all(target_os = "linux", test))]
+const DUPLICATE_SEALED_BARRIER: &[u8; 8] = b"NIPCTST1";
 
 #[cfg(target_os = "linux")]
 use super::linux_vnext::{
     memory::{
         LinuxCoordinatorWriterBatch, LinuxExpectedCoordinatorWriterBatch,
-        LinuxImportedCoordinatorWriterBatch, MemfdError,
+        LinuxExpectedReceiverWriterBatch, LinuxImportedCoordinatorWriterBatch,
+        LinuxImportedReceiverWriterBatch, LinuxReceiverWriterBatch, MemfdError,
     },
     spawn::{CoordinatorLinuxControlTransport, ReceiverLinuxControlTransport},
 };
@@ -65,6 +73,19 @@ pub(crate) struct LinuxCoordinatorWriterTransaction<'a> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct LinuxCoordinatorReceiverWriterTransaction<'a> {
+    transaction: CoordinatorCapabilityTransaction<'a, CoordinatorLinuxControlTransport>,
+    batch: LinuxReceiverWriterBatch,
+    attempted: bool,
+    #[cfg(test)]
+    sealed_frame_fault: bool,
+    #[cfg(test)]
+    skip_sealing: bool,
+    #[cfg(test)]
+    duplicate_sealed: bool,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinuxCapabilityBatchError {
     Memory(MemfdError),
@@ -97,6 +118,37 @@ pub(crate) struct LinuxReceiverCoordinatorWriterTransaction<'a> {
     already_poisoned: bool,
     #[cfg(test)]
     import_drop_observer: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxReceiverWriterTransaction<'a> {
+    dispatcher: &'a mut AcceptedControlDispatcher<ReceiverLinuxControlTransport>,
+    expected: Option<LinuxExpectedReceiverWriterBatch>,
+    imported: Option<LinuxImportedReceiverWriterBatch>,
+    deadline: AbsoluteDeadline,
+    transaction_id: u64,
+    attempted: bool,
+    already_poisoned: bool,
+    #[cfg(test)]
+    import_drop_observer: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    imported_application_fault: bool,
+    #[cfg(test)]
+    suppress_imported: bool,
+    #[cfg(test)]
+    imported_rights_fault: Option<usize>,
+    #[cfg(test)]
+    truncate_imported: bool,
+    #[cfg(test)]
+    imported_wrong_credentials: bool,
+    #[cfg(test)]
+    stale_imported: bool,
+    #[cfg(test)]
+    duplicate_imported: bool,
+    #[cfg(test)]
+    continuous_wrong_imported: bool,
+    #[cfg(test)]
+    expect_duplicate_sealed: bool,
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
@@ -319,6 +371,45 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
             _batch: batch,
         })
     }
+
+    pub(crate) fn begin_linux_receiver_writer_batch(
+        &mut self,
+        batch: LinuxReceiverWriterBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxCoordinatorReceiverWriterTransaction<'_>, LinuxCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+        {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::WrongProvenance,
+            ));
+        }
+        if batch.deadline() != deadline {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::DeadlineMismatch,
+            ));
+        }
+        let frame = self
+            .begin_native_transaction(batch.manifest_entries(), deadline)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        Ok(LinuxCoordinatorReceiverWriterTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            attempted: false,
+            #[cfg(test)]
+            sealed_frame_fault: false,
+            #[cfg(test)]
+            skip_sealing: false,
+            #[cfg(test)]
+            duplicate_sealed: false,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -364,6 +455,55 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
             import_drop_observer: None,
         })
     }
+
+    pub(crate) fn begin_linux_expected_receiver_writer_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxReceiverWriterTransaction<'_>, LinuxCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+        {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::WrongProvenance,
+            ));
+        }
+        let expected =
+            LinuxExpectedReceiverWriterBatch::prepare(expected, self.parameters.limits(), deadline)
+                .map_err(LinuxCapabilityBatchError::Memory)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        Ok(LinuxReceiverWriterTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            import_drop_observer: None,
+            #[cfg(test)]
+            imported_application_fault: false,
+            #[cfg(test)]
+            suppress_imported: false,
+            #[cfg(test)]
+            imported_rights_fault: None,
+            #[cfg(test)]
+            truncate_imported: false,
+            #[cfg(test)]
+            imported_wrong_credentials: false,
+            #[cfg(test)]
+            stale_imported: false,
+            #[cfg(test)]
+            duplicate_imported: false,
+            #[cfg(test)]
+            continuous_wrong_imported: false,
+            #[cfg(test)]
+            expect_duplicate_sealed: false,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -387,6 +527,114 @@ impl LinuxCoordinatorWriterTransaction<'_> {
         self.transaction
             .send(&capabilities)
             .map_err(LinuxCapabilityBatchError::Control)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCoordinatorReceiverWriterTransaction<'_> {
+    pub(crate) fn prepare(&mut self) -> Result<(), LinuxCapabilityBatchError> {
+        if self.attempted {
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        if let Err(error) = self.batch.revalidate_prefix() {
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Memory(error));
+        }
+        let capabilities = self.batch.capabilities();
+        self.transaction
+            .send(&capabilities)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        let imported = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Imported);
+        self.transaction
+            .receive_preparation(&imported)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        #[cfg(test)]
+        let should_seal = !self.skip_sealing;
+        #[cfg(not(test))]
+        let should_seal = true;
+        if should_seal && let Err(error) = self.batch.seal_after_import() {
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Memory(error));
+        }
+        let sealed = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Sealed);
+        #[cfg(test)]
+        if self.sealed_frame_fault {
+            let mut substituted = *sealed.as_bytes();
+            substituted[16] ^= 1;
+            return self
+                .transaction
+                .send_preparation_bytes(&substituted)
+                .map_err(LinuxCapabilityBatchError::Control);
+        }
+        self.transaction
+            .send_preparation(&sealed)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        #[cfg(test)]
+        if self.duplicate_sealed {
+            self.transaction
+                .send_preparation(&sealed)
+                .map_err(LinuxCapabilityBatchError::Control)?;
+            self.transaction
+                .send_preparation_bytes(DUPLICATE_SEALED_BARRIER)
+                .map_err(LinuxCapabilityBatchError::Control)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_for_test(&self) -> &LinuxReceiverWriterBatch {
+        &self.batch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_seal_at_for_test(&mut self, ordinal: usize) {
+        self.batch.fail_seal_at_for_test(ordinal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_coordinator_advice_at_for_test(&mut self, operation: usize) {
+        self.batch.fail_advice_at_for_test(operation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_final_sealed_for_test(&self) -> bool {
+        self.batch.all_final_sealed_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_counts_for_test(&self) -> (usize, usize) {
+        self.batch.seal_counts_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_sealed_for_test(&mut self) {
+        self.sealed_frame_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_final_sealing_for_test(&mut self) {
+        self.skip_sealing = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_sealed_for_test(&mut self) {
+        self.duplicate_sealed = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_capability_with_invalid_file_for_test(&mut self, ordinal: usize) {
+        self.batch
+            .replace_capability_with_invalid_file_for_test(ordinal);
     }
 }
 
@@ -498,6 +746,303 @@ impl LinuxReceiverCoordinatorWriterTransaction<'_> {
 }
 
 #[cfg(target_os = "linux")]
+impl LinuxReceiverWriterTransaction<'_> {
+    pub(crate) fn prepare(&mut self) -> Result<(), LinuxCapabilityBatchError> {
+        if self.attempted {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        let expected = self
+            .expected
+            .as_ref()
+            .expect("receiver expectation remains transaction-owned");
+        debug_assert_eq!(expected.deadline(), self.deadline);
+        let record = match self
+            .dispatcher
+            .transport
+            .receive_candidate_capability_record(expected.len(), self.deadline)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((frame, manifest)) = CapabilityFrame::decode(&record.frame) else {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !linux_received_receiver_writer_manifest_matches(
+            self.dispatcher.parameters,
+            self.transaction_id,
+            expected,
+            &manifest,
+        ) {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let expected = self
+            .expected
+            .take()
+            .expect("validated expectation is consumed once");
+        let imported = match expected.import(&manifest, record.descriptors) {
+            Ok(imported) => imported,
+            Err(failure) => {
+                #[cfg(test)]
+                let mut failure = failure;
+                let error = failure.error();
+                #[cfg(test)]
+                if let Some(observer) = &self.import_drop_observer {
+                    failure.observe_drop_for_test(observer.clone());
+                }
+                self.poison();
+                drop(failure);
+                return Err(LinuxCapabilityBatchError::Memory(error));
+            }
+        };
+        #[cfg(test)]
+        let mut imported = {
+            let mut imported = imported;
+            if let Some(observer) = &self.import_drop_observer {
+                imported.observe_drop_for_test(observer.clone());
+            }
+            imported
+        };
+        #[cfg(not(test))]
+        let mut imported = imported;
+        let imported_frame = frame.preparation_frame(PreparationFrameKind::Imported);
+        #[cfg(test)]
+        let imported_bytes = if self.imported_application_fault {
+            let mut substituted = *imported_frame.as_bytes();
+            substituted[..8].copy_from_slice(b"NIPCAPP1");
+            substituted
+        } else if self.stale_imported {
+            let mut substituted = *imported_frame.as_bytes();
+            substituted[56] ^= 1;
+            substituted
+        } else {
+            *imported_frame.as_bytes()
+        };
+        #[cfg(not(test))]
+        let imported_bytes = *imported_frame.as_bytes();
+        #[cfg(test)]
+        let should_send_imported = !self.suppress_imported;
+        #[cfg(test)]
+        let imported_send = if !should_send_imported {
+            Ok(())
+        } else if self.continuous_wrong_imported {
+            let mut wrong = imported_bytes;
+            wrong[..8].copy_from_slice(b"NIPCAPP1");
+            loop {
+                if self.deadline.is_expired() {
+                    break Err(SessionTransportError::DeadlineExpired);
+                }
+                if let Err(error) = self.dispatcher.transport.send_record(&wrong, self.deadline) {
+                    break Err(error);
+                }
+            }
+        } else if self.imported_wrong_credentials {
+            self.dispatcher
+                .transport
+                .send_record_from_fork_for_test(&imported_bytes)
+        } else if let Some(count) = self.imported_rights_fault {
+            let descriptor = imported.descriptor_for_test(0).as_raw_fd();
+            self.dispatcher.transport.send_record_with_rights_for_test(
+                &imported_bytes,
+                &vec![descriptor; count],
+                self.deadline,
+            )
+        } else {
+            let bytes = if self.truncate_imported {
+                &imported_bytes[..imported_bytes.len() - 1]
+            } else {
+                &imported_bytes
+            };
+            self.dispatcher.transport.send_record(bytes, self.deadline)
+        };
+        #[cfg(not(test))]
+        let imported_send = self
+            .dispatcher
+            .transport
+            .send_record(&imported_bytes, self.deadline);
+        if let Err(error) = imported_send {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        #[cfg(test)]
+        if self.duplicate_imported
+            && let Err(error) = self
+                .dispatcher
+                .transport
+                .send_record(&imported_bytes, self.deadline)
+        {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let sealed_frame = frame.preparation_frame(PreparationFrameKind::Sealed);
+        let sealed = match self
+            .dispatcher
+            .transport
+            .receive_record(sealed_frame.as_bytes().len(), self.deadline)
+        {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !sealed_frame.matches(&sealed) {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = imported.verify_final_seals(self.deadline) {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Memory(error));
+        }
+        #[cfg(test)]
+        if self.expect_duplicate_sealed {
+            let replay = match self
+                .dispatcher
+                .transport
+                .receive_record(sealed_frame.as_bytes().len(), self.deadline)
+            {
+                Ok(replay) => replay,
+                Err(error) => {
+                    self.poison();
+                    return Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(error),
+                    ));
+                }
+            };
+            if !sealed_frame.matches(&replay) {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::NonCanonical),
+                ));
+            }
+            let barrier = match self
+                .dispatcher
+                .transport
+                .receive_record(DUPLICATE_SEALED_BARRIER.len(), self.deadline)
+            {
+                Ok(barrier) => barrier,
+                Err(error) => {
+                    self.poison();
+                    return Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(error),
+                    ));
+                }
+            };
+            if barrier.as_slice() != DUPLICATE_SEALED_BARRIER {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::NonCanonical),
+                ));
+            }
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.imported = Some(imported);
+        Ok(())
+    }
+
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn imported_for_test(&mut self) -> &mut LinuxImportedReceiverWriterBatch {
+        self.imported
+            .as_mut()
+            .expect("test observation follows successful sealed preparation")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_import_drop_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.import_drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_imported_with_application_for_test(&mut self) {
+        self.imported_application_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn suppress_imported_for_test(&mut self) {
+        self.suppress_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_imported_rights_for_test(&mut self, count: usize) {
+        assert!((1..=16).contains(&count));
+        self.imported_rights_fault = Some(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn truncate_imported_for_test(&mut self) {
+        self.truncate_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_wrong_imported_credentials_for_test(&mut self) {
+        self.imported_wrong_credentials = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_receiver_advice_at_for_test(&mut self, operation: usize) {
+        self.expected
+            .as_mut()
+            .expect("test fault precedes the only preparation attempt")
+            .fail_advice_at_for_test(operation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stale_imported_for_test(&mut self) {
+        self.stale_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_imported_for_test(&mut self) {
+        self.duplicate_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn continuous_wrong_imported_for_test(&mut self) {
+        self.continuous_wrong_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expect_duplicate_sealed_replay_for_test(&mut self) {
+        self.expect_duplicate_sealed = true;
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn linux_received_manifest_matches(
     parameters: AcceptedSessionParameters,
     transaction_id: u64,
@@ -515,7 +1060,31 @@ pub(crate) fn linux_received_manifest_matches(
 }
 
 #[cfg(target_os = "linux")]
+fn linux_received_receiver_writer_manifest_matches(
+    parameters: AcceptedSessionParameters,
+    transaction_id: u64,
+    expected: &LinuxExpectedReceiverWriterBatch,
+    manifest: &TransferManifest,
+) -> bool {
+    let facts = parameters.facts();
+    manifest.nonce == facts.nonce()
+        && manifest.parent_pid == facts.parent_pid()
+        && manifest.child_pid == facts.child_pid()
+        && manifest.transfer_id == transaction_id
+        && manifest.authority_profile() == parameters.authority_profile()
+        && manifest.fits_limits(parameters.limits())
+        && expected.matches_manifest(manifest)
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for LinuxReceiverCoordinatorWriterTransaction<'_> {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxReceiverWriterTransaction<'_> {
     fn drop(&mut self) {
         self.poison();
     }
@@ -645,6 +1214,40 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
             self.dispatcher.poison_both();
             self.already_poisoned = true;
         }
+    }
+
+    fn receive_preparation(
+        &mut self,
+        expected: &PreparationFrame,
+    ) -> Result<(), AcceptedControlError> {
+        let bytes = match self
+            .dispatcher
+            .transport
+            .receive_record(expected.as_bytes().len(), self.deadline)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.poison();
+                return Err(AcceptedControlError::Transport(error));
+            }
+        };
+        if !expected.matches(&bytes) {
+            self.poison();
+            return Err(AcceptedControlError::Control(ControlError::NonCanonical));
+        }
+        Ok(())
+    }
+
+    fn send_preparation(&mut self, frame: &PreparationFrame) -> Result<(), AcceptedControlError> {
+        self.send_preparation_bytes(frame.as_bytes())
+    }
+
+    fn send_preparation_bytes(&mut self, bytes: &[u8]) -> Result<(), AcceptedControlError> {
+        if let Err(error) = self.dispatcher.transport.send_record(bytes, self.deadline) {
+            self.poison();
+            return Err(AcceptedControlError::Transport(error));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
