@@ -13,7 +13,9 @@ exact-release native evidence.
 - Baseline: `origin/codex/native-ipc-vnext` at `09a1500`
 - Linux branch: `codex/linux-native-debug`
 - Exact production implementation commit: `e904e35d7a507eda560e22aea7b9b4bd8d8d47c8`
-- Exact continuous wrong-peer evidence commit: `46f428fd6ac05c9867c3d556e8cc01ed18db5e1d`
+- Initial continuous wrong-peer test commit: `46f428fd6ac05c9867c3d556e8cc01ed18db5e1d`
+- Corrected real-listener test commit: `09c0601` (local integration branch;
+  physical-host rerun pending)
 - Exact corrected evidence tip: `98b71637dc64af699199c3864f21c620838783e2`
 - Implementation workflow: [Actions 29186489332](https://github.com/ro-ag/native-ipc-rs/actions/runs/29186489332)
 - First evidence workflow: [Actions 29186964531](https://github.com/ro-ag/native-ipc-rs/actions/runs/29186964531)
@@ -57,10 +59,11 @@ evidence under the handoff rules.
    evaluates for both supported Linux architectures.
 3. CI records Linux kernel, architecture, libc, toolchain, virtualization,
    root-mount, exact SHA, and worktree facts before tests.
-4. The private bootstrap listener now creates its directory atomically at mode
-   `0700`, restores exact mode under restrictive umasks, and checks the
-   original absolute deadline before every accept attempt and after credential
-   inspection.
+4. The legacy filesystem bootstrap listener now creates its directory
+   atomically at mode `0700`, restores exact mode under restrictive umasks, and
+   checks the original absolute deadline before every accept attempt and after
+   credential inspection. This is regression hardening for the legacy path,
+   not evidence for the vNext anonymous inherited `SOCK_SEQPACKET` bootstrap.
 5. The ancillary parser adopts every complete nonnegative descriptor word in a
    reachable `SCM_RIGHTS` record before reporting truncation, malformed data,
    wrong credentials, or wrong descriptor count. Complete descriptor words
@@ -127,9 +130,8 @@ Results:
   hosted jobs later passed for all three targets; and
 - cross-checks were treated as compilation evidence only.
 
-After the evidence review identified that the original test used only one
-wrong peer, commit `46f428f` replaced it with 16 consecutive wrong peers and
-was run directly on the same physical host:
+Commit `46f428f` attempted to add continuous wrong-peer pressure and was run
+directly on the physical host:
 
 ```sh
 cargo test -p native-ipc --all-features \
@@ -137,8 +139,18 @@ cargo test -p native-ipc --all-features \
   -- --exact --test-threads=1 --nocapture
 ```
 
-The test passed in 0.10 seconds. Its sixteenth accept deliberately crossed the
-original deadline; the pre-attempt deadline check prevented a seventeenth.
+The test passed in 0.10 seconds, but later independent review found that it
+cloned one pre-existing stream and exercised callbacks rather than native
+`accept(2)`, distinct connections, and per-connection credentials. That result
+is therefore withdrawn as native hostile-listener evidence.
+
+Local integration commit `09c0601` replaces it with a real nonblocking Unix
+listener and an isolated hostile child that continuously creates distinct
+credential-bearing connections through the original deadline. It proves that
+no accept callback begins after expiry. The replacement passed ten consecutive
+Linux Arm64 seccomp-unconfined Docker runs and strict Clippy. Docker is only
+characterization; a direct physical Linux rerun and exact-tip hosted CI remain
+pending.
 
 The first hosted evidence run then exposed a test-only auto-reap observation
 race: fd and task counts had reached baseline before one immediate
@@ -182,7 +194,7 @@ explicitly. Normal and stress completion did not reproduce that artifact.
 | memfd seals | Exact `F_SEAL_EXEC`, size seals, future-write seal, and final seal states were checked. Existing RW survives future-write sealing; new write mappings and later seals fail as required. | Kernel behavior characterized; production remains fail-closed |
 | Outside-tree delegation | A helper created before parent MDWE imported the pre-seal fd, retained RW after final sealing, upgraded it to RWX, restored RW immediately, and never executed payload bytes. | Accepted Linux kernel/authority limit |
 | Ancillary ownership | Exact 0/1/2/16-fd packets and malformed, truncated, duplicate, empty, negative, wrong-level/type, short/long, wrong-peer, wrong-count, and trailing-byte records restored fd baselines. | Code defect fixed |
-| Absolute deadlines | At `46f428f`, 16 consecutive wrong accept peers reached the original deadline and no seventeenth accept occurred. Wrong packets terminate immediately. Continuous EINTR, silence, saturated output, child exit, late send/receive, and already-expired accept paths cannot restart the deadline. | Code defect fixed |
+| Absolute deadlines | Wrong packets terminate immediately. Continuous EINTR, silence, saturated output, child exit, late send/receive, and already-expired accept paths cannot restart the deadline. The corrected real-listener hostile-child test at local `09c0601` passed Docker characterization, but direct physical-host evidence is pending. | Code defect fixed; real-listener native evidence pending |
 | Nonblocking Drop | Live and stalled exact-child owners returned from `Drop` after an atomic request/unpark; the durable worker killed and reaped the exact child. | Implemented private mechanism |
 | Reaping and PID reuse | Cleanup uses the clone-time pidfd for signal, readiness, and `waitid(P_PIDFD)`. Auto-reap and a concurrent broad waiter become `AlreadyReaped`, never a numeric-PID retry. | Implemented private mechanism |
 | Terminal cleanup faults | Persistent signal/poll/reap faults report terminal `Incomplete` once, retain the pidfd forever in an isolated process, and do not hot-loop. | Code defect fixed; process containment remains required |
@@ -236,7 +248,9 @@ AMD64/Arm64 all-feature and no-default tests.
 
 The first evidence workflow at `46f428f`,
 [Actions 29186964531](https://github.com/ro-ag/native-ipc-rs/actions/runs/29186964531),
-passed the new wrong-peer test in both feature modes and passed 9 of 10 jobs.
+passed the then-current callback-based wrong-peer test in both feature modes
+and passed 9 of 10 jobs. That test is no longer counted as native
+hostile-listener evidence.
 The no-default test step in its Linux AMD64 job exposed the immediate
 child-list sampling race described above. The corrected evidence tip
 `98b7163` passed all 10 jobs in
