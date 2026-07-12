@@ -36,7 +36,7 @@ let mut region = NativeRegion::allocate(RegionOptions::fixed(
     WriterOwner::Creator,
 ))?;
 region.initialize(|bytes| bytes[..4].copy_from_slice(b"NIPC"));
-let request = region.prepare_for_sharing();
+let request = region.prepare_for_sharing()?;
 assert!(request.mapped_len() >= 4096);
 # Ok::<(), native_ipc::memory::MemoryError>(())
 ```

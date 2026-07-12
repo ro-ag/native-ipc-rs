@@ -96,6 +96,13 @@ Target abbreviations: `Lx` = Linux GNU AMD64/Arm64, `Ma` = macOS Arm64,
 | R14.1 | Compatibility features neither weaken vNext nor appear in conformance examples. | migration feature policy/docs | migration examples use vNext | API/docs scan for legacy escape use | portable planned |
 | R16.1 | Every normative MUST has both positive and negative traceability. | this file + CI trace checker | `planned::trace::all_requirements_linked` | missing/stale test/evidence link rejects release | release blocked |
 
+## Implementation progress (not release evidence)
+
+| Phase | Invariant | Local evidence | Independent review | State |
+| --- | --- | --- | --- | --- |
+| 0 | Feasibility, claim boundaries, MUST inventory, and ordered plan | macOS Arm64 0.4 baseline plus primary-source mechanism review | no unresolved finding | implemented; native vNext probes unverified |
+| 1 | Private facade backends, required crate direction, application-neutral manifest, no safe native-parts escape | host fmt, strict Clippy, all-feature/no-default tests, compile-fail docs, warning-free rustdoc, four cross-target checks, retained 0.4 package tests | no unresolved finding after three review rounds | implemented locally; exact native targets unverified |
+
 ## Native release evidence ledger
 
 | Target | Exact release SHA | Source-tree conformance | Packaged-crate conformance | Leak/fault/RT suites | Status |

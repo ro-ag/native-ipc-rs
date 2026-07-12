@@ -15,8 +15,16 @@ compile_error!("native-ipc supports Linux and Windows on aarch64/x86_64, and mac
 
 /// Platform-neutral wire, layout, and sequencing primitives.
 pub use native_ipc_core as core;
-/// Native operating-system capability implementations.
-pub use native_ipc_platform as platform;
 
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
+
+mod backend;
+mod protocol;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum BackendStatus {
+    Available,
+    Incomplete(&'static str),
+}

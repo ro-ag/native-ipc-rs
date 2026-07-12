@@ -305,8 +305,13 @@ pub enum MemoryError {
         /// Configured maximum logical length.
         maximum: usize,
     },
-    /// Selected native backend rejected allocation.
-    Platform(NativeMemoryPlatformError),
+    /// Selected native backend rejected the bounded operation.
+    Platform {
+        /// Portable operation category.
+        operation: &'static str,
+    },
+    /// The operating-system CSPRNG could not mint object freshness.
+    RandomnessUnavailable,
 }
 
 impl fmt::Display for MemoryError {
@@ -317,16 +322,34 @@ impl fmt::Display for MemoryError {
 
 impl std::error::Error for MemoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Platform(error) => Some(error),
-            _ => None,
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<crate::backend::linux::LinuxError> for MemoryError {
+    fn from(_: crate::backend::linux::LinuxError) -> Self {
+        Self::Platform {
+            operation: "allocate",
         }
     }
 }
 
-impl From<NativeMemoryPlatformError> for MemoryError {
-    fn from(value: NativeMemoryPlatformError) -> Self {
-        Self::Platform(value)
+#[cfg(target_os = "macos")]
+impl From<crate::backend::macos::MachError> for MemoryError {
+    fn from(_: crate::backend::macos::MachError) -> Self {
+        Self::Platform {
+            operation: "allocate",
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<crate::backend::windows::WindowsError> for MemoryError {
+    fn from(_: crate::backend::windows::WindowsError) -> Self {
+        Self::Platform {
+            operation: "allocate",
+        }
     }
 }
 
@@ -449,18 +472,30 @@ impl NativeRegion {
         drop(self.inner.take());
     }
 
-    /// Freezes common initialization/growth and creates a native share request.
+    /// Freezes initialization/growth and creates an opaque native share request.
     ///
-    /// The request retains the permission and mandatory seal policy alongside
-    /// the native region. Its platform parts must be consumed by the matching
-    /// authenticated prepare/transfer operation.
-    pub fn prepare_for_sharing(mut self) -> NativeShareRequest {
-        NativeShareRequest {
+    /// The private owner is consumed and cannot be reused after preparation.
+    ///
+    /// ```compile_fail
+    /// use native_ipc::memory::{NativeRegion, RegionOptions, WriterOwner};
+    /// let mut region = NativeRegion::allocate(RegionOptions::fixed(
+    ///     32,
+    ///     WriterOwner::Creator,
+    /// )).unwrap();
+    /// let _prepared = region.prepare_for_sharing().unwrap();
+    /// region.clear();
+    /// ```
+    pub fn prepare_for_sharing(mut self) -> Result<NativeShareRequest, MemoryError> {
+        let incarnation =
+            crate::backend::mint_incarnation().map_err(|()| MemoryError::RandomnessUnavailable)?;
+        Ok(NativeShareRequest {
             inner: self.inner.take(),
+            incarnation,
+            logical_len: self.logical_len,
             permissions: self.options.permissions(),
             seal: self.options.seal(),
             cleanup: self.options.cleanup(),
-        }
+        })
     }
 
     fn inner(&self) -> &PlatformQuiescentRegion {
@@ -487,11 +522,24 @@ impl NativeRegion {
 
 /// Consuming boundary between common memory management and native transfer.
 ///
-/// This type exposes no bytes and supports no growth. It keeps the requested
-/// one-writer permission plan attached until the caller enters the existing
-/// platform-specific authenticated transfer typestate.
+/// This type exposes no bytes, native parts, or growth operation. It keeps the
+/// requested one-writer permission plan attached until a platform-neutral
+/// transfer batch consumes it.
+///
+/// ```compile_fail
+/// use native_ipc::memory::{NativeRegion, RegionOptions, WriterOwner};
+/// let region = NativeRegion::allocate(RegionOptions::fixed(
+///     32,
+///     WriterOwner::Creator,
+/// )).unwrap();
+/// let mut prepared = region.prepare_for_sharing().unwrap();
+/// prepared.initialize(|bytes| bytes.fill(0));
+/// ```
 pub struct NativeShareRequest {
     inner: Option<PlatformQuiescentRegion>,
+    #[allow(dead_code)]
+    incarnation: [u8; 16],
+    logical_len: usize,
     permissions: PermissionPlan,
     seal: SealPolicy,
     cleanup: CleanupPolicy,
@@ -516,17 +564,20 @@ impl NativeShareRequest {
             .len()
     }
 
-    /// Enters the platform authenticated transfer layer.
-    ///
-    /// The returned permission plan must select the matching creator-writer or
-    /// peer-writer consuming transition. Native code applies the actual seal or
-    /// maximum-rights attenuation; safe code cannot disable the seal policy.
-    pub fn into_platform_parts(mut self) -> (PlatformQuiescentRegion, PermissionPlan) {
-        let region = self
-            .inner
-            .take()
-            .expect("share request always owns its mapping");
-        (region, self.permissions)
+    #[allow(dead_code)]
+    pub(crate) const fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn native_spec(&self, region_id: u128) -> Option<crate::protocol::NativeRegionSpec> {
+        crate::protocol::NativeRegionSpec::new(
+            region_id,
+            self.incarnation,
+            self.permissions.writer() as u32,
+            self.logical_len,
+            self.mapped_len(),
+        )
     }
 
     /// Clears and releases a prepared request without sharing it.
@@ -584,25 +635,14 @@ fn validate_options(options: RegionOptions) -> Result<(), MemoryError> {
 
 #[cfg(target_os = "linux")]
 /// Native quiescent region selected on Linux.
-pub type PlatformQuiescentRegion = native_ipc_platform::linux::QuiescentRegion;
-#[cfg(target_os = "linux")]
-/// Native allocation error selected on Linux.
-pub type NativeMemoryPlatformError = native_ipc_platform::linux::LinuxError;
-
+pub(crate) type PlatformQuiescentRegion = crate::backend::linux::QuiescentRegion;
 #[cfg(target_os = "macos")]
 /// Native quiescent region selected on macOS.
-pub type PlatformQuiescentRegion = native_ipc_platform::macos::QuiescentRegion;
-#[cfg(target_os = "macos")]
-/// Native allocation error selected on macOS.
-pub type NativeMemoryPlatformError = native_ipc_platform::macos::MachError;
+pub(crate) type PlatformQuiescentRegion = crate::backend::macos::QuiescentRegion;
 
 #[cfg(target_os = "windows")]
 /// Native quiescent region selected on Windows.
-pub type PlatformQuiescentRegion = native_ipc_platform::windows::QuiescentRegion;
-#[cfg(target_os = "windows")]
-/// Native allocation error selected on Windows.
-pub type NativeMemoryPlatformError = native_ipc_platform::windows::WindowsError;
-
+pub(crate) type PlatformQuiescentRegion = crate::backend::windows::QuiescentRegion;
 #[cfg(target_os = "linux")]
 const fn native_platform() -> NativePlatform {
     NativePlatform::Linux
@@ -708,7 +748,11 @@ mod tests {
     #[test]
     fn share_request_preserves_permissions_and_removes_byte_access() {
         let region = NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Peer)).unwrap();
-        let request = region.prepare_for_sharing();
+        let request = region.prepare_for_sharing().unwrap();
+        assert_ne!(request.incarnation(), [0; 16]);
+        let native = request.native_spec(7).unwrap();
+        assert_eq!(native.incarnation, request.incarnation());
+        assert_eq!(native.region_id, 7);
         assert_eq!(request.seal_policy(), SealPolicy::RequiredOnShare);
         assert_eq!(
             request.permissions().creator_access(),
@@ -717,5 +761,18 @@ mod tests {
         assert_eq!(request.permissions().peer_access(), MemoryAccess::ReadWrite);
         assert!(request.mapped_len() >= 32);
         request.destroy();
+    }
+
+    #[test]
+    fn each_prepared_object_gets_an_independent_incarnation() {
+        let first = NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Creator))
+            .unwrap()
+            .prepare_for_sharing()
+            .unwrap();
+        let second = NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Creator))
+            .unwrap()
+            .prepare_for_sharing()
+            .unwrap();
+        assert_ne!(first.incarnation(), second.incarnation());
     }
 }

@@ -9,24 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
-name = "native-ipc"
+name = "native-ipc-core"
+version = "0.4.0"
+
+[[package]]
+name = "native-ipc-platform"
 version = "0.4.0"
 dependencies = [
  "libc",
  "native-ipc-core",
  "windows-sys",
-]
-
-[[package]]
-name = "native-ipc-core"
-version = "0.4.0"
-
-[[package]]
-name = "native-ipc-testkit"
-version = "0.4.0"
-dependencies = [
- "native-ipc",
- "native-ipc-core",
 ]
 
 [[package]]
