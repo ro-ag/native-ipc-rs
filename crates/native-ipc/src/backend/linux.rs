@@ -1167,8 +1167,8 @@ mod tests {
     fn descriptor_cleanup_is_zero_growth() {
         let executable = std::env::current_exe().unwrap();
         for test in [
-            "linux::tests::malformed_extra_descriptor_frame_has_zero_fd_growth",
-            "linux::tests::ancillary_on_later_stream_fragment_is_adopted_and_rejected",
+            "backend::linux::tests::malformed_extra_descriptor_frame_has_zero_fd_growth",
+            "backend::linux::tests::ancillary_on_later_stream_fragment_is_adopted_and_rejected",
         ] {
             let status = Command::new(&executable)
                 .args(["--exact", test, "--ignored", "--nocapture"])
@@ -1338,7 +1338,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let arguments = [
             OsStr::new("--exact"),
-            OsStr::new("linux::tests::spawned_helper_entry"),
+            OsStr::new("backend::linux::tests::spawned_helper_entry"),
             OsStr::new("--ignored"),
             OsStr::new("--nocapture"),
         ];

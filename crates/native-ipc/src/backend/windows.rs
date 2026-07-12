@@ -1443,7 +1443,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let arguments = [
             OsString::from("--exact"),
-            OsString::from("windows::tests::spawned_helper_entry"),
+            OsString::from("backend::windows::tests::spawned_helper_entry"),
             OsString::from("--ignored"),
             OsString::from("--nocapture"),
         ];
@@ -1471,7 +1471,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let arguments = [
             OsString::from("--exact"),
-            OsString::from("windows::tests::exit_before_connect_entry"),
+            OsString::from("backend::windows::tests::exit_before_connect_entry"),
             OsString::from("--ignored"),
         ];
         let result = ChildSession::spawn(&executable, &arguments);
@@ -1486,7 +1486,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let arguments = [
             OsString::from("--exact"),
-            OsString::from("windows::tests::stall_before_auth_entry"),
+            OsString::from("backend::windows::tests::stall_before_auth_entry"),
             OsString::from("--ignored"),
         ];
         let result = ChildSession::spawn(&executable, &arguments);
