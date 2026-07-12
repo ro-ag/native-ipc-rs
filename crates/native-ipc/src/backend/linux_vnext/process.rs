@@ -264,6 +264,9 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::session::AbsoluteDeadline;
 
     const ENV_DESCENDANT: &str = "NATIVE_IPC_MDWE_DESCENDANT";
     const ENV_HELD_EXECUTABLE_FD: &str = "NATIVE_IPC_HELD_EXECUTABLE_FD";
@@ -271,6 +274,8 @@ mod tests {
     const ENV_IDENTITY_HANDSHAKE_FD: &str = "NATIVE_IPC_IDENTITY_HANDSHAKE_FD";
     const PR_MDWE_NO_INHERIT: libc::c_ulong = 2;
     const CLONE_PIDFD: u64 = 0x0000_1000;
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    const EXEC_ERROR_LEN: usize = 8;
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[repr(C)]
@@ -288,6 +293,42 @@ mod tests {
         set_tid_size: u64,
         cgroup: u64,
     }
+
+    #[derive(Clone, Copy)]
+    enum AtomicExecFault {
+        None,
+        Mdwe,
+        Exec,
+        Partial,
+        Malformed,
+        Stall,
+        SilentExit,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AtomicExecError {
+        Deadline,
+        Malformed,
+        Child { stage: u32, errno: i32 },
+        Native(i32),
+        ExitedBeforeConfirmation,
+    }
+
+    #[repr(C)]
+    struct RawChildError {
+        stage: u32,
+        errno: i32,
+    }
+
+    struct AtomicExecChild {
+        pidfd: OwnedFd,
+        pid: libc::pid_t,
+        held: HeldExecutable,
+        not_sync: PhantomData<Cell<()>>,
+    }
+
+    static_assertions::assert_impl_all!(AtomicExecChild: Send);
+    static_assertions::assert_not_impl_any!(AtomicExecChild: Sync, Clone);
 
     assert_impl_all!(HeldExecutable: Send);
     assert_not_impl_any!(HeldExecutable: Sync, Clone);
@@ -557,6 +598,368 @@ mod tests {
             .unwrap()
     }
 
+    unsafe fn child_write_error_and_exit(fd: RawFd, stage: u32, errno: i32) -> ! {
+        let record = RawChildError {
+            stage: stage.to_le(),
+            errno: errno.to_le(),
+        };
+        let mut written = 0_usize;
+        let mut interrupts = 0_u8;
+        while written < EXEC_ERROR_LEN && interrupts < 16 {
+            // SAFETY: the fixed stack record remains live; fd is the inherited
+            // error-pipe writer and each length is bounded by the record.
+            let result = unsafe {
+                libc::write(
+                    fd,
+                    (&record as *const RawChildError)
+                        .cast::<u8>()
+                        .add(written)
+                        .cast(),
+                    EXEC_ERROR_LEN - written,
+                )
+            };
+            if result > 0 {
+                written += result as usize;
+            } else if result < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+                interrupts += 1;
+            } else {
+                break;
+            }
+        }
+        // SAFETY: raw child path never runs Rust destructors.
+        unsafe { libc::_exit(120) }
+    }
+
+    fn atomic_clone_exec_for_test(
+        held: HeldExecutable,
+        arguments: &[std::ffi::CString],
+        environment: &[std::ffi::CString],
+        fault: AtomicExecFault,
+        deadline: AbsoluteDeadline,
+    ) -> Result<AtomicExecChild, (AtomicExecError, AtomicExecChild)> {
+        let held_path =
+            std::ffi::CString::new(format!("/proc/self/fd/{}", held.fd.as_raw_fd())).unwrap();
+        let invalid_path = c"/native-ipc-vnext-intentional-missing-image";
+        let mut argv: Vec<*const libc::c_char> =
+            arguments.iter().map(|value| value.as_ptr()).collect();
+        argv.push(core::ptr::null());
+        let mut envp: Vec<*const libc::c_char> =
+            environment.iter().map(|value| value.as_ptr()).collect();
+        envp.push(core::ptr::null());
+        let argv_raw = argv.as_ptr();
+        let envp_raw = envp.as_ptr();
+        let held_path_raw = held_path.as_ptr();
+        let invalid_path_raw = invalid_path.as_ptr();
+        let fault_code = match fault {
+            AtomicExecFault::None => 0_u8,
+            AtomicExecFault::Mdwe => 1,
+            AtomicExecFault::Exec => 2,
+            AtomicExecFault::Partial => 3,
+            AtomicExecFault::Malformed => 4,
+            AtomicExecFault::Stall => 5,
+            AtomicExecFault::SilentExit => 6,
+        };
+
+        let mut pipe = [-1; 2];
+        // SAFETY: output has room for two descriptors.
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            panic!("atomic exec error pipe failed");
+        }
+        // SAFETY: successful pipe2 returned two unique descriptors.
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: successful pipe2 returned two unique descriptors.
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let reader_raw = reader.as_raw_fd();
+        let writer_raw = writer.as_raw_fd();
+
+        let mut raw_pidfd = -1;
+        let clone_arguments = CloneArgs {
+            flags: CLONE_PIDFD,
+            pidfd: (&mut raw_pidfd as *mut libc::c_int) as u64,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        // SAFETY: fork-like clone3 with an 88-byte zero-extended clone_args.
+        let pid = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                &clone_arguments,
+                core::mem::size_of::<CloneArgs>(),
+            ) as libc::pid_t
+        };
+        if pid == 0 {
+            // Child audit: only scalar/byte arithmetic and raw close, prctl,
+            // execve, write, errno-location, and _exit calls occur after clone.
+            // SAFETY: all pointers and fds were completely prebuilt in parent.
+            unsafe {
+                libc::close(reader_raw);
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3_u32,
+                    libc::c_uint::MAX,
+                    CLOSE_RANGE_CLOEXEC,
+                ) != 0
+                {
+                    child_write_error_and_exit(writer_raw, 0, *libc::__errno_location());
+                }
+                if fault_code == 3 {
+                    let record = RawChildError {
+                        stage: 1_u32.to_le(),
+                        errno: libc::EPERM.to_le(),
+                    };
+                    libc::write(writer_raw, (&record as *const RawChildError).cast(), 3);
+                    libc::_exit(121);
+                }
+                if fault_code == 4 {
+                    child_write_error_and_exit(writer_raw, 99, libc::EINVAL);
+                }
+                if fault_code == 5 {
+                    loop {
+                        libc::pause();
+                    }
+                }
+                if fault_code == 6 {
+                    libc::_exit(122);
+                }
+                if fault_code == 1 {
+                    child_write_error_and_exit(writer_raw, 1, libc::EPERM);
+                }
+                if libc::prctl(
+                    PR_SET_MDWE,
+                    PR_MDWE_REFUSE_EXEC_GAIN,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
+                    child_write_error_and_exit(writer_raw, 1, *libc::__errno_location());
+                }
+                let path = if fault_code == 2 {
+                    invalid_path_raw
+                } else {
+                    held_path_raw
+                };
+                libc::execve(path, argv_raw, envp_raw);
+                child_write_error_and_exit(writer_raw, 2, *libc::__errno_location());
+            }
+        }
+        assert!(pid > 0, "clone3 failed: {}", io::Error::last_os_error());
+        assert!(raw_pidfd >= 0);
+        // SAFETY: successful CLONE_PIDFD atomically installed this descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+        drop(writer);
+        let child = AtomicExecChild {
+            pidfd,
+            pid,
+            held,
+            not_sync: PhantomData,
+        };
+
+        let mut record = [0_u8; EXEC_ERROR_LEN];
+        let mut received = 0_usize;
+        loop {
+            // SAFETY: remaining record storage is writable and bounded.
+            let read = unsafe {
+                libc::read(
+                    reader.as_raw_fd(),
+                    record[received..].as_mut_ptr().cast(),
+                    record.len() - received,
+                )
+            };
+            if read > 0 {
+                received += read as usize;
+                if received == record.len() {
+                    let stage = u32::from_le_bytes(record[..4].try_into().unwrap());
+                    let errno = i32::from_le_bytes(record[4..].try_into().unwrap());
+                    if !matches!(stage, 0..=2) || errno <= 0 {
+                        return Err((AtomicExecError::Malformed, child));
+                    }
+                    return Err((AtomicExecError::Child { stage, errno }, child));
+                }
+                continue;
+            }
+            if read == 0 {
+                return if received == 0 {
+                    let mut event = libc::pollfd {
+                        fd: child.pidfd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: one pollfd remains live for this nonblocking check.
+                    let observed = unsafe { libc::poll(&mut event, 1, 0) };
+                    if observed < 0 {
+                        Err((AtomicExecError::Native(-1), child))
+                    } else if observed > 0 || !child.held_image_matches() {
+                        Err((AtomicExecError::ExitedBeforeConfirmation, child))
+                    } else if let Err(error) = child.await_post_exec_checkpoint(deadline) {
+                        Err((error, child))
+                    } else {
+                        Ok(child)
+                    }
+                } else {
+                    Err((AtomicExecError::Malformed, child))
+                };
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                if deadline.is_expired() {
+                    return Err((AtomicExecError::Deadline, child));
+                }
+                continue;
+            }
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err((
+                    AtomicExecError::Native(error.raw_os_error().unwrap_or(-1)),
+                    child,
+                ));
+            }
+            if deadline.is_expired() {
+                return Err((AtomicExecError::Deadline, child));
+            }
+            let timeout = deadline
+                .remaining()
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as libc::c_int;
+            let mut events = [
+                libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: child.pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: both pollfd entries remain live for this bounded call.
+            let polled = unsafe { libc::poll(events.as_mut_ptr(), 2, timeout) };
+            if polled < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return Err((AtomicExecError::Native(-1), child));
+            }
+            if deadline.is_expired() {
+                return Err((AtomicExecError::Deadline, child));
+            }
+        }
+    }
+
+    impl AtomicExecChild {
+        fn held_image_matches(&self) -> bool {
+            let path = std::ffi::CString::new(format!("/proc/{}/exe", self.pid)).unwrap();
+            // SAFETY: path is NUL-terminated and flags need no mode.
+            let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if raw < 0 {
+                return false;
+            }
+            // SAFETY: successful open returned one owned descriptor.
+            let actual = unsafe { OwnedFd::from_raw_fd(raw) };
+            matches!(file_key(actual.as_raw_fd()), Ok((key, _)) if key == self.held.key)
+        }
+
+        fn await_post_exec_checkpoint(
+            &self,
+            deadline: AbsoluteDeadline,
+        ) -> Result<(), AtomicExecError> {
+            loop {
+                // SAFETY: zero is valid initialization for waitid output.
+                let mut information: libc::siginfo_t = unsafe { core::mem::zeroed() };
+                // SAFETY: pidfd is live; WNOHANG and WNOWAIT cannot block or reap.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        self.pidfd.as_raw_fd() as libc::id_t,
+                        &mut information,
+                        libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if result != 0 {
+                    return Err(AtomicExecError::Native(
+                        io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+                    ));
+                }
+                if information.si_code == libc::CLD_STOPPED {
+                    // SAFETY: CLD_STOPPED initializes the SIGCHLD status member.
+                    return if unsafe { information.si_status() } == libc::SIGSTOP {
+                        Ok(())
+                    } else {
+                        Err(AtomicExecError::Malformed)
+                    };
+                }
+                if matches!(
+                    information.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ) {
+                    return Err(AtomicExecError::ExitedBeforeConfirmation);
+                }
+                if deadline.is_expired() {
+                    return Err(AtomicExecError::Deadline);
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        fn resume(&self) {
+            // SAFETY: pidfd is the exact atomic identity handle.
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGCONT,
+                        core::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                },
+                0
+            );
+        }
+
+        fn wait_and_reap(self, deadline: AbsoluteDeadline) -> i32 {
+            loop {
+                let mut event = libc::pollfd {
+                    fd: self.pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout = deadline
+                    .remaining()
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as libc::c_int;
+                // SAFETY: one pollfd remains live for the bounded call.
+                let result = unsafe { libc::poll(&mut event, 1, timeout) };
+                assert!(result >= 0);
+                assert!(!deadline.is_expired());
+                if result == 0 || event.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let mut status = 0;
+                // SAFETY: pidfd pins identity; WNOHANG cannot block.
+                assert_eq!(
+                    unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) },
+                    self.pid
+                );
+                return status;
+            }
+        }
+
+        fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> i32 {
+            // SAFETY: pidfd is the sole atomic identity handle; SIGKILL is scalar.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    core::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            self.wait_and_reap(deadline)
+        }
+    }
+
     fn set_mdwe(mask: libc::c_ulong) -> libc::c_int {
         // SAFETY: PR_SET_MDWE accepts scalar masks and zero trailing arguments.
         unsafe {
@@ -805,6 +1208,171 @@ mod tests {
             .args([
                 "--exact",
                 "backend::linux_vnext::process::tests::isolated_preexec_failure_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn atomic_exec_arguments() -> Vec<std::ffi::CString> {
+        [
+            "native-ipc-atomic-exec-helper",
+            "--exact",
+            "backend::linux_vnext::process::tests::atomic_exec_mdwe_helper",
+            "--ignored",
+            "--nocapture",
+        ]
+        .into_iter()
+        .map(|value| std::ffi::CString::new(value).unwrap())
+        .collect()
+    }
+
+    fn atomic_exec_environment(held: &HeldExecutable) -> Vec<std::ffi::CString> {
+        vec![
+            std::ffi::CString::new(format!("{ENV_HELD_EXECUTABLE_FD}={}", held.fd.as_raw_fd()))
+                .unwrap(),
+            std::ffi::CString::new(format!(
+                "{ENV_HELD_EXECUTABLE_KEY}={}:{}",
+                held.key.device, held.key.inode
+            ))
+            .unwrap(),
+        ]
+    }
+
+    #[test]
+    #[ignore = "executed only by the atomic clone3+MDWE+held-exec scaffold"]
+    fn atomic_exec_mdwe_helper() {
+        assert_held_description_closed();
+        assert_eq!(get_mdwe().unwrap(), PR_MDWE_REFUSE_EXEC_GAIN);
+        // Deterministic post-exec checkpoint: parent verifies the held image,
+        // observes this stop, then resumes us to return success.
+        // SAFETY: SIGSTOP has no handler and cannot be ignored.
+        assert_eq!(unsafe { libc::raise(libc::SIGSTOP) }, 0);
+    }
+
+    #[test]
+    #[ignore = "spawned alone by atomic_clone_exec_state_machine_is_bounded"]
+    fn isolated_atomic_clone_exec_state_machine_helper() {
+        let before = open_fd_count();
+        let executable = std::env::current_exe().unwrap();
+        let deadline = || AbsoluteDeadline::after(Duration::from_secs(5)).unwrap();
+
+        let held = HeldExecutable::open(&executable).unwrap();
+        let environment = atomic_exec_environment(&held);
+        let child = atomic_clone_exec_for_test(
+            held,
+            &atomic_exec_arguments(),
+            &environment,
+            AtomicExecFault::None,
+            deadline(),
+        )
+        .unwrap_or_else(|(error, child)| {
+            let _ = child.terminate_and_reap(deadline());
+            panic!("held exec failed: {error:?}")
+        });
+        assert_eq!(
+            pidfd_reported_pid(child.pidfd.as_raw_fd()),
+            i64::from(child.pid)
+        );
+        child.resume();
+        let status = child.wait_and_reap(deadline());
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+
+        let fixture = ExecutableFixture::copy_from(&executable);
+        let held = HeldExecutable::open(&fixture.file).unwrap();
+        std::fs::remove_file(&fixture.file).unwrap();
+        std::fs::copy("/bin/sleep", &fixture.file).unwrap();
+        let environment = atomic_exec_environment(&held);
+        let child = atomic_clone_exec_for_test(
+            held,
+            &atomic_exec_arguments(),
+            &environment,
+            AtomicExecFault::None,
+            deadline(),
+        )
+        .unwrap_or_else(|(error, child)| {
+            let _ = child.terminate_and_reap(deadline());
+            panic!("replacement-resistant exec failed: {error:?}")
+        });
+        child.resume();
+        let status = child.wait_and_reap(deadline());
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        drop(fixture);
+
+        for (fault, expected) in [
+            (
+                AtomicExecFault::Mdwe,
+                AtomicExecError::Child {
+                    stage: 1,
+                    errno: libc::EPERM,
+                },
+            ),
+            (
+                AtomicExecFault::Exec,
+                AtomicExecError::Child {
+                    stage: 2,
+                    errno: libc::ENOENT,
+                },
+            ),
+            (AtomicExecFault::Partial, AtomicExecError::Malformed),
+            (AtomicExecFault::Malformed, AtomicExecError::Malformed),
+            (
+                AtomicExecFault::SilentExit,
+                AtomicExecError::ExitedBeforeConfirmation,
+            ),
+        ] {
+            let held = HeldExecutable::open(&executable).unwrap();
+            let environment = atomic_exec_environment(&held);
+            let (error, child) = match atomic_clone_exec_for_test(
+                held,
+                &atomic_exec_arguments(),
+                &environment,
+                fault,
+                deadline(),
+            ) {
+                Ok(child) => {
+                    let _ = child.terminate_and_reap(deadline());
+                    panic!("injected child failure unexpectedly execed")
+                }
+                Err(failure) => failure,
+            };
+            assert_eq!(error, expected);
+            let status = child.wait_and_reap(deadline());
+            assert!(libc::WIFEXITED(status));
+        }
+
+        let held = HeldExecutable::open(&executable).unwrap();
+        let environment = atomic_exec_environment(&held);
+        let short = AbsoluteDeadline::after(Duration::from_millis(2)).unwrap();
+        let (error, child) = match atomic_clone_exec_for_test(
+            held,
+            &atomic_exec_arguments(),
+            &environment,
+            AtomicExecFault::Stall,
+            short,
+        ) {
+            Ok(child) => {
+                let _ = child.terminate_and_reap(deadline());
+                panic!("stalled child bypassed deadline")
+            }
+            Err(failure) => failure,
+        };
+        assert_eq!(error, AtomicExecError::Deadline);
+        let status = child.terminate_and_reap(deadline());
+        assert!(libc::WIFSIGNALED(status));
+
+        assert_eq!(open_fd_count(), before);
+    }
+
+    #[test]
+    fn atomic_clone_exec_state_machine_is_bounded() {
+        let executable = std::env::current_exe().unwrap();
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                "backend::linux_vnext::process::tests::isolated_atomic_clone_exec_state_machine_helper",
                 "--ignored",
                 "--nocapture",
             ])

@@ -149,6 +149,26 @@ This probe does not exec, install MDWE, own cleanup, or mint a receipt.
 Production work must build the preallocated async-signal-safe
 MDWE/exec/error-pipe path around this atomic primitive.
 
+A second private, test-only scaffold now exercises that next path without
+making it constructible by production code. The parent prebuilds the held-fd
+path, bounded argv/envp pointer arrays, and nonblocking CLOEXEC error pipe;
+fork-like `clone3(CLONE_PIDFD)` atomically returns the sole pidfd. The raw child
+closes the parent pipe end, applies `close_range(CLOSE_RANGE_CLOEXEC)`, installs
+exact MDWE, and `execve`s the held native ELF. Failures write one fixed-width
+stage/errno record with a bounded EINTR loop and `_exit`; zero-byte CLOEXEC EOF
+is only provisional exec-transition evidence. The scaffold fails closed when
+pidfd already reports death, then requires the live exact held image and a
+deterministic post-exec checkpoint. Future production use must additionally
+bind authenticated HELLO. Parent parsing uses the error pipe plus pidfd and one
+absolute deadline. Isolated tests cover silent pre-exec death, held-path
+replacement, post-exec MDWE and held-fd
+CLOEXEC, injected MDWE/exec errors, partial/malformed records, deadline expiry,
+pidfd readiness, and fd/process baselines. This remains test-only because the
+crate still lacks a durable nonblocking Drop/reaper handoff for an incompletely
+cleaned child; it therefore mints no image, channel, session, or memory
+authority. Future bootstrap-fd collision policy and native AMD64/Arm64 evidence
+also remain required.
+
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;
 PID/path checks or a leak-prone probe are not substitutes.
