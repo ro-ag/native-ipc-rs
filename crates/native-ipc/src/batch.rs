@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::active::{ActiveReader, ActiveWriter};
+use crate::protocol::{ManifestEntry, PeerAccess};
 use crate::region::{PreparedRegion, RegionId, WriterEndpoint};
 
 /// Portable batch construction or active-set lookup failure.
@@ -121,6 +122,24 @@ pub(crate) struct PendingBatch {
     pub(crate) regions: Vec<PreparedRegion>,
     pub(crate) total_logical: u64,
     pub(crate) total_mapped: u64,
+}
+
+impl PendingBatch {
+    pub(crate) fn manifest_entries(&self) -> Option<Vec<ManifestEntry>> {
+        self.regions
+            .iter()
+            .map(|region| {
+                let access = match region.spec().writer {
+                    WriterEndpoint::Coordinator => PeerAccess::ReadOnly,
+                    WriterEndpoint::Receiver => PeerAccess::SoleWriter,
+                };
+                Some(ManifestEntry::from_native(
+                    region.request.native_spec(region.spec().id.get())?,
+                    access,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[allow(dead_code)]

@@ -1,10 +1,12 @@
 use super::accepted_control::{AcceptedControlDispatcher, AcceptedControlError};
 use super::*;
+use crate::batch::TransferBatch;
 use crate::control::{CONTROL_HEADER_LEN, ControlError, ControlFrame, ControlState};
 use crate::protocol::{
     CapabilityFrame, ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess,
     TransferManifest,
 };
+use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
 use crate::session::SessionLimits;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::VecDeque;
@@ -39,6 +41,7 @@ struct MockFacts {
     capability_receive_calls: usize,
     capability_error_on_call: Option<usize>,
     capability_deadline: Option<AbsoluteDeadline>,
+    drop_events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 struct MockCapabilityRecord {
@@ -122,6 +125,9 @@ impl AuthenticatedZeroRightsTransport for MockTransport {
         let mut facts = self.0.0.lock().unwrap();
         facts.poison_calls += 1;
         facts.poisoned = true;
+        if let Some(events) = &facts.drop_events {
+            events.lock().unwrap().push("poison");
+        }
     }
 }
 
@@ -237,6 +243,33 @@ fn manifest_entries(count: usize) -> Vec<ManifestEntry> {
             ManifestEntry::from_native(native, PeerAccess::ReadOnly)
         })
         .collect()
+}
+
+fn prepared_batch(regions: &[(u128, WriterEndpoint)]) -> TransferBatch {
+    prepared_batch_with_observer(regions, None).0
+}
+
+fn prepared_batch_with_observer(
+    regions: &[(u128, WriterEndpoint)],
+    observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+) -> (TransferBatch, Vec<NativeRegionSpec>) {
+    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    let mut expected = Vec::new();
+    for &(id, writer) in regions {
+        let mut prepared = PrivateRegion::allocate(RegionOptions::fixed(1))
+            .unwrap()
+            .prepare(RegionSpec {
+                id: RegionId::new(id).unwrap(),
+                writer,
+            })
+            .unwrap();
+        expected.push(prepared.request.native_spec(id).unwrap());
+        if let Some(observer) = &observer {
+            prepared = prepared.observe_drop(observer.clone());
+        }
+        batch.add(prepared).unwrap();
+    }
+    (batch, expected)
 }
 
 fn capability_frame(nonce: [u8; 32], transaction: u64, count: usize) -> CapabilityFrame {
@@ -582,6 +615,126 @@ fn accepted_owner_mints_identity_and_monotonic_transaction_ids() {
     ));
     assert_eq!(handle.0.lock().unwrap().capability_send_calls, 2);
     assert_poisoned_without_more_io(&mut coordinator, &handle);
+}
+
+#[test]
+fn prepared_batch_is_retained_and_derives_canonical_mixed_direction_entries() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| {
+                let writer = if id % 2 == 0 {
+                    WriterEndpoint::Receiver
+                } else {
+                    WriterEndpoint::Coordinator
+                };
+                (id as u128, writer)
+            })
+            .collect();
+        let (mut coordinator, handle) = dispatcher(MAXIMUM);
+        let (batch, mut expected) = prepared_batch_with_observer(&regions, None);
+        expected.sort_unstable_by_key(|entry| entry.region_id);
+        let mut transaction = coordinator.begin_prepared_batch(batch, deadline()).unwrap();
+        transaction.send(count).unwrap();
+        transaction.complete_for_test();
+
+        let facts = handle.0.lock().unwrap();
+        assert_eq!(facts.capability_send_calls, 1);
+        let frame = &facts.capability_sent[0].0;
+        assert_eq!(
+            u32::from_le_bytes(frame[12..16].try_into().unwrap()) as usize,
+            count
+        );
+        for (ordinal, expected) in expected.iter().enumerate() {
+            let start = 96 + ordinal * 64;
+            assert_eq!(
+                u128::from_le_bytes(frame[start..start + 16].try_into().unwrap()),
+                expected.region_id
+            );
+            assert_eq!(&frame[start + 16..start + 32], &expected.incarnation);
+            assert_eq!(
+                u64::from_le_bytes(frame[start + 32..start + 40].try_into().unwrap()),
+                expected.logical_len
+            );
+            assert_eq!(
+                u64::from_le_bytes(frame[start + 40..start + 48].try_into().unwrap()),
+                expected.mapped_len
+            );
+            let expected_writer = if (ordinal + 1) % 2 == 0 { 1 } else { 0 };
+            let expected_access = if (ordinal + 1) % 2 == 0 { 2 } else { 1 };
+            assert_eq!(
+                u32::from_le_bytes(frame[start + 48..start + 52].try_into().unwrap()),
+                expected_writer
+            );
+            assert_eq!(
+                u32::from_le_bytes(frame[start + 52..start + 56].try_into().unwrap()),
+                expected_access
+            );
+            assert_eq!(
+                u16::from_le_bytes(frame[start + 56..start + 58].try_into().unwrap()) as usize,
+                ordinal
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_batch_poison_precedes_release_on_abandonment_and_send_failure() {
+    for fail_send in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut coordinator, handle) = dispatcher(MAXIMUM);
+        {
+            let mut facts = handle.0.lock().unwrap();
+            facts.drop_events = Some(events.clone());
+            if fail_send {
+                facts.capability_error_on_call = Some(1);
+            }
+        }
+        let (batch, _) = prepared_batch_with_observer(
+            &[
+                (1, WriterEndpoint::Coordinator),
+                (2, WriterEndpoint::Receiver),
+            ],
+            Some(events.clone()),
+        );
+        {
+            let mut transaction = coordinator.begin_prepared_batch(batch, deadline()).unwrap();
+            if fail_send {
+                assert!(transaction.send(2).is_err());
+            } else {
+                transaction.send(2).unwrap();
+            }
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "prepared-drop", "prepared-drop"]
+        );
+        assert_poisoned_without_more_io(&mut coordinator, &handle);
+    }
+}
+
+#[test]
+fn empty_prepared_batch_fails_before_transaction_or_id_consumption() {
+    let (mut coordinator, handle) = dispatcher(MAXIMUM);
+    let empty = TransferBatch::new(16, 1024).unwrap();
+    assert!(matches!(
+        coordinator.begin_prepared_batch(empty, deadline()),
+        Err(AcceptedControlError::Control(ControlError::NonCanonical))
+    ));
+    assert_eq!(handle.0.lock().unwrap().capability_send_calls, 0);
+
+    let mut transaction = coordinator
+        .begin_prepared_batch(
+            prepared_batch(&[(1, WriterEndpoint::Coordinator)]),
+            deadline(),
+        )
+        .unwrap();
+    transaction.send(1).unwrap();
+    transaction.complete_for_test();
+    let facts = handle.0.lock().unwrap();
+    let frame = &facts.capability_sent[0].0;
+    assert_eq!(u64::from_le_bytes(frame[56..64].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(frame[12..16].try_into().unwrap()), 1);
 }
 
 #[test]

@@ -172,6 +172,8 @@ impl PrivateRegion {
                 requested: self.guard,
                 installed: false,
             },
+            #[cfg(test)]
+            drop_events: None,
             _not_sync: PhantomData,
         })
     }
@@ -192,6 +194,8 @@ pub struct PreparedRegion {
     pub(crate) spec: RegionSpec,
     #[allow(dead_code)]
     pub(crate) guard: GuardCapability,
+    #[cfg(test)]
+    drop_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -216,6 +220,24 @@ impl PreparedRegion {
     #[allow(dead_code)]
     pub(crate) fn mapped_len(&self) -> usize {
         self.request.mapped_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop(
+        mut self,
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) -> Self {
+        self.drop_events = Some(events);
+        self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparedRegion {
+    fn drop(&mut self) {
+        if let Some(events) = &self.drop_events {
+            events.lock().unwrap().push("prepared-drop");
+        }
     }
 }
 

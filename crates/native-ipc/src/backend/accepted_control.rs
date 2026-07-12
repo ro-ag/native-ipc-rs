@@ -2,6 +2,7 @@ use super::{
     AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
+use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
 use crate::protocol::{CapabilityFrame, ManifestEntry, TransferManifest};
 use crate::session::AbsoluteDeadline;
@@ -35,6 +36,13 @@ pub(crate) struct CoordinatorCapabilityTransaction<'a, T: CoordinatorCapabilityT
     deadline: AbsoluteDeadline,
     attempted: bool,
     already_poisoned: bool,
+}
+
+/// Coordinator transaction that inseparably retains every portable prepared
+/// region whose metadata formed the native capability frame.
+pub(crate) struct CoordinatorPreparedBatchTransaction<'a, T: CoordinatorCapabilityTransport> {
+    transaction: CoordinatorCapabilityTransaction<'a, T>,
+    _batch: PendingBatch,
 }
 
 /// Receiver-owned open native transaction and its immediately owned imports.
@@ -169,6 +177,31 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
 }
 
 impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
+    pub(crate) fn begin_prepared_batch(
+        &mut self,
+        batch: TransferBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CoordinatorPreparedBatchTransaction<'_, T>, AcceptedControlError> {
+        let pending = batch
+            .into_pending()
+            .map_err(|_| AcceptedControlError::Control(ControlError::NonCanonical))?;
+        let entries = pending
+            .manifest_entries()
+            .ok_or(AcceptedControlError::Control(ControlError::NonCanonical))?;
+        let frame = self.begin_native_transaction(entries, deadline)?;
+        Ok(CoordinatorPreparedBatchTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            _batch: pending,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_capability_transaction(
         &mut self,
         entries: Vec<ManifestEntry>,
@@ -182,6 +215,20 @@ impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
             attempted: false,
             already_poisoned: false,
         })
+    }
+}
+
+impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, T> {
+    pub(crate) fn send(
+        &mut self,
+        capabilities: T::Capabilities<'_>,
+    ) -> Result<(), AcceptedControlError> {
+        self.transaction.send(capabilities)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(self) {
+        self.transaction.complete_for_test();
     }
 }
 
