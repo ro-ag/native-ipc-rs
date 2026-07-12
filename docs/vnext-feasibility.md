@@ -118,7 +118,7 @@ implementation must:
   containment owner that survives returned errors and Drop.
 
 The private `HeldExecutable`/`VerifiedExecutable` scaffold now implements the
-absolute native-ELF `openat2` policy, held device/inode, immediate pidfd, and
+absolute native-ELF `openat2` policy, held device/inode, pidfd retention, and
 post-spawn `/proc/PID/exe` comparison. It rejects relative paths,
 symlink/magic-link resolution, nonfiles, non-executables, non-ELF artifacts,
 foreign-class/machine ELF, wrong spawned images, and already-reaped children.
@@ -129,6 +129,20 @@ inherited bootstrap, authenticated channel, and bounded process owner below.
 The deterministic held-exec checkpoint passed native Linux AMD64/Arm64, ASan,
 and all auxiliary gates in
 [Actions 29180802767](https://github.com/ro-ag/native-ipc-rs/actions/runs/29180802767).
+
+The existing `Command::spawn` followed by `pidfd_open(PID)` is not sufficient
+for the final boundary: process-global `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or a
+concurrent broad waiter can reap the child and permit PID reuse before
+`pidfd_open`. A private test-only feasibility probe therefore uses the Linux
+`clone3` v2-sized `clone_args` UAPI (zero extensions) with fork-like flags, `CLONE_PIDFD`, and
+`SIGCHLD`. The kernel writes the pidfd in the same clone operation. In an
+isolated process with `SIGCHLD=SIG_IGN`, the probe proves the pidfd reports the
+returned child while live and remains readable after automatic reap. It passed
+Linux Arm64 Docker only with seccomp unconfined; Docker's default profile
+returned synthetic `ENOSYS`. This probe does not exec, install MDWE, own
+cleanup, mint a receipt, or provide native release evidence. Production work
+must build the preallocated async-signal-safe MDWE/exec/error-pipe path around
+this atomic primitive and execute it on native AMD64/Arm64 runners.
 
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;

@@ -270,7 +270,24 @@ mod tests {
     const ENV_HELD_EXECUTABLE_KEY: &str = "NATIVE_IPC_HELD_EXECUTABLE_KEY";
     const ENV_IDENTITY_HANDSHAKE_FD: &str = "NATIVE_IPC_IDENTITY_HANDSHAKE_FD";
     const PR_MDWE_NO_INHERIT: libc::c_ulong = 2;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
 
     assert_impl_all!(HeldExecutable: Send);
     assert_not_impl_any!(HeldExecutable: Sync, Clone);
@@ -530,6 +547,16 @@ mod tests {
         std::fs::read_dir("/proc/self/fd").unwrap().count()
     }
 
+    fn pidfd_reported_pid(pidfd: RawFd) -> i64 {
+        let contents = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")).unwrap();
+        contents
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:\t"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     fn set_mdwe(mask: libc::c_ulong) -> libc::c_int {
         // SAFETY: PR_SET_MDWE accepts scalar masks and zero trailing arguments.
         unsafe {
@@ -778,6 +805,139 @@ mod tests {
             .args([
                 "--exact",
                 "backend::linux_vnext::process::tests::isolated_preexec_failure_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[ignore = "spawned alone by clone3_pidfd_survives_ignored_sigchld"]
+    fn isolated_clone3_pidfd_sigchld_ignored_helper() {
+        let before = open_fd_count();
+
+        // This helper is an isolated process, so changing process-global child
+        // disposition cannot race any unrelated library user.
+        // SAFETY: zeroed sigaction is completed before the syscall.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_IGN;
+        // SAFETY: mask storage and action are initialized for SIGCHLD.
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        // SAFETY: installs SIG_IGN in this isolated feasibility helper only.
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &action, core::ptr::null_mut()) },
+            0
+        );
+
+        let mut pipe = [-1; 2];
+        // SAFETY: output has room for two descriptors.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: successful pipe2 returned two uniquely owned descriptors.
+        let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: successful pipe2 returned two uniquely owned descriptors.
+        let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        let read_raw = read_end.as_raw_fd();
+        let write_raw = write_end.as_raw_fd();
+
+        let mut raw_pidfd: libc::c_int = -1;
+        let arguments = CloneArgs {
+            flags: CLONE_PIDFD,
+            pidfd: (&mut raw_pidfd as *mut libc::c_int) as u64,
+            exit_signal: libc::SIGCHLD as u64,
+            ..CloneArgs::default()
+        };
+        // SAFETY: clone_args uses the Linux v2 size (11 u64 fields, 88 bytes)
+        // with every extension zero; zero stack/stack_size requests fork-like
+        // address-space separation.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                &arguments,
+                core::mem::size_of::<CloneArgs>(),
+            ) as libc::pid_t
+        };
+        if result == 0 {
+            // Child: raw async-signal-safe syscalls only. No Rust destructors,
+            // allocation, locks, formatting, panic, or unwinding may run.
+            // SAFETY: descriptors were inherited and scalar arguments are valid.
+            unsafe {
+                libc::close(write_raw);
+                let mut release = 0_u8;
+                loop {
+                    let read = libc::read(read_raw, (&mut release as *mut u8).cast(), 1);
+                    if read == 1 {
+                        libc::_exit(if release == b'G' { 37 } else { 111 });
+                    }
+                    if read < 0 && *libc::__errno_location() == libc::EINTR {
+                        continue;
+                    }
+                    libc::_exit(112);
+                }
+            }
+        }
+        assert!(result > 0, "clone3 failed: {}", io::Error::last_os_error());
+        assert!(raw_pidfd >= 0);
+        // SAFETY: successful CLONE_PIDFD atomically installed one owned pidfd.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+        drop(read_end);
+
+        assert_eq!(pidfd_reported_pid(pidfd.as_raw_fd()), i64::from(result));
+        // SAFETY: signal zero performs an existence/permission check only.
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    0,
+                    core::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            },
+            0
+        );
+        // SAFETY: one-byte input is live; the child is blocked on this pipe.
+        assert_eq!(
+            unsafe { libc::write(write_end.as_raw_fd(), (&b'G' as *const u8).cast(), 1,) },
+            1
+        );
+        drop(write_end);
+
+        let mut event = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd remains live for this bounded wait.
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 5_000) }, 1);
+        assert_ne!(event.revents & libc::POLLIN, 0);
+        // SIGCHLD=SIG_IGN auto-reaped the child, but the atomic pidfd remains
+        // readable and still reports the exact clone-time PID.
+        // SAFETY: numeric PID is used only to prove there is no waitable child.
+        assert_eq!(
+            unsafe { libc::waitpid(result, core::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(pidfd_reported_pid(pidfd.as_raw_fd()), -1);
+        drop(pidfd);
+        assert_eq!(open_fd_count(), before);
+    }
+
+    #[test]
+    fn clone3_pidfd_survives_ignored_sigchld() {
+        let executable = std::env::current_exe().unwrap();
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                "backend::linux_vnext::process::tests::isolated_clone3_pidfd_sigchld_ignored_helper",
                 "--ignored",
                 "--nocapture",
             ])
