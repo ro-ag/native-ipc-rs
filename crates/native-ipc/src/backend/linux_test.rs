@@ -375,6 +375,69 @@ fn bootstrap_dirs() -> std::collections::BTreeSet<PathBuf> {
 }
 
 #[test]
+fn bootstrap_directory_is_created_with_private_mode() {
+    let _serial = BOOTSTRAP_DIR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = std::env::temp_dir().join(format!("native-ipc-mode-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    create_private_bootstrap_dir(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    std::fs::remove_dir(&path).unwrap();
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn expired_accept_deadline_never_attempts_accept() {
+    let expected = PeerCredentials {
+        pid: std::process::id(),
+        // SAFETY: scalar identity syscalls have no preconditions.
+        uid: unsafe { libc::geteuid() },
+        // SAFETY: scalar identity syscalls have no preconditions.
+        gid: unsafe { libc::getegid() },
+    };
+    let mut accepts = 0;
+    let result = accept_expected_peer(
+        || {
+            accepts += 1;
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        },
+        expected,
+        Instant::now(),
+    );
+    assert!(matches!(result, Err(LinuxError::Bootstrap)));
+    assert_eq!(accepts, 0);
+}
+
+#[test]
+fn wrong_peer_accept_rechecks_deadline_before_accepting_again() {
+    let (wrong_peer, _other_end) = UnixStream::pair().unwrap();
+    let actual = peer_credentials(&wrong_peer).unwrap();
+    let expected = PeerCredentials {
+        pid: actual.pid.wrapping_add(1),
+        ..actual
+    };
+    let mut wrong_peer = Some(wrong_peer);
+    let mut accepts = 0;
+    let deadline = Instant::now() + Duration::from_millis(2);
+    let result = accept_expected_peer(
+        || {
+            accepts += 1;
+            while Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            Ok(wrong_peer
+                .take()
+                .expect("deadline must be checked after the first wrong peer"))
+        },
+        expected,
+        deadline,
+    );
+    assert!(matches!(result, Err(LinuxError::Bootstrap)));
+    assert_eq!(accepts, 1);
+}
+
+#[test]
 fn spawned_helper_is_pid_authenticated_and_owned() {
     let _serial = BOOTSTRAP_DIR_LOCK
         .lock()

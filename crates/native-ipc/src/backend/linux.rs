@@ -5,10 +5,10 @@ use std::fmt;
 use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -113,6 +113,44 @@ impl Drop for BootstrapGuard {
     }
 }
 
+fn create_private_bootstrap_dir(path: &Path) -> Result<(), LinuxError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).map_err(|_| LinuxError::Bootstrap)?;
+    if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_err() {
+        let _ = std::fs::remove_dir(path);
+        return Err(LinuxError::Bootstrap);
+    }
+    Ok(())
+}
+
+fn accept_expected_peer(
+    mut accept: impl FnMut() -> io::Result<UnixStream>,
+    expected: PeerCredentials,
+    deadline: Instant,
+) -> Result<UnixStream, LinuxError> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(LinuxError::Bootstrap);
+        }
+        match accept() {
+            Ok(stream) => {
+                let peer_matches = peer_credentials(&stream)? == expected;
+                if Instant::now() >= deadline {
+                    return Err(LinuxError::Bootstrap);
+                }
+                if peer_matches {
+                    return Ok(stream);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return Err(LinuxError::Bootstrap),
+        }
+    }
+}
+
 impl ChildSession {
     /// Spawns an exact helper executable and authenticates its post-exec connection.
     pub fn spawn(program: &OsStr, arguments: &[&OsStr]) -> Result<Self, LinuxError> {
@@ -125,7 +163,7 @@ impl ChildSession {
         }
         let suffix = hex(&nonce[..16]);
         let bootstrap_dir = std::env::temp_dir().join(format!("native-ipc-{suffix}"));
-        std::fs::create_dir(&bootstrap_dir).map_err(|_| LinuxError::Bootstrap)?;
+        create_private_bootstrap_dir(&bootstrap_dir)?;
         // Every failure past this point must return the filesystem and process
         // ledger to baseline: the guard removes the directory and, once the
         // helper is spawned, kills and reaps it.
@@ -133,8 +171,6 @@ impl ChildSession {
             bootstrap_dir: Some(bootstrap_dir),
             child: None,
         };
-        std::fs::set_permissions(guard.dir(), std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| LinuxError::Bootstrap)?;
         let socket_path = guard.dir().join("control.sock");
         let listener = UnixListener::bind(&socket_path).map_err(|_| LinuxError::Bootstrap)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
@@ -159,22 +195,11 @@ impl ChildSession {
         };
         guard.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(10);
-        let stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if peer_credentials(&stream)? == expected {
-                        break stream;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(LinuxError::Bootstrap);
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => return Err(LinuxError::Bootstrap),
-            }
-        };
+        let stream = accept_expected_peer(
+            || listener.accept().map(|(stream, _address)| stream),
+            expected,
+            deadline,
+        )?;
         let channel = AuthenticatedChannel::new(stream, expected, nonce)?;
         let (bootstrap_dir, child) = guard.disarm();
         Ok(Self {
