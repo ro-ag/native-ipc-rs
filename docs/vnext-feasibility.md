@@ -376,6 +376,47 @@ to reject and is not overclaimed here. Packaged-crate conformance, physical
 user-owned Arm64 hardware, public Ready/session/receipt authority, and whole
 vNext release completion remain unverified.
 
+Phase 5i-F consumes those bilateral Accepted states into private,
+role-asymmetric evidence owners. Coordinator-only evidence inseparably retains
+the exact clone-time lifecycle pidfd, held child image, accepted seqpacket
+endpoint and terminal transcript, and nonce-bound parent/child real UID/GID
+identity facts. Receiver-only evidence retains the authenticated spawning
+parent endpoint, terminal transcript, and corresponding identity facts; it
+explicitly carries no coordinator-owned child-image or pidfd proof. Neither
+role can extract raw native parts. Both owners are `Send`, non-`Sync`, and
+non-`Clone`.
+
+Accepted transcript facts are one-shot and require exact bilateral ACCEPT.
+Unaccepted, coordinator-only, rejected, poisoned, and replayed transcripts
+persistently return the terminal ordering error and cannot later yield facts.
+The tested invalid-evidence path, while the stored original deadline remains
+live, terminates and reaps the exact child before returning, with immediate
+child absence, fd baseline, and `ECHILD` evidence. If that deadline expires or
+native cleanup becomes terminal-incomplete, the durable worker instead retains
+the exact pidfd/child cleanup authority and reports incomplete facts. After a
+successful completion is published, the test separately waits within its own
+bound for the now-authority-free detached reaper task to retire; this is not a
+hard scheduler bound on every call.
+
+Exact implementation commit `a63a06ea34fdb2389abe1791bc636741b3018e15`
+is green across all ten jobs in
+[Actions 29202485515](https://github.com/ro-ag/native-ipc-rs/actions/runs/29202485515):
+Rust 1.97 native Linux AMD64/Arm64 all-feature, no-default, and native tests;
+Linux AMD64 ASan; macOS Arm64 and Windows AMD64/Arm64 general jobs; and Miri,
+fuzz, policy, and quality. The non-Linux jobs do not verify a macOS or Windows
+Phase 5i-F implementation. Local privileged, seccomp-unconfined Arm64 Docker
+all-feature/no-default runs and 25 focused repetitions are characterization
+only, not native-host or physical Arm64 evidence. The adversarial audit removed
+the stale symmetric generic receipt and ended with no P1/P2/P3.
+
+This evidence SHA is a private Linux mechanism checkpoint, not a release
+candidate. Phase 5i-F exposes no public `Ready`, session, control, fd transfer,
+batch, mapping, or memory authority. It proves no symmetric sole-writer or
+image property, immutable ongoing image attestation, or revocation of already
+delegated authority. Physical user-owned Arm64, macOS/Windows Phase 5i-F,
+packaged-crate conformance, whole-vNext completion, and release completion all
+remain unverified.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
