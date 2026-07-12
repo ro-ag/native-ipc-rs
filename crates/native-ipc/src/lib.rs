@@ -18,6 +18,8 @@ pub use native_ipc_core as core;
 
 /// Checked allocation-free runtime access after batch commit.
 pub mod active;
+#[allow(dead_code)]
+mod batch;
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
 /// Platform-neutral consuming region ownership states.

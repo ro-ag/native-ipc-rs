@@ -200,6 +200,20 @@ impl PreparedRegion {
     pub const fn guard_capability(&self) -> GuardCapability {
         self.guard
     }
+
+    pub(crate) const fn spec(&self) -> RegionSpec {
+        self.spec
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn logical_len(&self) -> usize {
+        self.request.logical_len()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mapped_len(&self) -> usize {
+        self.request.mapped_len()
+    }
 }
 
 #[cfg(test)]

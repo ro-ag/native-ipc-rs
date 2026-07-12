@@ -573,6 +573,11 @@ impl NativeShareRequest {
     }
 
     #[allow(dead_code)]
+    pub(crate) const fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    #[allow(dead_code)]
     pub(crate) const fn incarnation(&self) -> [u8; 16] {
         self.incarnation
     }
