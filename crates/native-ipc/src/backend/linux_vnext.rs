@@ -15,6 +15,9 @@ use crate::session::AbsoluteDeadline;
 
 const MAX_PACKET_FDS: usize = 16;
 const CONTROL_CAPACITY: usize = 256;
+/// Conservative Linux-native one-datagram ceiling; the generic HELLO hard max
+/// is intentionally not claimed as universally supported by `SOCK_SEQPACKET`.
+const MAX_ZERO_RIGHTS_PACKET_BYTES: usize = 64 * 1024;
 
 #[repr(C)]
 union ControlStorage {
@@ -132,6 +135,8 @@ impl SeqPacketEndpoint {
         let right = unsafe { OwnedFd::from_raw_fd(pair[1]) };
         enable_passcred(left.as_raw_fd())?;
         enable_passcred(right.as_raw_fd())?;
+        configure_packet_buffers(left.as_raw_fd())?;
+        configure_packet_buffers(right.as_raw_fd())?;
         Ok((Self::from_owned(left), Self::from_owned(right)))
     }
 
@@ -153,12 +158,26 @@ impl SeqPacketEndpoint {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         set_cloexec(fd.as_raw_fd())?;
         enable_passcred(fd.as_raw_fd())?;
+        configure_packet_buffers(fd.as_raw_fd())?;
         Ok(Self::from_owned(fd))
     }
 
     fn send(&mut self, bytes: &[u8], descriptors: &[RawFd]) -> Result<(), PacketError> {
+        self.send_bounded(bytes, descriptors, CONTROL_FRAME_LEN)
+    }
+
+    fn send_zero_rights(&mut self, bytes: &[u8]) -> Result<(), PacketError> {
+        self.send_bounded(bytes, &[], MAX_ZERO_RIGHTS_PACKET_BYTES)
+    }
+
+    fn send_bounded(
+        &mut self,
+        bytes: &[u8],
+        descriptors: &[RawFd],
+        maximum: usize,
+    ) -> Result<(), PacketError> {
         if bytes.is_empty()
-            || bytes.len() > CONTROL_FRAME_LEN
+            || bytes.len() > maximum
             || descriptors.len() > MAX_PACKET_FDS
             || descriptors.iter().any(|fd| *fd < 0)
         {
@@ -222,7 +241,32 @@ impl SeqPacketEndpoint {
         {
             return Err(PacketError::InvalidInput);
         }
-        let mut bytes = vec![0_u8; CONTROL_FRAME_LEN];
+        self.receive_bounded(
+            CONTROL_FRAME_LEN,
+            Some(expected_len),
+            expected_peer,
+            expected_descriptors,
+        )
+    }
+
+    fn receive_zero_rights(
+        &mut self,
+        expected_peer: PacketCredentials,
+    ) -> Result<ReceivedPacket, PacketError> {
+        self.receive_bounded(MAX_ZERO_RIGHTS_PACKET_BYTES, None, expected_peer, 0)
+    }
+
+    fn receive_bounded(
+        &mut self,
+        capacity: usize,
+        expected_len: Option<usize>,
+        expected_peer: PacketCredentials,
+        expected_descriptors: usize,
+    ) -> Result<ReceivedPacket, PacketError> {
+        if capacity == 0 || capacity > MAX_ZERO_RIGHTS_PACKET_BYTES {
+            return Err(PacketError::InvalidInput);
+        }
+        let mut bytes = vec![0_u8; capacity];
         let mut iovec = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
@@ -262,7 +306,7 @@ impl SeqPacketEndpoint {
         if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
             return Err(PacketError::Truncated);
         }
-        if received == 0 || received as usize != expected_len {
+        if received == 0 || expected_len.is_some_and(|expected| received as usize != expected) {
             return Err(PacketError::Truncated);
         }
         let (descriptors, credentials) = ancillary.validate(expected_peer, expected_descriptors)?;
@@ -446,6 +490,48 @@ impl ProcessBoundEndpoint {
         }
     }
 
+    fn send_zero_rights_before(
+        &mut self,
+        bytes: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), PacketError> {
+        if self.poisoned {
+            return Err(PacketError::Poisoned);
+        }
+        if bytes.is_empty() || bytes.len() > MAX_ZERO_RIGHTS_PACKET_BYTES {
+            return Err(PacketError::InvalidInput);
+        }
+        loop {
+            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
+            if deadline.is_expired() {
+                return Err(PacketError::DeadlineExpired);
+            }
+            let result = if self.inject_send_interrupt() {
+                Err(PacketError::Interrupted)
+            } else {
+                self.endpoint.send_zero_rights(bytes)
+            };
+            match result {
+                Ok(()) => {
+                    self.inject_expiry_after_send(deadline);
+                    if deadline.is_expired() {
+                        self.poisoned = true;
+                        return Err(PacketError::AmbiguousAfterSend);
+                    }
+                    return Ok(());
+                }
+                Err(PacketError::WouldBlock) => poll_until(
+                    self.endpoint.fd.as_raw_fd(),
+                    self.peer_pidfd.as_raw_fd(),
+                    libc::POLLOUT,
+                    deadline,
+                )?,
+                Err(PacketError::Interrupted) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn receive_before(
         &mut self,
         expected_len: usize,
@@ -465,6 +551,44 @@ impl ProcessBoundEndpoint {
             } else {
                 self.endpoint
                     .receive(expected_len, self.peer, expected_descriptors)
+            };
+            match result {
+                Ok(packet) => {
+                    self.inject_expiry_after_receive(deadline);
+                    if deadline.is_expired() {
+                        self.poisoned = true;
+                        return Err(PacketError::AmbiguousAfterReceive);
+                    }
+                    return Ok(packet);
+                }
+                Err(PacketError::WouldBlock) => poll_until(
+                    self.endpoint.fd.as_raw_fd(),
+                    self.peer_pidfd.as_raw_fd(),
+                    libc::POLLIN,
+                    deadline,
+                )?,
+                Err(PacketError::Interrupted) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn receive_zero_rights_before(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ReceivedPacket, PacketError> {
+        if self.poisoned {
+            return Err(PacketError::Poisoned);
+        }
+        loop {
+            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
+            if deadline.is_expired() {
+                return Err(PacketError::DeadlineExpired);
+            }
+            let result = if self.inject_receive_interrupt() {
+                Err(PacketError::Interrupted)
+            } else {
+                self.endpoint.receive_zero_rights(self.peer)
             };
             match result {
                 Ok(packet) => {
@@ -599,6 +723,44 @@ fn enable_passcred(fd: RawFd) -> Result<(), PacketError> {
     } != 0
     {
         return Err(last_native());
+    }
+    Ok(())
+}
+
+fn configure_packet_buffers(fd: RawFd) -> Result<(), PacketError> {
+    let requested =
+        i32::try_from(MAX_ZERO_RIGHTS_PACKET_BYTES * 2).map_err(|_| PacketError::InvalidInput)?;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: requested is one initialized scalar socket option value.
+        if unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&requested as *const i32).cast(),
+                size_of::<i32>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(last_native());
+        }
+        let mut actual = 0_i32;
+        let mut length = size_of::<i32>() as libc::socklen_t;
+        // SAFETY: actual and length are valid writable option outputs.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&mut actual as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || length as usize != size_of::<i32>()
+            || actual < requested
+        {
+            return Err(PacketError::InvalidInput);
+        }
     }
     Ok(())
 }

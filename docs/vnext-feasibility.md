@@ -103,6 +103,15 @@ capability after receipt. The original draft's requirement that every packet
 match the spawned child was impossible for child-received parent packets and
 has been corrected in the normative spec.
 
+Variable-length zero-rights bootstrap records use one datagram and a
+conservative Linux-native ceiling of 64 KiB, not the generic 16 MiB hard
+maximum. Socket construction requests and verifies send/receive buffers large
+enough for that ceiling or fails closed. Receive performs one bounded
+`recvmsg`, never `MSG_PEEK`, validates exact per-message credentials, adopts
+then closes any injected rights, and rejects zero length, oversize truncation,
+control truncation, malformed ancillary data, or wrong credentials. The fixed
+capability-frame path retains its existing smaller exact-size/fd-count limit.
+
 At source-tree commit `e904e35`, the parser additionally adopts every complete
 nonnegative descriptor word in every structurally reachable `SCM_RIGHTS`
 record before reporting malformed payload, truncation, wrong credentials, or
@@ -247,6 +256,12 @@ pipe, and original pair descriptors, every fixed error stage, malformed and
 partial records, silence, deadline expiry, repeated Drop, panic, and
 fd/task/child baselines. Native exact-target evidence for this new composition
 is still required.
+
+The exact pre-authentication spawn-owner commit `81832fd` is green across all
+ten hosted jobs in
+[Actions 29197002887](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197002887).
+That evidence does not cover the later variable-packet primitive, which remains
+local Arm64 Docker characterization pending native execution.
 
 The preceding exact-child and fresh-session scaffold passed hosted native Linux
 AMD64/Arm64 and Linux AMD64 ASan at exact commit `861c139` in

@@ -370,6 +370,176 @@ fn one_packet_has_exact_credentials_and_zero_to_sixteen_owned_fds() {
 }
 
 #[test]
+fn variable_zero_rights_packets_enforce_native_ceiling_and_credentials() {
+    let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let credentials = current_credentials();
+    for payload in [vec![7_u8; 1], vec![9_u8; MAX_ZERO_RIGHTS_PACKET_BYTES]] {
+        sender.send_zero_rights(&payload).unwrap();
+        let packet = receiver.receive_zero_rights(credentials).unwrap();
+        assert_eq!(packet.bytes, payload);
+        assert!(packet.descriptors.is_empty());
+        assert_eq!(packet.credentials, credentials);
+    }
+    assert_eq!(
+        sender.send_zero_rights(&vec![0; MAX_ZERO_RIGHTS_PACKET_BYTES + 1]),
+        Err(PacketError::InvalidInput)
+    );
+    assert!(matches!(
+        receiver.receive_zero_rights(credentials),
+        Err(PacketError::WouldBlock)
+    ));
+    assert_eq!(sender.send_zero_rights(&[]), Err(PacketError::InvalidInput));
+
+    sender.send_zero_rights(b"wrong").unwrap();
+    let wrong = PacketCredentials {
+        pid: credentials.pid.saturating_add(1),
+        ..credentials
+    };
+    assert!(matches!(
+        receiver.receive_zero_rights(wrong),
+        Err(PacketError::WrongPeer)
+    ));
+}
+
+#[test]
+fn queued_oversize_and_injected_rights_are_consumed_without_fd_growth() {
+    let (sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let credentials = current_credentials();
+    let oversize = vec![1_u8; MAX_ZERO_RIGHTS_PACKET_BYTES + 1];
+    // SAFETY: the buffer is live and the connected socket consumes one datagram.
+    assert_eq!(
+        unsafe {
+            libc::send(
+                sender.fd.as_raw_fd(),
+                oversize.as_ptr().cast(),
+                oversize.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        },
+        oversize.len() as isize
+    );
+    assert_eq!(
+        receiver.receive_zero_rights(credentials).err().unwrap(),
+        PacketError::Truncated
+    );
+    assert!(matches!(
+        receiver.receive_zero_rights(credentials),
+        Err(PacketError::WouldBlock)
+    ));
+
+    let before = open_fd_count();
+    let file = std::fs::File::open("/dev/null").unwrap();
+    send_unchecked_rights(&sender, b"r", &[file.as_raw_fd()]);
+    assert_eq!(
+        receiver.receive_zero_rights(credentials).err().unwrap(),
+        PacketError::WrongDescriptorCount
+    );
+    assert_eq!(open_fd_count(), before + 1);
+    drop(file);
+    assert_eq!(open_fd_count(), before);
+}
+
+#[test]
+fn variable_zero_rights_deadlines_interruptions_and_late_completion_poison() {
+    let (mut sender, mut receiver) = self_bound_pair();
+    sender.faults.send_interrupts = 2;
+    receiver.faults.receive_interrupts = 2;
+    let deadline = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+    sender.send_zero_rights_before(b"eintr", deadline).unwrap();
+    assert_eq!(
+        receiver.receive_zero_rights_before(deadline).unwrap().bytes,
+        b"eintr"
+    );
+
+    let silence = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        receiver.receive_zero_rights_before(silence).err().unwrap(),
+        PacketError::DeadlineExpired
+    );
+
+    sender.faults.expire_after_send = true;
+    let late = AbsoluteDeadline::after(Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        sender.send_zero_rights_before(b"late", late),
+        Err(PacketError::AmbiguousAfterSend)
+    );
+    assert_eq!(
+        sender.send_zero_rights_before(b"again", deadline),
+        Err(PacketError::Poisoned)
+    );
+
+    let (mut second_sender, mut second_receiver) = self_bound_pair();
+    second_sender
+        .send_zero_rights_before(b"late-r", deadline)
+        .unwrap();
+    second_receiver.faults.expire_after_receive = true;
+    let late = AbsoluteDeadline::after(Duration::from_millis(5)).unwrap();
+    assert_eq!(
+        second_receiver
+            .receive_zero_rights_before(late)
+            .err()
+            .unwrap(),
+        PacketError::AmbiguousAfterReceive
+    );
+    assert!(matches!(
+        second_receiver.receive_zero_rights_before(deadline),
+        Err(PacketError::Poisoned)
+    ));
+
+    let (mut saturated, _peer) = self_bound_pair();
+    let packet = vec![0_u8; MAX_ZERO_RIGHTS_PACKET_BYTES];
+    while matches!(
+        saturated.endpoint.send_zero_rights(&packet),
+        Ok(()) | Err(PacketError::Interrupted)
+    ) {}
+    let short = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        saturated.send_zero_rights_before(&packet, short),
+        Err(PacketError::DeadlineExpired)
+    );
+}
+
+#[test]
+fn variable_zero_rights_wait_wakes_on_exact_peer_exit() {
+    let (sender, receiver) = SeqPacketEndpoint::pair().unwrap();
+    let inherited = sender.fd.as_raw_fd();
+    let executable = std::env::current_exe().unwrap();
+    let mut command = Command::new(executable);
+    command.args([
+        "--exact",
+        "backend::linux_vnext::tests::immediate_exit_helper",
+        "--ignored",
+    ]);
+    // SAFETY: only the async-signal-safe fcntl syscall runs before exec; this
+    // exact connected endpoint is the sole intentional inherited test fd.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(inherited, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let credentials = PacketCredentials {
+        pid: child.id(),
+        uid: current_credentials().uid,
+        gid: current_credentials().gid,
+    };
+    let pidfd = open_pidfd(child.id());
+    drop(sender);
+    // SAFETY: receiver is the connected endpoint and pidfd/credentials name the child.
+    let mut receiver =
+        unsafe { ProcessBoundEndpoint::from_verified_process(receiver, pidfd, credentials) };
+    let deadline = AbsoluteDeadline::after(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        receiver.receive_zero_rights_before(deadline).err().unwrap(),
+        PacketError::PeerExited
+    );
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn one_absolute_deadline_bounds_nonblocking_send_receive_and_silence() {
     let (mut sender, mut receiver) = self_bound_pair();
     let deadline = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
