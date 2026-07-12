@@ -281,6 +281,39 @@ partial records, silence, deadline expiry, repeated Drop, panic, and
 fd/task/child baselines. Native exact-target evidence for this new composition
 is still required.
 
+The next local Phase 5i-D checkpoint consumes that owner through one
+`spawn_negotiating` entry so the caller cannot replace the absolute deadline
+between image confirmation and HELLO. The coordinator generates one nonzero
+32-byte nonce with nonblocking `getrandom`, sends exactly one canonical
+Coordinator HELLO, then accepts exactly one Receiver HELLO only after the
+packet primitive verifies zero rights and kernel per-message credentials for
+the exact clone PID and real UID/GID while the sole lifecycle pidfd remains
+live. The receiver validates the coordinator's directional real UID/GID and
+parent PID before using the authenticated record's nonce, independently
+discovers native atomic facts, echoes the nonce, and reduces the same canonical
+two-HELLO transcript. Executables carrying set-user-ID or set-group-ID mode
+bits are rejected before clone. Locally decidable invalid feature relations,
+limits, payloads, and entropy failures also reject before clone.
+
+Linux's one-datagram ceiling makes the exact opaque application payload limit
+65,312 bytes (`64 KiB - 224-byte HELLO header`). Unconfined Rust 1.97 Arm64
+Docker exercises empty, one-byte, and exact-limit payloads in both directions;
+wrong role, nonce, target, atomic facts, limits, reserved bytes, truncation,
+and injected `SCM_RIGHTS` all fail and restore exact direct-child/resource
+baselines. A root-only disposable test splits real IDs 65534 from effective
+IDs 0 and proves that automatic `SCM_CREDENTIALS` binds real IDs in both HELLO
+directions. Default Docker seccomp masks `clone3` as `ENOSYS`; this evidence
+therefore requires privileged, seccomp-unconfined execution and remains VM/
+emulation characterization rather than native release evidence.
+
+The resulting private `NegotiatingLinuxSpawn` is `Send`, non-`Sync`, and
+non-`Clone`. It exposes no endpoint, raw descriptor, ACCEPT/READY state,
+receipt, session, control, batch, or memory authority. Duplicate/flood/replay
+records cannot mint authority at this HELLO-only typestate and still require
+explicit native coverage at the later ACCEPT/poison transition. Hosted native
+AMD64/Arm64, ASan, physical Arm64, exact release-commit, and packaged-crate
+evidence are pending; no release claim follows from Docker.
+
 The exact variable-packet correction commit `ad4ca15` is green across all ten
 hosted jobs, including native Linux AMD64/Arm64 and ASan, in
 [Actions 29197506559](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197506559).
