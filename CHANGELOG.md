@@ -5,6 +5,36 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Security
+
+- Bind two-sided ACCEPT/REJECT ordering to a fresh nonzero 128-bit coordinator
+  decision challenge. Receiver ACCEPT or REJECT must echo the exact challenge,
+  preventing a malicious receiver from prequeuing a deterministic decision
+  before the coordinator decides. Zero and legacy challenge-free decisions are
+  rejected with no downgrade decoder; the challenge is causality evidence, not
+  a MAC, secret, receipt, or authority grant.
+- Define the strongest achievable Linux shared-memory authority contract:
+  `MFD_NOEXEC_SEAL`, complete seal ordering, non-executable library views, and
+  inherited irreversible MDWE are mandatory. Native AMD64/Arm64 evidence shows
+  Linux still permits a malicious delegated peer to create RX aliases. During
+  receiver-writer setup, an fd delegated outside the MDWE-inheriting process
+  tree may also retain RW and later gain execute. This residual authority is
+  explicit rather than overstated as object-level NX.
+- Add a private trusted pre-exec hook that installs exact inherited MDWE and
+  propagates setup failure before exec. It deliberately mints no witness;
+  memory preparation remains gated until exact-image, authenticated-channel,
+  pidfd, and bounded-cleanup ownership are combined.
+- Add private Linux executable evidence that opens an absolute native ELF with
+  `openat2` symlink/magic-link rejection, retains its inode, opens the child's
+  pidfd, executes through the held CLOEXEC descriptor, and compares
+  `/proc/PID/exe` before any image receipt can be minted.
+
+### Changed
+
+- **Breaking:** rename `PermissionPlan::executable()` to
+  `library_view_executable()`. The old name incorrectly suggested a guarantee
+  about every alias a malicious native-capability holder could create.
+
 ## [0.4.0] - 2026-07-11
 
 ### Changed

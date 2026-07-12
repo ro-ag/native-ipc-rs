@@ -139,8 +139,11 @@ impl PermissionPlan {
         }
     }
 
-    /// Shared executable mappings are never permitted.
-    pub const fn executable(self) -> bool {
+    /// Whether a mapping created by the library requests execute authority.
+    ///
+    /// This does not describe every alias a malicious native-capability holder
+    /// may create under the documented target-specific authority limits.
+    pub const fn library_view_executable(self) -> bool {
         false
     }
 }
@@ -305,8 +308,13 @@ pub enum MemoryError {
         /// Configured maximum logical length.
         maximum: usize,
     },
-    /// Selected native backend rejected allocation.
-    Platform(NativeMemoryPlatformError),
+    /// Selected native backend rejected the bounded operation.
+    Platform {
+        /// Portable operation category.
+        operation: &'static str,
+    },
+    /// The operating-system CSPRNG could not mint object freshness.
+    RandomnessUnavailable,
 }
 
 impl fmt::Display for MemoryError {
@@ -317,16 +325,34 @@ impl fmt::Display for MemoryError {
 
 impl std::error::Error for MemoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Platform(error) => Some(error),
-            _ => None,
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<crate::backend::linux::LinuxError> for MemoryError {
+    fn from(_: crate::backend::linux::LinuxError) -> Self {
+        Self::Platform {
+            operation: "allocate",
         }
     }
 }
 
-impl From<NativeMemoryPlatformError> for MemoryError {
-    fn from(value: NativeMemoryPlatformError) -> Self {
-        Self::Platform(value)
+#[cfg(target_os = "macos")]
+impl From<crate::backend::macos::MachError> for MemoryError {
+    fn from(_: crate::backend::macos::MachError) -> Self {
+        Self::Platform {
+            operation: "allocate",
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<crate::backend::windows::WindowsError> for MemoryError {
+    fn from(_: crate::backend::windows::WindowsError) -> Self {
+        Self::Platform {
+            operation: "allocate",
+        }
     }
 }
 
@@ -344,7 +370,10 @@ pub struct NativeRegion {
 }
 
 impl NativeRegion {
-    /// Allocates a zeroed, anonymous, non-executable native region.
+    /// Allocates a zeroed anonymous region with a non-executable library view.
+    ///
+    /// Delegated native authority follows the documented target policy; on
+    /// Linux, a malicious memfd holder may create a separate executable alias.
     pub fn allocate(options: RegionOptions) -> Result<Self, MemoryError> {
         validate_options(options)?;
         let inner = PlatformQuiescentRegion::new(options.logical_len())?;
@@ -449,18 +478,38 @@ impl NativeRegion {
         drop(self.inner.take());
     }
 
-    /// Freezes common initialization/growth and creates a native share request.
+    /// Freezes initialization/growth and creates an opaque native share request.
     ///
-    /// The request retains the permission and mandatory seal policy alongside
-    /// the native region. Its platform parts must be consumed by the matching
-    /// authenticated prepare/transfer operation.
-    pub fn prepare_for_sharing(mut self) -> NativeShareRequest {
-        NativeShareRequest {
+    /// The private owner is consumed and cannot be reused after preparation.
+    ///
+    /// ```compile_fail
+    /// use native_ipc::memory::{NativeRegion, RegionOptions, WriterOwner};
+    /// let mut region = NativeRegion::allocate(RegionOptions::fixed(
+    ///     32,
+    ///     WriterOwner::Creator,
+    /// )).unwrap();
+    /// let _prepared = region.prepare_for_sharing().unwrap();
+    /// region.clear();
+    /// ```
+    pub fn prepare_for_sharing(mut self) -> Result<NativeShareRequest, MemoryError> {
+        let incarnation =
+            crate::backend::mint_incarnation().map_err(|()| MemoryError::RandomnessUnavailable)?;
+        Ok(NativeShareRequest {
             inner: self.inner.take(),
+            incarnation,
+            logical_len: self.logical_len,
             permissions: self.options.permissions(),
             seal: self.options.seal(),
             cleanup: self.options.cleanup(),
-        }
+        })
+    }
+
+    pub(crate) fn prepare_with_writer(
+        mut self,
+        writer: WriterOwner,
+    ) -> Result<NativeShareRequest, MemoryError> {
+        self.options.permissions = PermissionPlan::new(writer);
+        self.prepare_for_sharing()
     }
 
     fn inner(&self) -> &PlatformQuiescentRegion {
@@ -487,11 +536,24 @@ impl NativeRegion {
 
 /// Consuming boundary between common memory management and native transfer.
 ///
-/// This type exposes no bytes and supports no growth. It keeps the requested
-/// one-writer permission plan attached until the caller enters the existing
-/// platform-specific authenticated transfer typestate.
+/// This type exposes no bytes, native parts, or growth operation. It keeps the
+/// requested one-writer permission plan attached until a platform-neutral
+/// transfer batch consumes it.
+///
+/// ```compile_fail
+/// use native_ipc::memory::{NativeRegion, RegionOptions, WriterOwner};
+/// let region = NativeRegion::allocate(RegionOptions::fixed(
+///     32,
+///     WriterOwner::Creator,
+/// )).unwrap();
+/// let mut prepared = region.prepare_for_sharing().unwrap();
+/// prepared.initialize(|bytes| bytes.fill(0));
+/// ```
 pub struct NativeShareRequest {
     inner: Option<PlatformQuiescentRegion>,
+    #[allow(dead_code)]
+    incarnation: [u8; 16],
+    logical_len: usize,
     permissions: PermissionPlan,
     seal: SealPolicy,
     cleanup: CleanupPolicy,
@@ -516,17 +578,25 @@ impl NativeShareRequest {
             .len()
     }
 
-    /// Enters the platform authenticated transfer layer.
-    ///
-    /// The returned permission plan must select the matching creator-writer or
-    /// peer-writer consuming transition. Native code applies the actual seal or
-    /// maximum-rights attenuation; safe code cannot disable the seal policy.
-    pub fn into_platform_parts(mut self) -> (PlatformQuiescentRegion, PermissionPlan) {
-        let region = self
-            .inner
-            .take()
-            .expect("share request always owns its mapping");
-        (region, self.permissions)
+    #[allow(dead_code)]
+    pub(crate) const fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn incarnation(&self) -> [u8; 16] {
+        self.incarnation
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn native_spec(&self, region_id: u128) -> Option<crate::protocol::NativeRegionSpec> {
+        crate::protocol::NativeRegionSpec::new(
+            region_id,
+            self.incarnation,
+            self.permissions.writer() as u32,
+            self.logical_len,
+            self.mapped_len(),
+        )
     }
 
     /// Clears and releases a prepared request without sharing it.
@@ -584,25 +654,14 @@ fn validate_options(options: RegionOptions) -> Result<(), MemoryError> {
 
 #[cfg(target_os = "linux")]
 /// Native quiescent region selected on Linux.
-pub type PlatformQuiescentRegion = native_ipc_platform::linux::QuiescentRegion;
-#[cfg(target_os = "linux")]
-/// Native allocation error selected on Linux.
-pub type NativeMemoryPlatformError = native_ipc_platform::linux::LinuxError;
-
+pub(crate) type PlatformQuiescentRegion = crate::backend::linux::QuiescentRegion;
 #[cfg(target_os = "macos")]
 /// Native quiescent region selected on macOS.
-pub type PlatformQuiescentRegion = native_ipc_platform::macos::QuiescentRegion;
-#[cfg(target_os = "macos")]
-/// Native allocation error selected on macOS.
-pub type NativeMemoryPlatformError = native_ipc_platform::macos::MachError;
+pub(crate) type PlatformQuiescentRegion = crate::backend::macos::QuiescentRegion;
 
 #[cfg(target_os = "windows")]
 /// Native quiescent region selected on Windows.
-pub type PlatformQuiescentRegion = native_ipc_platform::windows::QuiescentRegion;
-#[cfg(target_os = "windows")]
-/// Native allocation error selected on Windows.
-pub type NativeMemoryPlatformError = native_ipc_platform::windows::WindowsError;
-
+pub(crate) type PlatformQuiescentRegion = crate::backend::windows::QuiescentRegion;
 #[cfg(target_os = "linux")]
 const fn native_platform() -> NativePlatform {
     NativePlatform::Linux
@@ -640,82 +699,5 @@ const fn authority_mechanism() -> AuthorityMechanism {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capabilities_report_the_compilation_architecture() {
-        let capabilities = native_memory_capabilities();
-
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(capabilities.architecture(), NativeArchitecture::Arm64);
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(capabilities.architecture(), NativeArchitecture::Amd64);
-    }
-
-    #[test]
-    fn growable_region_preserves_bytes_and_reports_policy() {
-        let options = RegionOptions::growable(32, 128, WriterOwner::Creator);
-        let mut region = NativeRegion::allocate(options).unwrap();
-        region.initialize(|bytes| bytes[..4].copy_from_slice(b"NIPC"));
-        region.grow(96).unwrap();
-
-        let status = region.status();
-        assert_eq!(status.logical_len, 96);
-        assert_eq!(status.maximum_len, 128);
-        assert!(status.can_grow);
-        assert_eq!(status.permissions.creator_access(), MemoryAccess::ReadWrite);
-        assert_eq!(status.permissions.peer_access(), MemoryAccess::ReadOnly);
-        region.initialize(|bytes| assert_eq!(&bytes[..4], b"NIPC"));
-    }
-
-    #[test]
-    fn fixed_and_bounded_growth_fail_closed() {
-        let mut fixed =
-            NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Peer)).unwrap();
-        assert!(matches!(fixed.grow(64), Err(MemoryError::FixedSize)));
-
-        let mut bounded =
-            NativeRegion::allocate(RegionOptions::growable(32, 64, WriterOwner::Peer)).unwrap();
-        assert!(matches!(
-            bounded.grow(65),
-            Err(MemoryError::MaximumExceeded {
-                requested: 65,
-                maximum: 64
-            })
-        ));
-        assert!(matches!(
-            bounded.grow(16),
-            Err(MemoryError::ShrinkUnsupported {
-                current: 32,
-                requested: 16
-            })
-        ));
-    }
-
-    #[test]
-    fn clear_covers_logical_bytes() {
-        let mut region =
-            NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Creator)).unwrap();
-        region.initialize(|bytes| bytes.fill(0xaa));
-        region.clear();
-        region.initialize(|bytes| assert!(bytes.iter().all(|byte| *byte == 0)));
-        region.initialize(|bytes| bytes[..4].copy_from_slice(b"REUS"));
-        region.initialize(|bytes| assert_eq!(&bytes[..4], b"REUS"));
-        region.destroy();
-    }
-
-    #[test]
-    fn share_request_preserves_permissions_and_removes_byte_access() {
-        let region = NativeRegion::allocate(RegionOptions::fixed(32, WriterOwner::Peer)).unwrap();
-        let request = region.prepare_for_sharing();
-        assert_eq!(request.seal_policy(), SealPolicy::RequiredOnShare);
-        assert_eq!(
-            request.permissions().creator_access(),
-            MemoryAccess::ReadOnly
-        );
-        assert_eq!(request.permissions().peer_access(), MemoryAccess::ReadWrite);
-        assert!(request.mapped_len() >= 32);
-        request.destroy();
-    }
-}
+#[path = "memory_test.rs"]
+mod tests;

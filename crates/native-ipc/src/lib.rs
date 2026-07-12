@@ -15,8 +15,30 @@ compile_error!("native-ipc supports Linux and Windows on aarch64/x86_64, and mac
 
 /// Platform-neutral wire, layout, and sequencing primitives.
 pub use native_ipc_core as core;
-/// Native operating-system capability implementations.
-pub use native_ipc_platform as platform;
 
+/// Checked allocation-free runtime access after batch commit.
+pub mod active;
+#[allow(dead_code)]
+mod batch;
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
+/// Platform-neutral consuming region ownership states.
+pub mod region;
+/// Finite session limits, target capabilities, and absolute deadlines.
+pub mod session;
+
+mod backend;
+#[allow(dead_code)]
+mod control;
+#[allow(dead_code)]
+mod liveness;
+#[allow(dead_code)]
+mod negotiation;
+mod protocol;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum BackendStatus {
+    Available,
+    Incomplete(&'static str),
+}

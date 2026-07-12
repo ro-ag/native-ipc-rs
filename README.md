@@ -82,8 +82,11 @@ The workspace contains:
 - `native-ipc`: public facade;
 - `native-ipc-core`: explicit codecs, checked layouts, publication sequencing,
   and capability bindings;
-- `native-ipc-platform`: native mappings and capability policy; and
 - `native-ipc-testkit`: golden-vector and adversarial conformance helpers.
+
+Native backends are private modules of `native-ipc`. The superseded 0.4
+`native-ipc-platform` package remains in the repository for historical source
+and migration reference, but is not a vNext workspace package or public API.
 
 ## How memory is accessed
 
@@ -95,11 +98,13 @@ creator acknowledges `COMMIT`; consuming typestates expose runtime APIs only
 after that barrier completes. Runtime access remains mapping-owned and never
 returns shared references.
 
-The fixed-width control manifest covers an arbitrary bounded batch of
-directional regions and binds each transaction to authenticated process
-identities, a unique transfer ID, canonical roles, schema and generation,
-native access, and exact capability lengths. Control operations require
-exclusive channel access, so independent transfers cannot interleave.
+The private fixed-width control manifest is application-neutral. It binds each
+transaction to authenticated process identities, a unique transfer ID,
+canonical opaque region IDs, independent object incarnations, writer/access
+direction, ordinals, aggregate totals, and exact logical/mapped lengths. Layout
+schemas and generations belong to optional application adapters above this
+native transcript. Control operations require exclusive channel access, so
+independent transfers cannot interleave.
 
 ```mermaid
 sequenceDiagram
@@ -108,7 +113,7 @@ sequenceDiagram
     participant P as Authenticated peer
     participant R as Shared region
 
-    C->>OS: Allocate zeroed, non-executable region
+    C->>OS: Allocate zeroed region with non-executable library view
     OS-->>C: Exclusive quiescent mapping
     C->>R: Encode canonical header, slots, and routes
     C->>C: Validate full mapping and padding
@@ -186,8 +191,8 @@ before native capability transfer:
 ```sh
 cargo run -p native-ipc-core --example bounded_codec
 cargo run -p native-ipc-core --example checked_layout
-cargo run -p native-ipc-platform --example quiescent_region
-cargo run -p native-ipc-platform --example ready_commit
+cargo run --manifest-path crates/native-ipc-platform/Cargo.toml --example quiescent_region
+cargo run --manifest-path crates/native-ipc-platform/Cargo.toml --example ready_commit
 cargo run -p native-ipc-testkit --example hostile_inputs
 cargo run -p native-ipc --example common_memory
 ```
@@ -228,6 +233,17 @@ cargo run -p native-ipc --example common_memory
   OS-enforced read-only witnesses grant only acquire capabilities.
 - Runtime mappings never expose ordinary Rust slices. Slice access exists only
   in consuming, pre-transfer quiescent platform typestates.
+
+## Normative vNext contract
+
+The post-0.4 requirements are specified in
+[`docs/native-ipc-vnext-spec.md`](docs/native-ipc-vnext-spec.md). The document
+defines the platform-neutral opaque region API, true 1..=16 mixed-direction
+atomic batches, session lifecycle, native security rules, VST3-oriented generic
+acceptance profile, adversarial test matrix, and release gates.
+
+A fresh implementation session can start from
+[`docs/vnext-implementation-prompt.md`](docs/vnext-implementation-prompt.md).
 
 ## Current status
 

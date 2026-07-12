@@ -1,17 +1,17 @@
 [package]
 name = "native-ipc-platform"
 description = "Least-authority native OS capabilities and mappings for native-ipc"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-homepage.workspace = true
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.97"
+authors = ["Rodrigo Agurto"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ro-ag/native-ipc-rs"
+homepage = "https://github.com/ro-ag/native-ipc-rs"
 documentation = "https://docs.rs/native-ipc-platform"
 readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
+keywords = ["ipc", "shared-memory", "process", "capability", "security"]
+categories = ["os", "memory-management"]
 
 [dependencies]
 native-ipc-core = { path = "../native-ipc-core", version = "0.4.0" }
@@ -36,8 +36,14 @@ windows-sys = { version = "0.61", features = [
 [features]
 default = []
 
-[lints]
-workspace = true
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
 
 [package.metadata.docs.rs]
 targets = [

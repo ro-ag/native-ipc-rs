@@ -15,11 +15,35 @@ categories.workspace = true
 
 [dependencies]
 native-ipc-core = { path = "../native-ipc-core", version = "0.4.0" }
-native-ipc-platform = { path = "../native-ipc-platform", version = "0.4.0" }
+sha2 = { version = "0.10", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+static_assertions = "1.1"
 
 [features]
 default = ["std"]
 std = ["native-ipc-core/std"]
+raw-pointer = []
 
 [lints]
 workspace = true
