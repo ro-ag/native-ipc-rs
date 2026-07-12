@@ -5,20 +5,43 @@ safe-code ownership, kernel authority, authenticated-peer assumptions, and
 claims that cannot be made. Native proof still requires execution on every
 release target; this document is design evidence, not native conformance.
 
-## Linux 6.3+ non-executable memfds
+## Linux 6.3+ non-executable memfds — blocked contradiction
 
-Feasible with `memfd_create(MFD_CLOEXEC | MFD_NOEXEC_SEAL)`. Linux documents
-that `MFD_NOEXEC_SEAL` creates the memfd non-executable, installs
-`F_SEAL_EXEC`, and implies `MFD_ALLOW_SEALING`. The implementation must reject
-`EINVAL`/missing flags rather than fall back. It must verify object type, mode,
-seals, and negative executable-map/protection probes. The current 0.4 backend
-uses only `MFD_ALLOW_SEALING`, so it is not vNext evidence.
+`memfd_create(MFD_CLOEXEC | MFD_NOEXEC_SEAL)` creates the memfd with executable
+mode bits clear, installs `F_SEAL_EXEC`, and implies `MFD_ALLOW_SEALING`. Native
+AMD64 and Arm64 execution in [Actions 29179189298](https://github.com/ro-ag/native-ipc-rs/actions/runs/29179189298)
+confirmed that the seal rejects executable mode changes. The GitHub run proved
+that an already-existing writable mapping can still gain `PROT_EXEC` through
+`mprotect` after all required seals are installed. A local native Linux Arm64
+Docker reproduction additionally proved that a brand-new `PROT_EXEC` mapping
+of the sealed object succeeds. The mode/seal policy therefore does not provide
+VM maximum-protection enforcement for either existing or new views.
+
+Those results contradict the vNext requirement for both directions. A peer
+reader can create a new executable view of a coordinator-writer object, while
+receiver-writer ordering necessarily creates its writable mapping before
+`F_SEAL_FUTURE_WRITE` and the receiver can subsequently make that mapping
+executable. Safe-code ownership is sufficient for the trusted coordinator's
+own access discipline, but no specified kernel authority constrains the
+malicious receiver. `F_SEAL_EXEC` is therefore not a maximum-VM-protection
+mechanism analogous to Mach memory-entry maximum rights.
+
+The private vNext Linux preparation now rejects the mechanism without probing
+or making the real payload executable. Disposable isolated helper processes
+characterize both kernel paths, with process teardown as their cleanup
+backstop. Capability preparation fails closed in either direction. Linux release is blocked;
+the MUST cannot be weakened to cover only new executable mappings. Resolution
+requires either a normative threat/guarantee change or a separately proven
+mandatory containment mechanism that a malicious receiver cannot remove or
+bypass. No such unprivileged mechanism is currently specified.
 
 Primary source: <https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html>
 
 ## Linux peer-writer seal order
 
-Feasible as a bounded preparation subprotocol. Size and execute seals precede
+The future-write ordering is feasible as a bounded preparation subprotocol,
+but the complete receiver-writer contract is blocked by the executable-upgrade
+contradiction above. Size and execute seals precede
 escape. For receiver-writer entries the coordinator destroys its writable
 view, transfers the still-future-write-unsealed fd, waits for exact
 manifest-bound `IMPORTED`, installs `F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`, sends
@@ -153,7 +176,9 @@ apparent tensions resolve as follows:
    capability delivery. Ambiguous post-escape failures poison and contain.
 3. `F_SEAL_FUTURE_WRITE` is compatible with an already-created designated
    writer mapping; it forbids future writer mappings rather than revoking the
-   existing one.
+   existing one. Native execution additionally proved that `F_SEAL_EXEC` does
+   not stop that existing mapping from gaining execute through `mprotect`, so
+   Linux receiver-writer NX remains a genuine unresolved contradiction.
 4. Windows remote cleanup is containment/process teardown, not unsafe numeric
    remote-handle closure after resume.
 5. Unix process-group cleanup covers the direct child and ordinary descendants
@@ -163,8 +188,7 @@ apparent tensions resolve as follows:
    reap when a task is stuck in an uninterruptible kernel wait; the cleanup
    ledger retains ownership and reports this exact incomplete state.
 
-The mechanisms have a provisional paper-feasible design. Phase 0 remains open
-until focused native probes and independent review validate the chosen
-external-memory boundary and available host mechanisms. Release evidence also
-remains blocked pending the complete implementation and native execution on all
-five targets.
+The mechanisms no longer have a wholly paper-feasible design: Linux
+receiver-writer NX is blocked by native kernel behavior. Phase 0 and release
+remain blocked until the normative contract or mechanism is changed explicitly,
+in addition to the remaining implementation and five-target release evidence.

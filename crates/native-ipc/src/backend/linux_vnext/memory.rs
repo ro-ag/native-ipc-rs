@@ -19,6 +19,7 @@ enum MemfdError {
     InvalidObject,
     WrongObject,
     WrongProvenance,
+    ExecutableAuthorityUnsupported,
     Native(i32),
 }
 
@@ -27,6 +28,13 @@ struct ObjectKey {
     device: u64,
     inode: u64,
     mapped_len: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NxProbeFacts {
+    new_executable_mapping_denied: bool,
+    existing_mapping_upgrade_denied: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +179,21 @@ impl PrivateMemfd {
         operation(bytes);
     }
 
-    fn prepare_coordinator_writer(mut self) -> Result<CoordinatorWriterPrepared, MemfdError> {
+    fn prepare_coordinator_writer(self) -> Result<CoordinatorWriterPrepared, MemfdError> {
+        reject_unsupported_linux_nx()?;
+        self.prepare_coordinator_writer_after_nx()
+    }
+
+    #[cfg(test)]
+    fn prepare_coordinator_writer_for_ordering_test(
+        self,
+    ) -> Result<CoordinatorWriterPrepared, MemfdError> {
+        self.prepare_coordinator_writer_after_nx()
+    }
+
+    fn prepare_coordinator_writer_after_nx(
+        mut self,
+    ) -> Result<CoordinatorWriterPrepared, MemfdError> {
         add_seals(self.fd.as_raw_fd(), FINAL_SEALS & !F_SEAL_EXEC)?;
         let mapping = self.mapping.take().expect("private mapping is live");
         validate_object(self.fd.as_raw_fd(), mapping.len, FINAL_SEALS)?;
@@ -185,6 +207,22 @@ impl PrivateMemfd {
     }
 
     fn prepare_receiver_writer(
+        self,
+        binding: TransferBinding,
+    ) -> Result<ReceiverWriterPrepared, MemfdError> {
+        reject_unsupported_linux_nx()?;
+        self.prepare_receiver_writer_after_nx(binding)
+    }
+
+    #[cfg(test)]
+    fn prepare_receiver_writer_for_ordering_test(
+        self,
+        binding: TransferBinding,
+    ) -> Result<ReceiverWriterPrepared, MemfdError> {
+        self.prepare_receiver_writer_after_nx(binding)
+    }
+
+    fn prepare_receiver_writer_after_nx(
         mut self,
         binding: TransferBinding,
     ) -> Result<ReceiverWriterPrepared, MemfdError> {
@@ -354,6 +392,62 @@ impl VmMapping {
     }
 }
 
+fn reject_unsupported_linux_nx() -> Result<(), MemfdError> {
+    Err(MemfdError::ExecutableAuthorityUnsupported)
+}
+
+#[cfg(test)]
+fn probe_kernel_nx(fd: RawFd, mapping: &VmMapping) -> Result<NxProbeFacts, MemfdError> {
+    // This function may run only in the isolated disposable helper below.
+    // VmMapping owns any executable alias; process teardown is the final
+    // containment backstop if explicit cleanup or restoration fails.
+    let new_executable_mapping_denied =
+        match VmMapping::map(fd, mapping.len, libc::PROT_READ | libc::PROT_EXEC) {
+            Ok(executable) => {
+                drop(executable);
+                false
+            }
+            Err(MemfdError::Native(libc::EACCES)) | Err(MemfdError::Native(libc::EPERM)) => true,
+            Err(error) => return Err(error),
+        };
+
+    // SAFETY: this mapping is still private; a successful protection probe is
+    // restored to RW before facts or errors escape.
+    let upgraded = unsafe {
+        libc::mprotect(
+            mapping.base.as_ptr().cast(),
+            mapping.len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        )
+    };
+    let existing_mapping_upgrade_denied = upgraded != 0;
+    if existing_mapping_upgrade_denied
+        && !matches!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EACCES) | Some(libc::EPERM)
+        )
+    {
+        return Err(last_native());
+    }
+    if !existing_mapping_upgrade_denied {
+        // SAFETY: same live range; restoration removes execute again.
+        if unsafe {
+            libc::mprotect(
+                mapping.base.as_ptr().cast(),
+                mapping.len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        } != 0
+        {
+            return Err(last_native());
+        }
+    }
+    Ok(NxProbeFacts {
+        new_executable_mapping_denied,
+        existing_mapping_upgrade_denied,
+    })
+}
+
 impl Drop for VmMapping {
     fn drop(&mut self) {
         // SAFETY: this value uniquely owns this local mapping.
@@ -440,6 +534,7 @@ fn last_native() -> MemfdError {
 mod tests {
     use super::*;
     use static_assertions::{assert_impl_all, assert_not_impl_any};
+    use std::process::Command;
 
     assert_impl_all!(PrivateMemfd: Send);
     assert_not_impl_any!(PrivateMemfd: Sync, Clone);
@@ -489,35 +584,20 @@ mod tests {
         }
     }
 
-    fn protection_upgrade_fails(mapping: &VmMapping) -> bool {
-        // SAFETY: mapping is live; the test requests a prohibited execute upgrade.
-        (unsafe {
-            libc::mprotect(
-                mapping.base.as_ptr().cast(),
-                mapping.len,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            )
-        }) != 0
-    }
-
     #[test]
-    fn coordinator_writer_keeps_only_preseal_writer_and_exports_reader() {
+    fn coordinator_writer_ordering_keeps_preseal_writer_and_exports_reader() {
         let mut private = PrivateMemfd::new(37).unwrap();
         private.initialize(|bytes| bytes[..4].copy_from_slice(b"NIPC"));
-        let mut prepared = private.prepare_coordinator_writer().unwrap();
+        let mut prepared = private
+            .prepare_coordinator_writer_for_ordering_test()
+            .unwrap();
         validate_object(prepared.fd.as_raw_fd(), prepared.mapping.len, FINAL_SEALS).unwrap();
         // SAFETY: descriptor is live and mode is a scalar probe.
         assert_eq!(unsafe { libc::fchmod(prepared.fd.as_raw_fd(), 0o700) }, -1);
-        assert!(protection_upgrade_fails(&prepared.mapping));
         let reader_fd = prepared.reader_capability().unwrap();
         assert!(mapping_fails(
             reader_fd.as_raw_fd(),
             libc::PROT_READ | libc::PROT_WRITE,
-            prepared.mapping.len
-        ));
-        assert!(mapping_fails(
-            reader_fd.as_raw_fd(),
-            libc::PROT_READ | libc::PROT_EXEC,
             prepared.mapping.len
         ));
         let reader =
@@ -536,11 +616,60 @@ mod tests {
     }
 
     #[test]
-    fn receiver_writer_imports_before_final_seal_and_coordinator_has_no_writer() {
+    fn both_writer_directions_fail_closed_when_memfd_can_become_executable() {
+        let coordinator = PrivateMemfd::new(73).unwrap();
+        assert!(matches!(
+            coordinator.prepare_coordinator_writer(),
+            Err(MemfdError::ExecutableAuthorityUnsupported)
+        ));
+        let receiver = PrivateMemfd::new(73).unwrap();
+        assert!(matches!(
+            receiver.prepare_receiver_writer(binding(1)),
+            Err(MemfdError::ExecutableAuthorityUnsupported)
+        ));
+    }
+
+    #[test]
+    #[ignore = "spawned alone as a disposable kernel-NX characterization helper"]
+    fn isolated_kernel_nx_probe_helper() {
+        let disposable = PrivateMemfd::new(73).unwrap();
+        let facts = probe_kernel_nx(
+            disposable.fd.as_raw_fd(),
+            disposable.mapping.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            facts,
+            NxProbeFacts {
+                new_executable_mapping_denied: false,
+                existing_mapping_upgrade_denied: false,
+            }
+        );
+    }
+
+    #[test]
+    fn isolated_process_confirms_kernel_nx_gap() {
+        let executable = std::env::current_exe().unwrap();
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                "backend::linux_vnext::memory::tests::isolated_kernel_nx_probe_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn receiver_writer_ordering_imports_then_seals_without_coordinator_writer() {
         let mut private = PrivateMemfd::new(73).unwrap();
         private.initialize(|bytes| bytes[0] = 7);
         let provenance = binding(1);
-        let prepared = private.prepare_receiver_writer(provenance).unwrap();
+        let prepared = private
+            .prepare_receiver_writer_for_ordering_test(provenance)
+            .unwrap();
         let mapped_len = prepared.key.mapped_len;
         let (prepared, capability) = prepared.export_writer().unwrap();
         let mut peer = ImportedPeerWriter::import(capability, mapped_len, provenance).unwrap();
@@ -548,7 +677,6 @@ mod tests {
         assert!(peer.take_imported_receipt().is_none());
         let reader = prepared.seal_after_import(receipt).unwrap();
         peer.verify_sealed().unwrap();
-        assert!(protection_upgrade_fails(&peer.mapping));
         peer.write_volatile(0, 41);
         assert_eq!(reader.read_volatile(0), 41);
         assert_eq!(reader.read_volatile(mapped_len - 1), 0);
@@ -557,11 +685,6 @@ mod tests {
         assert!(mapping_fails(
             reader.fd.as_raw_fd(),
             libc::PROT_READ | libc::PROT_WRITE,
-            mapped_len
-        ));
-        assert!(mapping_fails(
-            reader.fd.as_raw_fd(),
-            libc::PROT_READ | libc::PROT_EXEC,
             mapped_len
         ));
         // SAFETY: scalar syscall arguments describe a one-byte write probe.
@@ -581,7 +704,7 @@ mod tests {
         let expected = binding(2);
         let prepared = PrivateMemfd::new(1)
             .unwrap()
-            .prepare_receiver_writer(expected)
+            .prepare_receiver_writer_for_ordering_test(expected)
             .unwrap();
         let mapped_len = prepared.key.mapped_len;
         let (prepared, capability) = prepared.export_writer().unwrap();

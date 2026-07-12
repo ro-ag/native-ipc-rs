@@ -620,6 +620,14 @@ Kernel 6.3 is required because older ordinary memfds cannot enforce the
 hostile-peer non-execute guarantee. See the kernel's
 [`MFD_NOEXEC_SEAL` design](https://www.kernel.org/doc/html/latest/userspace-api/mfd_noexec.html).
 
+**Open blocking contradiction (2026-07-11):** native AMD64/Arm64 and local
+Linux Arm64 Docker probes show that an `MFD_NOEXEC_SEAL` object with
+`F_SEAL_EXEC` still permits both a new `PROT_EXEC` mapping and an executable
+`mprotect` upgrade of an existing writable mapping. The requirements below are
+not relaxed: current Linux preparation MUST fail closed before capability
+escape, and Linux release remains blocked until a normative amendment or a
+separately proven mandatory kernel containment mechanism resolves this gap.
+
 Memory uses `memfd_create(MFD_CLOEXEC | MFD_NOEXEC_SEAL)`, checked `ftruncate`,
 and verifies the implied `F_SEAL_EXEC` plus `F_SEAL_GROW | F_SEAL_SHRINK |
 F_SEAL_FUTURE_WRITE | F_SEAL_SEAL` in a correct order. Reader capabilities are
