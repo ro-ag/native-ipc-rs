@@ -141,6 +141,21 @@ pub(crate) struct LinuxReceiverWriterBatch {
     advice_failure_at: Option<usize>,
 }
 
+/// Coordinator-owned canonical native preparation for one arbitrary mixed
+/// direction batch. Each entry remains inside its direction-specific owner;
+/// this wrapper exposes neither descriptors nor mappings as separable parts.
+pub(crate) struct LinuxMixedDirectionBatch {
+    entries: Vec<LinuxMixedDirectionEntry>,
+    deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+enum LinuxMixedDirectionEntry {
+    CoordinatorWriter(LinuxCoordinatorWriterBatch),
+    ReceiverWriter(LinuxReceiverWriterBatch),
+}
+
 pub(crate) struct LinuxExpectedCoordinatorWriterBatch {
     entries: Vec<LinuxExpectedCoordinatorWriterEntry>,
     total_logical: u64,
@@ -657,6 +672,9 @@ impl LinuxReceiverWriterBatch {
     pub(crate) fn revalidate_prefix(&self) -> Result<(), MemfdError> {
         check_deadline(self.deadline)?;
         self.entries.iter().try_for_each(|entry| {
+            if entry.mapping.is_some() || entry.pending_mapping.is_some() {
+                return Err(MemfdError::WrongObject);
+            }
             if validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, PREFIX_SEALS)?
                 != entry.key
             {
@@ -830,6 +848,121 @@ impl LinuxReceiverWriterBatch {
                     seals => panic!("unexpected seal set {seals:#x}"),
                 }
             })
+    }
+}
+
+impl LinuxMixedDirectionBatch {
+    pub(crate) fn prepare(
+        batch: TransferBatch,
+        authority_profile: NativeAuthorityProfile,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        Self::prepare_inner(batch, authority_profile, deadline, None)
+    }
+
+    fn prepare_inner(
+        batch: TransferBatch,
+        authority_profile: NativeAuthorityProfile,
+        deadline: AbsoluteDeadline,
+        failure_at: Option<usize>,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if authority_profile != NativeAuthorityProfile::LinuxMdweV1 {
+            return Err(MemfdError::WrongProvenance);
+        }
+        let mut pending = batch.into_pending().map_err(|_| MemfdError::InvalidBatch)?;
+        pending
+            .regions
+            .sort_unstable_by_key(|region| region.spec().id);
+        let mut entries = Vec::with_capacity(pending.regions.len());
+        #[cfg(test)]
+        let mut prepare_ordinal = 0_usize;
+        #[cfg(not(test))]
+        let _ = failure_at;
+        for region in pending.regions {
+            check_deadline(deadline)?;
+            #[cfg(test)]
+            {
+                prepare_ordinal += 1;
+                if failure_at == Some(prepare_ordinal) {
+                    return Err(MemfdError::Native(libc::EIO));
+                }
+            }
+            let writer = region.spec().writer;
+            let mapped_len =
+                u64::try_from(region.mapped_len()).map_err(|_| MemfdError::InvalidSize)?;
+            let mut single =
+                TransferBatch::new(1, mapped_len).map_err(|_| MemfdError::InvalidBatch)?;
+            single.add(region).map_err(|_| MemfdError::InvalidBatch)?;
+            let entry = match writer {
+                WriterEndpoint::Coordinator => LinuxMixedDirectionEntry::CoordinatorWriter(
+                    LinuxCoordinatorWriterBatch::prepare(single, authority_profile, deadline)?,
+                ),
+                WriterEndpoint::Receiver => LinuxMixedDirectionEntry::ReceiverWriter(
+                    LinuxReceiverWriterBatch::prepare(single, authority_profile, deadline)?,
+                ),
+            };
+            entries.push(entry);
+        }
+        check_deadline(deadline)?;
+        Ok(Self {
+            entries,
+            deadline,
+            #[cfg(test)]
+            drop_observer: None,
+        })
+    }
+
+    pub(crate) fn manifest_entries(&self) -> Vec<ManifestEntry> {
+        self.entries
+            .iter()
+            .flat_map(|entry| match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.manifest_entries(),
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.manifest_entries(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn capabilities(&self) -> Vec<BorrowedFd<'_>> {
+        self.entries
+            .iter()
+            .flat_map(|entry| match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.capabilities(),
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.capabilities(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn revalidate_before_send(&self) -> Result<(), MemfdError> {
+        check_deadline(self.deadline)?;
+        for entry in &self.entries {
+            match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.revalidate()?,
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.revalidate_prefix()?,
+            }
+            check_deadline(self.deadline)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_with_failure_for_test(
+        batch: TransferBatch,
+        authority_profile: NativeAuthorityProfile,
+        deadline: AbsoluteDeadline,
+        failure_at: usize,
+    ) -> Result<Self, MemfdError> {
+        assert!((1..=16).contains(&failure_at));
+        Self::prepare_inner(batch, authority_profile, deadline, Some(failure_at))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
     }
 }
 
@@ -1353,6 +1486,15 @@ impl Drop for LinuxReceiverWriterBatch {
         #[cfg(test)]
         if let Some(observer) = &self.drop_observer {
             observer.lock().unwrap().push("receiver-writer-batch-drop");
+        }
+    }
+}
+
+impl Drop for LinuxMixedDirectionBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("mixed-direction-batch-drop");
         }
     }
 }

@@ -210,6 +210,16 @@ guard destruction. G1h does not combine writer directions, end the transaction,
 charge ongoing active leases, expose mappings, or implement batch READY/COMMIT
 or public APIs.
 
+Linux G1i-a introduces the private native owner needed before mixed accepted
+transfer. `LinuxMixedDirectionBatch` consumes one complete portable batch,
+canonicalizes it by region ID, and retains every entry inside its existing
+direction-specific native owner. Its only production observations are the
+canonical manifest entries, one borrowed capability view in that same order,
+the original absolute deadline, and whole-batch pre-send revalidation. It does
+not extract an fd or mapping, send on accepted control, perform IMPORTED/SEALED,
+or expose pending/runtime authority. The later mixed accepted reducer must
+consume this owner and preserve full-batch attenuation before mapping work.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

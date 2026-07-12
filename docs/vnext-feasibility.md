@@ -755,6 +755,29 @@ reducer, active resource leases, runtime exposure, public session/control APIs,
 physical Arm64, packaged-crate, release, and whole-vNext evidence remain
 outstanding.
 
+Phase 5i-G1i-a adds only the private coordinator-side native preparation owner
+required for a later arbitrary mixed-direction accepted transaction. One
+`LinuxMixedDirectionBatch` consumes 1..=16 portable entries, sorts them by
+`RegionId`, retains each coordinator-writer or receiver-writer entry inside its
+already reviewed direction-specific memfd owner, and produces one matching
+canonical capability order. Pre-send revalidation checks final seals for
+coordinator-writer entries and prefix seals plus absent coordinator writable
+views for receiver-writer entries under the original deadline. No raw fd,
+mapping, per-entry pending token, or replacement deadline escapes.
+
+Adjacent Arm64 Linux characterization covers 1/2/4/16 reverse-input batches,
+alternating directions, exact initialized bytes, exact per-direction seals and
+peer access, canonical ordinals/capability order, non-`Clone`/non-`Sync`
+ownership, local profile/expiry rejection, retained coordinator-mapping
+rejection, first/middle/final synthetic preparation failure, owner destruction,
+and exact fd/vNext-map baselines. The independent final adversarial review
+reports no P1/P2/P3. Exact implementation SHA and hosted CI are pending.
+
+G1i-a deliberately performs no accepted capability send or peer import. The
+mixed receiver expectation/import owner, complete-batch IMPORTED/SEALED
+attenuation, READY/COMMIT, active leases, runtime/public APIs, and release
+evidence remain outstanding.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
