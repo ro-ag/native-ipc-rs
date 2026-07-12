@@ -687,6 +687,40 @@ also fixed by checking every initialized logical byte and directly observing
 poison before native cleanup on abandonment and revalidation failure. Final
 re-review reports no P1/P2/P3.
 
+Phase 5i-G1g implements the first production receiver expectation and native
+import path for the coordinator-writer-only slice. `ExpectedBatch` is built and
+canonicalized before capability receipt from caller-known ID, writer direction,
+and logical length only. The accepted receiver preflights negotiated count,
+per-region, aggregate, and fresh-session active count/page-rounded byte limits
+before transaction entry. It then receives one exact fd count under the same
+absolute deadline, decodes the canonical fixed frame, and binds every accepted
+session, transaction, profile, limit, entry, access, length, ordinal, flag, and
+total field before importing.
+
+Each imported fd is immediately owned, verified as the exact final-sealed
+anonymous object shape, and mapped read-only. The terminal receiver transaction
+retains the complete imported set and exposes no raw frame, fd, mapping, or
+runtime region. Import failure returns an owning failure candidate containing
+all partial mappings plus the current and remaining installed fds; the accepted
+owner poisons first and only then destroys that candidate. Exact-child tests
+cover 1/2/4/16 success, expected logical substitution, local unsupported
+direction rejection, and invalid native objects at ordinals 1/2/4/16 with
+poison-before-cleanup and fd/map/child baselines. Injected post-`mmap` advisory
+failures at operations 1/17/32 additionally prove first/middle/final pending
+mapping ownership and poison-before-release ordering. The dependency commit
+`9b00e6813abdb81ecb4352c60647fc0b569a6c42` and accepted-import implementation
+`9e81e3f47d883aa9f9c18767fb6aecfdf3c2a481` are green across all ten hosted
+jobs in [Actions 29211825345](https://github.com/ro-ag/native-ipc-rs/actions/runs/29211825345).
+Local macOS Rust 1.97 and privileged seccomp-unconfined Rust 1.97 Arm64 Docker
+full gates pass; Docker remains container/emulation characterization only.
+Independent adversarial review corrected active-limit preflight and all
+pre-poison partial-import ownership gaps, including fallible advice and a legal
+address-zero `mmap`; final re-review reports no P1/P2/P3.
+
+G1g remains a terminal import checkpoint. It does not implement an ongoing
+active-resource charge/lease, receiver-writer preparation, IMPORTED/SEALED,
+READY/COMMIT, activation, public `ExpectedBatch`/session APIs, or release proof.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

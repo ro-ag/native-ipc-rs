@@ -176,6 +176,21 @@ the older raw-entry and prepared-batch test scaffolds. Linux-specific event
 tests also prove transport poison precedes native-batch cleanup on abandonment
 and injected pre-send revalidation failure.
 
+Linux G1g adds the complementary terminal receiver owner for
+coordinator-writer batches. A private application-neutral `ExpectedBatch` is
+canonical and complete before receipt but contains no coordinator-minted
+incarnation or native authority. The accepted receiver alone enters the
+transaction, performs one exact credential-bound receive for the expected fd
+count, decodes the fixed capability frame, and matches accepted session facts,
+transaction ID, authority profile, negotiated batch and fresh-session active
+limits, IDs, writer/access direction, logical/page-rounded lengths, ordinals,
+flags, and totals. It then verifies final seals and anonymous-object properties,
+creates only read-only mappings, and retains every fd/mapping inside the
+terminal transaction. Failed import ownership retains partial mappings and all
+remaining installed fds until after session poison. G1g does not yet charge an
+ongoing active-resource ledger, activate mappings, support receiver-writer
+entries, or implement IMPORTED/SEALED/READY/COMMIT or public receiver APIs.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte
