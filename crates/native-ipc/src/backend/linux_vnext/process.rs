@@ -917,8 +917,8 @@ mod tests {
         assert_ne!(event.revents & libc::POLLIN, 0);
         // SIGCHLD=SIG_IGN auto-reaped the child, but the atomic pidfd remains
         // readable. Kernels vary between retaining the clone-time PID in
-        // fdinfo and reporting -1 after reap; signal-zero authority must be
-        // gone regardless.
+        // fdinfo and reporting -1 after reap; signal-zero may likewise still
+        // succeed transiently or fail with ESRCH.
         // SAFETY: numeric PID is used only to prove there is no waitable child.
         assert_eq!(
             unsafe { libc::waitpid(result, core::ptr::null_mut(), libc::WNOHANG) },
@@ -929,19 +929,20 @@ mod tests {
             Some(libc::ECHILD)
         );
         // SAFETY: signal zero performs an existence/permission check only.
-        assert_eq!(
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pidfd.as_raw_fd(),
-                    0,
-                    core::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            },
-            -1
+        let signal_zero = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                0,
+                core::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        assert!(
+            signal_zero == 0
+                || (signal_zero == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
         );
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
         let reported_pid = pidfd_reported_pid(pidfd.as_raw_fd());
         assert!(reported_pid == -1 || reported_pid == i64::from(result));
         drop(pidfd);
