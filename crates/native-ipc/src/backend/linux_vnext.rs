@@ -942,6 +942,8 @@ mod tests {
         let packet = receive_until(&mut endpoint, 6, parent, 0).unwrap();
         assert_eq!(packet.bytes, b"parent");
         endpoint.send(b"child", &[]).unwrap();
+        let acknowledgement = receive_until(&mut endpoint, 3, parent, 0).unwrap();
+        assert_eq!(acknowledgement.bytes, b"ack");
     }
 
     #[test]
@@ -1028,6 +1030,7 @@ mod tests {
             packet.credentials.pid,
             cached_peer_credentials(&parent_endpoint.endpoint).pid
         );
+        parent_endpoint.send_before(b"ack", &[], deadline).unwrap();
         assert!(child.wait().unwrap().success());
         let mut poll = libc::pollfd {
             fd: parent_endpoint.peer_pidfd.as_raw_fd(),
