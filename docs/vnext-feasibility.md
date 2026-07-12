@@ -451,6 +451,45 @@ a public `Ready`, session, or control API. It creates no batch, mapping, or
 memory authority. Packaged-crate, physical Arm64, exact-release-commit, and
 whole-vNext release evidence remain unverified.
 
+Phase 5i-G1a consumes the role-scoped Accepted Linux evidence owners into
+private native application-control owners. The coordinator transport alone
+inseparably owns the singular clone-time lifecycle pidfd, held executable,
+accepted evidence, seqpacket endpoint, and `OwnedChildLifecycle`. The receiver
+transport owns only authenticated spawning-parent evidence and its endpoint.
+It has no parent pidfd, image, or exit-code proof; it observes socket HUP and
+reports only `ExitedUnknown`.
+
+Every application-control record uses the original caller-supplied absolute
+deadline and requires exact directional `SCM_CREDENTIALS`. It permits zero
+`SCM_RIGHTS`; every injected installed fd is nevertheless adopted and closed
+before rejection. Receive remains one independently bounded `recvmsg` with no
+`MSG_PEEK`, using the negotiated 65,464-byte payload maximum and reusing the
+owned record allocation after validation. A valid record queued before
+dispatcher construction remains queued. Hostile framing, credentials, rights,
+replay, oversize, silence, and ambiguous I/O persistently poison the control
+owner.
+
+Linux `SOCK_SEQPACKET` distinguishes a live zero-length record from EOF only
+after the empty record has been consumed: a live empty record is malformed,
+while actual socket HUP is peer exit. Failure of that post-consumption
+diagnostic poll, including `EINTR`, is terminal so the caller never retries a
+second `recvmsg` and silently consumes the next queued record.
+
+Exact implementation commit `a26e1df71fccf44540a174a4994cd421668b5700`
+is green across all ten jobs in
+[Actions 29204483739](https://github.com/ro-ag/native-ipc-rs/actions/runs/29204483739),
+including native hosted Linux AMD64/Arm64 and ASan plus non-Linux and auxiliary
+gates. The hosted Linux Arm64 result is not physical user-owned Arm64 evidence.
+Local macOS Rust 1.97 gates are green. Privileged, seccomp-unconfined Arm64
+Docker full and focused runs pass as characterization only, not native-host,
+physical Arm64, or release evidence. Independent final review reports no
+issue. This remains private G1a: it exposes no public `Ready`, session, or
+control API and transfers no native batch `SCM_RIGHTS`. It creates no
+transaction, mapping, or memory authority; cannot revoke a delegated endpoint;
+and supplies no receiver-side exact parent pidfd, image, or exit-code proof.
+Physical Arm64, packaged-crate, exact-release, and whole-vNext evidence remain
+unverified.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
