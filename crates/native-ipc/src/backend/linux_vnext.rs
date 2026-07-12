@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::protocol::CONTROL_FRAME_LEN;
+use crate::session::AbsoluteDeadline;
 
 const MAX_PACKET_FDS: usize = 16;
 const CONTROL_CAPACITY: usize = 256;
@@ -46,6 +47,11 @@ enum PacketError {
     MalformedAncillary,
     WrongPeer,
     WrongDescriptorCount,
+    DeadlineExpired,
+    AmbiguousAfterSend,
+    AmbiguousAfterReceive,
+    Poisoned,
+    PeerExited,
     Native(i32),
 }
 
@@ -58,6 +64,24 @@ struct ReceivedPacket {
 struct SeqPacketEndpoint {
     fd: OwnedFd,
     not_sync: PhantomData<Cell<()>>,
+}
+
+struct ProcessBoundEndpoint {
+    endpoint: SeqPacketEndpoint,
+    peer_pidfd: OwnedFd,
+    peer: PacketCredentials,
+    poisoned: bool,
+    #[cfg(test)]
+    faults: DeadlineFaults,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DeadlineFaults {
+    send_interrupts: u8,
+    receive_interrupts: u8,
+    expire_after_send: bool,
+    expire_after_receive: bool,
 }
 
 impl SeqPacketEndpoint {
@@ -319,6 +343,248 @@ impl SeqPacketEndpoint {
     }
 }
 
+impl ProcessBoundEndpoint {
+    /// # Safety
+    ///
+    /// `peer_pidfd` must identify the exact process whose kernel packet
+    /// credentials are `peer`. `endpoint` must be the locally retained end of
+    /// the exact socketpair whose connected counterpart was inherited by that
+    /// process. The topology proof, process handle, credentials, and local
+    /// endpoint remain inseparable.
+    unsafe fn from_verified_process(
+        endpoint: SeqPacketEndpoint,
+        peer_pidfd: OwnedFd,
+        peer: PacketCredentials,
+    ) -> Self {
+        Self {
+            endpoint,
+            peer_pidfd,
+            peer,
+            poisoned: false,
+            #[cfg(test)]
+            faults: DeadlineFaults::default(),
+        }
+    }
+
+    fn send_before(
+        &mut self,
+        bytes: &[u8],
+        descriptors: &[RawFd],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), PacketError> {
+        if self.poisoned {
+            return Err(PacketError::Poisoned);
+        }
+        loop {
+            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
+            if deadline.is_expired() {
+                return Err(PacketError::DeadlineExpired);
+            }
+            let result = if self.inject_send_interrupt() {
+                Err(PacketError::Interrupted)
+            } else {
+                self.endpoint.send(bytes, descriptors)
+            };
+            match result {
+                Ok(()) => {
+                    self.inject_expiry_after_send(deadline);
+                    if deadline.is_expired() {
+                        self.poisoned = true;
+                        return Err(PacketError::AmbiguousAfterSend);
+                    }
+                    return Ok(());
+                }
+                Err(PacketError::WouldBlock) => poll_until(
+                    self.endpoint.fd.as_raw_fd(),
+                    self.peer_pidfd.as_raw_fd(),
+                    libc::POLLOUT,
+                    deadline,
+                )?,
+                Err(PacketError::Interrupted) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn receive_before(
+        &mut self,
+        expected_len: usize,
+        expected_descriptors: usize,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ReceivedPacket, PacketError> {
+        if self.poisoned {
+            return Err(PacketError::Poisoned);
+        }
+        loop {
+            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
+            if deadline.is_expired() {
+                return Err(PacketError::DeadlineExpired);
+            }
+            let result = if self.inject_receive_interrupt() {
+                Err(PacketError::Interrupted)
+            } else {
+                self.endpoint
+                    .receive(expected_len, self.peer, expected_descriptors)
+            };
+            match result {
+                Ok(packet) => {
+                    self.inject_expiry_after_receive(deadline);
+                    if deadline.is_expired() {
+                        self.poisoned = true;
+                        return Err(PacketError::AmbiguousAfterReceive);
+                    }
+                    return Ok(packet);
+                }
+                Err(PacketError::WouldBlock) => poll_until(
+                    self.endpoint.fd.as_raw_fd(),
+                    self.peer_pidfd.as_raw_fd(),
+                    libc::POLLIN,
+                    deadline,
+                )?,
+                Err(PacketError::Interrupted) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_send_interrupt(&mut self) -> bool {
+        if self.faults.send_interrupts == 0 {
+            false
+        } else {
+            self.faults.send_interrupts -= 1;
+            true
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn inject_send_interrupt(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn inject_receive_interrupt(&mut self) -> bool {
+        if self.faults.receive_interrupts == 0 {
+            false
+        } else {
+            self.faults.receive_interrupts -= 1;
+            true
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn inject_receive_interrupt(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn inject_expiry_after_send(&mut self, deadline: AbsoluteDeadline) {
+        if self.faults.expire_after_send {
+            self.faults.expire_after_send = false;
+            while !deadline.is_expired() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn inject_expiry_after_send(&mut self, _: AbsoluteDeadline) {}
+
+    #[cfg(test)]
+    fn inject_expiry_after_receive(&mut self, deadline: AbsoluteDeadline) {
+        if self.faults.expire_after_receive {
+            self.faults.expire_after_receive = false;
+            while !deadline.is_expired() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn inject_expiry_after_receive(&mut self, _: AbsoluteDeadline) {}
+}
+
+fn ensure_running(pidfd: RawFd, deadline: AbsoluteDeadline) -> Result<(), PacketError> {
+    if pidfd < 0 {
+        return Err(PacketError::InvalidInput);
+    }
+    loop {
+        if deadline.is_expired() {
+            return Err(PacketError::DeadlineExpired);
+        }
+        let mut peer = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `peer` points to one initialized poll entry.
+        let result = unsafe { libc::poll(&mut peer, 1, 0) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(last_native());
+        }
+        if result != 0 || peer.revents != 0 {
+            return Err(PacketError::PeerExited);
+        }
+        return Ok(());
+    }
+}
+
+fn poll_until(
+    socket: RawFd,
+    pidfd: RawFd,
+    requested: libc::c_short,
+    deadline: AbsoluteDeadline,
+) -> Result<(), PacketError> {
+    if socket < 0 || pidfd < 0 {
+        return Err(PacketError::InvalidInput);
+    }
+    loop {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            return Err(PacketError::DeadlineExpired);
+        }
+        let timeout = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as libc::c_int;
+        let mut descriptors = [
+            libc::pollfd {
+                fd: socket,
+                events: requested,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: both initialized entries remain live for the complete call.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        if result < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(last_native());
+        }
+        if deadline.is_expired() {
+            return Err(PacketError::DeadlineExpired);
+        }
+        if descriptors[1].revents != 0 {
+            return Err(PacketError::PeerExited);
+        }
+        if descriptors[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(PacketError::PeerExited);
+        }
+        if descriptors[0].revents & requested != 0 {
+            return Ok(());
+        }
+    }
+}
+
 fn enable_passcred(fd: RawFd) -> Result<(), PacketError> {
     let enabled: libc::c_int = 1;
     // SAFETY: the scalar option value has the documented size.
@@ -378,6 +644,8 @@ mod tests {
 
     assert_impl_all!(SeqPacketEndpoint: Send);
     assert_not_impl_any!(SeqPacketEndpoint: Sync, Clone);
+    assert_impl_all!(ProcessBoundEndpoint: Send);
+    assert_not_impl_any!(ProcessBoundEndpoint: Sync, Clone);
 
     fn current_credentials() -> PacketCredentials {
         PacketCredentials {
@@ -463,6 +731,36 @@ mod tests {
         }
     }
 
+    fn open_pidfd(pid: u32) -> OwnedFd {
+        // SAFETY: pidfd_open has scalar arguments and returns a new fd.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as RawFd;
+        assert!(raw >= 0);
+        // SAFETY: successful pidfd_open returned a new owned descriptor.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    fn self_bound_pair() -> (ProcessBoundEndpoint, ProcessBoundEndpoint) {
+        let (left, right) = SeqPacketEndpoint::pair().unwrap();
+        let credentials = current_credentials();
+        // SAFETY: both socket peers and pidfds name this exact test process.
+        let left = unsafe {
+            ProcessBoundEndpoint::from_verified_process(
+                left,
+                open_pidfd(std::process::id()),
+                credentials,
+            )
+        };
+        // SAFETY: both socket peers and pidfds name this exact test process.
+        let right = unsafe {
+            ProcessBoundEndpoint::from_verified_process(
+                right,
+                open_pidfd(std::process::id()),
+                credentials,
+            )
+        };
+        (left, right)
+    }
+
     #[test]
     fn one_packet_has_exact_credentials_and_zero_to_sixteen_owned_fds() {
         let (mut sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
@@ -481,6 +779,101 @@ mod tests {
                 assert_ne!(flags & libc::FD_CLOEXEC, 0);
             }
         }
+    }
+
+    #[test]
+    fn one_absolute_deadline_bounds_nonblocking_send_receive_and_silence() {
+        let (mut sender, mut receiver) = self_bound_pair();
+        let deadline = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+        sender.send_before(b"packet", &[], deadline).unwrap();
+        let packet = receiver.receive_before(6, 0, deadline).unwrap();
+        assert_eq!(packet.bytes, b"packet");
+
+        let started = Instant::now();
+        let silence = AbsoluteDeadline::after(Duration::from_millis(25)).unwrap();
+        assert!(matches!(
+            receiver.receive_before(6, 0, silence),
+            Err(PacketError::DeadlineExpired)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(1));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn saturated_send_recomputes_one_deadline_while_pollout_stays_blocked() {
+        let (mut sender, _receiver) = SeqPacketEndpoint::pair().unwrap();
+        let packet = [0_u8; CONTROL_FRAME_LEN];
+        let mut saturated = false;
+        for _ in 0..100_000 {
+            match sender.send(&packet, &[]) {
+                Ok(()) => {}
+                Err(PacketError::WouldBlock) => {
+                    saturated = true;
+                    break;
+                }
+                Err(PacketError::Interrupted) => {}
+                Err(error) => panic!("unexpected saturation error: {error:?}"),
+            }
+        }
+        assert!(saturated, "bounded socket send queue never saturated");
+        // SAFETY: the connected peer and pidfd both name this exact process.
+        let mut sender = unsafe {
+            ProcessBoundEndpoint::from_verified_process(
+                sender,
+                open_pidfd(std::process::id()),
+                current_credentials(),
+            )
+        };
+        let started = Instant::now();
+        let deadline = AbsoluteDeadline::after(Duration::from_millis(25)).unwrap();
+        assert!(matches!(
+            sender.send_before(&packet, &[], deadline),
+            Err(PacketError::DeadlineExpired)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(1));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn injected_eintr_retries_and_late_io_has_ambiguous_terminal_errors() {
+        let (mut sender, mut receiver) = self_bound_pair();
+        sender.faults.send_interrupts = 2;
+        receiver.faults.receive_interrupts = 2;
+        let deadline = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+        sender.send_before(b"eintr!", &[], deadline).unwrap();
+        assert_eq!(
+            receiver.receive_before(6, 0, deadline).unwrap().bytes,
+            b"eintr!"
+        );
+
+        sender.faults.expire_after_send = true;
+        let deadline = AbsoluteDeadline::after(Duration::from_millis(5)).unwrap();
+        assert_eq!(
+            sender.send_before(b"late-s", &[], deadline),
+            Err(PacketError::AmbiguousAfterSend)
+        );
+        let fresh = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            receiver.receive_before(6, 0, fresh).unwrap().bytes,
+            b"late-s"
+        );
+        assert_eq!(
+            sender.send_before(b"again!", &[], fresh),
+            Err(PacketError::Poisoned)
+        );
+
+        let (mut second_sender, mut second_receiver) = self_bound_pair();
+        second_sender.send_before(b"late-r", &[], fresh).unwrap();
+        second_receiver.faults.expire_after_receive = true;
+        let deadline = AbsoluteDeadline::after(Duration::from_millis(5)).unwrap();
+        assert!(matches!(
+            second_receiver.receive_before(6, 0, deadline),
+            Err(PacketError::AmbiguousAfterReceive)
+        ));
+        assert!(matches!(
+            second_receiver.receive_before(6, 0, fresh),
+            Err(PacketError::Poisoned)
+        ));
     }
 
     #[test]
@@ -552,8 +945,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawned as an immediate pidfd-exit helper"]
+    fn immediate_exit_helper() {}
+
+    #[test]
+    fn retained_pidfd_wakes_a_long_socket_wait_on_peer_exit() {
+        let (_sender, receiver) = SeqPacketEndpoint::pair().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "backend::linux_vnext::tests::immediate_exit_helper",
+                "--ignored",
+            ])
+            .spawn()
+            .unwrap();
+        let pidfd = open_pidfd(child.id());
+        let started = Instant::now();
+        let deadline = AbsoluteDeadline::after(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            poll_until(
+                receiver.fd.as_raw_fd(),
+                pidfd.as_raw_fd(),
+                libc::POLLIN,
+                deadline
+            ),
+            Err(PacketError::PeerExited)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
     fn spawned_packet_credentials_match_exact_child_and_retained_pidfd() {
-        let (mut parent_endpoint, child_endpoint) = SeqPacketEndpoint::pair().unwrap();
+        let (parent_endpoint, child_endpoint) = SeqPacketEndpoint::pair().unwrap();
         let source = child_endpoint.fd.as_raw_fd();
         let parent = current_credentials();
         assert_eq!(cached_peer_credentials(&parent_endpoint), parent);
@@ -585,25 +1010,27 @@ mod tests {
             uid: parent.uid,
             gid: parent.gid,
         };
-        // SAFETY: pidfd_open has scalar arguments and returns a new fd.
-        let raw_pidfd =
-            unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) } as RawFd;
-        assert!(raw_pidfd >= 0);
-        // SAFETY: successful pidfd_open returned a new owned descriptor.
-        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+        let pidfd = open_pidfd(child.id());
         drop(child_endpoint);
-
-        parent_endpoint.send(b"parent", &[]).unwrap();
-        let packet = receive_until(&mut parent_endpoint, 5, child_credentials, 0).unwrap();
+        // SAFETY: the packet topology, expected credentials, Child ID, and
+        // freshly opened pidfd all identify this exact live helper.
+        let mut parent_endpoint = unsafe {
+            ProcessBoundEndpoint::from_verified_process(parent_endpoint, pidfd, child_credentials)
+        };
+        let deadline = AbsoluteDeadline::after(Duration::from_secs(10)).unwrap();
+        parent_endpoint
+            .send_before(b"parent", &[], deadline)
+            .unwrap();
+        let packet = parent_endpoint.receive_before(5, 0, deadline).unwrap();
         assert_eq!(packet.bytes, b"child");
         assert_eq!(packet.credentials.pid, child.id());
         assert_ne!(
             packet.credentials.pid,
-            cached_peer_credentials(&parent_endpoint).pid
+            cached_peer_credentials(&parent_endpoint.endpoint).pid
         );
         assert!(child.wait().unwrap().success());
         let mut poll = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
+            fd: parent_endpoint.peer_pidfd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
