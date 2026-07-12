@@ -24,6 +24,8 @@ mod batch;
 pub mod memory;
 /// Platform-neutral consuming region ownership states.
 pub mod region;
+/// Finite session limits, target capabilities, and absolute deadlines.
+pub mod session;
 
 mod backend;
 mod protocol;
