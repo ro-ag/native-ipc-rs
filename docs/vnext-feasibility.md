@@ -743,8 +743,11 @@ SEALED wire records, continuous wrong-kind traffic, invalid objects at ordinals
 1/2/4/16, Nth final-seal failure at 1/2/4/16, first/middle/final receiver and
 coordinator post-`mmap` advisory failures, receiver final-seal revalidation
 failure, persistent poison, poison-before-native-cleanup, and fd/map/child/task
-baselines. The independent final adversarial review reports no P1/P2/P3.
-Exact implementation SHA and hosted CI evidence are pending.
+baselines. Exact implementation `3914dc18d6e3efcefdbc2f28487563932cb06703`
+is green in all ten hosted jobs in
+[Actions 29213561283](https://github.com/ro-ag/native-ipc-rs/actions/runs/29213561283),
+including native Linux AMD64/Arm64 and Linux AMD64 ASan. The independent final
+adversarial review reports no P1/P2/P3.
 
 G1h is not READY or COMMIT. It supports receiver-writer-only batches in this
 checkpoint; mixed-direction composition, the single full-batch READY/COMMIT
