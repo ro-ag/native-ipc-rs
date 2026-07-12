@@ -369,7 +369,10 @@ fn bootstrap_dirs() -> std::collections::BTreeSet<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("native-ipc-"))
+                .and_then(|name| name.strip_prefix("native-ipc-"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
         })
         .collect()
 }
