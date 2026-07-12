@@ -1,11 +1,15 @@
+use super::super::memory::{LinuxCoordinatorWriterBatch, MemfdError};
 use super::*;
-use crate::backend::accepted_control::AcceptedControlError;
+use crate::backend::accepted_control::{AcceptedControlError, LinuxCapabilityBatchError};
+use crate::batch::TransferBatch;
 use crate::control::{ControlError, ControlFrame, ControlState};
 use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
+use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PR_GET_MDWE: libc::c_int = 66;
@@ -78,6 +82,58 @@ fn native_capability_frame(transaction: u64, count: usize) -> CapabilityFrame {
         .collect();
     let manifest = TransferManifest::new([0x41; 32], 10, 11, transaction, entries).unwrap();
     CapabilityFrame::from_manifest(&manifest)
+}
+
+fn portable_coordinator_writer_batch(count: usize) -> TransferBatch {
+    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    for id in (1..=count).rev() {
+        let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
+        region.initialize(|bytes| bytes.fill(id as u8));
+        batch
+            .add(
+                region
+                    .prepare(RegionSpec {
+                        id: RegionId::new(id as u128).unwrap(),
+                        writer: WriterEndpoint::Coordinator,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    batch
+}
+
+fn encode_test_batch_entries(entries: &[ManifestEntry]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + entries.len() * 52);
+    bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(&entry.region_id.to_le_bytes());
+        bytes.extend_from_slice(&entry.incarnation);
+        bytes.extend_from_slice(&entry.writer.to_le_bytes());
+        bytes.extend_from_slice(&entry.logical_len.to_le_bytes());
+        bytes.extend_from_slice(&entry.mapped_len.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_test_batch_entries(bytes: &[u8]) -> Vec<ManifestEntry> {
+    assert!(bytes.len() >= 2);
+    let count = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as usize;
+    assert_eq!(bytes.len(), 2 + count * 52);
+    bytes[2..]
+        .chunks_exact(52)
+        .map(|entry| {
+            let native = NativeRegionSpec::new(
+                u128::from_le_bytes(entry[..16].try_into().unwrap()),
+                entry[16..32].try_into().unwrap(),
+                u32::from_le_bytes(entry[32..36].try_into().unwrap()),
+                u64::from_le_bytes(entry[36..44].try_into().unwrap()) as usize,
+                u64::from_le_bytes(entry[44..52].try_into().unwrap()) as usize,
+            )
+            .unwrap();
+            ManifestEntry::from_native(native, PeerAccess::ReadOnly)
+        })
+        .collect()
 }
 
 fn local_packet_credentials() -> PacketCredentials {
@@ -577,6 +633,74 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 unsafe { libc::pause() };
             }
         }
+        "coordinator-writer-batch" => {
+            let mut control = evidence.into_control().unwrap();
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"ready".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            let metadata = control.receive(deadline()).unwrap();
+            let expected = decode_test_batch_entries(&metadata.payload);
+            let expected_copy = expected.clone();
+            let mut transaction = control
+                .await_capability_transaction(expected, deadline())
+                .unwrap();
+            let received = transaction.receive().unwrap();
+            assert_eq!(received.descriptors.len(), expected_copy.len());
+            let final_seals = 0x20
+                | libc::F_SEAL_GROW
+                | libc::F_SEAL_SHRINK
+                | libc::F_SEAL_FUTURE_WRITE
+                | libc::F_SEAL_SEAL;
+            for (descriptor, entry) in received.descriptors.iter().zip(&expected_copy) {
+                // SAFETY: scalar fcntl query on a live received descriptor.
+                assert_eq!(
+                    unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) },
+                    final_seals
+                );
+                let len = entry.mapped_len as usize;
+                // SAFETY: the exact received memfd and manifest length describe
+                // one read-only shared mapping.
+                let reader = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        descriptor.as_raw_fd(),
+                        0,
+                    )
+                };
+                assert_ne!(reader, libc::MAP_FAILED);
+                // SAFETY: the live mapping contains at least one logical byte.
+                assert_eq!(
+                    unsafe { core::ptr::read_volatile(reader.cast::<u8>()) },
+                    entry.region_id as u8
+                );
+                // SAFETY: the mapping is live for this exact range.
+                assert_eq!(unsafe { libc::munmap(reader, len) }, 0);
+                // SAFETY: final future-write seals must reject this mapping.
+                let writer = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        descriptor.as_raw_fd(),
+                        0,
+                    )
+                };
+                assert_eq!(writer, libc::MAP_FAILED);
+            }
+            drop(transaction);
+            drop(control);
+            std::process::exit(0);
+        }
         "rights" => {
             let bytes = raw_frame(1);
             // SAFETY: successful open returns one uniquely owned descriptor.
@@ -964,6 +1088,158 @@ fn isolated_accepted_native_control_is_bounded_authenticated_and_role_scoped() {
 fn accepted_native_control_is_bounded_authenticated_and_role_scoped() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_accepted_native_control_is_bounded_authenticated_and_role_scoped",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by coordinator_writer_batches_share_the_accepted_owner"]
+fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+
+    let (mut mismatch, pid) = accepted_control("echo", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+    assert_eq!(mismatch.receive(deadline()).unwrap().payload, b"ready");
+    let original_deadline = deadline();
+    let prepared = LinuxCoordinatorWriterBatch::prepare(
+        portable_coordinator_writer_batch(1),
+        mismatch.authority_profile(),
+        original_deadline,
+    )
+    .unwrap();
+    let replacement_deadline = AbsoluteDeadline::after(Duration::from_secs(4)).unwrap();
+    assert!(matches!(
+        mismatch.begin_linux_coordinator_writer_batch(prepared, replacement_deadline),
+        Err(LinuxCapabilityBatchError::Memory(
+            MemfdError::DeadlineMismatch
+        ))
+    ));
+    mismatch
+        .send(
+            &ControlFrame {
+                kind: APPLICATION_CONTROL_KIND,
+                payload: Vec::new(),
+            },
+            original_deadline,
+        )
+        .unwrap();
+    assert!(
+        mismatch
+            .receive(original_deadline)
+            .unwrap()
+            .payload
+            .is_empty()
+    );
+    mismatch.terminate_and_reap(deadline()).unwrap();
+    drop(mismatch);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    for count in [1, 2, 4, 16] {
+        let (mut control, pid) =
+            accepted_control("coordinator-writer-batch", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        let operation_deadline = deadline();
+        let prepared = LinuxCoordinatorWriterBatch::prepare(
+            portable_coordinator_writer_batch(count),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        let metadata = encode_test_batch_entries(&prepared.manifest_entries());
+        control
+            .send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: metadata,
+                },
+                operation_deadline,
+            )
+            .unwrap();
+        {
+            let mut transaction = control
+                .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.send().unwrap();
+        }
+        assert_eq!(
+            control.send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: Vec::new(),
+                },
+                deadline(),
+            ),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+}
+
+#[test]
+fn coordinator_writer_batches_share_the_accepted_owner() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_coordinator_writer_batches_share_the_accepted_owner",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by coordinator_writer_batch_poison_precedes_native_cleanup"]
+fn isolated_coordinator_writer_batch_poison_precedes_native_cleanup() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+
+    for revalidation_failure in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control("echo", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxCoordinatorWriterBatch::prepare(
+            portable_coordinator_writer_batch(2),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        if revalidation_failure {
+            prepared.fail_revalidation_for_test();
+        }
+        {
+            let mut transaction = control
+                .begin_linux_coordinator_writer_batch(prepared, operation_deadline)
+                .unwrap();
+            if revalidation_failure {
+                assert_eq!(
+                    transaction.send(),
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::WrongObject))
+                );
+            }
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "native-batch-drop"]
+        );
+        assert_eq!(
+            control.send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: Vec::new(),
+                },
+                deadline(),
+            ),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+}
+
+#[test]
+fn coordinator_writer_batch_poison_precedes_native_cleanup() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_coordinator_writer_batch_poison_precedes_native_cleanup",
     );
 }
 

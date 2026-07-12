@@ -2,10 +2,17 @@ use super::{
     AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
+#[cfg(test)]
 use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
 use crate::protocol::{CapabilityFrame, ManifestEntry, TransferManifest};
 use crate::session::AbsoluteDeadline;
+
+#[cfg(target_os = "linux")]
+use super::linux_vnext::{
+    memory::{LinuxCoordinatorWriterBatch, MemfdError},
+    spawn::CoordinatorLinuxControlTransport,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcceptedControlError {
@@ -40,9 +47,23 @@ pub(crate) struct CoordinatorCapabilityTransaction<'a, T: CoordinatorCapabilityT
 
 /// Coordinator transaction that inseparably retains every portable prepared
 /// region whose metadata formed the native capability frame.
+#[cfg(test)]
 pub(crate) struct CoordinatorPreparedBatchTransaction<'a, T: CoordinatorCapabilityTransport> {
     transaction: CoordinatorCapabilityTransaction<'a, T>,
     _batch: PendingBatch,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxCoordinatorWriterTransaction<'a> {
+    transaction: CoordinatorCapabilityTransaction<'a, CoordinatorLinuxControlTransport>,
+    _batch: LinuxCoordinatorWriterBatch,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxCapabilityBatchError {
+    Memory(MemfdError),
+    Control(AcceptedControlError),
 }
 
 /// Receiver-owned open native transaction and its immediately owned imports.
@@ -170,6 +191,10 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         }
     }
 
+    pub(crate) const fn authority_profile(&self) -> crate::protocol::NativeAuthorityProfile {
+        self.parameters.authority_profile()
+    }
+
     fn poison_both(&mut self) {
         self.state.poison();
         self.transport.poison();
@@ -177,6 +202,7 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
 }
 
 impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
+    #[cfg(test)]
     pub(crate) fn begin_prepared_batch(
         &mut self,
         batch: TransferBatch,
@@ -218,6 +244,7 @@ impl<T: CoordinatorCapabilityTransport> AcceptedControlDispatcher<T> {
     }
 }
 
+#[cfg(test)]
 impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, T> {
     pub(crate) fn send(
         &mut self,
@@ -229,6 +256,63 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, 
     #[cfg(test)]
     pub(crate) fn complete_for_test(self) {
         self.transaction.complete_for_test();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
+    #[cfg(test)]
+    pub(crate) fn observe_linux_poison_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.transport.observe_poison_for_test(observer);
+    }
+
+    pub(crate) fn begin_linux_coordinator_writer_batch(
+        &mut self,
+        batch: LinuxCoordinatorWriterBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxCoordinatorWriterTransaction<'_>, LinuxCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+        {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::WrongProvenance,
+            ));
+        }
+        if batch.deadline() != deadline {
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::DeadlineMismatch,
+            ));
+        }
+        let frame = self
+            .begin_native_transaction(batch.manifest_entries(), deadline)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        Ok(LinuxCoordinatorWriterTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            _batch: batch,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCoordinatorWriterTransaction<'_> {
+    pub(crate) fn send(&mut self) -> Result<(), LinuxCapabilityBatchError> {
+        if let Err(error) = self._batch.revalidate() {
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Memory(error));
+        }
+        let capabilities = self._batch.capabilities();
+        self.transaction
+            .send(&capabilities)
+            .map_err(LinuxCapabilityBatchError::Control)
     }
 }
 

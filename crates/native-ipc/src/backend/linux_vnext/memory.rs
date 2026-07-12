@@ -7,6 +7,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::{Ordering, compiler_fence};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use crate::backend::linux::QuiescentRegion;
 use crate::batch::TransferBatch;
@@ -112,6 +114,10 @@ struct VmMapping {
 pub(crate) struct LinuxCoordinatorWriterBatch {
     entries: Vec<LinuxCoordinatorWriterEntry>,
     deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    revalidation_fault: bool,
 }
 
 struct LinuxCoordinatorWriterEntry {
@@ -379,7 +385,14 @@ impl LinuxCoordinatorWriterBatch {
             entries.push(LinuxCoordinatorWriterEntry { native, prepared });
         }
         check_deadline(deadline)?;
-        Ok(Self { entries, deadline })
+        Ok(Self {
+            entries,
+            deadline,
+            #[cfg(test)]
+            drop_observer: None,
+            #[cfg(test)]
+            revalidation_fault: false,
+        })
     }
 
     pub(crate) fn manifest_entries(&self) -> Vec<ManifestEntry> {
@@ -397,6 +410,10 @@ impl LinuxCoordinatorWriterBatch {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), MemfdError> {
+        #[cfg(test)]
+        if self.revalidation_fault {
+            return Err(MemfdError::WrongObject);
+        }
         check_deadline(self.deadline)?;
         self.entries.iter().try_for_each(|entry| {
             entry.prepared.revalidate(self.deadline)?;
@@ -406,6 +423,25 @@ impl LinuxCoordinatorWriterBatch {
 
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
         self.deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_revalidation_for_test(&mut self) {
+        self.revalidation_fault = true;
+    }
+}
+
+impl Drop for LinuxCoordinatorWriterBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("native-batch-drop");
+        }
     }
 }
 

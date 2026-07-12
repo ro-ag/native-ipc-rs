@@ -1,8 +1,8 @@
 //! vNext Linux anonymous packet transport primitives.
 
-mod memory;
+pub(crate) mod memory;
 mod process;
-mod spawn;
+pub(crate) mod spawn;
 
 use core::cell::Cell;
 use core::marker::PhantomData;

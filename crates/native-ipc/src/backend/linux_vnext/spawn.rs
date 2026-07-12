@@ -8,6 +8,8 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use crate::backend::accepted_control::AcceptedControlDispatcher;
 use crate::backend::{
@@ -175,13 +177,15 @@ struct ReceiverAcceptedEvidenceOwner {
     not_sync: PhantomData<Cell<()>>,
 }
 
-struct CoordinatorLinuxControlTransport {
+pub(crate) struct CoordinatorLinuxControlTransport {
     lifecycle: Option<ExactChildLifecycle>,
     endpoint: SeqPacketEndpoint,
     _executable: HeldExecutable,
     _evidence: CoordinatorAcceptedEvidence,
     peer: PacketCredentials,
     poisoned: bool,
+    #[cfg(test)]
+    poison_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -629,6 +633,8 @@ impl CoordinatorAcceptedEvidenceOwner {
                 gid: facts.child_gid(),
             },
             poisoned: false,
+            #[cfg(test)]
+            poison_observer: None,
             not_sync: PhantomData,
         };
         match AcceptedControlDispatcher::new(transport, parameters) {
@@ -724,6 +730,17 @@ impl AuthenticatedZeroRightsTransport for CoordinatorLinuxControlTransport {
 
     fn poison(&mut self) {
         self.poisoned = true;
+        #[cfg(test)]
+        if let Some(observer) = &self.poison_observer {
+            observer.lock().unwrap().push("poison");
+        }
+    }
+}
+
+#[cfg(test)]
+impl CoordinatorLinuxControlTransport {
+    pub(crate) fn observe_poison_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.poison_observer = Some(observer);
     }
 }
 
