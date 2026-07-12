@@ -141,12 +141,13 @@ returned child while live and remains readable after automatic reap.
 Post-reap diagnostics vary by kernel and timing: signal zero may still succeed
 or fail with `ESRCH`, and fdinfo may retain the clone-time PID or report `-1`.
 None of those diagnostic forms is treated as continued process authority; the
-authoritative post-reap assertion is that `waitpid` reports `ECHILD`. It passed
-Linux Arm64 Docker only with seccomp unconfined; Docker's default profile
-returned synthetic `ENOSYS`. This probe does not exec, install MDWE, own
-cleanup, mint a receipt, or provide native release evidence. Production work
-must build the preallocated async-signal-safe MDWE/exec/error-pipe path around
-this atomic primitive and execute it on native AMD64/Arm64 runners.
+authoritative post-reap assertion is that `waitpid` reports `ECHILD`. Docker
+Arm64 required an unconfined seccomp profile because its default profile
+returned synthetic `ENOSYS`. Exact native AMD64/Arm64, ASan, and auxiliary CI
+passed in [Actions 29181676361](https://github.com/ro-ag/native-ipc-rs/actions/runs/29181676361).
+This probe does not exec, install MDWE, own cleanup, or mint a receipt.
+Production work must build the preallocated async-signal-safe
+MDWE/exec/error-pipe path around this atomic primitive.
 
 Until that durable lifecycle owner exists, Linux image identity cannot mint the
 final authenticated-endpoint receipt. This blocks the safe session constructor;
