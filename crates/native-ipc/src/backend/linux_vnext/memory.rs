@@ -174,9 +174,26 @@ pub(crate) struct LinuxExpectedReceiverWriterBatch {
     advice_failure_at: Option<usize>,
 }
 
+pub(crate) struct LinuxExpectedMixedDirectionBatch {
+    entries: Vec<LinuxExpectedMixedDirectionEntry>,
+    total_logical: u64,
+    total_mapped: u64,
+    deadline: AbsoluteDeadline,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 struct LinuxExpectedCoordinatorWriterEntry {
     region_id: u128,
+    logical_len: u64,
+    mapped_len: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LinuxExpectedMixedDirectionEntry {
+    region_id: u128,
+    writer: WriterEndpoint,
     logical_len: u64,
     mapped_len: u64,
 }
@@ -194,6 +211,17 @@ pub(crate) struct LinuxImportedReceiverWriterBatch {
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
+pub(crate) struct LinuxImportedMixedDirectionBatch {
+    entries: Vec<LinuxImportedMixedDirectionEntry>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+enum LinuxImportedMixedDirectionEntry {
+    CoordinatorWriter(LinuxImportedCoordinatorWriterEntry),
+    ReceiverWriter(LinuxImportedReceiverWriterEntry),
+}
+
 pub(crate) struct LinuxImportFailure {
     error: MemfdError,
     _partial: Vec<LinuxImportedCoordinatorWriterEntry>,
@@ -207,6 +235,16 @@ pub(crate) struct LinuxImportFailure {
 pub(crate) struct LinuxReceiverWriterImportFailure {
     error: MemfdError,
     _partial: Vec<LinuxImportedReceiverWriterEntry>,
+    _current_fd: Option<OwnedFd>,
+    _current_mapping: Option<PendingVmMapping>,
+    _remaining: std::vec::IntoIter<OwnedFd>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+pub(crate) struct LinuxMixedDirectionImportFailure {
+    error: MemfdError,
+    _partial: Vec<LinuxImportedMixedDirectionEntry>,
     _current_fd: Option<OwnedFd>,
     _current_mapping: Option<PendingVmMapping>,
     _remaining: std::vec::IntoIter<OwnedFd>,
@@ -1327,6 +1365,230 @@ impl LinuxExpectedReceiverWriterBatch {
     }
 }
 
+impl LinuxExpectedMixedDirectionBatch {
+    pub(crate) fn prepare(
+        expected: ExpectedBatch,
+        limits: SessionLimits,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, MemfdError> {
+        check_deadline(deadline)?;
+        if expected.len() > usize::from(limits.max_regions_per_batch)
+            || expected.len() as u64 > u64::from(limits.max_active_regions)
+            || expected.total_logical > limits.max_batch_bytes
+        {
+            return Err(MemfdError::InvalidBatch);
+        }
+        let mut total_mapped = 0_u64;
+        let mut entries = Vec::with_capacity(expected.len());
+        for region in expected.regions {
+            check_deadline(deadline)?;
+            let logical_len = u64::try_from(region.logical_len)
+                .ok()
+                .filter(|logical| *logical <= limits.max_region_bytes)
+                .ok_or(MemfdError::InvalidBatch)?;
+            let mapped_len = u64::try_from(page_align(region.logical_len)?)
+                .map_err(|_| MemfdError::InvalidSize)?;
+            total_mapped = total_mapped
+                .checked_add(mapped_len)
+                .filter(|total| {
+                    *total <= limits.max_batch_bytes && *total <= limits.max_active_bytes
+                })
+                .ok_or(MemfdError::InvalidBatch)?;
+            entries.push(LinuxExpectedMixedDirectionEntry {
+                region_id: region.id.get(),
+                writer: region.writer,
+                logical_len,
+                mapped_len,
+            });
+        }
+        Ok(Self {
+            entries,
+            total_logical: expected.total_logical,
+            total_mapped,
+            deadline,
+            #[cfg(test)]
+            advice_failure_at: None,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
+    pub(crate) fn matches_manifest(&self, manifest: &TransferManifest) -> bool {
+        manifest.entries().len() == self.entries.len()
+            && manifest.total_logical() == self.total_logical
+            && manifest.total_mapped() == self.total_mapped
+            && self.entries.iter().zip(manifest.entries()).enumerate().all(
+                |(ordinal, (expected, received))| {
+                    let (writer, access) = match expected.writer {
+                        WriterEndpoint::Coordinator => (0, PeerAccess::ReadOnly),
+                        WriterEndpoint::Receiver => (1, PeerAccess::SoleWriter),
+                    };
+                    received.region_id == expected.region_id
+                        && received.writer == writer
+                        && received.access == access
+                        && received.logical_len == expected.logical_len
+                        && received.mapped_len == expected.mapped_len
+                        && received.ordinal as usize == ordinal
+                },
+            )
+    }
+
+    pub(crate) fn import(
+        self,
+        manifest: &TransferManifest,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<LinuxImportedMixedDirectionBatch, LinuxMixedDirectionImportFailure> {
+        let mut descriptors = descriptors.into_iter();
+        let mut imported: Vec<LinuxImportedMixedDirectionEntry> =
+            Vec::with_capacity(self.entries.len());
+        macro_rules! fail {
+            ($error:expr, $current_fd:expr, $current_mapping:expr) => {
+                return Err(LinuxMixedDirectionImportFailure {
+                    error: $error,
+                    _partial: imported,
+                    _current_fd: $current_fd,
+                    _current_mapping: $current_mapping,
+                    _remaining: descriptors,
+                    #[cfg(test)]
+                    drop_observer: None,
+                })
+            };
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        if descriptors.len() != self.entries.len() || !self.matches_manifest(manifest) {
+            fail!(MemfdError::WrongProvenance, None, None);
+        }
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for (expected, entry) in self
+            .entries
+            .into_iter()
+            .zip(manifest.entries().iter().copied())
+        {
+            let fd = descriptors
+                .next()
+                .expect("validated descriptor count matches manifest");
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let mapped_len = match usize::try_from(entry.mapped_len) {
+                Ok(mapped_len) => mapped_len,
+                Err(_) => fail!(MemfdError::InvalidSize, Some(fd), None),
+            };
+            let (seals, protection) = match expected.writer {
+                WriterEndpoint::Coordinator => (FINAL_SEALS, libc::PROT_READ),
+                WriterEndpoint::Receiver => (PREFIX_SEALS, libc::PROT_READ | libc::PROT_WRITE),
+            };
+            let key = match validate_object(fd.as_raw_fd(), mapped_len, seals) {
+                Ok(key) => key,
+                Err(error) => fail!(error, Some(fd), None),
+            };
+            if imported.iter().any(|retained| retained.key() == key) {
+                fail!(MemfdError::WrongObject, Some(fd), None);
+            }
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), None);
+            }
+            let pending = match PendingVmMapping::map(fd.as_raw_fd(), mapped_len, protection, false)
+            {
+                Ok(mapping) => mapping,
+                Err(error) => fail!(error, Some(fd), None),
+            };
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, Some(fd), Some(pending));
+            }
+            for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                #[cfg(test)]
+                {
+                    advice_operation += 1;
+                    if self.advice_failure_at == Some(advice_operation) {
+                        fail!(MemfdError::Native(libc::EIO), Some(fd), Some(pending));
+                    }
+                }
+                if let Err(error) = pending.advise(advice) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+                if let Err(error) = check_deadline(self.deadline) {
+                    fail!(error, Some(fd), Some(pending));
+                }
+            }
+            let mapping = match pending.into_mapping() {
+                Ok(mapping) => mapping,
+                Err((error, pending)) => fail!(error, Some(fd), Some(pending)),
+            };
+            let retained = match expected.writer {
+                WriterEndpoint::Coordinator => LinuxImportedMixedDirectionEntry::CoordinatorWriter(
+                    LinuxImportedCoordinatorWriterEntry {
+                        manifest: entry,
+                        fd,
+                        mapping,
+                        key,
+                    },
+                ),
+                WriterEndpoint::Receiver => LinuxImportedMixedDirectionEntry::ReceiverWriter(
+                    LinuxImportedReceiverWriterEntry {
+                        manifest: entry,
+                        fd,
+                        mapping,
+                        key,
+                    },
+                ),
+            };
+            imported.push(retained);
+            if let Err(error) = check_deadline(self.deadline) {
+                fail!(error, None, None);
+            }
+            let retained = imported.last().expect("current import is retained");
+            match retained.validate(seals) {
+                Ok(()) => {}
+                Err(error) => fail!(error, None, None),
+            }
+        }
+        if let Err(error) = check_deadline(self.deadline) {
+            fail!(error, None, None);
+        }
+        Ok(LinuxImportedMixedDirectionBatch {
+            entries: imported,
+            #[cfg(test)]
+            drop_observer: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+}
+
+impl LinuxImportedMixedDirectionEntry {
+    fn key(&self) -> ObjectKey {
+        match self {
+            Self::CoordinatorWriter(entry) => entry.key,
+            Self::ReceiverWriter(entry) => entry.key,
+        }
+    }
+
+    fn validate(&self, seals: libc::c_int) -> Result<(), MemfdError> {
+        let (fd, key) = match self {
+            Self::CoordinatorWriter(entry) => (&entry.fd, entry.key),
+            Self::ReceiverWriter(entry) => (&entry.fd, entry.key),
+        };
+        if validate_object(fd.as_raw_fd(), key.mapped_len, seals)? != key {
+            return Err(MemfdError::WrongObject);
+        }
+        Ok(())
+    }
+}
+
 impl LinuxImportFailure {
     pub(crate) const fn error(&self) -> MemfdError {
         self.error
@@ -1347,7 +1609,27 @@ impl core::fmt::Debug for LinuxReceiverWriterImportFailure {
     }
 }
 
+impl core::fmt::Debug for LinuxMixedDirectionImportFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("LinuxMixedDirectionImportFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 impl LinuxReceiverWriterImportFailure {
+    pub(crate) const fn error(&self) -> MemfdError {
+        self.error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
+impl LinuxMixedDirectionImportFailure {
     pub(crate) const fn error(&self) -> MemfdError {
         self.error
     }
@@ -1372,6 +1654,15 @@ impl Drop for LinuxReceiverWriterImportFailure {
         #[cfg(test)]
         if let Some(observer) = &self.drop_observer {
             observer.lock().unwrap().push("failed-receiver-import-drop");
+        }
+    }
+}
+
+impl Drop for LinuxMixedDirectionImportFailure {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("failed-mixed-import-drop");
         }
     }
 }
@@ -1451,6 +1742,18 @@ impl LinuxImportedReceiverWriterBatch {
     }
 }
 
+impl LinuxImportedMixedDirectionBatch {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.drop_observer = Some(observer);
+    }
+}
+
 impl Drop for LinuxImportedCoordinatorWriterBatch {
     fn drop(&mut self) {
         #[cfg(test)]
@@ -1468,6 +1771,15 @@ impl Drop for LinuxImportedReceiverWriterBatch {
                 .lock()
                 .unwrap()
                 .push("imported-receiver-batch-drop");
+        }
+    }
+}
+
+impl Drop for LinuxImportedMixedDirectionBatch {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer.lock().unwrap().push("imported-mixed-batch-drop");
         }
     }
 }

@@ -781,6 +781,29 @@ mixed receiver expectation/import owner, complete-batch IMPORTED/SEALED
 attenuation, READY/COMMIT, active leases, runtime/public APIs, and release
 evidence remain outstanding.
 
+Phase 5i-G1i-b adds the private receiver expectation and import half for one
+mixed-direction native batch. The expectation is complete before descriptor
+receipt and rejects negotiated count, region, aggregate logical/mapped, and
+active limits locally. Import consumes all installed descriptors at once,
+checks the exact full manifest shape and capability ordinal order, validates
+direction-specific final or prefix seals, rejects duplicate native objects,
+and establishes only pending RO coordinator-writer or RW receiver-writer
+mappings. Success and every partial-failure path retain all fds and mappings in
+one non-`Clone`, non-`Sync` owner until destruction.
+
+Adjacent Arm64 Linux characterization covers exact 1/2/4/16 alternating mixed
+imports and initialized bytes, full-limit and wrong-direction expectation
+rejection, duplicate/wrong native objects, first/middle/final invalid-object
+failure, first/middle/final post-`mmap` advice failure, failure-owner drop order,
+stored-deadline expiry, and exact fd/vNext-map baselines after success and
+failure. The independent final adversarial review reports no P1/P2/P3. Exact
+implementation SHA and hosted CI are pending.
+
+G1i-b has no accepted send/receive path and exposes no pending payload or
+runtime authority. Exact credentials/rights framing, full-batch attenuation,
+IMPORTED/SEALED, READY/COMMIT, active leases, public APIs, and release evidence
+remain with the later inseparable accepted reducer.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

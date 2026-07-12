@@ -220,6 +220,17 @@ not extract an fd or mapping, send on accepted control, perform IMPORTED/SEALED,
 or expose pending/runtime authority. The later mixed accepted reducer must
 consume this owner and preserve full-batch attenuation before mapping work.
 
+Linux G1i-b adds the matching private receiver-side native pending owner, still
+without accepted-session integration. One pre-receipt mixed expectation checks
+the complete negotiated count, logical-byte, mapped-byte, and active-resource
+limits before any descriptor is accepted. Import immediately owns the complete
+descriptor vector, validates canonical direction/access/length/ordinal shape,
+rejects duplicate native objects, and creates a read-only pending mapping for
+coordinator-writer entries or a writable pending mapping for receiver-writer
+entries. Every partial fd and mapping remains in either the successful mixed
+owner or one consuming failure owner. Neither exposes payload/runtime methods;
+the later accepted reducer must consume them under its stored deadline.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte
