@@ -222,7 +222,38 @@ Docker-characterized and requires native AMD64/Arm64 execution.
 Bootstrap-fd collision policy, authenticated HELLO composition, and physical
 Arm64 release evidence also remain required.
 
-The extended scaffold passed native Linux AMD64/Arm64 and Linux AMD64 ASan at
+The next private production checkpoint composes the held native ELF, a
+pre-created durable lifecycle worker, the sole clone-time
+`clone3(CLONE_PIDFD)` pidfd, and the parent half of an anonymous
+`SOCK_SEQPACKET` pair in one `UnauthenticatedLinuxSpawn`. The kernel dynamically
+chooses a collision-free duplicate of the child endpoint. The raw child marks
+the complete descriptor table CLOEXEC, clears CLOEXEC only on that bootstrap
+slot, calls `setsid`, installs exact irreversible MDWE, and executes the held
+descriptor with `execveat(AT_EMPTY_PATH)`. A fixed CLOEXEC nonblocking error
+pipe reports close-range, bootstrap-fd, `setsid`, MDWE, and exec failures. The
+parent immediately arms the durable pidfd owner and uses the error pipe, pidfd,
+held inode, and one caller-derived absolute deadline to reject malformed,
+partial, silent, stalled, exited, or wrong-image outcomes. Error-pipe EOF is
+only provisional exec evidence; exact image and live pidfd checks must also
+succeed.
+
+This owner is deliberately unreachable and pre-authentication. It exposes no
+packet send, fd transfer, receipt, session, HELLO, negotiation, or memory
+authority. Drop requests exact pidfd cleanup through the pre-created worker;
+the fresh group remains explicitly unverified as described above. Local Rust
+1.97 Arm64 unconfined-Docker tests cover occupied fd slots, held-path
+replacement, exactly one inherited bootstrap socket, closure of the held,
+pipe, and original pair descriptors, every fixed error stage, malformed and
+partial records, silence, deadline expiry, repeated Drop, panic, and
+fd/task/child baselines. Native exact-target evidence for this new composition
+is still required.
+
+The preceding exact-child and fresh-session scaffold passed hosted native Linux
+AMD64/Arm64 and Linux AMD64 ASan at exact commit `861c139` in
+[Actions 29196282000](https://github.com/ro-ag/native-ipc-rs/actions/runs/29196282000).
+That is exact mechanism evidence for the containment/baseline tip, not native
+evidence for the later uncommitted spawn composition and not physical Arm64
+release evidence. An earlier extended scaffold passed at
 commit `cd38c26` in CI run
 [`29182825256`](https://github.com/ro-ag/native-ipc-rs/actions/runs/29182825256).
 That evidence validates this private mechanism checkpoint only; it does not
@@ -238,9 +269,9 @@ The durable owner removes the leak-prone exact direct-child cleanup blocker in
 isolation. The fresh-session checkpoint characterizes grouping but cannot
 provide race-resistant descendant teardown. Linux
 image identity still cannot mint the final authenticated-endpoint receipt until
-that owner is composed with the collision-safe inherited bootstrap fd,
-authenticated nonce-bound HELLO, and exact packet credentials for the same
-child. This still blocks the safe session constructor;
+the new collision-safe pre-authentication owner completes authenticated
+nonce-bound HELLO and exact per-message packet credentials for the same child.
+This still blocks the safe session constructor;
 PID/path checks or a standalone private probe are not substitutes.
 
 Primary sources: Linux man-pages for [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html),

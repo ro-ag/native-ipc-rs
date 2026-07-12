@@ -2,6 +2,7 @@
 
 mod memory;
 mod process;
+mod spawn;
 
 use core::cell::Cell;
 use core::marker::PhantomData;

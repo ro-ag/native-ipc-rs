@@ -34,7 +34,7 @@ struct OpenHow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SpawnPolicyError {
+pub(super) enum SpawnPolicyError {
     InvalidExecutable,
     WrongExecutable,
     ExitedBeforeVerification,
@@ -47,7 +47,7 @@ struct ExecutableKey {
     inode: u64,
 }
 
-struct HeldExecutable {
+pub(super) struct HeldExecutable {
     fd: OwnedFd,
     key: ExecutableKey,
     not_sync: PhantomData<Cell<()>>,
@@ -62,7 +62,7 @@ struct VerifiedExecutable {
 }
 
 impl HeldExecutable {
-    fn open(path: &Path) -> Result<Self, SpawnPolicyError> {
+    pub(super) fn open(path: &Path) -> Result<Self, SpawnPolicyError> {
         if !path.is_absolute() {
             return Err(SpawnPolicyError::InvalidExecutable);
         }
@@ -128,6 +128,27 @@ impl HeldExecutable {
 
     fn command(&self) -> Command {
         Command::new(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
+
+    pub(super) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    pub(super) fn matches_process_image(&self, pid: libc::pid_t) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let Ok(path) = std::ffi::CString::new(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        // SAFETY: path is NUL-terminated and these flags have no mode argument.
+        let raw = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return false;
+        }
+        // SAFETY: successful open returned one uniquely owned descriptor.
+        let actual = unsafe { OwnedFd::from_raw_fd(raw) };
+        matches!(file_key(actual.as_raw_fd()), Ok((key, _)) if key == self.key)
     }
 }
 
@@ -277,7 +298,7 @@ enum DescendantCleanup {
 /// the dedicated worker holding the same atomic pidfd until kernel cleanup
 /// becomes possible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExactChildCleanup {
+pub(super) struct ExactChildCleanup {
     direct_child: Option<ExactChildExit>,
     descendants: DescendantCleanup,
     last_native_error: Option<i32>,
@@ -312,7 +333,7 @@ struct LifecycleShared {
 /// Worker prepared before acquiring a child, so every successful clone can
 /// transfer its pidfd into an already-durable cleanup owner without spawning
 /// or waiting from `Drop`.
-struct PreparedExactChildLifecycle {
+pub(super) struct PreparedExactChildLifecycle {
     shared: Arc<LifecycleShared>,
     worker: Thread,
     armed: bool,
@@ -320,7 +341,7 @@ struct PreparedExactChildLifecycle {
 
 /// Private exact-child owner. This is deliberately not a receipt and cannot
 /// construct authenticated channel, session, or memory authority.
-struct ExactChildLifecycle {
+pub(super) struct ExactChildLifecycle {
     pidfd: Arc<OwnedFd>,
     pid: libc::pid_t,
     shared: Arc<LifecycleShared>,
@@ -329,7 +350,7 @@ struct ExactChildLifecycle {
 }
 
 impl PreparedExactChildLifecycle {
-    fn new() -> Result<Self, SpawnPolicyError> {
+    pub(super) fn new() -> Result<Self, SpawnPolicyError> {
         Self::new_with_worker(|worker_shared| {
             let worker = std::thread::Builder::new()
                 .name("native-ipc-child-reaper".into())
@@ -372,7 +393,7 @@ impl PreparedExactChildLifecycle {
         })
     }
 
-    fn arm(
+    pub(super) fn arm(
         mut self,
         pid: libc::pid_t,
         pidfd: OwnedFd,
@@ -416,17 +437,17 @@ impl Drop for PreparedExactChildLifecycle {
 }
 
 impl ExactChildLifecycle {
-    fn pid(&self) -> libc::pid_t {
+    pub(super) fn pid(&self) -> libc::pid_t {
         self.pid
     }
 
-    fn pidfd(&self) -> RawFd {
+    pub(super) fn pidfd(&self) -> RawFd {
         self.pidfd.as_raw_fd()
     }
 
     /// Records the trusted child-side `setsid` checkpoint. This is containment
     /// state only and cannot mint image, channel, session, or memory authority.
-    fn establish_fresh_session(&self) {
+    pub(super) fn establish_fresh_session(&self) {
         self.shared.fresh_session.store(true, Ordering::Release);
     }
 
@@ -435,7 +456,7 @@ impl ExactChildLifecycle {
         self.wait_for_completion(deadline)
     }
 
-    fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+    pub(super) fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
         self.request(LIFECYCLE_TERMINATE);
         self.wait_for_completion(deadline)
     }
