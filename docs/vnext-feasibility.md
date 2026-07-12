@@ -29,7 +29,9 @@ mechanism analogous to Mach memory-entry maximum rights.
 The private vNext Linux preparation now rejects the mechanism without probing
 or making the real payload executable. Disposable isolated helper processes
 characterize both kernel paths, with process teardown as their cleanup
-backstop. Capability preparation fails closed in either direction. Linux release is blocked;
+backstop. The fail-closed correction passed both Linux architectures and ASan
+in [Actions 29179459798](https://github.com/ro-ag/native-ipc-rs/actions/runs/29179459798).
+Capability preparation fails closed in either direction. Linux release is blocked;
 the MUST cannot be weakened to cover only new executable mappings. Resolution
 requires either a normative threat/guarantee change or a separately proven
 mandatory containment mechanism that a malicious receiver cannot remove or
