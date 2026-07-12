@@ -1,5 +1,7 @@
 //! vNext Linux anonymous packet transport primitives.
 
+mod memory;
+
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, size_of, zeroed};
