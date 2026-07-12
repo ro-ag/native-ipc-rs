@@ -112,6 +112,27 @@ then closes any injected rights, and rejects zero length, oversize truncation,
 control truncation, malformed ancillary data, or wrong credentials. The fixed
 capability-frame path retains its existing smaller exact-size/fd-count limit.
 
+Linux atomic-capability discovery derives 32/64-bit lock freedom only from the
+compiler's `target_has_atomic` facts and compile-time supported-target gates.
+It reads page size and L1 data-cache-line size from `sysconf`, checks positive
+`usize` narrowing, power-of-two shape, and atomic alignment, then constructs
+the platform-neutral `AtomicCapabilities` through its private verified-native
+constructor. Missing, zero, overflowing, non-power-of-two, or under-aligned
+facts fail closed. This private discovery does not yet mint a HELLO, session,
+receipt, or memory-authority witness.
+
+An isolated native probe places cache-line-aligned `AtomicU32` and `AtomicU64`
+publication/acknowledgement pairs in anonymous `MAP_SHARED` memory. Parent and
+raw fork child prove Release/Acquire observation in both directions. After
+fork, the child uses only compiler-proven lock-free atomics, spin hints, raw
+syscalls, and `_exit`; parent-death `SIGKILL` is installed as its failure
+backstop. A separate exact-pidfd watchdog bounds the disposable probe process
+and reaps it exactly. The successful publication path checks runtime facts,
+exact inner-child reap/ECHILD, and fd/map/child baselines. Forced parent-death
+cleanup of the reparented inner child is not claimed as exact-reap evidence and
+remains excluded from the baseline claim. Local Arm64 Docker evidence is
+characterization pending native AMD64/Arm64 execution.
+
 At source-tree commit `e904e35`, the parser additionally adopts every complete
 nonnegative descriptor word in every structurally reachable `SCM_RIGHTS`
 record before reporting malformed payload, truncation, wrong credentials, or
@@ -257,11 +278,15 @@ partial records, silence, deadline expiry, repeated Drop, panic, and
 fd/task/child baselines. Native exact-target evidence for this new composition
 is still required.
 
+The exact variable-packet correction commit `ad4ca15` is green across all ten
+hosted jobs, including native Linux AMD64/Arm64 and ASan, in
+[Actions 29197506559](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197506559).
+The earlier failed run `29197362446` is not evidence. This exact run does not
+cover the later uncommitted atomic-capability discovery.
+
 The exact pre-authentication spawn-owner commit `81832fd` is green across all
 ten hosted jobs in
 [Actions 29197002887](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197002887).
-That evidence does not cover the later variable-packet primitive, which remains
-local Arm64 Docker characterization pending native execution.
 
 The preceding exact-child and fresh-session scaffold passed hosted native Linux
 AMD64/Arm64 and Linux AMD64 ASan at exact commit `861c139` in

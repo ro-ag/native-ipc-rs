@@ -11,13 +11,57 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::protocol::CONTROL_FRAME_LEN;
-use crate::session::AbsoluteDeadline;
+use crate::session::{AbsoluteDeadline, AtomicCapabilities, NegotiationError};
 
 const MAX_PACKET_FDS: usize = 16;
 const CONTROL_CAPACITY: usize = 256;
 /// Conservative Linux-native one-datagram ceiling; the generic HELLO hard max
 /// is intentionally not claimed as universally supported by `SOCK_SEQPACKET`.
 const MAX_ZERO_RIGHTS_PACKET_BYTES: usize = 64 * 1024;
+
+// Every supported Linux build must have compiler-backed lock-free operations
+// for the widths that vNext can advertise. These are target facts, not runtime
+// guesses or hardcoded truth values.
+const _: () = assert!(cfg!(target_has_atomic = "32"));
+const _: () = assert!(cfg!(target_has_atomic = "64"));
+
+fn discover_atomic_capabilities() -> Result<AtomicCapabilities, NegotiationError> {
+    // SAFETY: sysconf receives documented scalar selectors and returns values
+    // without writing through pointers.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as i128;
+    // SAFETY: this Linux selector reports the L1 data-cache line size.
+    let cache_line = unsafe { libc::sysconf(libc::_SC_LEVEL1_DCACHE_LINESIZE) } as i128;
+    atomic_capabilities_from_native_facts(page, cache_line)
+}
+
+fn atomic_capabilities_from_native_facts(
+    page: i128,
+    cache_line: i128,
+) -> Result<AtomicCapabilities, NegotiationError> {
+    let page = checked_native_alignment(page)?;
+    let cache_line = checked_native_alignment(cache_line)?;
+    AtomicCapabilities::from_verified_native(
+        page,
+        cache_line,
+        cfg!(target_has_atomic = "32"),
+        cfg!(target_has_atomic = "64"),
+    )
+}
+
+fn checked_native_alignment(value: i128) -> Result<usize, NegotiationError> {
+    if value <= 0 {
+        return Err(NegotiationError::AtomicUnsupported);
+    }
+    let value = usize::try_from(value).map_err(|_| NegotiationError::NativeSizeNarrowing)?;
+    if !value.is_power_of_two()
+        || value
+            < align_of::<core::sync::atomic::AtomicU32>()
+                .max(align_of::<core::sync::atomic::AtomicU64>())
+    {
+        return Err(NegotiationError::AtomicUnsupported);
+    }
+    Ok(value)
+}
 
 #[repr(C)]
 union ControlStorage {

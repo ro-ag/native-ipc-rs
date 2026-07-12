@@ -3,12 +3,14 @@ use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::fd::IntoRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const ENV_CHILD_FD: &str = "NATIVE_IPC_VNEXT_TEST_CHILD_FD";
 const ENV_PARENT_PID: &str = "NATIVE_IPC_VNEXT_TEST_PARENT_PID";
 const ENV_PARENT_UID: &str = "NATIVE_IPC_VNEXT_TEST_PARENT_UID";
 const ENV_PARENT_GID: &str = "NATIVE_IPC_VNEXT_TEST_PARENT_GID";
+const PR_SET_PDEATHSIG_TEST: libc::c_int = 1;
 
 #[derive(Default)]
 pub(super) struct DeadlineFaults {
@@ -104,6 +106,20 @@ fn wait_until_expired(deadline: AbsoluteDeadline) {
     while !deadline.is_expired() {
         std::thread::yield_now();
     }
+}
+
+fn open_map_count() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .count()
+}
+
+fn direct_child_is_absent(pid: libc::pid_t) -> bool {
+    !std::fs::read_to_string("/proc/thread-self/children")
+        .unwrap()
+        .split_ascii_whitespace()
+        .any(|value| value.parse::<libc::pid_t>() == Ok(pid))
 }
 
 fn send_unchecked_rights(endpoint: &SeqPacketEndpoint, bytes: &[u8], fds: &[RawFd]) {
@@ -402,7 +418,8 @@ fn variable_zero_rights_packets_enforce_native_ceiling_and_credentials() {
 }
 
 #[test]
-fn queued_oversize_and_injected_rights_are_consumed_without_fd_growth() {
+#[ignore = "spawned alone by queued_oversize_and_injected_rights_are_consumed_without_fd_growth"]
+fn isolated_queued_oversize_and_injected_rights_are_consumed_without_fd_growth() {
     let (sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
     let credentials = current_credentials();
     let oversize = vec![1_u8; MAX_ZERO_RIGHTS_PACKET_BYTES + 1];
@@ -437,6 +454,20 @@ fn queued_oversize_and_injected_rights_are_consumed_without_fd_growth() {
     assert_eq!(open_fd_count(), before + 1);
     drop(file);
     assert_eq!(open_fd_count(), before);
+}
+
+#[test]
+fn queued_oversize_and_injected_rights_are_consumed_without_fd_growth() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::tests::isolated_queued_oversize_and_injected_rights_are_consumed_without_fd_growth",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]
@@ -797,6 +828,288 @@ fn spawned_credential_helper() {
     endpoint.send(b"child", &[]).unwrap();
     let acknowledgement = receive_until(&mut endpoint, 3, parent, 0).unwrap();
     assert_eq!(acknowledgement.bytes, b"ack");
+}
+
+struct AtomicProbeMapping {
+    address: *mut libc::c_void,
+    length: usize,
+}
+
+impl AtomicProbeMapping {
+    fn new(length: usize) -> Self {
+        // SAFETY: anonymous shared mapping needs no fd or offset object.
+        let address = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        Self { address, length }
+    }
+}
+
+impl Drop for AtomicProbeMapping {
+    fn drop(&mut self) {
+        // SAFETY: this object uniquely owns the complete live mapping.
+        assert_eq!(unsafe { libc::munmap(self.address, self.length) }, 0);
+    }
+}
+
+#[test]
+#[ignore = "spawned alone by linux_atomic_capabilities_match_native_publication"]
+fn isolated_linux_atomic_capabilities_match_native_publication() {
+    const PUBLISHED_U32: u32 = 0x51a7_c032;
+    const ACK_U32: u32 = 0xa11c_0032;
+    const PUBLISHED_U64: u64 = 0x51a7_c064_51a7_c064;
+    const ACK_U64: u64 = 0xa11c_0064_a11c_0064;
+
+    let before_fds = open_fd_count();
+    let before_maps = open_map_count();
+    let capabilities = discover_atomic_capabilities().unwrap();
+    // SAFETY: scalar sysconf selectors have no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // SAFETY: scalar sysconf selectors have no pointer arguments.
+    let cache_line = unsafe { libc::sysconf(libc::_SC_LEVEL1_DCACHE_LINESIZE) };
+    assert!(page > 0 && cache_line > 0);
+    assert_eq!(capabilities.page_alignment(), page as usize);
+    assert_eq!(capabilities.cache_line_alignment(), cache_line as usize);
+    assert_eq!(
+        capabilities.atomic_u32_alignment(),
+        core::mem::align_of::<AtomicU32>()
+    );
+    assert_eq!(
+        capabilities.atomic_u64_alignment(),
+        core::mem::align_of::<AtomicU64>()
+    );
+    assert_eq!(
+        capabilities.atomic_u32_lock_free(),
+        cfg!(target_has_atomic = "32")
+    );
+    assert_eq!(
+        capabilities.atomic_u64_lock_free(),
+        cfg!(target_has_atomic = "64")
+    );
+    capabilities.require(true, true).unwrap();
+
+    let stride = capabilities.cache_line_alignment();
+    let required = stride.checked_mul(4).unwrap();
+    assert!(required <= capabilities.page_alignment());
+    let mapping = AtomicProbeMapping::new(capabilities.page_alignment());
+    let base = mapping.address.cast::<u8>();
+    // SAFETY: the page-aligned mapping covers four cache-line-aligned slots;
+    // each atomic is initialized before fork and has a disjoint address.
+    let (published_u32, ack_u32, published_u64, ack_u64) = unsafe {
+        let published_u32 = base.cast::<AtomicU32>();
+        let ack_u32 = base.add(stride).cast::<AtomicU32>();
+        let published_u64 = base.add(stride * 2).cast::<AtomicU64>();
+        let ack_u64 = base.add(stride * 3).cast::<AtomicU64>();
+        published_u32.write(AtomicU32::new(0));
+        ack_u32.write(AtomicU32::new(0));
+        published_u64.write(AtomicU64::new(0));
+        ack_u64.write(AtomicU64::new(0));
+        (&*published_u32, &*ack_u32, &*published_u64, &*ack_u64)
+    };
+    for address in [
+        published_u32 as *const AtomicU32 as usize,
+        ack_u32 as *const AtomicU32 as usize,
+    ] {
+        assert!(address.is_multiple_of(capabilities.atomic_u32_alignment()));
+    }
+    for address in [
+        published_u64 as *const AtomicU64 as usize,
+        ack_u64 as *const AtomicU64 as usize,
+    ] {
+        assert!(address.is_multiple_of(capabilities.atomic_u64_alignment()));
+    }
+
+    // SAFETY: the isolated test process has initialized all fork-shared state.
+    let parent_pid = unsafe { libc::getpid() };
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        // Child audit: target_has_atomic compile-time gates prove these widths
+        // lock-free; only raw syscalls, atomic operations, spin hints, and raw
+        // _exit follow. PDEATHSIG is the failure-path backstop for a panicking
+        // isolated parent.
+        // SAFETY: scalar raw syscall arguments install an uncatchable death signal.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                PR_SET_PDEATHSIG_TEST,
+                libc::SIGKILL,
+                0,
+                0,
+                0,
+            )
+        } != 0
+            // SAFETY: scalar raw syscall checks the parent-death race.
+            || unsafe { libc::syscall(libc::SYS_getppid) } != libc::c_long::from(parent_pid)
+        {
+            // SAFETY: the raw child must not unwind or run Rust destructors.
+            unsafe { libc::_exit(124) };
+        }
+        while published_u32.load(Ordering::Acquire) != PUBLISHED_U32 {
+            core::hint::spin_loop();
+        }
+        ack_u32.store(ACK_U32, Ordering::Release);
+        while published_u64.load(Ordering::Acquire) != PUBLISHED_U64 {
+            core::hint::spin_loop();
+        }
+        ack_u64.store(ACK_U64, Ordering::Release);
+        // SAFETY: the raw child must not unwind or run Rust destructors.
+        unsafe { libc::_exit(0) };
+    }
+
+    published_u32.store(PUBLISHED_U32, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ack_u32.load(Ordering::Acquire) != ACK_U32 {
+        assert!(Instant::now() < deadline, "u32 cross-process ack stalled");
+        core::hint::spin_loop();
+    }
+    published_u64.store(PUBLISHED_U64, Ordering::Release);
+    while ack_u64.load(Ordering::Acquire) != ACK_U64 {
+        assert!(Instant::now() < deadline, "u64 cross-process ack stalled");
+        core::hint::spin_loop();
+    }
+
+    let mut status = 0;
+    loop {
+        // SAFETY: this isolated parent owns the exact direct child; WNOHANG
+        // cannot block and consumes only this child's status.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            break;
+        }
+        assert_eq!(waited, 0);
+        assert!(Instant::now() < deadline, "atomic child did not exit");
+        std::thread::yield_now();
+    }
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert!(direct_child_is_absent(pid));
+    // SAFETY: the exact child status was consumed above.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, core::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    drop(mapping);
+    assert_eq!(open_fd_count(), before_fds);
+    assert_eq!(open_map_count(), before_maps);
+}
+
+#[test]
+fn linux_atomic_capabilities_match_native_publication() {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::tests::isolated_linux_atomic_capabilities_match_native_publication",
+            "--ignored",
+            "--nocapture",
+        ])
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    let pidfd = open_pidfd(child.id());
+    let watchdog = Instant::now() + Duration::from_secs(10);
+    let mut event = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: the sole pidfd poll entry remains live for this bounded query.
+        let ready = unsafe { libc::poll(&mut event, 1, 10) };
+        if ready > 0 {
+            break;
+        }
+        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            panic!(
+                "atomic probe pidfd poll failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+        if Instant::now() >= watchdog {
+            // SAFETY: pidfd_send_signal targets only this exact isolated helper.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    core::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            let kill_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // SAFETY: the exact pidfd remains live for this bounded poll.
+                let killed = unsafe { libc::poll(&mut event, 1, 10) };
+                if killed > 0 {
+                    break;
+                }
+                if killed < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    panic!(
+                        "atomic probe kill poll failed: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+                assert!(
+                    Instant::now() < kill_deadline,
+                    "atomic probe remained alive after exact SIGKILL"
+                );
+            }
+            break;
+        }
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    // SAFETY: Child::wait consumed this exact direct-child status.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, core::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
+#[test]
+fn linux_atomic_capability_discovery_fails_closed() {
+    assert_eq!(
+        atomic_capabilities_from_native_facts(-1, 64),
+        Err(NegotiationError::AtomicUnsupported)
+    );
+    assert_eq!(
+        atomic_capabilities_from_native_facts(4096, 0),
+        Err(NegotiationError::AtomicUnsupported)
+    );
+    assert_eq!(
+        atomic_capabilities_from_native_facts(4097, 64),
+        Err(NegotiationError::AtomicUnsupported)
+    );
+    assert_eq!(
+        atomic_capabilities_from_native_facts(4096, 1),
+        Err(NegotiationError::AtomicUnsupported)
+    );
+    assert_eq!(
+        atomic_capabilities_from_native_facts(i128::MAX, 64),
+        Err(NegotiationError::NativeSizeNarrowing)
+    );
+    let unavailable = AtomicCapabilities::from_verified_native(4096, 64, false, true).unwrap();
+    assert_eq!(
+        unavailable.require(true, false),
+        Err(NegotiationError::AtomicUnsupported)
+    );
 }
 
 #[test]
