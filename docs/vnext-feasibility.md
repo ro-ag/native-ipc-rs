@@ -130,8 +130,11 @@ backstop. A separate exact-pidfd watchdog bounds the disposable probe process
 and reaps it exactly. The successful publication path checks runtime facts,
 exact inner-child reap/ECHILD, and fd/map/child baselines. Forced parent-death
 cleanup of the reparented inner child is not claimed as exact-reap evidence and
-remains excluded from the baseline claim. Local Arm64 Docker evidence is
-characterization pending native AMD64/Arm64 execution.
+remains excluded from the baseline claim. At exact commit `d3ee93b`, all ten
+hosted jobs are green in
+[Actions 29197989720](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197989720),
+including native Linux AMD64/Arm64 and ASan. The hosted Linux Arm64 result is
+VM characterization, not physical Arm64 release evidence.
 
 At source-tree commit `e904e35`, the parser additionally adopts every complete
 nonnegative descriptor word in every structurally reachable `SCM_RIGHTS`
@@ -281,8 +284,13 @@ is still required.
 The exact variable-packet correction commit `ad4ca15` is green across all ten
 hosted jobs, including native Linux AMD64/Arm64 and ASan, in
 [Actions 29197506559](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197506559).
-The earlier failed run `29197362446` is not evidence. This exact run does not
-cover the later uncommitted atomic-capability discovery.
+The earlier failed run `29197362446` is not evidence.
+
+The exact atomic-capability discovery commit `d3ee93b` is green across all ten
+hosted jobs, including native Linux AMD64/Arm64 and ASan, in
+[Actions 29197989720](https://github.com/ro-ag/native-ipc-rs/actions/runs/29197989720).
+The hosted Linux Arm64 result is VM characterization, not physical Arm64
+release evidence.
 
 The exact pre-authentication spawn-owner commit `81832fd` is green across all
 ten hosted jobs in
