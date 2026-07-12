@@ -369,7 +369,12 @@ fn wait_for_child_baseline(
     deadline: AbsoluteDeadline,
 ) {
     loop {
-        if open_fd_count() == expected_fds && open_task_count() == expected_tasks {
+        let children = std::fs::read_to_string("/proc/thread-self/children").unwrap();
+        let child_is_absent = !children
+            .split_ascii_whitespace()
+            .any(|child| child.parse::<libc::pid_t>() == Ok(pid));
+        if open_fd_count() == expected_fds && open_task_count() == expected_tasks && child_is_absent
+        {
             break;
         }
         assert!(!deadline.is_expired(), "child cleanup missed its baseline");
@@ -385,12 +390,6 @@ fn wait_for_child_baseline(
     assert_eq!(
         io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
-    );
-    let children = std::fs::read_to_string("/proc/thread-self/children").unwrap();
-    assert!(
-        !children
-            .split_ascii_whitespace()
-            .any(|child| child.parse::<libc::pid_t>() == Ok(pid))
     );
 }
 
