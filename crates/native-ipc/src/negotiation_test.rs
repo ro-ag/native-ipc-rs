@@ -6,6 +6,15 @@ assert_not_impl_any!(HelloPair: Clone);
 assert_not_impl_any!(NegotiatedTranscript: Clone);
 
 const NONCE: [u8; 32] = [0x5a; 32];
+const CHALLENGE_BYTES: [u8; 16] = [0xa5; 16];
+
+fn challenge() -> DecisionChallenge {
+    DecisionChallenge::from_os_csprng(CHALLENGE_BYTES).unwrap()
+}
+
+fn reason(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).unwrap()
+}
 
 fn atomics() -> AtomicOffer {
     AtomicOffer::from_local(
@@ -127,9 +136,11 @@ fn accept_and_reject_are_payload_free_exact_decisions() {
         atomics: atomics(),
         target: TargetFacts::current(),
         hello_digest: [7; 32],
+        decision_challenge: challenge(),
     });
     let accept_bytes = encoded(&accept);
     assert_eq!(accept_bytes.len(), HEADER_LEN);
+    assert_eq!(&accept_bytes[80..96], &CHALLENGE_BYTES);
     assert_eq!(
         decode_frame(
             &accept_bytes,
@@ -144,10 +155,12 @@ fn accept_and_reject_are_payload_free_exact_decisions() {
     let reject = NegotiationFrame::Reject(RejectFrame {
         role: SenderRole::Receiver,
         nonce: NONCE,
-        reason: 7,
+        reason: reason(7),
+        decision_challenge: challenge(),
     });
     let reject_bytes = encoded(&reject);
     assert_eq!(get_u32(&reject_bytes, 28), 7);
+    assert_eq!(&reject_bytes[80..96], &CHALLENGE_BYTES);
     assert_eq!(
         decode_frame(
             &reject_bytes,
@@ -159,15 +172,181 @@ fn accept_and_reject_are_payload_free_exact_decisions() {
         reject
     );
 
-    let zero_reason = NegotiationFrame::Reject(RejectFrame {
-        role: SenderRole::Receiver,
-        nonce: NONCE,
-        reason: 0,
-    });
+    let mut zero_reason = reject_bytes.clone();
+    zero_reason[28..32].fill(0);
     assert_eq!(
-        zero_reason.encode_into(&mut [0; HEADER_LEN]),
+        decode_frame(
+            &zero_reason,
+            SenderRole::Receiver,
+            NONCE,
+            HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+        ),
         Err(NegotiationWireError::BadRejectReason)
     );
+
+    assert_eq!(
+        DecisionChallenge::from_os_csprng([0; 16]),
+        Err(NegotiationWireError::BadDecisionChallenge)
+    );
+    for mut zero_challenge in [accept_bytes, reject_bytes] {
+        zero_challenge[80..96].fill(0);
+        assert_eq!(
+            decode_frame(
+                &zero_challenge,
+                SenderRole::decode(zero_challenge[14]).unwrap(),
+                NONCE,
+                HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+            ),
+            Err(NegotiationWireError::BadDecisionChallenge)
+        );
+    }
+}
+
+#[test]
+fn accept_and_reject_have_exact_platform_independent_wire_goldens() {
+    let fixed_atomics = AtomicOffer {
+        u32_lock_free: true,
+        u64_lock_free: true,
+        u32_alignment: 4,
+        u64_alignment: 8,
+        page_alignment: 4096,
+        cache_line_alignment: 128,
+    };
+    let fixed_target = TargetFacts {
+        os: 1,
+        architecture: 1,
+        pointer_width: 64,
+        endian: 1,
+    };
+    let accept = encoded(&NegotiationFrame::Accept(AcceptFrame {
+        role: SenderRole::Coordinator,
+        nonce: NONCE,
+        selected_features: FeatureBits([1, 2]),
+        effective_limits: SessionLimits::default(),
+        atomics: fixed_atomics,
+        target: fixed_target,
+        hello_digest: [7; 32],
+        decision_challenge: challenge(),
+    }));
+    let reject = encoded(&NegotiationFrame::Reject(RejectFrame {
+        role: SenderRole::Receiver,
+        nonce: NONCE,
+        reason: reason(7),
+        decision_challenge: challenge(),
+    }));
+
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&accept)),
+        [
+            0xab, 0x8d, 0x8c, 0xbc, 0x2f, 0x18, 0xfc, 0x90, 0x0b, 0xe1, 0x8c, 0x83, 0x9a, 0x1e,
+            0x43, 0x58, 0xa8, 0xf2, 0x7a, 0x4d, 0x2e, 0xfa, 0xa2, 0x30, 0x9a, 0x8e, 0x85, 0x2f,
+            0x0b, 0xac, 0xb6, 0xfe,
+        ]
+    );
+    assert_eq!(
+        <[u8; 32]>::from(Sha256::digest(&reject)),
+        [
+            0x1d, 0xeb, 0x42, 0x80, 0x73, 0xdc, 0xfa, 0x23, 0x0c, 0x50, 0x11, 0x1c, 0x13, 0x9b,
+            0xeb, 0x1d, 0xd5, 0x49, 0xc4, 0x15, 0xae, 0x11, 0xfc, 0x6e, 0x79, 0x71, 0x11, 0x1e,
+            0xba, 0x82, 0x9c, 0xf1,
+        ]
+    );
+}
+
+#[test]
+fn decision_frames_reject_every_truncation_reserved_byte_role_and_extra_byte() {
+    let frames = [
+        encoded(&NegotiationFrame::Accept(AcceptFrame {
+            role: SenderRole::Coordinator,
+            nonce: NONCE,
+            selected_features: FeatureBits([1, 0]),
+            effective_limits: SessionLimits::default(),
+            atomics: atomics(),
+            target: TargetFacts::current(),
+            hello_digest: [7; 32],
+            decision_challenge: challenge(),
+        })),
+        encoded(&NegotiationFrame::Reject(RejectFrame {
+            role: SenderRole::Coordinator,
+            nonce: NONCE,
+            reason: reason(7),
+            decision_challenge: challenge(),
+        })),
+    ];
+    for bytes in &frames {
+        for len in 0..HEADER_LEN {
+            assert_eq!(
+                decode_frame(
+                    &bytes[..len],
+                    SenderRole::Coordinator,
+                    NONCE,
+                    HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+                ),
+                Err(NegotiationWireError::Truncated),
+                "kind {} length {len}",
+                get_u16(bytes, 12)
+            );
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(
+            decode_frame(
+                &extra,
+                SenderRole::Coordinator,
+                NONCE,
+                HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+            ),
+            Err(NegotiationWireError::NonCanonical)
+        );
+        assert_eq!(
+            decode_frame(
+                bytes,
+                SenderRole::Receiver,
+                NONCE,
+                HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+            ),
+            Err(NegotiationWireError::BadRole)
+        );
+    }
+
+    let accept = &frames[0];
+    for offset in [15, 28, 29, 30, 31, 98, 99]
+        .into_iter()
+        .chain(198..HEADER_LEN)
+    {
+        let mut bad = accept.clone();
+        bad[offset] = 1;
+        assert_eq!(
+            decode_frame(
+                &bad,
+                SenderRole::Coordinator,
+                NONCE,
+                HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+            ),
+            Err(NegotiationWireError::NonCanonical),
+            "ACCEPT reserved offset {offset}"
+        );
+    }
+    let reject = &frames[1];
+    for offset in [15]
+        .into_iter()
+        .chain(64..80)
+        .chain(96..198)
+        .chain(198..HEADER_LEN)
+    {
+        let mut bad = reject.clone();
+        bad[offset] = 1;
+        assert_eq!(
+            decode_frame(
+                &bad,
+                SenderRole::Coordinator,
+                NONCE,
+                HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
+            ),
+            Err(NegotiationWireError::NonCanonical),
+            "REJECT reserved offset {offset}"
+        );
+    }
 }
 
 #[test]
@@ -319,12 +498,25 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     receiver.limits.max_regions_per_batch = 4;
 
     let mut transcript = negotiate(&coordinator, &receiver, verified).unwrap();
-    let coordinator_accept = transcript.expected_accept(SenderRole::Coordinator);
-    let receiver_accept = transcript.expected_accept(SenderRole::Receiver);
+    let coordinator_accept = transcript.coordinator_accept(challenge()).unwrap();
+    assert_eq!(transcript.decision_challenge(), None);
+    assert_eq!(
+        transcript.receiver_accept(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    transcript
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    assert_eq!(transcript.decision_challenge(), Some(challenge()));
+    let receiver_accept = transcript.receiver_accept().unwrap();
     assert_ne!(receiver_accept.hello_digest, [0; 32]);
     assert_eq!(coordinator_accept.selected_features, FeatureBits([3, 0]));
     assert_eq!(coordinator_accept.effective_limits.max_regions_per_batch, 4);
     let mut out_of_order = negotiate(&coordinator, &receiver, verified).unwrap();
+    assert_eq!(
+        out_of_order.receiver_accept(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
     assert_eq!(
         out_of_order.validate_accept(receiver_accept, SenderRole::Receiver),
         Err(NegotiationWireError::DecisionReplayOrOrder)
@@ -351,6 +543,9 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     substitutions.push(wrong);
     for wrong in substitutions {
         let mut substitution_transcript = negotiate(&coordinator, &receiver, verified).unwrap();
+        let coordinator_accept = substitution_transcript
+            .coordinator_accept(challenge())
+            .unwrap();
         substitution_transcript
             .validate_accept(coordinator_accept, SenderRole::Coordinator)
             .unwrap();
@@ -359,6 +554,23 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
             Err(NegotiationWireError::EffectiveMismatch)
         );
     }
+    let mut wrong_challenge_transcript = negotiate(&coordinator, &receiver, verified).unwrap();
+    let coordinator_accept = wrong_challenge_transcript
+        .coordinator_accept(challenge())
+        .unwrap();
+    wrong_challenge_transcript
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    let mut wrong_challenge = wrong_challenge_transcript.receiver_accept().unwrap();
+    wrong_challenge.decision_challenge = DecisionChallenge::from_os_csprng([0x3c; 16]).unwrap();
+    assert_eq!(
+        wrong_challenge_transcript.validate_accept(wrong_challenge, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionChallengeMismatch)
+    );
+    assert_eq!(
+        wrong_challenge_transcript.receiver_accept(),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
     let mut wrong_role = negotiate(&coordinator, &receiver, verified).unwrap();
     assert_eq!(
         wrong_role.validate_accept(receiver_accept, SenderRole::Coordinator),
@@ -366,13 +578,12 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     );
 
     transcript
-        .validate_accept(coordinator_accept, SenderRole::Coordinator)
-        .unwrap();
-    transcript
         .validate_accept(receiver_accept, SenderRole::Receiver)
         .unwrap();
+    assert_eq!(transcript.decision_challenge(), Some(challenge()));
 
     let mut replay = negotiate(&coordinator, &receiver, verified).unwrap();
+    let coordinator_accept = replay.coordinator_accept(challenge()).unwrap();
     replay
         .validate_accept(coordinator_accept, SenderRole::Coordinator)
         .unwrap();
@@ -384,7 +595,10 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     changed_payload.application_payload.push(b'!');
     let changed = negotiate(&coordinator, &changed_payload, verified).unwrap();
     assert_ne!(
-        changed.expected_accept(SenderRole::Receiver).hello_digest,
+        changed
+            .coordinator_accept(challenge())
+            .unwrap()
+            .hello_digest,
         receiver_accept.hello_digest
     );
 
@@ -411,7 +625,8 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     let optional = negotiate(&optional_coordinator, &optional_receiver, verified).unwrap();
     assert_eq!(
         optional
-            .expected_accept(SenderRole::Coordinator)
+            .coordinator_accept(challenge())
+            .unwrap()
             .selected_features,
         FeatureBits([1, 0])
     );
@@ -421,6 +636,145 @@ fn exact_two_hello_transcript_binds_both_accept_decisions() {
     assert_eq!(
         negotiate(&coordinator, &wrong_target, verified),
         Err(NegotiationWireError::TargetMismatch)
+    );
+}
+
+#[test]
+fn reject_constructors_are_challenge_bound_ordered_and_terminal() {
+    let verified = AtomicCapabilities::from_verified_native(4096, 128, true, true).unwrap();
+    let mut coordinator = match hello(b"") {
+        NegotiationFrame::Hello(frame) => frame,
+        _ => unreachable!(),
+    };
+    coordinator.supported_features = FeatureBits([3, 0]);
+    coordinator.required_features = FeatureBits::default();
+    let mut receiver = duplicate_hello(&coordinator);
+    receiver.role = SenderRole::Receiver;
+    let new_transcript = || negotiate(&coordinator, &receiver, verified).unwrap();
+
+    let mut coordinator_rejects = new_transcript();
+    let reject = coordinator_rejects
+        .coordinator_reject(challenge(), reason(9))
+        .unwrap();
+    assert_eq!(reject.role, SenderRole::Coordinator);
+    assert_eq!(reject.decision_challenge, challenge());
+    assert_eq!(reject.reason, reason(9));
+    assert_eq!(coordinator_rejects.decision_challenge(), None);
+    assert_eq!(
+        coordinator_rejects.coordinator_accept(challenge()),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    let mut coordinator_reject_peer = new_transcript();
+    assert_eq!(
+        coordinator_reject_peer.validate_reject(reject, SenderRole::Coordinator),
+        Ok(reason(9))
+    );
+    assert_eq!(
+        coordinator_reject_peer.validate_reject(reject, SenderRole::Coordinator),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        coordinator_reject_peer.coordinator_accept(challenge()),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut receiver_rejects = new_transcript();
+    assert_eq!(
+        receiver_rejects.receiver_reject(reason(11)),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut coordinator_side = new_transcript();
+    let mut receiver_side = new_transcript();
+    let coordinator_accept = coordinator_side.coordinator_accept(challenge()).unwrap();
+    coordinator_side
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    receiver_side
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    let reject = receiver_side.receiver_reject(reason(11)).unwrap();
+    assert_eq!(reject.role, SenderRole::Receiver);
+    assert_eq!(reject.decision_challenge, challenge());
+    assert_eq!(reject.reason, reason(11));
+    assert_eq!(receiver_side.decision_challenge(), Some(challenge()));
+    assert_eq!(
+        receiver_side.receiver_reject(reason(11)),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        coordinator_side.validate_reject(reject, SenderRole::Receiver),
+        Ok(reason(11))
+    );
+    assert_eq!(
+        coordinator_side.validate_reject(reject, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let prequeued = RejectFrame {
+        role: SenderRole::Receiver,
+        nonce: NONCE,
+        reason: reason(11),
+        decision_challenge: challenge(),
+    };
+    let mut prequeued_peer = new_transcript();
+    assert_eq!(
+        prequeued_peer.validate_reject(prequeued, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+    assert_eq!(
+        prequeued_peer.coordinator_accept(challenge()),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut wrong_challenge = reject;
+    wrong_challenge.decision_challenge = DecisionChallenge::from_os_csprng([0x3c; 16]).unwrap();
+    let mut wrong_challenge_peer = new_transcript();
+    let coordinator_accept = wrong_challenge_peer
+        .coordinator_accept(challenge())
+        .unwrap();
+    wrong_challenge_peer
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    assert_eq!(
+        wrong_challenge_peer.validate_reject(wrong_challenge, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionChallengeMismatch)
+    );
+    assert_eq!(
+        wrong_challenge_peer.validate_reject(reject, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut wrong_role = reject;
+    wrong_role.role = SenderRole::Coordinator;
+    let mut wrong_role_peer = new_transcript();
+    let coordinator_accept = wrong_role_peer.coordinator_accept(challenge()).unwrap();
+    wrong_role_peer
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    assert_eq!(
+        wrong_role_peer.validate_reject(wrong_role, SenderRole::Receiver),
+        Err(NegotiationWireError::EffectiveMismatch)
+    );
+    assert_eq!(
+        wrong_role_peer.validate_reject(reject, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
+    );
+
+    let mut wrong_nonce = reject;
+    wrong_nonce.nonce[0] ^= 1;
+    let mut wrong_nonce_peer = new_transcript();
+    let coordinator_accept = wrong_nonce_peer.coordinator_accept(challenge()).unwrap();
+    wrong_nonce_peer
+        .validate_accept(coordinator_accept, SenderRole::Coordinator)
+        .unwrap();
+    assert_eq!(
+        wrong_nonce_peer.validate_reject(wrong_nonce, SenderRole::Receiver),
+        Err(NegotiationWireError::EffectiveMismatch)
+    );
+    assert_eq!(
+        wrong_nonce_peer.validate_reject(reject, SenderRole::Receiver),
+        Err(NegotiationWireError::DecisionReplayOrOrder)
     );
 }
 

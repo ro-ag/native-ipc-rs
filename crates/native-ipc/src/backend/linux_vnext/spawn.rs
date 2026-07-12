@@ -4,13 +4,15 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 use std::ffi::{CString, OsString};
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::negotiation::{
-    AtomicOffer, FeatureBits, HEADER_LEN, HelloFrame, HelloPair, NegotiatedTranscript,
-    NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts, decode_frame,
+    AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
+    NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
+    decode_frame,
 };
 use crate::session::{AbsoluteDeadline, NegotiationError, SessionLimits};
 
@@ -108,19 +110,73 @@ struct LinuxHelloOffer {
 /// session, control, batch, or memory-authority operation.
 struct NegotiatingLinuxSpawn {
     lifecycle: Option<ExactChildLifecycle>,
-    _endpoint: SeqPacketEndpoint,
-    _executable: HeldExecutable,
-    _transcript: NegotiatedTranscript,
-    _nonce: [u8; NONCE_LEN],
+    endpoint: SeqPacketEndpoint,
+    executable: HeldExecutable,
+    transcript: NegotiatedTranscript,
+    nonce: [u8; NONCE_LEN],
+    deadline: AbsoluteDeadline,
     _peer_application_payload: Vec<u8>,
     not_sync: PhantomData<Cell<()>>,
 }
 
 struct ReceiverNegotiatingState {
-    _endpoint: SeqPacketEndpoint,
-    _transcript: NegotiatedTranscript,
+    endpoint: SeqPacketEndpoint,
+    transcript: NegotiatedTranscript,
+    nonce: [u8; NONCE_LEN],
+    peer: PacketCredentials,
+    deadline: AbsoluteDeadline,
     _peer_application_payload: Vec<u8>,
     not_sync: PhantomData<Cell<()>>,
+}
+
+struct AcceptedLinuxSpawn {
+    lifecycle: Option<ExactChildLifecycle>,
+    _endpoint: SeqPacketEndpoint,
+    _executable: HeldExecutable,
+    _transcript: NegotiatedTranscript,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct AcceptedLinuxReceiver {
+    _endpoint: SeqPacketEndpoint,
+    _transcript: NegotiatedTranscript,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct ReceiverDecisionPending {
+    endpoint: SeqPacketEndpoint,
+    transcript: NegotiatedTranscript,
+    deadline: AbsoluteDeadline,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+struct RejectedLinuxReceiver {
+    _endpoint: SeqPacketEndpoint,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+enum CoordinatorDecisionOutcome {
+    Pending(ReceiverDecisionPending),
+    Rejected {
+        reason: NonZeroU32,
+        state: RejectedLinuxReceiver,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationDecision {
+    Accept,
+    Reject(NonZeroU32),
+}
+
+#[derive(Debug)]
+enum DecisionOutcome<T, R = ()> {
+    Accepted(T),
+    Rejected {
+        by: SenderRole,
+        reason: NonZeroU32,
+        state: R,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -160,11 +216,253 @@ impl NegotiatingLinuxSpawn {
             .pid()
     }
 
+    fn pidfd(&self) -> RawFd {
+        self.lifecycle
+            .as_ref()
+            .expect("live negotiating owner")
+            .pidfd()
+    }
+
     fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
         if let Some(lifecycle) = self.lifecycle.take() {
             let _ = lifecycle.terminate_and_reap(deadline);
         }
     }
+
+    fn decide(
+        self,
+        decision: ApplicationDecision,
+    ) -> Result<DecisionOutcome<AcceptedLinuxSpawn>, LinuxSpawnError> {
+        self.decide_with_entropy_fault(decision, EntropyFault::None)
+    }
+
+    fn decide_with_entropy_fault(
+        mut self,
+        decision: ApplicationDecision,
+        entropy_fault: EntropyFault,
+    ) -> Result<DecisionOutcome<AcceptedLinuxSpawn>, LinuxSpawnError> {
+        let deadline = self.deadline;
+        let result = (|| {
+            let challenge = generate_decision_challenge(deadline, entropy_fault)?;
+            match decision {
+                ApplicationDecision::Reject(reason) => {
+                    let reject = self
+                        .transcript
+                        .coordinator_reject(challenge, reason)
+                        .map_err(LinuxSpawnError::Negotiation)?;
+                    let frame = NegotiationFrame::Reject(reject);
+                    let encoded = encode_negotiation_frame(&frame)?;
+                    send_negotiating_spawn(&mut self, &encoded)?;
+                    return Ok(DecisionOutcome::Rejected {
+                        by: SenderRole::Coordinator,
+                        reason,
+                        state: (),
+                    });
+                }
+                ApplicationDecision::Accept => {
+                    let accept = self
+                        .transcript
+                        .coordinator_accept(challenge)
+                        .map_err(LinuxSpawnError::Negotiation)?;
+                    self.transcript
+                        .validate_accept(accept, SenderRole::Coordinator)
+                        .map_err(LinuxSpawnError::Negotiation)?;
+                    let encoded = encode_negotiation_frame(&NegotiationFrame::Accept(accept))?;
+                    send_negotiating_spawn(&mut self, &encoded)?;
+                }
+            }
+
+            let expected_peer = exact_child_credentials(&self)?;
+            let pidfd = self.pidfd();
+            let packet = receive_with_exact_child_fields(
+                &mut self.endpoint,
+                pidfd,
+                expected_peer,
+                deadline,
+            )?;
+            match decode_frame(
+                &packet.bytes,
+                SenderRole::Receiver,
+                self.nonce,
+                MAX_LINUX_HELLO_PAYLOAD as u32,
+            )
+            .map_err(LinuxSpawnError::Negotiation)?
+            {
+                NegotiationFrame::Accept(accept) => {
+                    self.transcript
+                        .validate_accept(accept, SenderRole::Receiver)
+                        .map_err(LinuxSpawnError::Negotiation)?;
+                }
+                NegotiationFrame::Reject(reject) => {
+                    let reason = self
+                        .transcript
+                        .validate_reject(reject, SenderRole::Receiver)
+                        .map_err(LinuxSpawnError::Negotiation)?;
+                    return Ok(DecisionOutcome::Rejected {
+                        by: SenderRole::Receiver,
+                        reason,
+                        state: (),
+                    });
+                }
+                NegotiationFrame::Hello(_) => {
+                    return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
+                }
+            }
+            ensure_live(self.pidfd(), deadline)?;
+            if !self.executable.matches_process_image(self.pid()) {
+                return Err(LinuxSpawnError::WrongExecutable);
+            }
+            ensure_live(self.pidfd(), deadline)?;
+            Ok(DecisionOutcome::Accepted(()))
+        })();
+        match result {
+            Ok(DecisionOutcome::Accepted(())) => {
+                Ok(DecisionOutcome::Accepted(AcceptedLinuxSpawn {
+                    lifecycle: self.lifecycle.take(),
+                    _endpoint: self.endpoint,
+                    _executable: self.executable,
+                    _transcript: self.transcript,
+                    not_sync: PhantomData,
+                }))
+            }
+            Ok(DecisionOutcome::Rejected {
+                by,
+                reason,
+                state: (),
+            }) => {
+                self.terminate_and_reap(deadline);
+                Ok(DecisionOutcome::Rejected {
+                    by,
+                    reason,
+                    state: (),
+                })
+            }
+            Err(error) => {
+                self.terminate_and_reap(deadline);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ReceiverNegotiatingState {
+    fn await_coordinator_decision(mut self) -> Result<CoordinatorDecisionOutcome, LinuxSpawnError> {
+        let packet = receive_socket_before(&mut self.endpoint, self.peer, self.deadline)?;
+        match decode_frame(
+            &packet.bytes,
+            SenderRole::Coordinator,
+            self.nonce,
+            MAX_LINUX_HELLO_PAYLOAD as u32,
+        )
+        .map_err(LinuxSpawnError::Negotiation)?
+        {
+            NegotiationFrame::Accept(accept) => {
+                self.transcript
+                    .validate_accept(accept, SenderRole::Coordinator)
+                    .map_err(LinuxSpawnError::Negotiation)?;
+            }
+            NegotiationFrame::Reject(reject) => {
+                let reason = self
+                    .transcript
+                    .validate_reject(reject, SenderRole::Coordinator)
+                    .map_err(LinuxSpawnError::Negotiation)?;
+                return Ok(CoordinatorDecisionOutcome::Rejected {
+                    reason,
+                    state: RejectedLinuxReceiver {
+                        _endpoint: self.endpoint,
+                        not_sync: PhantomData,
+                    },
+                });
+            }
+            NegotiationFrame::Hello(_) => {
+                return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
+            }
+        }
+        Ok(CoordinatorDecisionOutcome::Pending(
+            ReceiverDecisionPending {
+                endpoint: self.endpoint,
+                transcript: self.transcript,
+                deadline: self.deadline,
+                not_sync: PhantomData,
+            },
+        ))
+    }
+}
+
+impl ReceiverDecisionPending {
+    fn decide(
+        mut self,
+        decision: ApplicationDecision,
+    ) -> Result<DecisionOutcome<AcceptedLinuxReceiver, RejectedLinuxReceiver>, LinuxSpawnError>
+    {
+        match decision {
+            ApplicationDecision::Reject(reason) => {
+                let reject = self
+                    .transcript
+                    .receiver_reject(reason)
+                    .map_err(LinuxSpawnError::Negotiation)?;
+                let frame = NegotiationFrame::Reject(reject);
+                let encoded = encode_negotiation_frame(&frame)?;
+                send_socket_before(&mut self.endpoint, &encoded, self.deadline)?;
+                Ok(DecisionOutcome::Rejected {
+                    by: SenderRole::Receiver,
+                    reason,
+                    state: RejectedLinuxReceiver {
+                        _endpoint: self.endpoint,
+                        not_sync: PhantomData,
+                    },
+                })
+            }
+            ApplicationDecision::Accept => {
+                let accept = self
+                    .transcript
+                    .receiver_accept()
+                    .map_err(LinuxSpawnError::Negotiation)?;
+                self.transcript
+                    .validate_accept(accept, SenderRole::Receiver)
+                    .map_err(LinuxSpawnError::Negotiation)?;
+                let encoded = encode_negotiation_frame(&NegotiationFrame::Accept(accept))?;
+                send_socket_before(&mut self.endpoint, &encoded, self.deadline)?;
+                Ok(DecisionOutcome::Accepted(AcceptedLinuxReceiver {
+                    _endpoint: self.endpoint,
+                    _transcript: self.transcript,
+                    not_sync: PhantomData,
+                }))
+            }
+        }
+    }
+}
+
+impl AcceptedLinuxSpawn {
+    fn pid(&self) -> libc::pid_t {
+        self.lifecycle.as_ref().expect("live accepted owner").pid()
+    }
+
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            let _ = lifecycle.terminate_and_reap(deadline);
+        }
+    }
+}
+
+fn exact_child_credentials(
+    owner: &NegotiatingLinuxSpawn,
+) -> Result<PacketCredentials, LinuxSpawnError> {
+    Ok(PacketCredentials {
+        pid: u32::try_from(owner.pid()).map_err(|_| LinuxSpawnError::InvalidInput)?,
+        // SAFETY: automatic SCM_CREDENTIALS carries real IDs.
+        uid: unsafe { libc::getuid() },
+        // SAFETY: automatic SCM_CREDENTIALS carries real IDs.
+        gid: unsafe { libc::getgid() },
+    })
+}
+
+fn send_negotiating_spawn(
+    owner: &mut NegotiatingLinuxSpawn,
+    bytes: &[u8],
+) -> Result<(), LinuxSpawnError> {
+    let pidfd = owner.pidfd();
+    send_with_exact_child_fields(&mut owner.endpoint, pidfd, bytes, owner.deadline)
 }
 
 fn spawn_negotiating(
@@ -256,10 +554,11 @@ fn exchange_coordinator_hello(
     };
     Ok(NegotiatingLinuxSpawn {
         lifecycle: owner.lifecycle.take(),
-        _endpoint: owner.endpoint,
-        _executable: owner.executable,
-        _transcript: transcript,
-        _nonce: nonce,
+        endpoint: owner.endpoint,
+        executable: owner.executable,
+        transcript,
+        nonce,
+        deadline,
         _peer_application_payload: peer_application_payload,
         not_sync: PhantomData,
     })
@@ -308,8 +607,11 @@ fn receive_inherited_hello(
         NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
             .map_err(LinuxSpawnError::Negotiation)?;
     Ok(ReceiverNegotiatingState {
-        _endpoint: endpoint,
-        _transcript: transcript,
+        endpoint,
+        transcript,
+        nonce,
+        peer: expected_parent,
+        deadline,
         _peer_application_payload: peer_application_payload,
         not_sync: PhantomData,
     })
@@ -685,6 +987,18 @@ fn encode_hello(hello: &HelloFrame) -> Result<Vec<u8>, LinuxSpawnError> {
     Ok(encoded)
 }
 
+fn encode_negotiation_frame(frame: &NegotiationFrame) -> Result<Vec<u8>, LinuxSpawnError> {
+    let length = frame.encoded_len().map_err(LinuxSpawnError::Negotiation)?;
+    if length > MAX_ZERO_RIGHTS_PACKET_BYTES {
+        return Err(LinuxSpawnError::InvalidInput);
+    }
+    let mut encoded = vec![0; length];
+    frame
+        .encode_into(&mut encoded)
+        .map_err(LinuxSpawnError::Negotiation)?;
+    Ok(encoded)
+}
+
 fn authenticated_nonce(bytes: &[u8]) -> Result<[u8; NONCE_LEN], LinuxSpawnError> {
     if bytes.len() < HEADER_LEN {
         return Err(LinuxSpawnError::Negotiation(
@@ -704,7 +1018,22 @@ fn generate_nonce(
     deadline: AbsoluteDeadline,
     fault: EntropyFault,
 ) -> Result<[u8; NONCE_LEN], LinuxSpawnError> {
-    let mut nonce = [0_u8; NONCE_LEN];
+    generate_entropy(deadline, fault)
+}
+
+fn generate_decision_challenge(
+    deadline: AbsoluteDeadline,
+    fault: EntropyFault,
+) -> Result<DecisionChallenge, LinuxSpawnError> {
+    DecisionChallenge::from_os_csprng(generate_entropy(deadline, fault)?)
+        .map_err(LinuxSpawnError::Negotiation)
+}
+
+fn generate_entropy<const LENGTH: usize>(
+    deadline: AbsoluteDeadline,
+    fault: EntropyFault,
+) -> Result<[u8; LENGTH], LinuxSpawnError> {
+    let mut bytes = [0_u8; LENGTH];
     #[cfg(test)]
     let mut interrupted_once = false;
     #[cfg(not(test))]
@@ -722,19 +1051,19 @@ fn generate_nonce(
             EntropyFault::Interrupted => unsafe {
                 libc::syscall(
                     libc::SYS_getrandom,
-                    nonce.as_mut_ptr(),
-                    nonce.len(),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
                     libc::GRND_NONBLOCK,
                 )
             },
             EntropyFault::WouldBlock => -1,
-            EntropyFault::Short => (NONCE_LEN - 1) as libc::c_long,
-            EntropyFault::AllZero => NONCE_LEN as libc::c_long,
+            EntropyFault::Short => (LENGTH - 1) as libc::c_long,
+            EntropyFault::AllZero => LENGTH as libc::c_long,
             EntropyFault::None => unsafe {
                 libc::syscall(
                     libc::SYS_getrandom,
-                    nonce.as_mut_ptr(),
-                    nonce.len(),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
                     libc::GRND_NONBLOCK,
                 )
             },
@@ -743,8 +1072,8 @@ fn generate_nonce(
         let result = unsafe {
             libc::syscall(
                 libc::SYS_getrandom,
-                nonce.as_mut_ptr(),
-                nonce.len(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
                 libc::GRND_NONBLOCK,
             )
         };
@@ -759,10 +1088,10 @@ fn generate_nonce(
             }
             return Err(LinuxSpawnError::EntropyUnavailable);
         }
-        if result as usize != NONCE_LEN || nonce == [0; NONCE_LEN] {
+        if result as usize != LENGTH || bytes == [0; LENGTH] {
             return Err(LinuxSpawnError::EntropyUnavailable);
         }
-        return Ok(nonce);
+        return Ok(bytes);
     }
 }
 
@@ -771,9 +1100,19 @@ fn send_with_exact_child(
     bytes: &[u8],
     deadline: AbsoluteDeadline,
 ) -> Result<(), LinuxSpawnError> {
+    let pidfd = owner.pidfd();
+    send_with_exact_child_fields(&mut owner.endpoint, pidfd, bytes, deadline)
+}
+
+fn send_with_exact_child_fields(
+    endpoint: &mut SeqPacketEndpoint,
+    pidfd: RawFd,
+    bytes: &[u8],
+    deadline: AbsoluteDeadline,
+) -> Result<(), LinuxSpawnError> {
     loop {
-        super::ensure_running(owner.pidfd(), deadline).map_err(LinuxSpawnError::Packet)?;
-        match owner.endpoint.send_zero_rights(bytes) {
+        super::ensure_running(pidfd, deadline).map_err(LinuxSpawnError::Packet)?;
+        match endpoint.send_zero_rights(bytes) {
             Ok(()) => {
                 if deadline.is_expired() {
                     return Err(LinuxSpawnError::Packet(PacketError::AmbiguousAfterSend));
@@ -781,13 +1120,10 @@ fn send_with_exact_child(
                 return Ok(());
             }
             Err(PacketError::Interrupted) => continue,
-            Err(PacketError::WouldBlock) => super::poll_until(
-                owner.endpoint.fd.as_raw_fd(),
-                owner.pidfd(),
-                libc::POLLOUT,
-                deadline,
-            )
-            .map_err(LinuxSpawnError::Packet)?,
+            Err(PacketError::WouldBlock) => {
+                super::poll_until(endpoint.fd.as_raw_fd(), pidfd, libc::POLLOUT, deadline)
+                    .map_err(LinuxSpawnError::Packet)?
+            }
             Err(error) => return Err(LinuxSpawnError::Packet(error)),
         }
     }
@@ -798,9 +1134,19 @@ fn receive_with_exact_child(
     expected_peer: PacketCredentials,
     deadline: AbsoluteDeadline,
 ) -> Result<super::ReceivedPacket, LinuxSpawnError> {
+    let pidfd = owner.pidfd();
+    receive_with_exact_child_fields(&mut owner.endpoint, pidfd, expected_peer, deadline)
+}
+
+fn receive_with_exact_child_fields(
+    endpoint: &mut SeqPacketEndpoint,
+    pidfd: RawFd,
+    expected_peer: PacketCredentials,
+    deadline: AbsoluteDeadline,
+) -> Result<super::ReceivedPacket, LinuxSpawnError> {
     loop {
-        super::ensure_running(owner.pidfd(), deadline).map_err(LinuxSpawnError::Packet)?;
-        match owner.endpoint.receive_zero_rights(expected_peer) {
+        super::ensure_running(pidfd, deadline).map_err(LinuxSpawnError::Packet)?;
+        match endpoint.receive_zero_rights(expected_peer) {
             Ok(packet) => {
                 if deadline.is_expired() {
                     return Err(LinuxSpawnError::Packet(PacketError::AmbiguousAfterReceive));
@@ -808,13 +1154,10 @@ fn receive_with_exact_child(
                 return Ok(packet);
             }
             Err(PacketError::Interrupted) => continue,
-            Err(PacketError::WouldBlock) => super::poll_until(
-                owner.endpoint.fd.as_raw_fd(),
-                owner.pidfd(),
-                libc::POLLIN,
-                deadline,
-            )
-            .map_err(LinuxSpawnError::Packet)?,
+            Err(PacketError::WouldBlock) => {
+                super::poll_until(endpoint.fd.as_raw_fd(), pidfd, libc::POLLIN, deadline)
+                    .map_err(LinuxSpawnError::Packet)?
+            }
             Err(error) => return Err(LinuxSpawnError::Packet(error)),
         }
     }

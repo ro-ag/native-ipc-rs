@@ -2,6 +2,7 @@ use super::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 const PR_GET_MDWE: libc::c_int = 66;
@@ -12,6 +13,14 @@ assert_impl_all!(NegotiatingLinuxSpawn: Send);
 assert_not_impl_any!(NegotiatingLinuxSpawn: Sync, Clone);
 assert_impl_all!(ReceiverNegotiatingState: Send);
 assert_not_impl_any!(ReceiverNegotiatingState: Sync, Clone);
+assert_impl_all!(AcceptedLinuxSpawn: Send);
+assert_not_impl_any!(AcceptedLinuxSpawn: Sync, Clone);
+assert_impl_all!(AcceptedLinuxReceiver: Send);
+assert_not_impl_any!(AcceptedLinuxReceiver: Sync, Clone);
+assert_impl_all!(ReceiverDecisionPending: Send);
+assert_not_impl_any!(ReceiverDecisionPending: Sync, Clone);
+assert_impl_all!(RejectedLinuxReceiver: Send);
+assert_not_impl_any!(RejectedLinuxReceiver: Sync, Clone);
 
 fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
@@ -97,6 +106,16 @@ fn spawn_helper() {
         .unwrap()
         .parse()
         .unwrap();
+    if let Ok(encoded) = std::env::var("NATIVE_IPC_VNEXT_POST_REEXEC_DECISION") {
+        // SAFETY: the re-exec helper uniquely owns the intentionally inherited fd.
+        let mut endpoint = unsafe { SeqPacketEndpoint::from_inherited(raw) }.unwrap();
+        let bytes = decode_hex(&encoded);
+        send_socket_before(&mut endpoint, &bytes, deadline()).unwrap();
+        loop {
+            // SAFETY: exact coordinator cleanup terminates this helper.
+            unsafe { libc::pause() };
+        }
+    }
     // Check inherited state before any operation that could open/reuse an fd.
     for closed in std::env::var("NATIVE_IPC_VNEXT_EXPECT_CLOSED")
         .unwrap()
@@ -169,16 +188,567 @@ fn spawn_helper() {
             state._peer_application_payload.len(),
             expected_coordinator_len
         );
-        loop {
-            // SAFETY: keep the negotiating state and exact endpoint alive until
-            // coordinator pidfd cleanup terminates this disposable helper.
-            unsafe { libc::pause() };
+        if let Ok(mode) = std::env::var("NATIVE_IPC_VNEXT_TEST_MALICIOUS_DECISION") {
+            send_malicious_receiver_decision(state, &mode);
+        } else if let Ok(decision) = std::env::var("NATIVE_IPC_VNEXT_TEST_DECISION") {
+            let decision = match decision.as_str() {
+                "accept" => ApplicationDecision::Accept,
+                "reject" => ApplicationDecision::Reject(NonZeroU32::new(19).unwrap()),
+                _ => panic!("unknown application decision"),
+            };
+            let pending = match state
+                .await_coordinator_decision()
+                .expect("coordinator decision")
+            {
+                CoordinatorDecisionOutcome::Pending(pending) => pending,
+                CoordinatorDecisionOutcome::Rejected { state, .. } => {
+                    let _state = state;
+                    loop {
+                        // SAFETY: coordinator clean rejection terminates this helper.
+                        unsafe { libc::pause() };
+                    }
+                }
+            };
+            match pending.decide(decision).expect("receiver decision") {
+                DecisionOutcome::Accepted(_accepted) => loop {
+                    // SAFETY: keep Accepted state alive until coordinator cleanup.
+                    unsafe { libc::pause() };
+                },
+                DecisionOutcome::Rejected { .. } => loop {
+                    // SAFETY: coordinator clean rejection terminates this helper.
+                    unsafe { libc::pause() };
+                },
+            }
+        } else {
+            loop {
+                // SAFETY: keep the negotiating state and exact endpoint alive until
+                // coordinator pidfd cleanup terminates this disposable helper.
+                unsafe { libc::pause() };
+            }
         }
     }
     loop {
         // SAFETY: pause blocks this disposable helper until exact pidfd cleanup.
         unsafe { libc::pause() };
     }
+}
+
+fn send_malicious_receiver_decision(mut state: ReceiverNegotiatingState, mode: &str) -> ! {
+    let fake_challenge = DecisionChallenge::from_os_csprng([0x5a; 16]).unwrap();
+    let frame = if mode == "prequeued-accept" || mode == "prequeued-reject" {
+        let coordinator = state.transcript.coordinator_accept(fake_challenge).unwrap();
+        state
+            .transcript
+            .validate_accept(coordinator, SenderRole::Coordinator)
+            .unwrap();
+        if mode == "prequeued-accept" {
+            NegotiationFrame::Accept(state.transcript.receiver_accept().unwrap())
+        } else {
+            NegotiationFrame::Reject(
+                state
+                    .transcript
+                    .receiver_reject(NonZeroU32::new(23).unwrap())
+                    .unwrap(),
+            )
+        }
+    } else if mode == "duplicate-hello" || mode == "malformed-flood" {
+        let atomics = discover_atomic_capabilities().unwrap();
+        let hello = make_hello(SenderRole::Receiver, state.nonce, hello_offer(1), atomics).unwrap();
+        let mut bytes = encode_hello(&hello).unwrap();
+        if mode == "malformed-flood" {
+            bytes.truncate(HEADER_LEN - 1);
+        }
+        send_socket_before(&mut state.endpoint, &bytes, state.deadline).unwrap();
+        if mode == "malformed-flood" {
+            let _ = send_socket_before(&mut state.endpoint, &bytes, state.deadline);
+        }
+        loop {
+            // SAFETY: exact coordinator cleanup terminates this helper.
+            unsafe { libc::pause() };
+        }
+    } else {
+        let packet =
+            receive_socket_before(&mut state.endpoint, state.peer, state.deadline).unwrap();
+        let coordinator = match decode_frame(
+            &packet.bytes,
+            SenderRole::Coordinator,
+            state.nonce,
+            MAX_LINUX_HELLO_PAYLOAD as u32,
+        )
+        .unwrap()
+        {
+            NegotiationFrame::Accept(accept) => accept,
+            _ => panic!("expected Coordinator ACCEPT"),
+        };
+        state
+            .transcript
+            .validate_accept(coordinator, SenderRole::Coordinator)
+            .unwrap();
+        if mode == "decision-silent" {
+            loop {
+                // SAFETY: exact coordinator cleanup terminates this helper.
+                unsafe { libc::pause() };
+            }
+        }
+        if mode == "decision-exit" {
+            // SAFETY: disposable child exits after exact Coordinator ACCEPT.
+            unsafe { libc::_exit(0) }
+        }
+        if mode.starts_with("reject-") {
+            NegotiationFrame::Reject(
+                state
+                    .transcript
+                    .receiver_reject(NonZeroU32::new(29).unwrap())
+                    .unwrap(),
+            )
+        } else {
+            NegotiationFrame::Accept(state.transcript.receiver_accept().unwrap())
+        }
+    };
+    let mut bytes = encode_negotiation_frame(&frame).unwrap();
+    if mode == "reexec" {
+        let path = std::env::var_os("NATIVE_IPC_VNEXT_TEST_REEXEC_PATH").unwrap();
+        let raw = state.endpoint.fd.as_raw_fd();
+        // SAFETY: clearing CLOEXEC intentionally transfers this exact endpoint
+        // through the controlled re-exec test boundary.
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_SETFD, 0) }, 0);
+        let error = std::process::Command::new(path)
+            .args(&helper_arguments()[1..])
+            .env("NATIVE_IPC_VNEXT_BOOTSTRAP_FD", raw.to_string())
+            .env("NATIVE_IPC_VNEXT_POST_REEXEC_DECISION", encode_hex(&bytes))
+            .exec();
+        panic!("controlled re-exec failed: {error}");
+    }
+    match mode {
+        "prequeued-accept" | "prequeued-reject" => {}
+        "wrong-role" => bytes[14] = SenderRole::Coordinator as u8,
+        "wrong-nonce" => bytes[32] ^= 1,
+        "wrong-challenge" => bytes[80] ^= 1,
+        "zero-challenge" => bytes[80..96].fill(0),
+        "wrong-features" => bytes[64] ^= 1,
+        "wrong-limit-regions" => bytes[96] ^= 1,
+        "wrong-limit-active" => bytes[100] ^= 1,
+        "wrong-limit-region-bytes" => bytes[104] ^= 1,
+        "wrong-limit-batch-bytes" => bytes[112] ^= 1,
+        "wrong-limit-active-bytes" => bytes[120] ^= 1,
+        "wrong-limit-transactions" => bytes[128] ^= 1,
+        "wrong-limit-bootstrap" => bytes[136] ^= 1,
+        "wrong-limit-control" => bytes[140] ^= 1,
+        "wrong-atomics" => bytes[144] ^= 1,
+        "wrong-target" => bytes[160] ^= 1,
+        "wrong-digest" => bytes[166] ^= 1,
+        "reserved" => bytes[198] = 1,
+        "truncated" => bytes.truncate(HEADER_LEN - 1),
+        "reject-wrong-role" => bytes[14] = SenderRole::Coordinator as u8,
+        "reject-wrong-nonce" => bytes[32] ^= 1,
+        "reject-wrong-challenge" => bytes[80] ^= 1,
+        "reject-zero-reason" => bytes[28..32].fill(0),
+        "reject-reserved" => bytes[198] = 1,
+        "rights" | "reject-rights" => {
+            // SAFETY: successful open returns one uniquely owned test descriptor.
+            let raw =
+                unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            assert!(raw >= 0);
+            // SAFETY: the successful open descriptor is uniquely owned.
+            let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+            state
+                .endpoint
+                .send(&bytes, &[descriptor.as_raw_fd()])
+                .unwrap();
+            loop {
+                // SAFETY: exact coordinator cleanup terminates this helper.
+                unsafe { libc::pause() };
+            }
+        }
+        _ => panic!("unknown malicious decision mode"),
+    }
+    send_socket_before(&mut state.endpoint, &bytes, state.deadline).unwrap();
+    loop {
+        // SAFETY: exact coordinator cleanup terminates this helper.
+        unsafe { libc::pause() };
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> Vec<u8> {
+    assert_eq!(encoded.len() % 2, 0);
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |value: u8| match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                b'A'..=b'F' => value - b'A' + 10,
+                _ => panic!("invalid test hex"),
+            };
+            (digit(pair[0]) << 4) | digit(pair[1])
+        })
+        .collect()
+}
+
+fn decision_environment(
+    coordinator_len: usize,
+    receiver_len: usize,
+    receiver_decision: &str,
+) -> Vec<(OsString, OsString)> {
+    [
+        ("NATIVE_IPC_VNEXT_TEST_HELLO", receiver_len.to_string()),
+        (
+            "NATIVE_IPC_VNEXT_TEST_COORDINATOR_LEN",
+            coordinator_len.to_string(),
+        ),
+        (
+            "NATIVE_IPC_VNEXT_TEST_DECISION",
+            receiver_decision.to_owned(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+    .collect()
+}
+
+#[test]
+#[ignore = "spawned alone by bilateral_decisions_and_rejections_restore_baselines"]
+fn isolated_bilateral_decisions_and_rejections_restore_baselines() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let executable = std::env::current_exe().unwrap();
+    let arguments = helper_arguments();
+
+    for payload_len in [0, 1, MAX_LINUX_HELLO_PAYLOAD] {
+        let owner = spawn_negotiating(
+            &executable,
+            &arguments,
+            &decision_environment(payload_len, payload_len, "accept"),
+            hello_offer(payload_len),
+            deadline(),
+        )
+        .unwrap();
+        let pid = owner.pid();
+        let accepted = match owner.decide(ApplicationDecision::Accept).unwrap() {
+            DecisionOutcome::Accepted(accepted) => accepted,
+            DecisionOutcome::Rejected { .. } => panic!("bilateral ACCEPT rejected"),
+        };
+        assert_eq!(accepted.pid(), pid);
+        accepted.terminate_and_reap(deadline());
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let coordinator_reject = spawn_negotiating(
+        &executable,
+        &arguments,
+        &decision_environment(1, 1, "accept"),
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = coordinator_reject.pid();
+    assert!(matches!(
+        coordinator_reject
+            .decide(ApplicationDecision::Reject(NonZeroU32::new(17).unwrap()))
+            .unwrap(),
+        DecisionOutcome::Rejected {
+            by: SenderRole::Coordinator,
+            reason,
+            ..
+        } if reason.get() == 17
+    ));
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let receiver_reject = spawn_negotiating(
+        &executable,
+        &arguments,
+        &decision_environment(1, 1, "reject"),
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = receiver_reject.pid();
+    assert!(matches!(
+        receiver_reject
+            .decide(ApplicationDecision::Accept)
+            .unwrap(),
+        DecisionOutcome::Rejected {
+            by: SenderRole::Receiver,
+            reason,
+            ..
+        } if reason.get() == 19
+    ));
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+}
+
+#[test]
+fn bilateral_decisions_and_rejections_restore_baselines() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_bilateral_decisions_and_rejections_restore_baselines",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by challenged_decision_mutations_restore_baselines"]
+fn isolated_challenged_decision_mutations_restore_baselines() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    for mode in [
+        "prequeued-accept",
+        "prequeued-reject",
+        "duplicate-hello",
+        "malformed-flood",
+        "wrong-role",
+        "wrong-nonce",
+        "wrong-challenge",
+        "zero-challenge",
+        "wrong-features",
+        "wrong-limit-regions",
+        "wrong-limit-active",
+        "wrong-limit-region-bytes",
+        "wrong-limit-batch-bytes",
+        "wrong-limit-active-bytes",
+        "wrong-limit-transactions",
+        "wrong-limit-bootstrap",
+        "wrong-limit-control",
+        "wrong-atomics",
+        "wrong-target",
+        "wrong-digest",
+        "reserved",
+        "truncated",
+        "rights",
+        "reject-wrong-role",
+        "reject-wrong-nonce",
+        "reject-wrong-challenge",
+        "reject-zero-reason",
+        "reject-reserved",
+        "reject-rights",
+    ] {
+        let mut environment = decision_environment(1, 1, "accept");
+        environment.push((
+            OsString::from("NATIVE_IPC_VNEXT_TEST_MALICIOUS_DECISION"),
+            OsString::from(mode),
+        ));
+        let owner = spawn_negotiating(
+            &std::env::current_exe().unwrap(),
+            &helper_arguments(),
+            &environment,
+            hello_offer(1),
+            deadline(),
+        )
+        .unwrap();
+        let pid = owner.pid();
+        assert!(
+            owner.decide(ApplicationDecision::Accept).is_err(),
+            "malicious decision accepted: {mode}"
+        );
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+}
+
+#[test]
+fn challenged_decision_mutations_restore_baselines() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_challenged_decision_mutations_restore_baselines",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by decision_entropy_and_stored_deadline_restore_baselines"]
+fn isolated_decision_entropy_and_stored_deadline_restore_baselines() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let executable = std::env::current_exe().unwrap();
+    let arguments = helper_arguments();
+
+    for decision in [
+        ApplicationDecision::Accept,
+        ApplicationDecision::Reject(NonZeroU32::new(31).unwrap()),
+    ] {
+        for fault in [
+            EntropyFault::WouldBlock,
+            EntropyFault::Short,
+            EntropyFault::AllZero,
+        ] {
+            let owner = spawn_negotiating(
+                &executable,
+                &arguments,
+                &decision_environment(1, 1, "accept"),
+                hello_offer(1),
+                deadline(),
+            )
+            .unwrap();
+            let pid = owner.pid();
+            assert_eq!(
+                owner
+                    .decide_with_entropy_fault(decision, fault)
+                    .err()
+                    .unwrap(),
+                LinuxSpawnError::EntropyUnavailable
+            );
+            wait_for_baseline(before_fds, before_tasks, pid, deadline());
+        }
+    }
+
+    let owner = spawn_negotiating(
+        &executable,
+        &arguments,
+        &decision_environment(1, 1, "accept"),
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = owner.pid();
+    let accepted = match owner
+        .decide_with_entropy_fault(ApplicationDecision::Accept, EntropyFault::Interrupted)
+        .unwrap()
+    {
+        DecisionOutcome::Accepted(accepted) => accepted,
+        DecisionOutcome::Rejected { .. } => panic!("interrupted challenge rejected"),
+    };
+    accepted.terminate_and_reap(deadline());
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let short = AbsoluteDeadline::after(Duration::from_secs(2)).unwrap();
+    let owner = spawn_negotiating(
+        &executable,
+        &arguments,
+        &decision_environment(1, 1, "accept"),
+        hello_offer(1),
+        short,
+    )
+    .unwrap();
+    let pid = owner.pid();
+    while !short.is_expired() {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        LinuxSpawnError::DeadlineExpired
+    );
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+}
+
+#[test]
+fn decision_entropy_and_stored_deadline_restore_baselines() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_decision_entropy_and_stored_deadline_restore_baselines",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by reexec_between_hello_and_accept_never_becomes_accepted"]
+fn isolated_reexec_between_hello_and_accept_never_becomes_accepted() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let directory =
+        std::env::temp_dir().join(format!("native-ipc-decision-reexec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+    let replacement = directory.join("replacement-helper");
+    std::fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut environment = decision_environment(1, 1, "accept");
+    environment.extend([
+        (
+            OsString::from("NATIVE_IPC_VNEXT_TEST_MALICIOUS_DECISION"),
+            OsString::from("reexec"),
+        ),
+        (
+            OsString::from("NATIVE_IPC_VNEXT_TEST_REEXEC_PATH"),
+            replacement.as_os_str().to_owned(),
+        ),
+    ]);
+    let owner = spawn_negotiating(
+        &std::env::current_exe().unwrap(),
+        &helper_arguments(),
+        &environment,
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = owner.pid();
+    assert_eq!(
+        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        LinuxSpawnError::WrongExecutable
+    );
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn reexec_between_hello_and_accept_never_becomes_accepted() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_reexec_between_hello_and_accept_never_becomes_accepted",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by decision_silence_and_exit_restore_exact_baselines"]
+fn isolated_decision_silence_and_exit_restore_exact_baselines() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let executable = std::env::current_exe().unwrap();
+    let arguments = helper_arguments();
+
+    let mut silent_environment = decision_environment(1, 1, "accept");
+    silent_environment.push((
+        OsString::from("NATIVE_IPC_VNEXT_TEST_MALICIOUS_DECISION"),
+        OsString::from("decision-silent"),
+    ));
+    let operation_deadline = AbsoluteDeadline::after(Duration::from_millis(250)).unwrap();
+    let started = std::time::Instant::now();
+    let owner = spawn_negotiating(
+        &executable,
+        &arguments,
+        &silent_environment,
+        hello_offer(1),
+        operation_deadline,
+    )
+    .unwrap();
+    let pid = owner.pid();
+    assert_eq!(
+        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        LinuxSpawnError::Packet(PacketError::DeadlineExpired)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let mut exit_environment = decision_environment(1, 1, "accept");
+    exit_environment.push((
+        OsString::from("NATIVE_IPC_VNEXT_TEST_MALICIOUS_DECISION"),
+        OsString::from("decision-exit"),
+    ));
+    let owner = spawn_negotiating(
+        &executable,
+        &arguments,
+        &exit_environment,
+        hello_offer(1),
+        deadline(),
+    )
+    .unwrap();
+    let pid = owner.pid();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        LinuxSpawnError::Packet(PacketError::PeerExited)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+}
+
+#[test]
+fn decision_silence_and_exit_restore_exact_baselines() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_decision_silence_and_exit_restore_exact_baselines",
+    );
 }
 
 fn consume_coordinator_then(raw: RawFd, mode: &str) -> ! {
@@ -283,10 +853,10 @@ fn isolated_canonical_two_sided_hello_native_boundaries() {
             deadline(),
         )
         .unwrap();
-        assert_ne!(owner._nonce, [0; NONCE_LEN]);
+        assert_ne!(owner.nonce, [0; NONCE_LEN]);
         assert_eq!(owner._peer_application_payload.len(), receiver_len);
-        assert!(!nonces.contains(&owner._nonce));
-        nonces.push(owner._nonce);
+        assert!(!nonces.contains(&owner.nonce));
+        nonces.push(owner.nonce);
         let pid = owner.pid();
         owner.terminate_and_reap(deadline());
         wait_for_baseline(before_fds, before_tasks, pid, deadline());

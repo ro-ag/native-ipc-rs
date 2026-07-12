@@ -312,6 +312,50 @@ receipt, session, control, batch, or memory authority. Duplicate/flood/replay
 records cannot mint authority at this HELLO-only typestate and still require
 explicit native coverage at the later ACCEPT/poison transition.
 
+Local Phase 5i-E consumes both negotiating owners through challenged bilateral
+application decisions while retaining the original bootstrap deadline. After
+the coordinator application chooses ACCEPT or REJECT, the coordinator obtains
+a fresh nonzero 128-bit `DecisionChallenge` from nonblocking `getrandom` under
+that stored deadline. Coordinator ACCEPT binds the challenge to the complete
+HELLO digest and effective facts. Only a receiver that first validates that
+Coordinator ACCEPT obtains a non-cloneable `ReceiverDecisionPending`; its
+application then explicitly chooses ACCEPT or REJECT, and the exact response
+echoes the challenge. Coordinator REJECT is clean and terminal without a
+receiver reply. Receiver REJECT is likewise terminal after the challenged
+Coordinator ACCEPT. Entropy failure, malformed/foreign decisions, wrong or
+zero challenges, stale ordering, rights injection, deadline ambiguity, or
+peer exit fail closed and exact-clean the owned child.
+
+The challenge resolves a protocol-causality contradiction found during the
+implementation audit: without an unpredictable value delivered only in the
+Coordinator decision, a malicious receiver could prequeue the deterministic
+Receiver ACCEPT derived from the two HELLOs. A nonblocking queue probe could
+not close the race. The challenged transcript makes prequeued Receiver ACCEPT
+or REJECT fail with exact challenge mismatch instead of pretending that socket
+arrival order proves causality.
+
+Only bilateral exact ACCEPT yields private `AcceptedLinuxSpawn` and
+`AcceptedLinuxReceiver`. These names intentionally do not claim the public
+normative `Ready` state. They expose no receipt, endpoint/raw descriptor,
+public session, control, transfer batch, mapping, or memory authority. Before
+the coordinator accepted owner is constructed, live pidfd / held-image match /
+live pidfd is rechecked under the stored deadline. A controlled copied-inode
+re-exec between HELLO and ACCEPT is rejected. This is exact authenticated
+launch/bootstrap-principal evidence, not immutable ongoing image attestation;
+a malicious receiver may later re-exec or delegate already received authority.
+
+Rust 1.97 privileged, seccomp-unconfined Arm64 Docker covers ACCEPT with
+empty/one/exact-65,312-byte HELLO payloads, both clean Reject paths, fresh
+challenge entropy faults and EINTR, application delay through the original
+deadline, prequeued decisions, every effective-field/challenge mutation,
+malformed flood, duplicate HELLO, SCM_RIGHTS, silence, exit, re-exec, and exact
+fd/task/child/ECHILD baselines. Full all-feature and no-default workspace
+tests/doctests plus strict Clippy pass locally. This is emulated/VM
+characterization only; exact hosted native AMD64/Arm64/ASan, physical Arm64,
+packaged-crate, and exact release-commit evidence remain pending. A duplicate
+decision queued after a valid final ACCEPT remains for the future common
+accepted-state dispatcher to reject and is not overclaimed here.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

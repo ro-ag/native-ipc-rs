@@ -7,6 +7,12 @@ Versioning once a stable API is released.
 
 ### Security
 
+- Bind two-sided ACCEPT/REJECT ordering to a fresh nonzero 128-bit coordinator
+  decision challenge. Receiver ACCEPT or REJECT must echo the exact challenge,
+  preventing a malicious receiver from prequeuing a deterministic decision
+  before the coordinator decides. Zero and legacy challenge-free decisions are
+  rejected with no downgrade decoder; the challenge is causality evidence, not
+  a MAC, secret, receipt, or authority grant.
 - Define the strongest achievable Linux shared-memory authority contract:
   `MFD_NOEXEC_SEAL`, complete seal ordering, non-executable library views, and
   inherited irreversible MDWE are mandatory. Native AMD64/Arm64 evidence shows

@@ -14,10 +14,19 @@ The authenticated channel uses this fixed two-sided sequence:
 4. receiver `ACCEPT` or `REJECT`.
 
 Each application sees the peer's bounded opaque HELLO payload before making
-its decision. Only the final exact `ACCEPT` transitions to ready. A malformed,
-stale, substituted, out-of-order, partial, or timed-out frame poisons the
-session once transport exists; a canonical application `REJECT` is a clean
-negotiation outcome.
+its decision. The coordinator decision carries a fresh nonzero 128-bit
+OS-CSPRNG challenge. After coordinator `ACCEPT`, the receiver makes its own
+explicit application decision and its `ACCEPT` or `REJECT` echoes that challenge
+exactly. Coordinator `REJECT` is terminal. Only the final exact `ACCEPT`
+transitions to ready. A malformed, stale, substituted, out-of-order, partial,
+or timed-out frame poisons the session once transport exists; a canonical
+application `REJECT` is a clean negotiation outcome.
+
+The challenge prevents a malicious receiver from prequeuing a deterministic
+decision before the coordinator decides. It is neither authentication, the
+session nonce, a receipt, a MAC, nor a secret after delivery. A single online
+guess succeeds with probability 2^-128. Entropy/deadline failure after the
+decision begins poisons without retrying or replacing the original deadline.
 
 ## Wire registry
 
@@ -34,14 +43,28 @@ negotiation outcome.
   are ignored; unknown required bits reject negotiation.
 - Rejection reason zero is invalid. Named nonzero reason assignments will be
   fixed before the public session API is exposed.
+- ACCEPT and REJECT bytes 80..96 carry the decision challenge. The all-zero
+  value is invalid. For HELLO, those bytes retain their original meaning as the
+  two required-feature `u64` words.
 
 The selected feature set is the known intersection of both supported sets and
 verified effective capabilities. It must include both required sets. Numeric
 limits are exact checked minima. ACCEPT repeats the selected features,
 effective limits, effective atomic/alignment facts, target, role, and session
 nonce, plus a domain-separated SHA-256 digest of both canonical HELLO records
-(including their opaque payloads). It is compared to the immutable result of
-both HELLO frames. Decision validation is ordered and one-shot per role.
+(including their opaque payloads), and the decision challenge. It is compared
+to the immutable result of both HELLO frames. The first exact coordinator
+ACCEPT stores its challenge; the receiver decision must echo it. Decision
+validation is ordered and one-shot per role. REJECT carries the session nonce,
+nonzero reason, and decision challenge; its other decision-body bytes are zero.
+Canonical REJECT decoding alone is not an authorized decision: the
+transcript-owned reducer must additionally validate role, nonce, reason,
+challenge, and current decision order before terminating negotiation.
+
+This is a deliberate incompatible correction to an unpublished and unfrozen
+pre-public wire 1.0 draft. Header length remains 224, wire number remains 1.0,
+and the HELLO payload ceiling is unchanged. There is no legacy zero-challenge
+decoder, dual decoder, downgrade path, or compatibility mode.
 
 The SHA-256 preimage is exactly the following concatenation, with no implicit
 padding or separators:
@@ -62,8 +85,9 @@ code `u8`; application payload length `u32`; and exactly that many payload
 bytes. Atomic flag bits 0 and 1 mean lock-free u32 and u64 respectively.
 
 Header length, derived frame length, zero result, fixed flags, reserved bytes,
-and the ACCEPT digest field are excluded. They are fixed, derived, or required
-zero by the canonical wire decoder. The unit-test golden vector for the fixed
+the decision challenge, and the ACCEPT digest field are excluded. They are
+fixed, derived, decision-time input, or validated elsewhere by the canonical
+wire decoder. The unit-test golden vector for the fixed
 coordinator/receiver fixture is
 `a55eeda47e9f0124bd9f9b675e7b356fdc72cde173ff7d62acd7a15819b9312a`.
 
