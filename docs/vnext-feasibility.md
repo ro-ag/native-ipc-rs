@@ -531,6 +531,53 @@ coordinator/receiver regression proves one native operation, retained duplicate
 input, transaction-owned fd cleanup, and persistent poison. Focused re-review
 reports no remaining P1/P2/P3.
 
+Phase 5i-G1c moves capability-frame provenance and transaction allocation into
+the inseparable accepted-session owner. Both role-scoped Accepted evidence
+owners now transfer the exact authenticated parent/child identities, accepted
+nonce, and effective negotiated limits into `AcceptedControlDispatcher`.
+Callers supply only proposed manifest entries. The dispatcher validates and
+canonicalizes them, enforces negotiated entry, per-region logical, aggregate
+logical, aggregate mapped, and transaction limits, then mints the nonzero
+monotonic transaction ID and exact capability frame internally. It never
+accepts a caller-built frame or caller-selected nonce, PID pair, or transaction
+ID.
+
+Pure local invalid-manifest, limit, and already-expired-deadline failures occur
+before transaction entry, native I/O, or ID consumption. Transaction-limit
+exhaustion is terminal and poisons the accepted owner. Once a transaction is
+entered, the G1b rules remain unchanged: one caller-derived absolute deadline,
+coordinator-only initiation, ordinary-control exclusion, exact directional
+credentials, immediate ownership of installed fds, and persistent poisoning on
+failure or guard destruction.
+
+Adjacent tests cover exact evidence propagation, internally minted identity
+and transaction IDs, nonce/PID/transaction/count substitution, monotonic
+allocation and exhaustion, duplicate entries, count/per-logical-region and
+aggregate logical/mapped limits, expired-deadline non-consumption, and
+preservation of the G1b replay,
+interleaving, rights-count, deadline, cleanup, and poisoning corpus. Local
+macOS Rust 1.97 formatting, strict Clippy, all-feature, and no-default-feature
+tests pass. Privileged seccomp-unconfined Rust 1.97 Arm64 Docker passes the same
+proportional gates but remains container/emulation characterization only.
+
+Exact implementation commit `bd4e2789cdcf218e5569529003f975e4c7c41e1b`
+is green across all ten jobs in
+[Actions 29206612933](https://github.com/ro-ag/native-ipc-rs/actions/runs/29206612933),
+including hosted native Linux AMD64/Arm64, ASan, non-Linux targets, and every
+auxiliary gate. Independent review found one P2 where the initial limit check
+incorrectly applied the negotiated per-region logical-byte maximum to the
+page-rounded mapped length. The correction applies that limit only to logical
+bytes, keeps aggregate mapped bytes under `max_batch_bytes`, and adds the exact
+4,095-logical/4,096-mapped boundary regression. Final re-review reports no
+remaining P1/P2/P3.
+
+G1c adds no production transaction completion path and makes no IMPORTED,
+SEALED, READY, COMMIT, activation, mapping, or public `Session<Ready>` claim.
+The complete prepared-memory/expected-batch adapter, import and native object
+validation, receiver-writer preparation, full-manifest barriers, runtime
+activation, public APIs, native-host/physical Arm64, packaged-crate, release,
+and whole-vNext evidence remain outstanding.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

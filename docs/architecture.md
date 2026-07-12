@@ -113,15 +113,22 @@ barrier transitions. This prevents two transactions from interleaving frames;
 any malformed, stale, timed-out, or ambiguous transition poisons the session
 and keeps all pending runtime wrappers private.
 
-The private Linux G1b checkpoint keeps accepted application-control and native
+The private Linux G1c checkpoint keeps accepted application-control and native
 capability traffic in one `AcceptedControlDispatcher`. Sealed role-specific
 transport traits let only the coordinator send the first canonical capability
 record while the receiver can only await it. A transaction guard borrows that
-owner, stores the caller's one absolute deadline, and owns every installed fd;
-it never yields the socket, pidfd, executable, evidence, or descriptors. Until
-the manifest-bound import/seal and READY/COMMIT reducer exists, the guard has no
-completion operation and its destruction persistently poisons the session.
-This is a terminal transport/ownership checkpoint, not an active batch.
+owner, stores the caller's one absolute deadline, and owns every installed fd.
+The dispatcher retains the immutable accepted nonce, authenticated parent and
+child identities, and negotiated limits; it alone mints monotonically
+increasing transaction IDs and the canonical capability frame. Callers provide
+only candidate manifest entries and cannot substitute accepted provenance or a
+wire frame. Local manifest validation occurs before transaction entry and does
+not consume an ID, while negotiated transaction exhaustion poisons the owner.
+The guard never yields the socket, pidfd, executable, evidence, or descriptors.
+Until the manifest-bound import/seal and READY/COMMIT reducer exists, it has no
+production completion operation and its destruction persistently poisons the
+session. This is a terminal provenance/transport ownership checkpoint, not an
+active batch.
 
 ## Unsafe-code policy
 
