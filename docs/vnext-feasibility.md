@@ -137,7 +137,10 @@ concurrent broad waiter can reap the child and permit PID reuse before
 `clone3` v2-sized `clone_args` UAPI (zero extensions) with fork-like flags, `CLONE_PIDFD`, and
 `SIGCHLD`. The kernel writes the pidfd in the same clone operation. In an
 isolated process with `SIGCHLD=SIG_IGN`, the probe proves the pidfd reports the
-returned child while live and remains readable after automatic reap. It passed
+returned child while live and remains readable after automatic reap, while a
+signal-zero operation fails with `ESRCH`. Post-reap fdinfo is kernel-dependent:
+it may retain the clone-time PID or report `-1`; neither form is treated as
+continued process authority. It passed
 Linux Arm64 Docker only with seccomp unconfined; Docker's default profile
 returned synthetic `ENOSYS`. This probe does not exec, install MDWE, own
 cleanup, mint a receipt, or provide native release evidence. Production work
