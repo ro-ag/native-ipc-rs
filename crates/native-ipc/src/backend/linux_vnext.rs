@@ -5,7 +5,7 @@ mod process;
 
 use core::cell::Cell;
 use core::marker::PhantomData;
-use core::mem::{ManuallyDrop, size_of, zeroed};
+use core::mem::{ManuallyDrop, align_of, size_of, zeroed};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -62,6 +62,38 @@ struct ReceivedPacket {
     bytes: Vec<u8>,
     descriptors: Vec<OwnedFd>,
     credentials: PacketCredentials,
+}
+
+struct ReceivedAncillary {
+    descriptors: Vec<OwnedFd>,
+    credentials: Option<PacketCredentials>,
+    rights_records: usize,
+    valid: bool,
+}
+
+impl ReceivedAncillary {
+    fn validate(
+        self,
+        expected_peer: PacketCredentials,
+        expected_descriptors: usize,
+    ) -> Result<(Vec<OwnedFd>, PacketCredentials), PacketError> {
+        if !self.valid {
+            return Err(PacketError::MalformedAncillary);
+        }
+        let credentials = self.credentials.ok_or(PacketError::MalformedAncillary)?;
+        if credentials != expected_peer {
+            return Err(PacketError::WrongPeer);
+        }
+        if self.descriptors.len() != expected_descriptors {
+            return Err(PacketError::WrongDescriptorCount);
+        }
+        if (expected_descriptors == 0 && self.rights_records != 0)
+            || (expected_descriptors != 0 && self.rights_records != 1)
+        {
+            return Err(PacketError::MalformedAncillary);
+        }
+        Ok((self.descriptors, credentials))
+    }
 }
 
 struct SeqPacketEndpoint {
@@ -222,90 +254,9 @@ impl SeqPacketEndpoint {
             return Err(last_io_kind());
         }
 
-        let mut descriptors = Vec::new();
-        let mut credentials = None;
-        let mut rights_records = 0_usize;
-        let mut ancillary_valid = true;
-        if message.msg_controllen > control_len {
-            return Err(PacketError::MalformedAncillary);
-        }
-        let control_start = message.msg_control as usize;
-        let control_end = control_start
-            .checked_add(message.msg_controllen)
-            .ok_or(PacketError::MalformedAncillary)?;
-        // SAFETY: the kernel initialized a cmsg chain within `msg_controllen`.
-        let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        while !header.is_null() {
-            let address = header as usize;
-            if address < control_start
-                || address
-                    .checked_add(size_of::<libc::cmsghdr>())
-                    .is_none_or(|end| end > control_end)
-            {
-                ancillary_valid = false;
-                break;
-            }
-            // SAFETY: the complete cmsghdr lies inside the returned control bytes.
-            let current = unsafe { &*header };
-            let minimum = unsafe { libc::CMSG_LEN(0) as usize };
-            if current.cmsg_len < minimum
-                || address
-                    .checked_add(current.cmsg_len)
-                    .is_none_or(|end| end > control_end)
-            {
-                ancillary_valid = false;
-                break;
-            }
-            let payload_len = current.cmsg_len - minimum;
-            match (current.cmsg_level, current.cmsg_type) {
-                (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
-                    if payload_len != size_of::<libc::ucred>() || credentials.is_some() {
-                        ancillary_valid = false;
-                    } else {
-                        // SAFETY: exact payload length proves one ucred is present.
-                        let native = unsafe {
-                            core::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>())
-                        };
-                        if native.pid <= 0 {
-                            ancillary_valid = false;
-                        } else {
-                            credentials = Some(PacketCredentials {
-                                pid: native.pid as u32,
-                                uid: native.uid,
-                                gid: native.gid,
-                            });
-                        }
-                    }
-                }
-                (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
-                    rights_records += 1;
-                    if rights_records > 1 {
-                        ancillary_valid = false;
-                    }
-                    if payload_len == 0 || !payload_len.is_multiple_of(size_of::<RawFd>()) {
-                        ancillary_valid = false;
-                    } else {
-                        for index in 0..payload_len / size_of::<RawFd>() {
-                            // SAFETY: the cmsg length proves this fd element exists.
-                            let raw = unsafe {
-                                core::ptr::read_unaligned(
-                                    libc::CMSG_DATA(header).cast::<RawFd>().add(index),
-                                )
-                            };
-                            if raw < 0 {
-                                ancillary_valid = false;
-                            } else {
-                                // SAFETY: SCM_RIGHTS installed a new owned descriptor.
-                                descriptors.push(unsafe { OwnedFd::from_raw_fd(raw) });
-                            }
-                        }
-                    }
-                }
-                _ => ancillary_valid = false,
-            }
-            // SAFETY: advances only within the kernel-produced control chain.
-            header = unsafe { libc::CMSG_NXTHDR(&message, header) };
-        }
+        // SAFETY: recvmsg initialized the returned cmsg chain and uniquely
+        // installed every nonnegative SCM_RIGHTS descriptor in this process.
+        let ancillary = unsafe { adopt_received_ancillary(&message, control_len)? };
 
         if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
             return Err(PacketError::Truncated);
@@ -313,21 +264,7 @@ impl SeqPacketEndpoint {
         if received == 0 || received as usize != expected_len {
             return Err(PacketError::Truncated);
         }
-        if !ancillary_valid {
-            return Err(PacketError::MalformedAncillary);
-        }
-        let credentials = credentials.ok_or(PacketError::MalformedAncillary)?;
-        if credentials != expected_peer {
-            return Err(PacketError::WrongPeer);
-        }
-        if descriptors.len() != expected_descriptors {
-            return Err(PacketError::WrongDescriptorCount);
-        }
-        if (expected_descriptors == 0 && rights_records != 0)
-            || (expected_descriptors != 0 && rights_records != 1)
-        {
-            return Err(PacketError::MalformedAncillary);
-        }
+        let (descriptors, credentials) = ancillary.validate(expected_peer, expected_descriptors)?;
         bytes.truncate(received as usize);
         Ok(ReceivedPacket {
             bytes,
@@ -335,6 +272,114 @@ impl SeqPacketEndpoint {
             credentials,
         })
     }
+}
+
+/// Parses a kernel-produced, structurally traversable ancillary chain and
+/// adopts every complete descriptor word in each reachable `SCM_RIGHTS`
+/// record before returning its validation result.
+///
+/// # Safety
+///
+/// Every nonnegative descriptor encoded in a reachable `SCM_RIGHTS` payload
+/// must be a newly installed, uniquely owned descriptor. The complete
+/// `msg_control` range must remain live for this call. No installed descriptor
+/// may lie in or beyond a malformed header whose bounds or length make the
+/// remainder of the chain untraversable; recovery from such synthetic layouts
+/// is intentionally outside this function's contract.
+unsafe fn adopt_received_ancillary(
+    message: &libc::msghdr,
+    control_capacity: usize,
+) -> Result<ReceivedAncillary, PacketError> {
+    if message.msg_controllen > control_capacity {
+        return Err(PacketError::MalformedAncillary);
+    }
+    let mut ancillary = ReceivedAncillary {
+        descriptors: Vec::new(),
+        credentials: None,
+        rights_records: 0,
+        valid: true,
+    };
+    let control_start = message.msg_control as usize;
+    let control_end = control_start
+        .checked_add(message.msg_controllen)
+        .ok_or(PacketError::MalformedAncillary)?;
+    // SAFETY: the caller guarantees a live cmsg range.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    while !header.is_null() {
+        let address = header as usize;
+        if address < control_start
+            || !address.is_multiple_of(align_of::<libc::cmsghdr>())
+            || address
+                .checked_add(size_of::<libc::cmsghdr>())
+                .is_none_or(|end| end > control_end)
+        {
+            ancillary.valid = false;
+            break;
+        }
+        // SAFETY: the complete cmsghdr lies inside the caller-provided range.
+        let current = unsafe { &*header };
+        // SAFETY: CMSG_LEN performs scalar layout arithmetic only.
+        let minimum = unsafe { libc::CMSG_LEN(0) as usize };
+        if current.cmsg_len < minimum
+            || address
+                .checked_add(current.cmsg_len)
+                .is_none_or(|end| end > control_end)
+        {
+            ancillary.valid = false;
+            break;
+        }
+        let payload_len = current.cmsg_len - minimum;
+        match (current.cmsg_level, current.cmsg_type) {
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
+                if payload_len != size_of::<libc::ucred>() || ancillary.credentials.is_some() {
+                    ancillary.valid = false;
+                } else {
+                    // SAFETY: exact payload length proves one ucred is present.
+                    let native = unsafe {
+                        core::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>())
+                    };
+                    if native.pid <= 0 {
+                        ancillary.valid = false;
+                    } else {
+                        ancillary.credentials = Some(PacketCredentials {
+                            pid: native.pid as u32,
+                            uid: native.uid,
+                            gid: native.gid,
+                        });
+                    }
+                }
+            }
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                ancillary.rights_records += 1;
+                if ancillary.rights_records > 1 {
+                    ancillary.valid = false;
+                }
+                if payload_len == 0 || !payload_len.is_multiple_of(size_of::<RawFd>()) {
+                    ancillary.valid = false;
+                }
+                for index in 0..payload_len / size_of::<RawFd>() {
+                    // SAFETY: the cmsg length proves this complete fd word exists.
+                    let raw = unsafe {
+                        core::ptr::read_unaligned(
+                            libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                        )
+                    };
+                    if raw < 0 {
+                        ancillary.valid = false;
+                    } else {
+                        // SAFETY: the caller transferred unique ownership.
+                        ancillary
+                            .descriptors
+                            .push(unsafe { OwnedFd::from_raw_fd(raw) });
+                    }
+                }
+            }
+            _ => ancillary.valid = false,
+        }
+        // SAFETY: advances only within the caller-provided control chain.
+        header = unsafe { libc::CMSG_NXTHDR(message, header) };
+    }
+    Ok(ancillary)
 }
 
 impl ProcessBoundEndpoint {

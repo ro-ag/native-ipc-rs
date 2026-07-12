@@ -1,5 +1,6 @@
 use super::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
+use std::os::fd::IntoRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -13,13 +14,17 @@ const ENV_PARENT_GID: &str = "NATIVE_IPC_VNEXT_TEST_PARENT_GID";
 pub(super) struct DeadlineFaults {
     send_interrupts: u8,
     receive_interrupts: u8,
+    send_interrupts_until_expired: bool,
+    receive_interrupts_until_expired: bool,
     expire_after_send: bool,
     expire_after_receive: bool,
 }
 
 impl ProcessBoundEndpoint {
     pub(super) fn inject_send_interrupt(&mut self) -> bool {
-        if self.faults.send_interrupts == 0 {
+        if self.faults.send_interrupts_until_expired {
+            true
+        } else if self.faults.send_interrupts == 0 {
             false
         } else {
             self.faults.send_interrupts -= 1;
@@ -28,7 +33,9 @@ impl ProcessBoundEndpoint {
     }
 
     pub(super) fn inject_receive_interrupt(&mut self) -> bool {
-        if self.faults.receive_interrupts == 0 {
+        if self.faults.receive_interrupts_until_expired {
+            true
+        } else if self.faults.receive_interrupts == 0 {
             false
         } else {
             self.faults.receive_interrupts -= 1;
@@ -93,6 +100,12 @@ fn open_fd_count() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
+fn wait_until_expired(deadline: AbsoluteDeadline) {
+    while !deadline.is_expired() {
+        std::thread::yield_now();
+    }
+}
+
 fn send_unchecked_rights(endpoint: &SeqPacketEndpoint, bytes: &[u8], fds: &[RawFd]) {
     let mut iovec = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
@@ -121,6 +134,168 @@ fn send_unchecked_rights(endpoint: &SeqPacketEndpoint, bytes: &[u8], fds: &[RawF
             bytes.len() as isize
         );
     }
+}
+
+#[derive(Clone, Copy)]
+enum MalformedRightsTail {
+    DuplicateRights,
+    EmptyRights,
+    NegativeRight,
+    WrongLevel,
+    WrongType,
+    ShortLength,
+    LongLength,
+    RightWithTrailingByte,
+}
+
+unsafe fn write_synthetic_header(
+    control: &mut ControlStorage,
+    offset: usize,
+    level: libc::c_int,
+    kind: libc::c_int,
+    declared_len: usize,
+) -> *mut libc::cmsghdr {
+    // SAFETY: callers use aligned CMSG_SPACE offsets within ControlStorage.
+    let header = unsafe {
+        control
+            .as_mut_ptr()
+            .cast::<u8>()
+            .add(offset)
+            .cast::<libc::cmsghdr>()
+    };
+    // SAFETY: the complete aligned header lies inside ControlStorage.
+    unsafe {
+        header.write(libc::cmsghdr {
+            cmsg_len: declared_len,
+            cmsg_level: level,
+            cmsg_type: kind,
+        });
+    }
+    header
+}
+
+unsafe fn write_synthetic_right(control: &mut ControlStorage, offset: usize, raw: RawFd) -> usize {
+    // SAFETY: CMSG_LEN performs scalar layout arithmetic only.
+    let length = unsafe { libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize };
+    // SAFETY: caller reserved a complete rights record at this aligned offset.
+    let header = unsafe {
+        write_synthetic_header(control, offset, libc::SOL_SOCKET, libc::SCM_RIGHTS, length)
+    };
+    // SAFETY: the rights payload has exact RawFd size and alignment is not required.
+    unsafe { core::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), raw) };
+    // SAFETY: CMSG_SPACE performs scalar layout arithmetic only.
+    offset + unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize }
+}
+
+fn assert_malformed_rights_tail_closes_adopted_fds(tail: MalformedRightsTail) {
+    let before = open_fd_count();
+    let first = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+    let mut control = ControlStorage::zeroed();
+    // SAFETY: ownership of `first` transfers into the synthetic SCM_RIGHTS record.
+    let second_offset = unsafe { write_synthetic_right(&mut control, 0, first) };
+    // SAFETY: CMSG_LEN/CMSG_SPACE perform scalar layout arithmetic only.
+    let minimum = unsafe { libc::CMSG_LEN(0) as usize };
+    // SAFETY: every chosen range remains within the fixed control storage.
+    let control_len = unsafe {
+        match tail {
+            MalformedRightsTail::DuplicateRights => {
+                let second = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+                write_synthetic_right(&mut control, second_offset, second)
+            }
+            MalformedRightsTail::EmptyRights => {
+                write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_RIGHTS,
+                    minimum,
+                );
+                second_offset + minimum
+            }
+            MalformedRightsTail::NegativeRight => {
+                let length = libc::CMSG_LEN(size_of::<RawFd>() as u32) as usize;
+                let header = write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_RIGHTS,
+                    length,
+                );
+                core::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), -1);
+                second_offset + libc::CMSG_SPACE(size_of::<RawFd>() as u32) as usize
+            }
+            MalformedRightsTail::WrongLevel => {
+                write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::IPPROTO_IP,
+                    libc::SCM_RIGHTS,
+                    minimum,
+                );
+                second_offset + minimum
+            }
+            MalformedRightsTail::WrongType => {
+                write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_CREDENTIALS + 1,
+                    minimum,
+                );
+                second_offset + minimum
+            }
+            MalformedRightsTail::ShortLength => {
+                write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_RIGHTS,
+                    minimum - 1,
+                );
+                second_offset + minimum
+            }
+            MalformedRightsTail::LongLength => {
+                write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_RIGHTS,
+                    minimum + 1,
+                );
+                second_offset + minimum
+            }
+            MalformedRightsTail::RightWithTrailingByte => {
+                let trailing = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
+                let payload_len = size_of::<RawFd>() + 1;
+                let length = libc::CMSG_LEN(payload_len as u32) as usize;
+                let header = write_synthetic_header(
+                    &mut control,
+                    second_offset,
+                    libc::SOL_SOCKET,
+                    libc::SCM_RIGHTS,
+                    length,
+                );
+                core::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), trailing);
+                libc::CMSG_DATA(header)
+                    .cast::<u8>()
+                    .add(size_of::<RawFd>())
+                    .write(0xa5);
+                second_offset + libc::CMSG_SPACE(payload_len as u32) as usize
+            }
+        }
+    };
+    assert!(control_len <= CONTROL_CAPACITY);
+    let mut message: libc::msghdr = unsafe { zeroed() };
+    message.msg_control = control.as_mut_ptr();
+    message.msg_controllen = control_len;
+    // SAFETY: all nonnegative fds in rights records were transferred with
+    // IntoRawFd and the complete synthetic control range remains live.
+    let ancillary = unsafe { adopt_received_ancillary(&message, control_len) }.unwrap();
+    assert!(matches!(
+        ancillary.validate(current_credentials(), 1),
+        Err(PacketError::MalformedAncillary)
+    ));
+    assert_eq!(open_fd_count(), before);
 }
 
 fn cached_peer_credentials(endpoint: &SeqPacketEndpoint) -> PacketCredentials {
@@ -209,6 +384,61 @@ fn one_absolute_deadline_bounds_nonblocking_send_receive_and_silence() {
         Err(PacketError::DeadlineExpired)
     ));
     assert!(started.elapsed() >= Duration::from_millis(1));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn expired_deadline_performs_no_io_and_does_not_consume_a_queued_packet() {
+    let (mut sender, mut receiver) = self_bound_pair();
+    let expired_send = AbsoluteDeadline::after(Duration::from_millis(2)).unwrap();
+    wait_until_expired(expired_send);
+    assert_eq!(
+        sender.send_before(b"never!", &[], expired_send),
+        Err(PacketError::DeadlineExpired)
+    );
+    assert!(matches!(
+        receiver.endpoint.receive(6, current_credentials(), 0),
+        Err(PacketError::WouldBlock)
+    ));
+
+    let (mut sender, mut receiver) = self_bound_pair();
+    let fresh = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+    sender.send_before(b"queued", &[], fresh).unwrap();
+    let expired_receive = AbsoluteDeadline::after(Duration::from_millis(2)).unwrap();
+    wait_until_expired(expired_receive);
+    assert!(matches!(
+        receiver.receive_before(6, 0, expired_receive),
+        Err(PacketError::DeadlineExpired)
+    ));
+    assert_eq!(
+        receiver
+            .endpoint
+            .receive(6, current_credentials(), 0)
+            .unwrap()
+            .bytes,
+        b"queued"
+    );
+}
+
+#[test]
+fn continuous_interruption_retries_cannot_extend_one_absolute_deadline() {
+    let (mut sender, mut receiver) = self_bound_pair();
+    sender.faults.send_interrupts_until_expired = true;
+    let started = Instant::now();
+    let deadline = AbsoluteDeadline::after(Duration::from_millis(25)).unwrap();
+    assert_eq!(
+        sender.send_before(b"never!", &[], deadline),
+        Err(PacketError::DeadlineExpired)
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    receiver.faults.receive_interrupts_until_expired = true;
+    let started = Instant::now();
+    let deadline = AbsoluteDeadline::after(Duration::from_millis(25)).unwrap();
+    assert!(matches!(
+        receiver.receive_before(6, 0, deadline),
+        Err(PacketError::DeadlineExpired)
+    ));
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
@@ -327,11 +557,51 @@ fn truncated_ancillary_closes_every_fd_that_the_kernel_installed() {
 }
 
 #[test]
+#[ignore = "spawned alone by descriptor_cleanup_is_zero_growth"]
+fn truncated_payload_closes_rights_installed_before_msg_trunc_is_reported() {
+    let (sender, mut receiver) = SeqPacketEndpoint::pair().unwrap();
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let bytes = vec![0_u8; CONTROL_FRAME_LEN + 1];
+    let before = open_fd_count();
+    send_unchecked_rights(&sender, &bytes, &[file.as_raw_fd()]);
+    assert!(matches!(
+        receive_until(&mut receiver, CONTROL_FRAME_LEN, current_credentials(), 1),
+        Err(PacketError::Truncated)
+    ));
+    assert_eq!(open_fd_count(), before);
+}
+
+#[test]
+#[ignore = "spawned alone by descriptor_cleanup_is_zero_growth"]
+fn malformed_rights_chains_close_every_fd_adopted_before_rejection() {
+    for tail in [
+        MalformedRightsTail::DuplicateRights,
+        MalformedRightsTail::EmptyRights,
+        MalformedRightsTail::NegativeRight,
+        MalformedRightsTail::WrongLevel,
+        MalformedRightsTail::WrongType,
+        MalformedRightsTail::ShortLength,
+        MalformedRightsTail::LongLength,
+    ] {
+        assert_malformed_rights_tail_closes_adopted_fds(tail);
+    }
+}
+
+#[test]
+#[ignore = "spawned alone by descriptor_cleanup_is_zero_growth"]
+fn rights_payload_with_complete_fd_and_trailing_byte_closes_every_fd() {
+    assert_malformed_rights_tail_closes_adopted_fds(MalformedRightsTail::RightWithTrailingByte);
+}
+
+#[test]
 fn descriptor_cleanup_is_zero_growth() {
     let executable = std::env::current_exe().unwrap();
     for test in [
         "backend::linux_vnext::tests::short_wrong_peer_and_extra_rights_packets_close_every_installed_fd",
         "backend::linux_vnext::tests::truncated_ancillary_closes_every_fd_that_the_kernel_installed",
+        "backend::linux_vnext::tests::truncated_payload_closes_rights_installed_before_msg_trunc_is_reported",
+        "backend::linux_vnext::tests::malformed_rights_chains_close_every_fd_adopted_before_rejection",
+        "backend::linux_vnext::tests::rights_payload_with_complete_fd_and_trailing_byte_closes_every_fd",
     ] {
         let status = Command::new(&executable)
             .args(["--exact", test, "--ignored", "--nocapture"])
