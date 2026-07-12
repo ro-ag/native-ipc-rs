@@ -442,20 +442,25 @@ fn continuous_wrong_peer_accepts_cannot_extend_original_deadline() {
         gid: unsafe { libc::getegid() },
     };
     let mut accepted = 0_usize;
-    let mut attempts_after_deadline = 0_usize;
+    let mut accept_attempts = 0_usize;
+    let mut crossing_attempt = None;
     let mut observed_pids = std::collections::BTreeSet::new();
     let started = Instant::now();
     let timeout = Duration::from_millis(100);
     let deadline = started + timeout;
     let result = accept_expected_peer(
         || {
-            if Instant::now() >= deadline {
-                attempts_after_deadline += 1;
-            }
+            accept_attempts += 1;
             match listener.accept() {
                 Ok((stream, _address)) => {
                     accepted += 1;
                     observed_pids.insert(peer_credentials(&stream).unwrap().pid);
+                    if accepted == 2 {
+                        while Instant::now() < deadline {
+                            std::thread::yield_now();
+                        }
+                        crossing_attempt = Some(accept_attempts);
+                    }
                     Ok(stream)
                 }
                 Err(error) => Err(error),
@@ -479,7 +484,7 @@ fn continuous_wrong_peer_accepts_cannot_extend_original_deadline() {
         "hostile child did not sustain connection pressure"
     );
     assert_eq!(observed_pids, [wrong_pid].into_iter().collect());
-    assert_eq!(attempts_after_deadline, 0);
+    assert_eq!(crossing_attempt, Some(accept_attempts));
 }
 
 #[test]
