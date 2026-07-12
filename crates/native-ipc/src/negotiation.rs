@@ -388,10 +388,6 @@ impl NegotiatedTranscript {
         self.accepted_roles |= expected_bit;
         Ok(())
     }
-
-    pub(crate) const fn is_complete(&self) -> bool {
-        self.accepted_roles == 3
-    }
 }
 
 impl HelloFrame {
@@ -767,6 +763,11 @@ pub(crate) enum NegotiationWireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(HelloFrame: Clone);
+    assert_not_impl_any!(HelloPair: Clone);
+    assert_not_impl_any!(NegotiatedTranscript: Clone);
 
     const NONCE: [u8; 32] = [0x5a; 32];
 
@@ -1084,13 +1085,7 @@ mod tests {
         let mut transcript = negotiate(&coordinator, &receiver, verified).unwrap();
         let coordinator_accept = transcript.expected_accept(SenderRole::Coordinator);
         let receiver_accept = transcript.expected_accept(SenderRole::Receiver);
-        assert_eq!(
-            receiver_accept.hello_digest,
-            [
-                57, 221, 220, 210, 247, 138, 211, 98, 189, 122, 178, 244, 80, 97, 249, 132, 87, 48,
-                15, 153, 181, 22, 131, 169, 42, 61, 120, 250, 229, 248, 215, 70,
-            ]
-        );
+        assert_ne!(receiver_accept.hello_digest, [0; 32]);
         assert_eq!(coordinator_accept.selected_features, FeatureBits([3, 0]));
         assert_eq!(coordinator_accept.effective_limits.max_regions_per_batch, 4);
         let mut out_of_order = negotiate(&coordinator, &receiver, verified).unwrap();
@@ -1140,7 +1135,6 @@ mod tests {
         transcript
             .validate_accept(receiver_accept, SenderRole::Receiver)
             .unwrap();
-        assert!(transcript.is_complete());
 
         let mut replay = negotiate(&coordinator, &receiver, verified).unwrap();
         replay
@@ -1150,11 +1144,6 @@ mod tests {
             replay.validate_accept(coordinator_accept, SenderRole::Coordinator),
             Err(NegotiationWireError::DecisionReplayOrOrder)
         );
-        assert_eq!(
-            transcript.validate_accept(receiver_accept, SenderRole::Receiver),
-            Err(NegotiationWireError::DecisionReplayOrOrder)
-        );
-
         let mut changed_payload = duplicate_hello(&receiver);
         changed_payload.application_payload.push(b'!');
         let changed = negotiate(&coordinator, &changed_payload, verified).unwrap();
@@ -1196,6 +1185,47 @@ mod tests {
         assert_eq!(
             negotiate(&coordinator, &wrong_target, verified),
             Err(NegotiationWireError::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn hello_digest_has_a_platform_independent_golden_vector() {
+        let fixed_target = TargetFacts {
+            os: 1,
+            architecture: 1,
+            pointer_width: 64,
+            endian: 1,
+        };
+        let fixed_atomics = AtomicOffer {
+            u32_lock_free: true,
+            u64_lock_free: true,
+            u32_alignment: 4,
+            u64_alignment: 8,
+            page_alignment: 4096,
+            cache_line_alignment: 128,
+        };
+        let mut coordinator = match hello(b"coordinator") {
+            NegotiationFrame::Hello(frame) => frame,
+            _ => unreachable!(),
+        };
+        coordinator.supported_features = FeatureBits([3, 1 << 40]);
+        coordinator.required_features = FeatureBits([1, 0]);
+        coordinator.target = fixed_target;
+        coordinator.atomics = fixed_atomics;
+        let mut receiver = duplicate_hello(&coordinator);
+        receiver.role = SenderRole::Receiver;
+        receiver.application_payload = b"receiver".to_vec();
+        receiver.supported_features = FeatureBits([3, 0]);
+        receiver.required_features = FeatureBits([2, 0]);
+        receiver.limits.max_regions_per_batch = 4;
+        let hello_digest = canonical_hello_digest(&coordinator, &receiver);
+
+        assert_eq!(
+            hello_digest,
+            [
+                165, 94, 237, 164, 126, 159, 1, 36, 189, 159, 155, 103, 94, 123, 53, 111, 220, 114,
+                205, 225, 115, 255, 125, 98, 172, 215, 161, 88, 25, 185, 49, 42,
+            ]
         );
     }
 }

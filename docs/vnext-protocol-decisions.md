@@ -65,7 +65,7 @@ Header length, derived frame length, zero result, fixed flags, reserved bytes,
 and the ACCEPT digest field are excluded. They are fixed, derived, or required
 zero by the canonical wire decoder. The unit-test golden vector for the fixed
 coordinator/receiver fixture is
-`39dddcd2f78ad36ebd7ab2f45061f98457300f99b51683a92a3d78fae5f8d746`.
+`a55eeda47e9f0124bd9f9b675e7b356fdc72cde173ff7d62acd7a15819b9312a`.
 
 Page, cache-line, and atomic alignments reported by either endpoint must equal
 the locally discovered native facts. Lock-free support is the logical AND of
