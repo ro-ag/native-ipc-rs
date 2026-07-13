@@ -14,6 +14,7 @@ type PosixSpawnAttr = *mut c_void;
 
 const MACH_PORT_NULL: MachPort = 0;
 const MACH_PORT_RIGHT_RECEIVE: c_int = 1;
+const MACH_PORT_RIGHT_SEND: c_int = 0;
 const MACH_MSG_TYPE_COPY_SEND: u8 = 19;
 const MACH_MSG_TYPE_MAKE_SEND: u8 = 20;
 const MACH_MSG_TYPE_PORT_SEND: u8 = 17;
@@ -178,10 +179,25 @@ impl SendRight {
     pub(super) const fn name(&self) -> MachPort {
         self.0
     }
+
+    #[cfg(test)]
+    pub(super) fn copy_existing(name: MachPort) -> Result<Self, BootstrapError> {
+        if name == MACH_PORT_NULL {
+            return Err(BootstrapError::InvalidMessage);
+        }
+        // SAFETY: the caller supplies a live send-right name in the current
+        // task; incrementing its user-reference count creates one owned copy.
+        mach("mach_port_mod_refs(send,+1)", unsafe {
+            mach_port_mod_refs(current_task(), name, MACH_PORT_RIGHT_SEND, 1)
+        })?;
+        Ok(Self(name))
+    }
 }
 impl Drop for SendRight {
     fn drop(&mut self) {
         deallocate_port(current_task(), self.0);
+        #[cfg(test)]
+        super::observe_vnext_drop_for_test("send-right");
     }
 }
 

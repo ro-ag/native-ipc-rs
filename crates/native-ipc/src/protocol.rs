@@ -47,6 +47,13 @@ pub(crate) enum NativeAuthorityProfile {
         allow(dead_code, reason = "Linux accepted-session profile")
     )]
     LinuxMdweV1 = 1,
+    /// macOS memory entries clamp current and maximum protection to one
+    /// complementary, non-executable endpoint authority.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "macOS accepted-session profile")
+    )]
+    MacMachV1 = 2,
 }
 
 impl NativeAuthorityProfile {
@@ -344,6 +351,7 @@ impl TransferManifest {
         let authority_profile = match u32::from_le_bytes(frame[76..80].try_into().ok()?) {
             0 => NativeAuthorityProfile::Legacy,
             1 => NativeAuthorityProfile::LinuxMdweV1,
+            2 => NativeAuthorityProfile::MacMachV1,
             _ => return None,
         };
         let mut entries = Vec::with_capacity(count);
