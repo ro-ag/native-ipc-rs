@@ -272,6 +272,21 @@ impl PreparedRegion {
         } = self;
         (request, spec, guard)
     }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn into_windows_transfer_parts(
+        self,
+    ) -> (memory::NativeShareRequest, RegionSpec, GuardCapability) {
+        let Self {
+            #[cfg(test)]
+                drop_observer: _,
+            request,
+            spec,
+            guard,
+            _not_sync: _,
+        } = self;
+        (request, spec, guard)
+    }
 }
 
 #[cfg(test)]

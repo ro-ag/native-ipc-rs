@@ -1282,6 +1282,13 @@ pub const fn status() -> BackendStatus {
     BackendStatus::Available
 }
 
+#[path = "windows_vnext/memory.rs"]
+pub(crate) mod vnext_memory;
+
+#[cfg(test)]
+#[path = "windows_vnext/memory_test.rs"]
+mod vnext_memory_test;
+
 #[cfg(test)]
 #[path = "windows_test.rs"]
 mod tests;

@@ -234,11 +234,35 @@ fn vnext_authority_profile_is_exactly_transcript_bound() {
         vec![entry(1)],
     )
     .unwrap();
+    let macos = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::MacMachV1,
+        vec![entry(1)],
+    )
+    .unwrap();
+    let windows = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        vec![entry(1)],
+    )
+    .unwrap();
     let legacy = legacy.encode(CAPABILITY_MAGIC);
     let linux = linux.encode(CAPABILITY_MAGIC);
+    let macos = macos.encode(CAPABILITY_MAGIC);
+    let windows = windows.encode(CAPABILITY_MAGIC);
     assert_eq!(u32::from_le_bytes(legacy[76..80].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(linux[76..80].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(macos[76..80].try_into().unwrap()), 2);
+    assert_eq!(u32::from_le_bytes(windows[76..80].try_into().unwrap()), 3);
     assert_ne!(legacy, linux);
+    assert_ne!(linux, macos);
+    assert_ne!(macos, windows);
 }
 
 #[test]
