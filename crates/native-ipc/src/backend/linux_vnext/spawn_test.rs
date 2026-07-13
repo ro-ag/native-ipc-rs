@@ -1,6 +1,11 @@
-use super::super::memory::{LinuxCoordinatorWriterBatch, LinuxReceiverWriterBatch, MemfdError};
+use super::super::memory::{
+    LinuxCoordinatorWriterBatch, LinuxMixedDirectionBatch, LinuxReceiverWriterBatch, MemfdError,
+};
 use super::*;
-use crate::backend::accepted_control::{AcceptedControlError, LinuxCapabilityBatchError};
+use crate::backend::accepted_control::{
+    AcceptedControlError, LinuxCapabilityBatchError, LinuxCoordinatorMixedDirectionTransaction,
+    LinuxReceiverMixedDirectionTransaction,
+};
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState};
 use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
@@ -40,6 +45,10 @@ assert_impl_all!(CoordinatorAcceptedControl: Send);
 assert_not_impl_any!(CoordinatorAcceptedControl: Sync, Clone);
 assert_impl_all!(ReceiverAcceptedControl: Send);
 assert_not_impl_any!(ReceiverAcceptedControl: Sync, Clone);
+assert_impl_all!(LinuxCoordinatorMixedDirectionTransaction<'static>: Send);
+assert_not_impl_any!(LinuxCoordinatorMixedDirectionTransaction<'static>: Sync, Clone);
+assert_impl_all!(LinuxReceiverMixedDirectionTransaction<'static>: Send);
+assert_not_impl_any!(LinuxReceiverMixedDirectionTransaction<'static>: Sync, Clone);
 
 const APPLICATION_CONTROL_KIND: u32 = 0x8000_0047;
 
@@ -122,6 +131,29 @@ fn portable_receiver_writer_batch(count: usize) -> TransferBatch {
     batch
 }
 
+fn portable_mixed_direction_batch(count: usize) -> TransferBatch {
+    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    for id in (1..=count).rev() {
+        let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
+        region.initialize(|bytes| bytes.fill(id as u8));
+        batch
+            .add(
+                region
+                    .prepare(RegionSpec {
+                        id: RegionId::new(id as u128).unwrap(),
+                        writer: if id % 2 == 0 {
+                            WriterEndpoint::Receiver
+                        } else {
+                            WriterEndpoint::Coordinator
+                        },
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    batch
+}
+
 fn expected_coordinator_writer_batch(count: usize) -> ExpectedBatch {
     expected_coordinator_writer_batch_with_first_delta(count, 0)
 }
@@ -134,6 +166,31 @@ fn expected_receiver_writer_batch(count: usize) -> ExpectedBatch {
                 id: RegionId::new(id as u128).unwrap(),
                 writer: WriterEndpoint::Receiver,
                 logical_len: id * 17,
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn expected_mixed_direction_batch(count: usize) -> ExpectedBatch {
+    expected_mixed_direction_batch_with_first_delta(count, 0)
+}
+
+fn expected_mixed_direction_batch_with_first_delta(
+    count: usize,
+    first_delta: usize,
+) -> ExpectedBatch {
+    ExpectedBatch::try_from_specs(
+        (1..=count)
+            .rev()
+            .map(|id| ExpectedRegion {
+                id: RegionId::new(id as u128).unwrap(),
+                writer: if id % 2 == 0 {
+                    WriterEndpoint::Receiver
+                } else {
+                    WriterEndpoint::Coordinator
+                },
+                logical_len: id * 17 + usize::from(id == 1) * first_delta,
             })
             .collect(),
     )
@@ -1001,6 +1058,151 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
             assert_eq!(
                 events.lock().unwrap().as_slice(),
                 &["poison", "imported-receiver-batch-drop"]
+            );
+            drop(control);
+            std::process::exit(0);
+        }
+        "mixed-direction-batch"
+        | "mixed-direction-seal-failure"
+        | "mixed-direction-import-advice-failure"
+        | "mixed-direction-coordinator-advice-failure"
+        | "mixed-direction-final-seal-missing"
+        | "mixed-direction-imported-rights"
+        | "mixed-direction-imported-wrong-credentials"
+        | "mixed-direction-stale-imported"
+        | "mixed-direction-wrong-logical" => {
+            let count = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut control = evidence.into_control().unwrap();
+            control.observe_linux_receiver_poison_for_test(events.clone());
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"ready".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            let operation_deadline = deadline();
+            let mut transaction = control
+                .begin_linux_expected_mixed_direction_batch(
+                    expected_mixed_direction_batch_with_first_delta(
+                        count,
+                        usize::from(mode.ends_with("wrong-logical")),
+                    ),
+                    operation_deadline,
+                )
+                .unwrap();
+            transaction.observe_import_drop_for_test(events.clone());
+            if mode.ends_with("rights") {
+                let rights = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.inject_imported_rights_for_test(rights);
+            }
+            if mode.ends_with("wrong-credentials") {
+                transaction.use_wrong_imported_credentials_for_test();
+            }
+            if mode.ends_with("import-advice-failure") {
+                let operation = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.fail_receiver_advice_at_for_test(operation);
+            }
+            if mode.ends_with("stale-imported") {
+                transaction.stale_imported_for_test();
+            }
+            let prepared = transaction.prepare();
+            if mode.ends_with("wrong-logical") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(ControlError::NonCanonical)
+                    ))
+                );
+                drop(transaction);
+                assert_eq!(events.lock().unwrap().as_slice(), &["poison"]);
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.ends_with("import-advice-failure") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                        libc::EIO
+                    )))
+                );
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "failed-mixed-import-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.ends_with("final-seal-missing") {
+                assert_eq!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Memory(MemfdError::InvalidObject))
+                );
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "imported-mixed-batch-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.ends_with("seal-failure")
+                || mode.ends_with("coordinator-advice-failure")
+                || mode.ends_with("rights")
+                || mode.ends_with("wrong-credentials")
+                || mode.ends_with("stale-imported")
+            {
+                assert!(matches!(
+                    prepared,
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(
+                            SessionTransportError::PeerExited | SessionTransportError::Native
+                        )
+                    ))
+                ));
+                drop(transaction);
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "imported-mixed-batch-drop"]
+                );
+                drop(control);
+                std::process::exit(0);
+            }
+            prepared.unwrap();
+            let imported = transaction.imported_for_test();
+            assert_eq!(imported.len(), count);
+            for ordinal in 0..count {
+                let region_id = ordinal + 1;
+                if region_id % 2 == 0 {
+                    for offset in 0..region_id * 17 {
+                        imported.write_receiver_for_test(ordinal, offset, region_id as u8);
+                    }
+                } else {
+                    for offset in 0..region_id * 17 {
+                        assert_eq!(
+                            imported.read_coordinator_for_test(ordinal, offset),
+                            region_id as u8
+                        );
+                    }
+                }
+            }
+            drop(transaction);
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                &["poison", "imported-mixed-batch-drop"]
             );
             drop(control);
             std::process::exit(0);
@@ -1996,6 +2198,421 @@ fn isolated_receiver_writer_batches_complete_imported_sealed_pending() {
 fn receiver_writer_batches_complete_imported_sealed_pending() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_receiver_writer_batches_complete_imported_sealed_pending",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by mixed_direction_batches_share_the_accepted_owner"]
+fn isolated_mixed_direction_batches_share_the_accepted_owner() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+
+    let (mut mismatch, pid) = accepted_control("echo", 0, 0, MAX_LINUX_CONTROL_PAYLOAD);
+    assert_eq!(mismatch.receive(deadline()).unwrap().payload, b"ready");
+    let original_deadline = deadline();
+    let prepared = LinuxMixedDirectionBatch::prepare(
+        portable_mixed_direction_batch(2),
+        mismatch.authority_profile(),
+        original_deadline,
+    )
+    .unwrap();
+    let replacement_deadline = deadline();
+    assert!(matches!(
+        mismatch.begin_linux_mixed_direction_batch(prepared, replacement_deadline),
+        Err(LinuxCapabilityBatchError::Memory(
+            MemfdError::DeadlineMismatch
+        ))
+    ));
+    mismatch
+        .send(
+            &ControlFrame {
+                kind: APPLICATION_CONTROL_KIND,
+                payload: Vec::new(),
+            },
+            original_deadline,
+        )
+        .unwrap();
+    assert!(
+        mismatch
+            .receive(original_deadline)
+            .unwrap()
+            .payload
+            .is_empty()
+    );
+    mismatch.terminate_and_reap(deadline()).unwrap();
+    drop(mismatch);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    for count in [1, 2, 4, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) =
+            accepted_control("mixed-direction-batch", 0, count, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(count),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.prepare().unwrap();
+            loop {
+                let complete = (0..count).all(|ordinal| {
+                    let region_id = ordinal + 1;
+                    region_id % 2 != 0
+                        || (0..region_id * 17).all(|offset| {
+                            transaction
+                                .batch_for_test()
+                                .read_receiver_for_test(ordinal, offset)
+                                == region_id as u8
+                        })
+                });
+                if complete {
+                    break;
+                }
+                assert!(!operation_deadline.is_expired());
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::ReplayOrReorder)
+                ))
+            );
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "mixed-direction-batch-drop"]
+        );
+        assert_eq!(
+            control.send(
+                &ControlFrame {
+                    kind: APPLICATION_CONTROL_KIND,
+                    payload: Vec::new(),
+                },
+                deadline(),
+            ),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut control, pid) = accepted_control(
+        "mixed-direction-wrong-logical",
+        0,
+        2,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+    control.observe_linux_poison_for_test(events.clone());
+    let operation_deadline = deadline();
+    let mut prepared = LinuxMixedDirectionBatch::prepare(
+        portable_mixed_direction_batch(2),
+        control.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    prepared.observe_drop_for_test(events.clone());
+    {
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        assert!(matches!(
+            transaction.prepare(),
+            Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(
+                    SessionTransportError::PeerExited | SessionTransportError::Native
+                )
+            ))
+        ));
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["poison", "mixed-direction-batch-drop"]
+    );
+    control.terminate_and_reap(deadline()).unwrap();
+    drop(control);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    for failure in [1, 17, 32] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-import-advice-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+                .unwrap();
+            assert!(matches!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(
+                        SessionTransportError::PeerExited | SessionTransportError::Native
+                    )
+                ))
+            ));
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "mixed-direction-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 9, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-coordinator-advice-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.fail_coordinator_advice_at_for_test(failure);
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                    libc::EIO
+                )))
+            );
+            assert!(transaction.all_final_sealed_for_test());
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "mixed-direction-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    for failure in [1, 4, 8] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-seal-failure",
+            failure,
+            16,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(16),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+                .unwrap();
+            transaction.fail_seal_at_for_test(failure);
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Memory(MemfdError::Native(
+                    libc::EIO
+                )))
+            );
+            assert_eq!(transaction.seal_counts_for_test(), (1, 15));
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "mixed-direction-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut control, pid) = accepted_control(
+        "mixed-direction-final-seal-missing",
+        0,
+        2,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+    control.observe_linux_poison_for_test(events.clone());
+    let operation_deadline = deadline();
+    let mut prepared = LinuxMixedDirectionBatch::prepare(
+        portable_mixed_direction_batch(2),
+        control.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    prepared.observe_drop_for_test(events.clone());
+    {
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        transaction.skip_final_sealing_for_test();
+        transaction.prepare().unwrap();
+        assert_eq!(transaction.seal_counts_for_test(), (1, 1));
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["poison", "mixed-direction-batch-drop"]
+    );
+    control.terminate_and_reap(deadline()).unwrap();
+    drop(control);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut control, pid) = accepted_control(
+        "mixed-direction-stale-imported",
+        0,
+        2,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+    control.observe_linux_poison_for_test(events.clone());
+    let operation_deadline = deadline();
+    let mut prepared = LinuxMixedDirectionBatch::prepare(
+        portable_mixed_direction_batch(2),
+        control.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    prepared.observe_drop_for_test(events.clone());
+    {
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        assert_eq!(
+            transaction.prepare(),
+            Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical)
+            ))
+        );
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["poison", "mixed-direction-batch-drop"]
+    );
+    control.terminate_and_reap(deadline()).unwrap();
+    drop(control);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+
+    for rights in [1, 16] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-imported-rights",
+            rights,
+            2,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(2),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        {
+            let mut transaction = control
+                .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+                .unwrap();
+            assert_eq!(
+                transaction.prepare(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(SessionTransportError::MalformedRecord)
+                ))
+            );
+        }
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["poison", "mixed-direction-batch-drop"]
+        );
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut control, pid) = accepted_control(
+        "mixed-direction-imported-wrong-credentials",
+        0,
+        2,
+        MAX_LINUX_CONTROL_PAYLOAD,
+    );
+    assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+    control.observe_linux_poison_for_test(events.clone());
+    let operation_deadline = deadline();
+    let mut prepared = LinuxMixedDirectionBatch::prepare(
+        portable_mixed_direction_batch(2),
+        control.authority_profile(),
+        operation_deadline,
+    )
+    .unwrap();
+    prepared.observe_drop_for_test(events.clone());
+    {
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        assert_eq!(
+            transaction.prepare(),
+            Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(SessionTransportError::IdentityMismatch)
+            ))
+        );
+    }
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["poison", "mixed-direction-batch-drop"]
+    );
+    control.terminate_and_reap(deadline()).unwrap();
+    drop(control);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn mixed_direction_batches_share_the_accepted_owner() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_mixed_direction_batches_share_the_accepted_owner",
     );
 }
 

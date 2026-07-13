@@ -149,6 +149,10 @@ pub(crate) struct LinuxMixedDirectionBatch {
     deadline: AbsoluteDeadline,
     #[cfg(test)]
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    seal_failure_at: Option<usize>,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
 }
 
 enum LinuxMixedDirectionEntry {
@@ -213,6 +217,8 @@ pub(crate) struct LinuxImportedReceiverWriterBatch {
 
 pub(crate) struct LinuxImportedMixedDirectionBatch {
     entries: Vec<LinuxImportedMixedDirectionEntry>,
+    #[cfg(test)]
+    sealed_verified: bool,
     #[cfg(test)]
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
@@ -948,6 +954,10 @@ impl LinuxMixedDirectionBatch {
             deadline,
             #[cfg(test)]
             drop_observer: None,
+            #[cfg(test)]
+            seal_failure_at: None,
+            #[cfg(test)]
+            advice_failure_at: None,
         })
     }
 
@@ -983,6 +993,141 @@ impl LinuxMixedDirectionBatch {
         Ok(())
     }
 
+    pub(crate) fn requires_imported_sealed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, LinuxMixedDirectionEntry::ReceiverWriter(_)))
+    }
+
+    pub(crate) fn seal_after_import(&mut self) -> Result<(), MemfdError> {
+        let mut first_error = check_deadline(self.deadline).err();
+
+        // Revalidate the complete mixed object set before attenuation. One bad
+        // entry is remembered without preventing best-effort sealing of every
+        // receiver-writer fd that has already escaped.
+        for entry in &self.entries {
+            let (fd, key, seals) = match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    (
+                        entry.prepared.fd.as_raw_fd(),
+                        entry.prepared.key,
+                        FINAL_SEALS,
+                    )
+                }
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    (entry.fd.as_raw_fd(), entry.key, PREFIX_SEALS)
+                }
+            };
+            let validation = validate_object(fd, key.mapped_len, seals).and_then(|validated| {
+                if validated == key {
+                    Ok(())
+                } else {
+                    Err(MemfdError::WrongObject)
+                }
+            });
+            if first_error.is_none() {
+                first_error = validation.err();
+            }
+        }
+
+        #[cfg(test)]
+        let mut seal_ordinal = 0_usize;
+        for entry in &mut self.entries {
+            let LinuxMixedDirectionEntry::ReceiverWriter(batch) = entry else {
+                continue;
+            };
+            for entry in &mut batch.entries {
+                if first_error.is_none() {
+                    first_error = check_deadline(self.deadline).err();
+                }
+                #[cfg(test)]
+                {
+                    seal_ordinal += 1;
+                    if self.seal_failure_at == Some(seal_ordinal) {
+                        if first_error.is_none() {
+                            first_error = Some(MemfdError::Native(libc::EIO));
+                        }
+                        continue;
+                    }
+                }
+                if let Err(error) = add_seals(
+                    entry.fd.as_raw_fd(),
+                    libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL,
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+                let validation =
+                    validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS)
+                        .and_then(|validated| {
+                            if validated == entry.key {
+                                Ok(())
+                            } else {
+                                Err(MemfdError::WrongObject)
+                            }
+                        });
+                if first_error.is_none() {
+                    first_error = validation.err();
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // All escaped writer fds are final-sealed before the first coordinator
+        // read mapping is attempted.
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for entry in &mut self.entries {
+            let LinuxMixedDirectionEntry::ReceiverWriter(batch) = entry else {
+                continue;
+            };
+            for entry in &mut batch.entries {
+                check_deadline(self.deadline)?;
+                let pending = PendingVmMapping::map(
+                    entry.fd.as_raw_fd(),
+                    entry.key.mapped_len,
+                    libc::PROT_READ,
+                    false,
+                )?;
+                entry.pending_mapping = Some(pending);
+                check_deadline(self.deadline)?;
+                for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                    #[cfg(test)]
+                    {
+                        advice_operation += 1;
+                        if self.advice_failure_at == Some(advice_operation) {
+                            return Err(MemfdError::Native(libc::EIO));
+                        }
+                    }
+                    entry
+                        .pending_mapping
+                        .as_ref()
+                        .expect("pending mixed mapping remains batch-owned")
+                        .advise(advice)?;
+                    check_deadline(self.deadline)?;
+                }
+                let pending = entry
+                    .pending_mapping
+                    .take()
+                    .expect("validated mixed mapping remains batch-owned");
+                entry.mapping = Some(match pending.into_mapping() {
+                    Ok(mapping) => mapping,
+                    Err((error, pending)) => {
+                        entry.pending_mapping = Some(pending);
+                        return Err(error);
+                    }
+                });
+            }
+        }
+        check_deadline(self.deadline)
+    }
+
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
         self.deadline
     }
@@ -1001,6 +1146,47 @@ impl LinuxMixedDirectionBatch {
     #[cfg(test)]
     pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_seal_at_for_test(&mut self, ordinal: usize) {
+        assert!(ordinal > 0);
+        self.seal_failure_at = Some(ordinal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_final_sealed_for_test(&self) -> bool {
+        self.entries.iter().all(|entry| match entry {
+            LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.revalidate().is_ok(),
+            LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.all_final_sealed_for_test(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_counts_for_test(&self) -> (usize, usize) {
+        self.entries
+            .iter()
+            .fold((0, 0), |(prefix, final_sealed), entry| match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(_) => (prefix, final_sealed + 1),
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    let (entry_prefix, entry_final) = batch.seal_counts_for_test();
+                    (prefix + entry_prefix, final_sealed + entry_final)
+                }
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_receiver_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        let LinuxMixedDirectionEntry::ReceiverWriter(batch) = &self.entries[ordinal] else {
+            panic!("test read requires a receiver-writer entry");
+        };
+        batch.read_for_test(0, offset)
     }
 }
 
@@ -1419,6 +1605,12 @@ impl LinuxExpectedMixedDirectionBatch {
         self.deadline
     }
 
+    pub(crate) fn requires_imported_sealed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.writer == WriterEndpoint::Receiver)
+    }
+
     pub(crate) fn matches_manifest(&self, manifest: &TransferManifest) -> bool {
         manifest.entries().len() == self.entries.len()
             && manifest.total_logical() == self.total_logical
@@ -1557,6 +1749,8 @@ impl LinuxExpectedMixedDirectionBatch {
         }
         Ok(LinuxImportedMixedDirectionBatch {
             entries: imported,
+            #[cfg(test)]
+            sealed_verified: false,
             #[cfg(test)]
             drop_observer: None,
         })
@@ -1743,9 +1937,58 @@ impl LinuxImportedReceiverWriterBatch {
 }
 
 impl LinuxImportedMixedDirectionBatch {
+    pub(crate) fn verify_final_seals(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), MemfdError> {
+        check_deadline(deadline)?;
+        for entry in &self.entries {
+            entry.validate(FINAL_SEALS)?;
+            check_deadline(deadline)?;
+        }
+        #[cfg(test)]
+        {
+            self.sealed_verified = true;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_coordinator_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        assert!(self.sealed_verified);
+        let LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) = &self.entries[ordinal]
+        else {
+            panic!("test read requires a coordinator-writer entry");
+        };
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: the final-sealed imported mapping remains mixed-batch-owned.
+        unsafe { core::ptr::read_volatile(entry.mapping.base.as_ptr().add(offset)) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_receiver_for_test(&mut self, ordinal: usize, offset: usize, value: u8) {
+        assert!(self.sealed_verified);
+        let LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) = &mut self.entries[ordinal]
+        else {
+            panic!("test write requires a receiver-writer entry");
+        };
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: this mapping was established writable before final sealing
+        // and remains the receiver's transaction-owned sole-writer view.
+        unsafe { core::ptr::write_volatile(entry.mapping.base.as_ptr().add(offset), value) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_for_test(&self, ordinal: usize) -> BorrowedFd<'_> {
+        match &self.entries[ordinal] {
+            LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) => entry.fd.as_fd(),
+            LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) => entry.fd.as_fd(),
+        }
     }
 
     #[cfg(test)]
