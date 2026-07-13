@@ -59,7 +59,7 @@ assert_not_impl_any!(
 assert_impl_all!(WindowsReceivedCapabilities: Send);
 assert_not_impl_any!(WindowsReceivedCapabilities: Sync, Clone);
 
-fn deadline() -> AbsoluteDeadline {
+pub(super) fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(20)).unwrap()
 }
 
@@ -122,7 +122,7 @@ fn receiver_evidence(parent_pid: u32, child_pid: u32, nonce: [u8; 32]) -> Receiv
         .unwrap()
 }
 
-fn coordinator_transport(session: ChildSession) -> CoordinatorWindowsControlTransport {
+pub(super) fn coordinator_transport(session: ChildSession) -> CoordinatorWindowsControlTransport {
     let parent = unsafe { GetCurrentProcessId() };
     let child = session.pid();
     let nonce = session.vnext_nonce();
@@ -138,7 +138,7 @@ fn coordinator_transport(session: ChildSession) -> CoordinatorWindowsControlTran
     transport
 }
 
-fn receiver_transport(channel: ChildChannel) -> ReceiverWindowsControlTransport {
+pub(super) fn receiver_transport(channel: ChildChannel) -> ReceiverWindowsControlTransport {
     let parent = channel.parent_pid();
     let nonce = channel.vnext_nonce();
     let child = unsafe { GetCurrentProcessId() };
@@ -154,7 +154,7 @@ fn receiver_transport(channel: ChildChannel) -> ReceiverWindowsControlTransport 
     transport
 }
 
-fn spawn_helper(test: &str) -> ChildSession {
+pub(super) fn spawn_helper(test: &str) -> ChildSession {
     let executable = std::env::current_exe().unwrap();
     let arguments = [
         OsString::from("--exact"),
@@ -166,14 +166,7 @@ fn spawn_helper(test: &str) -> ChildSession {
 }
 
 fn wait_and_reap(transport: &mut CoordinatorWindowsControlTransport) {
-    for _ in 0..20_000 {
-        if transport.try_poll_peer().unwrap() == PeerState::ExitedUnknown {
-            transport.terminate_and_reap(deadline()).unwrap();
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("Windows helper did not exit");
+    transport.wait_for_child_exit_for_test(deadline()).unwrap();
 }
 
 fn build_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
@@ -264,6 +257,39 @@ fn successful_native_io_is_rechecked_after_the_syscall() {
     );
     set_post_io_delay_for_test(0);
     reader.terminate_and_reap(deadline()).unwrap();
+}
+
+#[test]
+fn expired_capability_receive_adopts_then_closes_every_installed_handle() {
+    let session =
+        spawn_helper("backend::windows::vnext_transport_test::expired_capability_receive_helper");
+    let parent = unsafe { GetCurrentProcessId() };
+    let child = session.pid();
+    let nonce = session.vnext_nonce();
+    let (batch, _) = build_batch(4);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        nonce,
+        parent,
+        child,
+        1,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        prepared.manifest_entries(),
+    )
+    .unwrap();
+    let frame = CapabilityFrame::from_manifest(&manifest);
+    let mut transport = coordinator_transport(session);
+    transport.send_record(frame.as_bytes(), deadline()).unwrap();
+    assert_eq!(transport.receive_record(1, deadline()).unwrap(), [0x61]);
+    transport
+        .send_capability_record(&frame, &prepared, deadline())
+        .unwrap();
+    wait_and_reap(&mut transport);
 }
 
 #[test]
@@ -479,6 +505,28 @@ fn one_record_then_stall_helper() {
     let mut transport = receiver_transport(channel);
     transport.send_record(&[0x32], deadline()).unwrap();
     std::thread::sleep(Duration::from_secs(1));
+}
+
+#[test]
+#[ignore = "spawned only by the post-I/O capability deadline test"]
+fn expired_capability_receive_helper() {
+    let channel = connect_spawned_helper().unwrap();
+    let mut transport = receiver_transport(channel);
+    let frame_bytes = transport
+        .receive_record(CONTROL_FRAME_LEN, deadline())
+        .unwrap();
+    let (frame, _) = CapabilityFrame::decode(&frame_bytes).unwrap();
+    transport.send_record(&[0x61], deadline()).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let baseline = live_handles_for_test();
+    set_post_io_delay_for_test(10);
+    let short = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    assert!(matches!(
+        transport.receive_capability_record(&frame, short),
+        Err(SessionTransportError::DeadlineExpired)
+    ));
+    set_post_io_delay_for_test(0);
+    assert_eq!(live_handles_for_test(), baseline);
 }
 
 #[test]

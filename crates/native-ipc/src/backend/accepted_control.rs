@@ -2,29 +2,29 @@ use super::{
     AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::active::{ActivationError, ActiveReader, ActiveWriter, LeaseReservation};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::PendingBatch;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use crate::batch::TransferBatch;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::batch::{ActiveRegionSet, BatchError, CommittedRegion, LocalRegionAuthority};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::liveness::ResourceError;
 use crate::liveness::ResourceOwner;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::protocol::CONTROL_FRAME_LEN;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::protocol::CoordinatorCapacityStatus;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
 use crate::session::AbsoluteDeadline;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::session::{ActiveLeaseFacts, AtomicCapabilities, ProtocolVersion, SessionState};
 #[cfg(all(target_os = "linux", test))]
 use std::os::fd::AsRawFd;
@@ -63,6 +63,16 @@ use super::macos::{
         MacImportedMixedDirectionBatch, MacMixedDirectionBatch,
     },
     vnext_transport::{CoordinatorMacControlTransport, ReceiverMacControlTransport},
+};
+
+#[cfg(target_os = "windows")]
+use super::windows::{
+    vnext_memory::{
+        WindowsActiveRegionOwner, WindowsActiveRegionSpec, WindowsBatchError,
+        WindowsExpectedMixedDirectionBatch, WindowsImportedMixedDirectionBatch,
+        WindowsMixedDirectionBatch,
+    },
+    vnext_transport::{CoordinatorWindowsControlTransport, ReceiverWindowsControlTransport},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +220,68 @@ pub(crate) enum MacCapabilityBatchError {
 pub(crate) enum MacActivationError {
     WrongSession,
     Memory(MacBatchError),
+    Active(ActivationError),
+    Batch(BatchError),
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) struct WindowsCoordinatorMixedDirectionTransaction<'a> {
+    transaction: CoordinatorCapabilityTransaction<'a, CoordinatorWindowsControlTransport>,
+    batch: WindowsMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    attempted: bool,
+    #[cfg(test)]
+    sealed_frame_fault: bool,
+    #[cfg(test)]
+    commit_frame_fault: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) struct WindowsCoordinatorCommittedMixedDirectionBatch {
+    batch: WindowsMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) struct WindowsReceiverMixedDirectionTransaction<'a> {
+    dispatcher: &'a mut AcceptedControlDispatcher<ReceiverWindowsControlTransport>,
+    expected: Option<WindowsExpectedMixedDirectionBatch>,
+    imported: Option<WindowsImportedMixedDirectionBatch>,
+    frame: Option<CapabilityFrame>,
+    reservations: Vec<LeaseReservation>,
+    deadline: AbsoluteDeadline,
+    transaction_id: u64,
+    attempted: bool,
+    already_poisoned: bool,
+    #[cfg(test)]
+    imported_frame_fault: bool,
+    #[cfg(test)]
+    ready_frame_fault: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) struct WindowsReceiverCommittedMixedDirectionBatch {
+    batch: WindowsImportedMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) enum WindowsCapabilityBatchError {
+    Memory(WindowsBatchError),
+    Control(AcceptedControlError),
+    Resource(ResourceError),
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) enum WindowsActivationError {
+    WrongSession,
+    Memory(WindowsBatchError),
     Active(ActivationError),
     Batch(BatchError),
 }
@@ -498,17 +570,17 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         self.parameters.limits()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) const fn atomics(&self) -> AtomicCapabilities {
         self.parameters.atomics()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
         self.parameters.protocol_version()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn session_state(&self) -> SessionState {
         if self.state.is_poisoned()
             || !matches!(
@@ -522,22 +594,22 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn active_lease_facts(&self) -> ActiveLeaseFacts {
         self.resources.active_lease_facts()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn try_close_resources(&mut self) -> Result<(), ResourceError> {
         self.resources.try_close()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn poison_session(&mut self) {
         self.poison_both();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn reserve_mapped_lengths(
         &mut self,
         mapped_lengths: Vec<u64>,
@@ -817,6 +889,152 @@ impl AcceptedControlDispatcher<CoordinatorMacControlTransport> {
             }
         };
         activate_mac_regions(self, specs, reservations, || {
+            batch.into_active_region_owners()
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl AcceptedControlDispatcher<CoordinatorWindowsControlTransport> {
+    #[cfg(test)]
+    pub(crate) fn windows_remote_capability_count_for_test(&self) -> usize {
+        self.transport.remote_capability_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_windows_child_exit_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.transport.wait_for_child_exit_for_test(deadline)
+    }
+
+    pub(crate) fn begin_windows_mixed_direction_batch(
+        &mut self,
+        batch: WindowsMixedDirectionBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<WindowsCoordinatorMixedDirectionTransaction<'_>, WindowsCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::WindowsSectionsV1
+            || batch.deadline() != deadline
+        {
+            return Err(WindowsCapabilityBatchError::Memory(
+                WindowsBatchError::WrongProvenance,
+            ));
+        }
+        let reservations = self
+            .reserve_mapped_lengths(batch.reservation_lengths())
+            .map_err(WindowsCapabilityBatchError::Resource)?;
+        let frame = self
+            .begin_native_transaction(batch.manifest_entries(), deadline)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        Ok(WindowsCoordinatorMixedDirectionTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            reservations,
+            attempted: false,
+            #[cfg(test)]
+            sealed_frame_fault: false,
+            #[cfg(test)]
+            commit_frame_fault: false,
+        })
+    }
+
+    pub(crate) fn activate_windows_coordinator_mixed_direction_batch(
+        &mut self,
+        committed: WindowsCoordinatorCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, WindowsActivationError> {
+        let WindowsCoordinatorCommittedMixedDirectionBatch {
+            batch,
+            reservations,
+            parameters,
+            deadline,
+        } = committed;
+        if parameters != self.parameters || batch.deadline() != deadline {
+            self.poison_both();
+            return Err(WindowsActivationError::WrongSession);
+        }
+        let specs = match batch.activation_specs() {
+            Ok(specs) => specs,
+            Err(error) => {
+                self.poison_both();
+                return Err(WindowsActivationError::Memory(error));
+            }
+        };
+        activate_windows_regions(self, specs, reservations, || {
+            batch.into_active_region_owners()
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl AcceptedControlDispatcher<ReceiverWindowsControlTransport> {
+    pub(crate) fn begin_windows_expected_mixed_direction_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<WindowsReceiverMixedDirectionTransaction<'_>, WindowsCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::WindowsSectionsV1
+        {
+            return Err(WindowsCapabilityBatchError::Memory(
+                WindowsBatchError::WrongProvenance,
+            ));
+        }
+        let expected =
+            WindowsExpectedMixedDirectionBatch::new(expected, self.parameters.limits(), deadline)
+                .map_err(WindowsCapabilityBatchError::Memory)?;
+        let reservations = self
+            .reserve_mapped_lengths(expected.reservation_lengths())
+            .map_err(WindowsCapabilityBatchError::Resource)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        Ok(WindowsReceiverMixedDirectionTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            frame: None,
+            reservations,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            imported_frame_fault: false,
+            #[cfg(test)]
+            ready_frame_fault: false,
+        })
+    }
+
+    pub(crate) fn activate_windows_receiver_mixed_direction_batch(
+        &mut self,
+        committed: WindowsReceiverCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, WindowsActivationError> {
+        let WindowsReceiverCommittedMixedDirectionBatch {
+            batch,
+            reservations,
+            parameters,
+            deadline,
+        } = committed;
+        if parameters != self.parameters {
+            self.poison_both();
+            return Err(WindowsActivationError::WrongSession);
+        }
+        let specs = match batch.activation_specs(deadline) {
+            Ok(specs) => specs,
+            Err(error) => {
+                self.poison_both();
+                return Err(WindowsActivationError::Memory(error));
+            }
+        };
+        activate_windows_regions(self, specs, reservations, || {
             batch.into_active_region_owners()
         })
     }
@@ -1611,6 +1829,75 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn activate_windows_regions<T: AuthenticatedZeroRightsTransport>(
+    dispatcher: &mut AcceptedControlDispatcher<T>,
+    specs: Vec<WindowsActiveRegionSpec>,
+    reservations: Vec<LeaseReservation>,
+    owners: impl FnOnce() -> Vec<WindowsActiveRegionOwner>,
+) -> Result<ActiveRegionSet, WindowsActivationError> {
+    let expected = specs
+        .iter()
+        .map(|spec| (spec.id, spec.authority))
+        .collect::<Vec<_>>();
+    if reservations.len() != specs.len() {
+        dispatcher.poison_both();
+        return Err(WindowsActivationError::Memory(
+            WindowsBatchError::WrongProvenance,
+        ));
+    }
+    let owners = owners();
+    if owners.len() != specs.len() {
+        dispatcher.poison_both();
+        return Err(WindowsActivationError::Memory(
+            WindowsBatchError::WrongProvenance,
+        ));
+    }
+    let mut active = Vec::with_capacity(specs.len());
+    for ((expected_spec, owner), reservation) in specs.into_iter().zip(owners).zip(reservations) {
+        if owner.spec() != expected_spec {
+            dispatcher.poison_both();
+            return Err(WindowsActivationError::Memory(
+                WindowsBatchError::WrongProvenance,
+            ));
+        }
+        let region = match (expected_spec.authority, owner) {
+            (LocalRegionAuthority::Reader, WindowsActiveRegionOwner::Reader { owner, .. }) => {
+                match ActiveReader::new_leased(owner, expected_spec.logical_len, reservation) {
+                    Ok(reader) => CommittedRegion::Reader(reader),
+                    Err(error) => {
+                        dispatcher.poison_both();
+                        return Err(WindowsActivationError::Active(error));
+                    }
+                }
+            }
+            (LocalRegionAuthority::Writer, WindowsActiveRegionOwner::Writer { owner, .. }) => {
+                match ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation) {
+                    Ok(writer) => CommittedRegion::Writer(writer),
+                    Err(error) => {
+                        dispatcher.poison_both();
+                        return Err(WindowsActivationError::Active(error));
+                    }
+                }
+            }
+            _ => {
+                dispatcher.poison_both();
+                return Err(WindowsActivationError::Memory(
+                    WindowsBatchError::WrongProvenance,
+                ));
+            }
+        };
+        active.push((expected_spec.id, region));
+    }
+    match ActiveRegionSet::from_local_committed(expected, active) {
+        Ok(active) => Ok(active),
+        Err(error) => {
+            dispatcher.poison_both();
+            Err(WindowsActivationError::Batch(error))
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn activate_mac_regions<T: AuthenticatedZeroRightsTransport>(
     dispatcher: &mut AcceptedControlDispatcher<T>,
@@ -1873,6 +2160,128 @@ impl LinuxCoordinatorReceiverWriterTransaction<'_> {
     pub(crate) fn replace_capability_with_invalid_file_for_test(&mut self, ordinal: usize) {
         self.batch
             .replace_capability_with_invalid_file_for_test(ordinal);
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsCoordinatorMixedDirectionTransaction<'_> {
+    #[cfg(test)]
+    pub(crate) fn remote_capability_count_for_test(&self) -> usize {
+        self.transaction
+            .dispatcher
+            .transport
+            .remote_capability_count_for_test()
+    }
+
+    pub(crate) fn prepare(&mut self) -> Result<(), WindowsCapabilityBatchError> {
+        if self.attempted {
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        if let Err(error) = self.batch.revalidate_before_send() {
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Memory(error));
+        }
+        let offer = *self.transaction.frame.as_bytes();
+        self.transaction
+            .send_preparation_bytes(&offer)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        self.transaction
+            .send(&self.batch)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        let imported = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Imported);
+        self.transaction
+            .receive_preparation(&imported)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        if let Err(error) = self.batch.revalidate_before_send() {
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Memory(error));
+        }
+        let sealed = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Sealed);
+        #[cfg(test)]
+        if self.sealed_frame_fault {
+            let mut bytes = *sealed.as_bytes();
+            bytes[56] ^= 1;
+            self.transaction
+                .send_preparation_bytes(&bytes)
+                .map_err(WindowsCapabilityBatchError::Control)?;
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        self.transaction
+            .send_preparation(&sealed)
+            .map_err(WindowsCapabilityBatchError::Control)
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<WindowsCoordinatorCommittedMixedDirectionBatch, WindowsCapabilityBatchError> {
+        if !self.attempted {
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let ready = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Ready);
+        self.transaction
+            .receive_completion(&ready)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        let commit = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Commit);
+        #[cfg(test)]
+        if self.commit_frame_fault {
+            let mut bytes = *commit.as_bytes();
+            bytes[56] ^= 1;
+            self.transaction
+                .send_preparation_bytes(&bytes)
+                .map_err(WindowsCapabilityBatchError::Control)?;
+            self.transaction.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        self.transaction
+            .send_completion(&commit)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        self.transaction
+            .finish()
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        self.transaction
+            .dispatcher
+            .transport
+            .complete_remote_capability_transaction();
+        Ok(WindowsCoordinatorCommittedMixedDirectionBatch {
+            batch: self.batch,
+            reservations: self.reservations,
+            parameters: self.transaction.dispatcher.parameters,
+            deadline: self.transaction.deadline,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_sealed_for_test(&mut self) {
+        self.sealed_frame_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_commit_for_test(&mut self) {
+        self.commit_frame_fault = true;
     }
 }
 
@@ -2590,6 +2999,228 @@ impl LinuxReceiverWriterTransaction<'_> {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl WindowsReceiverMixedDirectionTransaction<'_> {
+    pub(crate) fn prepare(&mut self) -> Result<(), WindowsCapabilityBatchError> {
+        if self.attempted {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        let offer = match self
+            .dispatcher
+            .transport
+            .receive_record(CONTROL_FRAME_LEN, self.deadline)
+        {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.poison();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((frame, manifest)) = CapabilityFrame::decode(&offer) else {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        let expected = self
+            .expected
+            .as_ref()
+            .expect("Windows receiver expectation remains transaction-owned");
+        if !windows_received_mixed_manifest_matches(
+            self.dispatcher.parameters,
+            self.transaction_id,
+            expected,
+            &manifest,
+        ) {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let received = match self
+            .dispatcher
+            .transport
+            .receive_capability_record(&frame, self.deadline)
+        {
+            Ok(received) => received,
+            Err(error) => {
+                self.poison();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let expected = self
+            .expected
+            .take()
+            .expect("validated Windows expectation is consumed once");
+        let imported = match expected.import(&manifest, received.into_handles()) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.poison();
+                return Err(WindowsCapabilityBatchError::Memory(error));
+            }
+        };
+        let imported_frame = frame.preparation_frame(PreparationFrameKind::Imported);
+        #[cfg(test)]
+        let imported_bytes = if self.imported_frame_fault {
+            let mut bytes = *imported_frame.as_bytes();
+            bytes[56] ^= 1;
+            bytes
+        } else {
+            *imported_frame.as_bytes()
+        };
+        #[cfg(not(test))]
+        let imported_bytes = *imported_frame.as_bytes();
+        if let Err(error) = self
+            .dispatcher
+            .transport
+            .send_record(&imported_bytes, self.deadline)
+        {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        #[cfg(test)]
+        if self.imported_frame_fault {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let sealed_frame = frame.preparation_frame(PreparationFrameKind::Sealed);
+        let sealed = match self
+            .dispatcher
+            .transport
+            .receive_record(sealed_frame.as_bytes().len(), self.deadline)
+        {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.poison();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !sealed_frame.matches(&sealed) {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = imported.activation_specs(self.deadline) {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Memory(error));
+        }
+        self.imported = Some(imported);
+        self.frame = Some(frame);
+        Ok(())
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<WindowsReceiverCommittedMixedDirectionBatch, WindowsCapabilityBatchError> {
+        if !self.attempted || self.imported.is_none() || self.frame.is_none() {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let frame = self
+            .frame
+            .as_ref()
+            .expect("successful Windows preparation retains its frame");
+        let ready = frame.completion_frame(CompletionFrameKind::Ready);
+        #[cfg(test)]
+        let ready_bytes = if self.ready_frame_fault {
+            let mut bytes = *ready.as_bytes();
+            bytes[56] ^= 1;
+            bytes
+        } else {
+            *ready.as_bytes()
+        };
+        #[cfg(not(test))]
+        let ready_bytes = *ready.as_bytes();
+        if let Err(error) = self
+            .dispatcher
+            .transport
+            .send_record(&ready_bytes, self.deadline)
+        {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        #[cfg(test)]
+        if self.ready_frame_fault {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let commit = frame.completion_frame(CompletionFrameKind::Commit);
+        let committed = match self
+            .dispatcher
+            .transport
+            .receive_record(commit.as_bytes().len(), self.deadline)
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                self.poison();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !commit.matches(&committed) {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = self.dispatcher.state.end_transaction() {
+            self.poison();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(error),
+            ));
+        }
+        self.already_poisoned = true;
+        Ok(WindowsReceiverCommittedMixedDirectionBatch {
+            batch: self
+                .imported
+                .take()
+                .expect("exact COMMIT releases the imported Windows batch"),
+            reservations: core::mem::take(&mut self.reservations),
+            parameters: self.dispatcher.parameters,
+            deadline: self.deadline,
+        })
+    }
+
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_imported_for_test(&mut self) {
+        self.imported_frame_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_ready_for_test(&mut self) {
+        self.ready_frame_fault = true;
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl MacReceiverMixedDirectionTransaction<'_> {
     pub(crate) fn prepare(&mut self) -> Result<(), MacCapabilityBatchError> {
@@ -3210,6 +3841,23 @@ fn linux_received_mixed_manifest_matches(
         && expected.matches_manifest(manifest)
 }
 
+#[cfg(target_os = "windows")]
+fn windows_received_mixed_manifest_matches(
+    parameters: AcceptedSessionParameters,
+    transaction_id: u64,
+    expected: &WindowsExpectedMixedDirectionBatch,
+    manifest: &TransferManifest,
+) -> bool {
+    let facts = parameters.facts();
+    manifest.nonce == facts.nonce()
+        && manifest.parent_pid == facts.parent_pid()
+        && manifest.child_pid == facts.child_pid()
+        && manifest.transfer_id == transaction_id
+        && manifest.authority_profile() == parameters.authority_profile()
+        && manifest.fits_limits(parameters.limits())
+        && expected.matches_manifest(manifest)
+}
+
 #[cfg(target_os = "macos")]
 fn mac_received_mixed_manifest_matches(
     parameters: AcceptedSessionParameters,
@@ -3255,6 +3903,13 @@ impl Drop for MacReceiverMixedDirectionTransaction<'_> {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl Drop for WindowsReceiverMixedDirectionTransaction<'_> {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
 impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
     /// Awaits a coordinator-initiated native transaction without sending any
     /// receiver-originated start record.
@@ -3277,7 +3932,7 @@ impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn frame_matches_entries(&self, frame: &CapabilityFrame, entries: Vec<ManifestEntry>) -> bool {
         let Some((_, manifest)) = CapabilityFrame::decode(frame.as_bytes()) else {
             return false;
@@ -3422,7 +4077,7 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn receive_completion(
         &mut self,
         expected: &CompletionFrame,
@@ -3449,7 +4104,7 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
         self.send_preparation_bytes(frame.as_bytes())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn send_completion(&mut self, frame: &CompletionFrame) -> Result<(), AcceptedControlError> {
         self.send_preparation_bytes(frame.as_bytes())
     }
