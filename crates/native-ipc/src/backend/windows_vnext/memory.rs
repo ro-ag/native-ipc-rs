@@ -6,12 +6,15 @@ use core::mem::{size_of, zeroed};
 use core::ptr::NonNull;
 
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
-use windows_sys::Win32::Foundation::{CompareObjectHandles, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CompareObjectHandles, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    HANDLE_FLAG_PROTECT_FROM_CLOSE, SetHandleInformation,
+};
 use windows_sys::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, MapViewOfFile,
-    PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    MemoryRegionInfo, PAGE_READONLY, PAGE_READWRITE, QueryVirtualMemoryInformation, VirtualQuery,
+    WIN32_MEMORY_REGION_INFORMATION,
 };
-use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
@@ -29,6 +32,7 @@ use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const OBJECT_NAME_INFORMATION: i32 = 1;
 const OBJECT_TYPE_INFORMATION: i32 = 2;
+const MEMORY_REGION_MAPPED_PAGE_FILE: u32 = 1 << 3;
 
 /// Windows mixed-batch construction or import failure.
 #[derive(Debug)]
@@ -89,26 +93,29 @@ impl WindowsActiveRegionOwner {
     }
 }
 
-struct SectionView(View);
+struct SectionView(Option<View>);
 
-struct SectionHandle(OwnedHandle);
+struct SectionHandle(Option<OwnedHandle>);
 
 impl SectionHandle {
     fn new(handle: OwnedHandle) -> Self {
         #[cfg(test)]
         LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() + 1));
-        Self(handle)
+        Self(Some(handle))
     }
 
     fn raw(&self) -> HANDLE {
-        self.0.0
+        self.0.as_ref().expect("live section handle").0
     }
 }
 
 impl Drop for SectionHandle {
     fn drop(&mut self) {
+        let _released = self.0.take().is_none_or(|handle| handle.close().is_ok());
         #[cfg(test)]
-        LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() - 1));
+        if _released {
+            LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() - 1));
+        }
     }
 }
 
@@ -116,15 +123,15 @@ impl SectionView {
     fn new(view: View) -> Self {
         #[cfg(test)]
         LIVE_VNEXT_VIEWS.with(|count| count.set(count.get() + 1));
-        Self(view)
+        Self(Some(view))
     }
 
     fn base(&self) -> NonNull<u8> {
-        self.0.base
+        self.0.as_ref().expect("live section view").base
     }
 
     fn len(&self) -> usize {
-        self.0.len
+        self.0.as_ref().expect("live section view").len
     }
 }
 
@@ -146,8 +153,11 @@ pub(crate) fn live_handles_for_test() -> usize {
 
 impl Drop for SectionView {
     fn drop(&mut self) {
+        let _released = self.0.take().is_none_or(|view| view.unmap().is_ok());
         #[cfg(test)]
-        LIVE_VNEXT_VIEWS.with(|count| count.set(count.get() - 1));
+        if _released {
+            LIVE_VNEXT_VIEWS.with(|count| count.set(count.get() - 1));
+        }
     }
 }
 
@@ -482,13 +492,30 @@ impl WindowsReceivedHandle {
     /// `handle` must be a newly installed, non-pseudo handle owned by this
     /// process and must not have any other Rust owner.
     pub(crate) unsafe fn from_raw(handle: usize) -> Result<Self, WindowsBatchError> {
-        Ok(Self(SectionHandle::new(OwnedHandle::new(
-            handle as HANDLE,
-        )?)))
+        let handle = OwnedHandle::new(handle as HANDLE)?;
+        let flags = match handle_flags(handle.0) {
+            Ok(flags) => flags,
+            Err(error) => {
+                clear_handle_flags(handle.0)?;
+                return Err(error);
+            }
+        };
+        if flags != 0 {
+            clear_handle_flags(handle.0)?;
+            return Err(WindowsBatchError::WrongAccess);
+        }
+        Ok(Self(SectionHandle::new(handle)))
     }
 
     fn raw(&self) -> HANDLE {
         self.0.raw()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_flags_for_test(&self, flags: u32) -> bool {
+        let mask = HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE;
+        // SAFETY: the test owner keeps the handle live for this call.
+        unsafe { SetHandleInformation(self.raw(), mask, flags) != 0 }
     }
 }
 
@@ -826,6 +853,10 @@ fn map_exact_unnamed_section(
     if mapped_len == 0 || granted_access(handle)? != access {
         return Err(WindowsBatchError::WrongAccess);
     }
+    if handle_flags(handle)? != 0 {
+        clear_handle_flags(handle)?;
+        return Err(WindowsBatchError::WrongAccess);
+    }
     if object_type(handle)? != "Section" || !object_is_unnamed(handle)? {
         return Err(WindowsBatchError::WrongObject);
     }
@@ -837,6 +868,35 @@ fn map_exact_unnamed_section(
         base,
         len: mapped_len,
     });
+    let mut region: WIN32_MEMORY_REGION_INFORMATION = unsafe { zeroed() };
+    let mut returned = 0_usize;
+    // SAFETY: current-process pseudo-handle, mapped base, output, and output
+    // length match the public allocation-level information class.
+    if unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            base.as_ptr().cast_const().cast(),
+            MemoryRegionInfo,
+            (&mut region as *mut WIN32_MEMORY_REGION_INFORMATION).cast(),
+            size_of::<WIN32_MEMORY_REGION_INFORMATION>(),
+            &mut returned,
+        )
+    } == 0
+        || returned != size_of::<WIN32_MEMORY_REGION_INFORMATION>()
+    {
+        return Err(WindowsBatchError::WrongObject);
+    }
+    // windows-sys exposes the C bitfield as its generated backing word. The
+    // documented bit order makes bit 3 MappedPageFile; exact equality also
+    // rejects data/image/physical/direct/private and reserved classifications.
+    let region_flags = unsafe { region.Anonymous.Anonymous._bitfield };
+    if region.AllocationBase != base.as_ptr().cast()
+        || region.AllocationProtect != PAGE_READWRITE
+        || region.RegionSize != mapped_len
+        || region_flags != MEMORY_REGION_MAPPED_PAGE_FILE
+    {
+        return Err(WindowsBatchError::WrongObject);
+    }
     let mut information: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
     // SAFETY: the mapped base and output structure are valid.
     if unsafe {
@@ -864,20 +924,27 @@ fn map_exact_unnamed_section(
     {
         return Err(WindowsBatchError::WrongObject);
     }
-    let mut filename = [0_u16; 2];
-    // SAFETY: current-process pseudo-handle, mapped base, and output are valid.
-    let named_file = unsafe {
-        GetMappedFileNameW(
-            GetCurrentProcess(),
-            base.as_ptr().cast_const().cast(),
-            filename.as_mut_ptr(),
-            filename.len() as u32,
-        )
-    };
-    if named_file != 0 {
-        return Err(WindowsBatchError::WrongObject);
-    }
     Ok(view)
+}
+
+fn handle_flags(handle: HANDLE) -> Result<u32, WindowsBatchError> {
+    let mut flags = 0_u32;
+    // SAFETY: the handle is live and the output pointer is valid.
+    if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+        Err(WindowsBatchError::WrongObject)
+    } else {
+        Ok(flags)
+    }
+}
+
+fn clear_handle_flags(handle: HANDLE) -> Result<(), WindowsBatchError> {
+    let mask = HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE;
+    // SAFETY: the newly installed handle is live and still exclusively owned.
+    if unsafe { SetHandleInformation(handle, mask, 0) } == 0 {
+        Err(WindowsBatchError::WrongObject)
+    } else {
+        Ok(())
+    }
 }
 
 fn granted_access(handle: HANDLE) -> Result<u32, WindowsBatchError> {

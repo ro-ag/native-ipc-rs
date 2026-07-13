@@ -2,14 +2,20 @@ use super::vnext_memory::{
     WindowsBatchError, WindowsExpectedMixedDirectionBatch, WindowsMixedDirectionBatch,
     WindowsReceivedHandle, live_handles_for_test, live_views_for_test,
 };
-use super::{QuiescentRegion, duplicate_to};
+use super::{OwnedHandle, QuiescentRegion, View, duplicate_to};
 use crate::batch::{ExpectedBatch, ExpectedRegion, LocalRegionAuthority, TransferBatch};
 use crate::protocol::{NativeAuthorityProfile, TransferManifest};
 use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 use std::mem::zeroed;
 use std::time::Duration;
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+use windows_sys::Win32::Foundation::{
+    HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
+    PAGE_READWRITE, SEC_RESERVE, VirtualAlloc, VirtualProtect,
+};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -287,6 +293,73 @@ fn exact_size_and_access_are_rejected_before_activation() {
         expected.import(&transfer, vec![wrong_access]),
         Err(WindowsBatchError::WrongAccess)
     ));
+}
+
+#[test]
+fn split_reserved_tail_cannot_bypass_exact_allocation_size() {
+    let page = page_size();
+    let (batch, expected) = build_batch(1);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let transfer = manifest(prepared.manifest_entries());
+    let oversized = page.checked_mul(2).unwrap();
+    // SAFETY: pagefile sentinel, null security/name, and exact nonzero size.
+    let section = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            core::ptr::null(),
+            PAGE_READWRITE | SEC_RESERVE,
+            0,
+            u32::try_from(oversized).unwrap(),
+            core::ptr::null(),
+        )
+    };
+    let section = OwnedHandle::new(section).unwrap();
+    let view = View::map(section.0, oversized, FILE_MAP_WRITE).unwrap();
+    // SAFETY: the address is the base of this reserved section view and one
+    // page is inside it; committing that prefix creates the split VQ runs.
+    assert_eq!(
+        unsafe { VirtualAlloc(view.base.as_ptr().cast(), page, MEM_COMMIT, PAGE_READWRITE,) },
+        view.base.as_ptr().cast()
+    );
+    let remote = duplicate_to(section.0, unsafe { GetCurrentProcess() }, FILE_MAP_READ).unwrap();
+    let remote = unsafe { WindowsReceivedHandle::from_raw(remote.0) }.unwrap();
+    let expected =
+        WindowsExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+            .unwrap();
+    assert!(matches!(
+        expected.import(&transfer, vec![remote]),
+        Err(WindowsBatchError::WrongObject)
+    ));
+}
+
+#[test]
+fn inherited_and_protected_handles_are_rejected_and_closed() {
+    for flag in [HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE] {
+        let (batch, expected) = build_batch(1);
+        let prepared = WindowsMixedDirectionBatch::prepare(
+            batch,
+            NativeAuthorityProfile::WindowsSectionsV1,
+            deadline(),
+        )
+        .unwrap();
+        let transfer = manifest(prepared.manifest_entries());
+        let before = live_handles_for_test();
+        let handle = prepared.duplicate_capability_for_test(0).unwrap();
+        assert!(handle.set_flags_for_test(flag));
+        let expected =
+            WindowsExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+                .unwrap();
+        assert!(matches!(
+            expected.import(&transfer, vec![handle]),
+            Err(WindowsBatchError::WrongAccess)
+        ));
+        assert_eq!(live_handles_for_test(), before);
+    }
 }
 
 #[test]
