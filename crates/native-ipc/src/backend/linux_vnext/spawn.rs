@@ -751,6 +751,25 @@ impl CoordinatorLinuxControlTransport {
     pub(crate) fn observe_poison_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.poison_observer = Some(observer);
     }
+
+    pub(crate) fn wait_and_reap_clean_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.poisoned = true;
+        let lifecycle = self
+            .lifecycle
+            .take()
+            .ok_or(SessionTransportError::PeerExited)?;
+        let cleanup = lifecycle.wait_and_reap(deadline);
+        if cleanup.direct_child_succeeded() {
+            Ok(())
+        } else if cleanup.last_native_error().is_some() {
+            Err(SessionTransportError::Native)
+        } else {
+            Err(SessionTransportError::DeadlineExpired)
+        }
+    }
 }
 
 impl OwnedChildLifecycle for CoordinatorLinuxControlTransport {

@@ -13,6 +13,10 @@ pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
 const IMPORTED_MAGIC: [u8; 8] = *b"NIPCIMP1";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
+#[cfg(any(target_os = "linux", test))]
+const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
+#[cfg(any(target_os = "linux", test))]
+const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
@@ -150,6 +154,21 @@ pub(crate) struct PreparationFrame {
     bytes: [u8; CONTROL_FRAME_LEN],
 }
 
+/// Exact full-manifest transaction completion barrier kind.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionFrameKind {
+    Ready,
+    Commit,
+}
+
+/// Zero-rights READY or COMMIT frame derived only from the canonical
+/// capability frame retained by the accepted transaction owner.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct CompletionFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+}
+
 #[allow(
     dead_code,
     reason = "private G1b capability transport is currently implemented only on Linux"
@@ -185,10 +204,33 @@ impl CapabilityFrame {
             }),
         }
     }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn completion_frame(&self, kind: CompletionFrameKind) -> CompletionFrame {
+        let (_, manifest) = Self::decode(&self.bytes)
+            .expect("capability frames are constructed from canonical manifests");
+        CompletionFrame {
+            bytes: manifest.encode(match kind {
+                CompletionFrameKind::Ready => READY_MAGIC,
+                CompletionFrameKind::Commit => COMMIT_MAGIC,
+            }),
+        }
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl PreparationFrame {
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        bytes == self.bytes
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl CompletionFrame {
     pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
         &self.bytes
     }

@@ -312,6 +312,11 @@ impl ExactChildCleanup {
     pub(super) const fn last_native_error(self) -> Option<i32> {
         self.last_native_error
     }
+
+    #[cfg(test)]
+    pub(super) const fn direct_child_succeeded(self) -> bool {
+        matches!(self.direct_child, Some(ExactChildExit::Exited(0)))
+    }
 }
 
 struct ReapTask {
@@ -461,7 +466,7 @@ impl ExactChildLifecycle {
         self.shared.fresh_session.store(true, Ordering::Release);
     }
 
-    fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+    pub(super) fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
         self.request(LIFECYCLE_WAIT);
         self.wait_for_completion(deadline)
     }

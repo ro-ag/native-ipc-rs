@@ -7,15 +7,27 @@ use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
-#[cfg(target_os = "linux")]
-use crate::protocol::PreparationFrameKind;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
+#[cfg(target_os = "linux")]
+use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
 use crate::session::AbsoluteDeadline;
 #[cfg(all(target_os = "linux", test))]
 use std::os::fd::AsRawFd;
 
 #[cfg(all(target_os = "linux", test))]
 const DUPLICATE_SEALED_BARRIER: &[u8; 8] = b"NIPCTST1";
+#[cfg(all(target_os = "linux", test))]
+const COMPLETION_REJECTED_BARRIER: &[u8; 8] = b"NIPCTST2";
+
+#[cfg(all(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionFault {
+    None,
+    InterleavedApplication,
+    SubstitutedManifest,
+    Truncated,
+    Duplicate,
+}
 
 #[cfg(target_os = "linux")]
 use super::linux_vnext::{
@@ -94,6 +106,15 @@ pub(crate) struct LinuxCoordinatorMixedDirectionTransaction<'a> {
     attempted: bool,
     #[cfg(test)]
     skip_sealing: bool,
+    #[cfg(test)]
+    commit_fault: CompletionFault,
+}
+
+/// Full-manifest COMMIT has completed, but no runtime mapping authority has
+/// been activated or charged to the accepted session yet.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
+    batch: LinuxMixedDirectionBatch,
 }
 
 #[cfg(target_os = "linux")]
@@ -167,6 +188,7 @@ pub(crate) struct LinuxReceiverMixedDirectionTransaction<'a> {
     dispatcher: &'a mut AcceptedControlDispatcher<ReceiverLinuxControlTransport>,
     expected: Option<LinuxExpectedMixedDirectionBatch>,
     imported: Option<LinuxImportedMixedDirectionBatch>,
+    frame: Option<CapabilityFrame>,
     deadline: AbsoluteDeadline,
     transaction_id: u64,
     attempted: bool,
@@ -179,6 +201,17 @@ pub(crate) struct LinuxReceiverMixedDirectionTransaction<'a> {
     imported_wrong_credentials: bool,
     #[cfg(test)]
     stale_imported: bool,
+    #[cfg(test)]
+    ready_fault: CompletionFault,
+    #[cfg(test)]
+    acknowledge_commit_rejection: bool,
+}
+
+/// Exact COMMIT has been received, but the imported mappings remain opaque
+/// pending ownership until session-charged activation succeeds atomically.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxReceiverCommittedMixedDirectionBatch {
+    batch: LinuxImportedMixedDirectionBatch,
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
@@ -370,6 +403,15 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
         self.transport.observe_poison_for_test(observer);
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_for_linux_peer_success_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.state.poison();
+        self.transport.wait_and_reap_clean_for_test(deadline)
+    }
+
     pub(crate) fn begin_linux_coordinator_writer_batch(
         &mut self,
         batch: LinuxCoordinatorWriterBatch,
@@ -473,6 +515,8 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
             attempted: false,
             #[cfg(test)]
             skip_sealing: false,
+            #[cfg(test)]
+            commit_fault: CompletionFault::None,
         })
     }
 }
@@ -592,6 +636,7 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
             dispatcher: self,
             expected: Some(expected),
             imported: None,
+            frame: None,
             deadline,
             transaction_id,
             attempted: false,
@@ -604,6 +649,10 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
             imported_wrong_credentials: false,
             #[cfg(test)]
             stale_imported: false,
+            #[cfg(test)]
+            ready_fault: CompletionFault::None,
+            #[cfg(test)]
+            acknowledge_commit_rejection: false,
         })
     }
 }
@@ -786,6 +835,92 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
         Ok(())
     }
 
+    /// Completes the single full-manifest READY/COMMIT barrier and returns an
+    /// opaque committed owner. Runtime access remains unavailable until a
+    /// later activation step charges every mapping to the session ledger.
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<LinuxCoordinatorCommittedMixedDirectionBatch, LinuxCapabilityBatchError> {
+        if !self.attempted {
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let ready = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Ready);
+        self.transaction
+            .receive_completion(&ready)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        let commit = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Commit);
+        #[cfg(test)]
+        if self.commit_fault == CompletionFault::Duplicate {
+            self.transaction
+                .send_completion(&commit)
+                .and_then(|()| self.transaction.send_completion(&commit))
+                .map_err(LinuxCapabilityBatchError::Control)?;
+            self.transaction
+                .finish()
+                .map_err(LinuxCapabilityBatchError::Control)?;
+            return Ok(LinuxCoordinatorCommittedMixedDirectionBatch { batch: self.batch });
+        }
+        #[cfg(test)]
+        if self.commit_fault != CompletionFault::None {
+            let mut bytes = *commit.as_bytes();
+            let error = match self.commit_fault {
+                CompletionFault::None | CompletionFault::Duplicate => unreachable!(),
+                CompletionFault::InterleavedApplication => {
+                    bytes[..8].copy_from_slice(b"NIPCAPP1");
+                    self.transaction.send_preparation_bytes(&bytes)
+                }
+                CompletionFault::SubstitutedManifest => {
+                    bytes[56] ^= 1;
+                    self.transaction.send_preparation_bytes(&bytes)
+                }
+                CompletionFault::Truncated => self
+                    .transaction
+                    .send_preparation_bytes(&bytes[..bytes.len() - 1]),
+            };
+            error.map_err(LinuxCapabilityBatchError::Control)?;
+            let rejection = match self
+                .transaction
+                .dispatcher
+                .transport
+                .receive_record(COMPLETION_REJECTED_BARRIER.len(), self.transaction.deadline)
+            {
+                Ok(rejection) => rejection,
+                Err(error) => {
+                    self.transaction.poison();
+                    return Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Transport(error),
+                    ));
+                }
+            };
+            if rejection != COMPLETION_REJECTED_BARRIER {
+                self.transaction.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::NonCanonical),
+                ));
+            }
+            self.transaction.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        self.transaction
+            .send_completion(&commit)
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        self.transaction
+            .finish()
+            .map_err(LinuxCapabilityBatchError::Control)?;
+        Ok(LinuxCoordinatorCommittedMixedDirectionBatch { batch: self.batch })
+    }
+
     #[cfg(test)]
     pub(crate) fn batch_for_test(&self) -> &LinuxMixedDirectionBatch {
         &self.batch
@@ -814,6 +949,33 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
     #[cfg(test)]
     pub(crate) fn skip_final_sealing_for_test(&mut self) {
         self.skip_sealing = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interleave_application_commit_for_test(&mut self) {
+        self.commit_fault = CompletionFault::InterleavedApplication;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_commit_manifest_for_test(&mut self) {
+        self.commit_fault = CompletionFault::SubstitutedManifest;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn truncate_commit_for_test(&mut self) {
+        self.commit_fault = CompletionFault::Truncated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_commit_for_test(&mut self) {
+        self.commit_fault = CompletionFault::Duplicate;
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
+impl LinuxCoordinatorCommittedMixedDirectionBatch {
+    pub(crate) fn batch_for_test(&self) -> &LinuxMixedDirectionBatch {
+        &self.batch
     }
 }
 
@@ -1362,7 +1524,131 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
             return Err(LinuxCapabilityBatchError::Memory(error));
         }
         self.imported = Some(imported);
+        self.frame = Some(frame);
         Ok(())
+    }
+
+    /// Sends full-manifest READY, accepts only the exact matching COMMIT, and
+    /// returns opaque committed pending ownership without runtime exposure.
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<LinuxReceiverCommittedMixedDirectionBatch, LinuxCapabilityBatchError> {
+        if !self.attempted || self.imported.is_none() || self.frame.is_none() {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let frame = self
+            .frame
+            .as_ref()
+            .expect("successful preparation retains the canonical frame");
+        let ready = frame.completion_frame(CompletionFrameKind::Ready);
+        let commit = frame.completion_frame(CompletionFrameKind::Commit);
+        #[cfg(test)]
+        if self.ready_fault == CompletionFault::Duplicate {
+            self.dispatcher
+                .transport
+                .send_record(ready.as_bytes(), self.deadline)
+                .and_then(|()| {
+                    self.dispatcher
+                        .transport
+                        .send_record(ready.as_bytes(), self.deadline)
+                })
+                .map_err(|error| {
+                    self.poison();
+                    LinuxCapabilityBatchError::Control(AcceptedControlError::Transport(error))
+                })?;
+        }
+        #[cfg(test)]
+        if self.ready_fault != CompletionFault::None
+            && self.ready_fault != CompletionFault::Duplicate
+        {
+            let mut bytes = *ready.as_bytes();
+            let send = match self.ready_fault {
+                CompletionFault::None | CompletionFault::Duplicate => unreachable!(),
+                CompletionFault::InterleavedApplication => {
+                    bytes[..8].copy_from_slice(b"NIPCAPP1");
+                    self.dispatcher.transport.send_record(&bytes, self.deadline)
+                }
+                CompletionFault::SubstitutedManifest => {
+                    bytes[56] ^= 1;
+                    self.dispatcher.transport.send_record(&bytes, self.deadline)
+                }
+                CompletionFault::Truncated => self
+                    .dispatcher
+                    .transport
+                    .send_record(&bytes[..bytes.len() - 1], self.deadline),
+            };
+            if let Err(error) = send {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        #[cfg(test)]
+        let ready_already_sent = self.ready_fault == CompletionFault::Duplicate;
+        #[cfg(not(test))]
+        let ready_already_sent = false;
+        if !ready_already_sent
+            && let Err(error) = self
+                .dispatcher
+                .transport
+                .send_record(ready.as_bytes(), self.deadline)
+        {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let committed = match self
+            .dispatcher
+            .transport
+            .receive_record(commit.as_bytes().len(), self.deadline)
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !commit.matches(&committed) {
+            #[cfg(test)]
+            if self.acknowledge_commit_rejection
+                && let Err(error) = self
+                    .dispatcher
+                    .transport
+                    .send_record(COMPLETION_REJECTED_BARRIER, self.deadline)
+            {
+                self.poison();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = self.dispatcher.state.end_transaction() {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(error),
+            ));
+        }
+        self.already_poisoned = true;
+        let batch = self
+            .imported
+            .take()
+            .expect("exact COMMIT releases the retained imported batch once");
+        Ok(LinuxReceiverCommittedMixedDirectionBatch { batch })
     }
 
     fn poison(&mut self) {
@@ -1409,6 +1695,38 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
     #[cfg(test)]
     pub(crate) fn stale_imported_for_test(&mut self) {
         self.stale_imported = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interleave_application_ready_for_test(&mut self) {
+        self.ready_fault = CompletionFault::InterleavedApplication;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_ready_manifest_for_test(&mut self) {
+        self.ready_fault = CompletionFault::SubstitutedManifest;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn truncate_ready_for_test(&mut self) {
+        self.ready_fault = CompletionFault::Truncated;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_ready_for_test(&mut self) {
+        self.ready_fault = CompletionFault::Duplicate;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acknowledge_commit_rejection_for_test(&mut self) {
+        self.acknowledge_commit_rejection = true;
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
+impl LinuxReceiverCommittedMixedDirectionBatch {
+    pub(crate) fn imported_for_test(&mut self) -> &mut LinuxImportedMixedDirectionBatch {
+        &mut self.batch
     }
 }
 
@@ -1632,7 +1950,35 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn receive_completion(
+        &mut self,
+        expected: &CompletionFrame,
+    ) -> Result<(), AcceptedControlError> {
+        let bytes = match self
+            .dispatcher
+            .transport
+            .receive_record(expected.as_bytes().len(), self.deadline)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.poison();
+                return Err(AcceptedControlError::Transport(error));
+            }
+        };
+        if !expected.matches(&bytes) {
+            self.poison();
+            return Err(AcceptedControlError::Control(ControlError::NonCanonical));
+        }
+        Ok(())
+    }
+
     fn send_preparation(&mut self, frame: &PreparationFrame) -> Result<(), AcceptedControlError> {
+        self.send_preparation_bytes(frame.as_bytes())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_completion(&mut self, frame: &CompletionFrame) -> Result<(), AcceptedControlError> {
         self.send_preparation_bytes(frame.as_bytes())
     }
 
@@ -1641,6 +1987,19 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
             self.poison();
             return Err(AcceptedControlError::Transport(error));
         }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), AcceptedControlError> {
+        if !self.attempted {
+            self.poison();
+            return Err(AcceptedControlError::Control(ControlError::ReplayOrReorder));
+        }
+        if let Err(error) = self.dispatcher.state.end_transaction() {
+            self.poison();
+            return Err(AcceptedControlError::Control(error));
+        }
+        self.already_poisoned = true;
         Ok(())
     }
 

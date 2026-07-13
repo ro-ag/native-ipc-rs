@@ -130,6 +130,51 @@ fn preparation_frames_are_disjoint_exact_full_manifest_receipts() {
 }
 
 #[test]
+fn completion_frames_are_disjoint_exact_full_manifest_barriers() {
+    let manifest = TransferManifest::new_with_authority(
+        [0x42; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1), entry(2)],
+    )
+    .unwrap();
+    let capability = CapabilityFrame::from_manifest(&manifest);
+    let imported = capability.preparation_frame(PreparationFrameKind::Imported);
+    let sealed = capability.preparation_frame(PreparationFrameKind::Sealed);
+    let ready = capability.completion_frame(CompletionFrameKind::Ready);
+    let commit = capability.completion_frame(CompletionFrameKind::Commit);
+
+    assert_ne!(capability.as_bytes(), ready.as_bytes());
+    assert_ne!(capability.as_bytes(), commit.as_bytes());
+    assert_ne!(imported.as_bytes(), ready.as_bytes());
+    assert_ne!(sealed.as_bytes(), ready.as_bytes());
+    assert_ne!(ready.as_bytes(), commit.as_bytes());
+    assert!(ready.matches(ready.as_bytes()));
+    assert!(commit.matches(commit.as_bytes()));
+
+    for offset in [0, 8, 12, 16, 48, 52, 56, 64, 68, 72, 76, 80, 88, 96, 112] {
+        let mut substituted = *ready.as_bytes();
+        substituted[offset] ^= 1;
+        assert!(!ready.matches(&substituted), "offset {offset}");
+    }
+    for length in 0..CONTROL_FRAME_LEN {
+        assert!(
+            !ready.matches(&ready.as_bytes()[..length]),
+            "ready truncation {length}"
+        );
+        assert!(
+            !commit.matches(&commit.as_bytes()[..length]),
+            "commit truncation {length}"
+        );
+    }
+    let mut oversized = commit.as_bytes().to_vec();
+    oversized.push(0);
+    assert!(!commit.matches(&oversized));
+}
+
+#[test]
 fn vnext_authority_profile_is_exactly_transcript_bound() {
     let legacy = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
     let linux = TransferManifest::new_with_authority(

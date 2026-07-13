@@ -3,7 +3,8 @@ use super::super::memory::{
 };
 use super::*;
 use crate::backend::accepted_control::{
-    AcceptedControlError, LinuxCapabilityBatchError, LinuxCoordinatorMixedDirectionTransaction,
+    AcceptedControlError, LinuxCapabilityBatchError, LinuxCoordinatorCommittedMixedDirectionBatch,
+    LinuxCoordinatorMixedDirectionTransaction, LinuxReceiverCommittedMixedDirectionBatch,
     LinuxReceiverMixedDirectionTransaction,
 };
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
@@ -49,6 +50,10 @@ assert_impl_all!(LinuxCoordinatorMixedDirectionTransaction<'static>: Send);
 assert_not_impl_any!(LinuxCoordinatorMixedDirectionTransaction<'static>: Sync, Clone);
 assert_impl_all!(LinuxReceiverMixedDirectionTransaction<'static>: Send);
 assert_not_impl_any!(LinuxReceiverMixedDirectionTransaction<'static>: Sync, Clone);
+assert_impl_all!(LinuxCoordinatorCommittedMixedDirectionBatch: Send);
+assert_not_impl_any!(LinuxCoordinatorCommittedMixedDirectionBatch: Sync, Clone);
+assert_impl_all!(LinuxReceiverCommittedMixedDirectionBatch: Send);
+assert_not_impl_any!(LinuxReceiverCommittedMixedDirectionBatch: Sync, Clone);
 
 const APPLICATION_CONTROL_KIND: u32 = 0x8000_0047;
 
@@ -1070,7 +1075,15 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
         | "mixed-direction-imported-rights"
         | "mixed-direction-imported-wrong-credentials"
         | "mixed-direction-stale-imported"
-        | "mixed-direction-wrong-logical" => {
+        | "mixed-direction-wrong-logical"
+        | "mixed-direction-ready-application"
+        | "mixed-direction-ready-substitution"
+        | "mixed-direction-ready-truncated"
+        | "mixed-direction-ready-duplicate"
+        | "mixed-direction-commit-application"
+        | "mixed-direction-commit-substitution"
+        | "mixed-direction-commit-truncated"
+        | "mixed-direction-commit-duplicate" => {
             let count = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
                 .unwrap()
                 .parse::<usize>()
@@ -1117,6 +1130,26 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
             }
             if mode.ends_with("stale-imported") {
                 transaction.stale_imported_for_test();
+            }
+            match mode {
+                "mixed-direction-ready-application" => {
+                    transaction.interleave_application_ready_for_test();
+                }
+                "mixed-direction-ready-substitution" => {
+                    transaction.substitute_ready_manifest_for_test();
+                }
+                "mixed-direction-ready-truncated" => {
+                    transaction.truncate_ready_for_test();
+                }
+                "mixed-direction-ready-duplicate" => {
+                    transaction.duplicate_ready_for_test();
+                }
+                "mixed-direction-commit-application"
+                | "mixed-direction-commit-substitution"
+                | "mixed-direction-commit-truncated" => {
+                    transaction.acknowledge_commit_rejection_for_test();
+                }
+                _ => {}
             }
             let prepared = transaction.prepare();
             if mode.ends_with("wrong-logical") {
@@ -1182,7 +1215,49 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 std::process::exit(0);
             }
             prepared.unwrap();
-            let imported = transaction.imported_for_test();
+            if mode.ends_with("duplicate") {
+                let committed = transaction.commit().unwrap();
+                if mode == "mixed-direction-commit-duplicate" {
+                    assert_eq!(
+                        control.receive(deadline()),
+                        Err(AcceptedControlError::Control(ControlError::BadMagic))
+                    );
+                    assert_eq!(events.lock().unwrap().as_slice(), &["poison"]);
+                } else {
+                    assert!(events.lock().unwrap().is_empty());
+                }
+                drop(committed);
+                let expected_events: &[&str] = if mode == "mixed-direction-commit-duplicate" {
+                    &["poison", "imported-mixed-batch-drop"]
+                } else {
+                    &["imported-mixed-batch-drop"]
+                };
+                assert_eq!(events.lock().unwrap().as_slice(), expected_events);
+                drop(control);
+                std::process::exit(0);
+            }
+            if mode.starts_with("mixed-direction-ready-")
+                || mode.starts_with("mixed-direction-commit-")
+            {
+                assert!(matches!(
+                    transaction.commit(),
+                    Err(LinuxCapabilityBatchError::Control(
+                        AcceptedControlError::Control(error)
+                    ))
+                    if error == ControlError::NonCanonical
+                ));
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["poison", "imported-mixed-batch-drop"]
+                );
+                loop {
+                    let _control = &control;
+                    // SAFETY: coordinator exact-child cleanup terminates this helper.
+                    unsafe { libc::pause() };
+                }
+            }
+            let mut committed = transaction.commit().unwrap();
+            let imported = committed.imported_for_test();
             assert_eq!(imported.len(), count);
             for ordinal in 0..count {
                 let region_id = ordinal + 1;
@@ -1199,13 +1274,35 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     }
                 }
             }
-            drop(transaction);
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"committed".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            assert_eq!(control.receive(deadline()).unwrap().payload, b"continue");
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: Vec::new(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            drop(committed);
             assert_eq!(
                 events.lock().unwrap().as_slice(),
-                &["poison", "imported-mixed-batch-drop"]
+                &["imported-mixed-batch-drop"]
             );
-            drop(control);
-            std::process::exit(0);
+            loop {
+                let _control = &control;
+                // SAFETY: coordinator exact-child cleanup terminates this helper.
+                unsafe { libc::pause() };
+            }
         }
         "coordinator-writer-batch-local-reject" => {
             let mut control = evidence.into_control().unwrap();
@@ -2263,12 +2360,13 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
                 .begin_linux_mixed_direction_batch(prepared, operation_deadline)
                 .unwrap();
             transaction.prepare().unwrap();
+            let committed = transaction.commit().unwrap();
             loop {
                 let complete = (0..count).all(|ordinal| {
                     let region_id = ordinal + 1;
                     region_id % 2 != 0
                         || (0..region_id * 17).all(|offset| {
-                            transaction
+                            committed
                                 .batch_for_test()
                                 .read_receiver_for_test(ordinal, offset)
                                 == region_id as u8
@@ -2280,27 +2378,24 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
                 assert!(!operation_deadline.is_expired());
                 std::thread::yield_now();
             }
+            assert_eq!(control.receive(deadline()).unwrap().payload, b"committed");
+            control
+                .send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: b"continue".to_vec(),
+                    },
+                    deadline(),
+                )
+                .unwrap();
+            assert!(control.receive(deadline()).unwrap().payload.is_empty());
+            assert!(events.lock().unwrap().is_empty());
+            drop(committed);
             assert_eq!(
-                transaction.prepare(),
-                Err(LinuxCapabilityBatchError::Control(
-                    AcceptedControlError::Control(ControlError::ReplayOrReorder)
-                ))
+                events.lock().unwrap().as_slice(),
+                &["mixed-direction-batch-drop"]
             );
         }
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["poison", "mixed-direction-batch-drop"]
-        );
-        assert_eq!(
-            control.send(
-                &ControlFrame {
-                    kind: APPLICATION_CONTROL_KIND,
-                    payload: Vec::new(),
-                },
-                deadline(),
-            ),
-            Err(AcceptedControlError::Control(ControlError::Poisoned))
-        );
         control.terminate_and_reap(deadline()).unwrap();
         drop(control);
         wait_for_baseline(before_fds, before_tasks, pid, deadline());
@@ -2613,6 +2708,112 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
 fn mixed_direction_batches_share_the_accepted_owner() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_mixed_direction_batches_share_the_accepted_owner",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by mixed_direction_ready_commit_rejects_hostile_barriers"]
+fn isolated_mixed_direction_ready_commit_rejects_hostile_barriers() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+
+    for mode in [
+        "mixed-direction-ready-application",
+        "mixed-direction-ready-substitution",
+        "mixed-direction-ready-truncated",
+        "mixed-direction-ready-duplicate",
+        "mixed-direction-commit-application",
+        "mixed-direction-commit-substitution",
+        "mixed-direction-commit-truncated",
+        "mixed-direction-commit-duplicate",
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(mode, 0, 2, MAX_LINUX_CONTROL_PAYLOAD);
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        control.observe_linux_poison_for_test(events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(2),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(events.clone());
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        match mode {
+            "mixed-direction-commit-application" => {
+                transaction.interleave_application_commit_for_test();
+            }
+            "mixed-direction-commit-substitution" => {
+                transaction.substitute_commit_manifest_for_test();
+            }
+            "mixed-direction-commit-truncated" => {
+                transaction.truncate_commit_for_test();
+            }
+            "mixed-direction-commit-duplicate" => {
+                transaction.duplicate_commit_for_test();
+            }
+            _ => {}
+        }
+        transaction.prepare().unwrap();
+        let duplicate = mode.ends_with("duplicate");
+        if duplicate {
+            let committed = transaction.commit().unwrap();
+            if mode == "mixed-direction-ready-duplicate" {
+                assert_eq!(
+                    control.receive(deadline()),
+                    Err(AcceptedControlError::Control(ControlError::BadMagic))
+                );
+                assert_eq!(events.lock().unwrap().as_slice(), &["poison"]);
+            } else {
+                assert!(events.lock().unwrap().is_empty());
+            }
+            control
+                .wait_for_linux_peer_success_for_test(deadline())
+                .unwrap();
+            drop(committed);
+            let expected_events: &[&str] = if mode == "mixed-direction-ready-duplicate" {
+                &["poison", "mixed-direction-batch-drop"]
+            } else {
+                &["mixed-direction-batch-drop"]
+            };
+            assert_eq!(events.lock().unwrap().as_slice(), expected_events);
+        } else {
+            assert!(matches!(
+                transaction.commit(),
+                Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Control(ControlError::NonCanonical)
+                ))
+            ));
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                &["poison", "mixed-direction-batch-drop"]
+            );
+            assert_eq!(
+                control.send(
+                    &ControlFrame {
+                        kind: APPLICATION_CONTROL_KIND,
+                        payload: Vec::new(),
+                    },
+                    deadline(),
+                ),
+                Err(AcceptedControlError::Control(ControlError::Poisoned))
+            );
+            control.terminate_and_reap(deadline()).unwrap();
+        }
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+        assert_eq!(open_vnext_map_count(), before_maps, "mode {mode}");
+    }
+}
+
+#[test]
+fn mixed_direction_ready_commit_rejects_hostile_barriers() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_mixed_direction_ready_commit_rejects_hostile_barriers",
     );
 }
 
