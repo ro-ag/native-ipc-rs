@@ -20,11 +20,15 @@ struct SharedResources {
     active_bytes: AtomicU64,
     maximum_regions: u32,
     maximum_bytes: u64,
+    #[cfg(test)]
+    lease_drop_observer: std::sync::Mutex<Option<Arc<std::sync::Mutex<Vec<&'static str>>>>>,
 }
 
 pub(crate) struct RegionLease {
     shared: Arc<SharedResources>,
     bytes: u64,
+    #[cfg(test)]
+    drop_observer: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +73,8 @@ impl ResourceOwner {
                 active_bytes: AtomicU64::new(0),
                 maximum_regions: limits.max_active_regions,
                 maximum_bytes: limits.max_active_bytes,
+                #[cfg(test)]
+                lease_drop_observer: std::sync::Mutex::new(None),
             }),
             not_sync: PhantomData,
         })
@@ -103,9 +109,18 @@ impl ResourceOwner {
             self.shared.active_regions.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
+        #[cfg(test)]
+        let drop_observer = self
+            .shared
+            .lease_drop_observer
+            .lock()
+            .expect("test lease observer mutex is not poisoned")
+            .clone();
         Ok(LeaseReservation::new(RegionLease {
             shared: Arc::clone(&self.shared),
             bytes,
+            #[cfg(test)]
+            drop_observer,
         }))
     }
 
@@ -157,6 +172,18 @@ impl ResourceOwner {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_lease_drop_for_test(
+        &mut self,
+        observer: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        *self
+            .shared
+            .lease_drop_observer
+            .lock()
+            .expect("test lease observer mutex is not poisoned") = Some(observer);
+    }
+
     fn ensure_active(&self) -> Result<(), ResourceError> {
         match self.state() {
             LivenessState::Active => Ok(()),
@@ -191,6 +218,13 @@ impl Drop for RegionLease {
         debug_assert!(previous_bytes >= self.bytes);
         let previous_regions = self.shared.active_regions.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous_regions >= 1);
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer
+                .lock()
+                .expect("test lease observer mutex is not poisoned")
+                .push("active-lease-drop");
+        }
     }
 }
 

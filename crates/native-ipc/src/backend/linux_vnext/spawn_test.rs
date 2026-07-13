@@ -3,9 +3,9 @@ use super::super::memory::{
 };
 use super::*;
 use crate::backend::accepted_control::{
-    AcceptedControlError, LinuxCapabilityBatchError, LinuxCoordinatorCommittedMixedDirectionBatch,
-    LinuxCoordinatorMixedDirectionTransaction, LinuxReceiverCommittedMixedDirectionBatch,
-    LinuxReceiverMixedDirectionTransaction,
+    AcceptedControlError, LinuxActivationError, LinuxCapabilityBatchError,
+    LinuxCoordinatorCommittedMixedDirectionBatch, LinuxCoordinatorMixedDirectionTransaction,
+    LinuxReceiverCommittedMixedDirectionBatch, LinuxReceiverMixedDirectionTransaction,
 };
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState};
@@ -1094,14 +1094,22 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
         | "mixed-direction-commit-application"
         | "mixed-direction-commit-substitution"
         | "mixed-direction-commit-truncated"
-        | "mixed-direction-commit-duplicate" => {
+        | "mixed-direction-commit-duplicate"
+        | "mixed-direction-coordinator-activation-failure"
+        | "mixed-direction-receiver-activation-failure" => {
             let count = std::env::var("NATIVE_IPC_VNEXT_CONTROL_RECEIVER_LEN")
                 .unwrap()
                 .parse::<usize>()
                 .unwrap();
             let events = Arc::new(Mutex::new(Vec::new()));
+            let active_drops = Arc::new(Mutex::new(Vec::new()));
             let mut control = evidence.into_control().unwrap();
-            control.observe_linux_receiver_poison_for_test(events.clone());
+            if mode == "mixed-direction-receiver-activation-failure" {
+                control.observe_linux_receiver_poison_for_test(active_drops.clone());
+            } else {
+                control.observe_linux_receiver_poison_for_test(events.clone());
+            }
+            control.observe_active_lease_drop_for_test(active_drops.clone());
             control
                 .send(
                     &ControlFrame {
@@ -1111,6 +1119,9 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     deadline(),
                 )
                 .unwrap();
+            let session_fds = open_fd_count();
+            let session_tasks = open_task_count();
+            let session_maps = open_vnext_map_count();
             let operation_deadline = deadline();
             let mut transaction = control
                 .begin_linux_expected_mixed_direction_batch(
@@ -1226,6 +1237,14 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 std::process::exit(0);
             }
             prepared.unwrap();
+            transaction.observe_active_drop_for_test(active_drops.clone());
+            if mode == "mixed-direction-receiver-activation-failure" {
+                let failure = std::env::var("NATIVE_IPC_VNEXT_CONTROL_COORDINATOR_LEN")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                transaction.fail_activation_at_for_test(failure);
+            }
             if mode.ends_with("duplicate") {
                 let committed = transaction.commit().unwrap();
                 if mode == "mixed-direction-commit-duplicate" {
@@ -1268,6 +1287,45 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 }
             }
             let committed = transaction.commit().unwrap();
+            if mode == "mixed-direction-receiver-activation-failure" {
+                assert_eq!(
+                    control
+                        .activate_linux_receiver_mixed_direction_batch(committed)
+                        .err(),
+                    Some(LinuxActivationError::Memory(MemfdError::Native(libc::EIO)))
+                );
+                assert_eq!(
+                    control.receive(deadline()),
+                    Err(AcceptedControlError::Control(ControlError::Poisoned))
+                );
+                let released = control.active_lease_facts_for_test();
+                assert_eq!((released.regions, released.bytes), (0, 0));
+                let drops = active_drops.lock().unwrap();
+                assert_eq!(drops.first(), Some(&"poison"));
+                assert_eq!(
+                    drops
+                        .iter()
+                        .filter(|event| **event == "active-mapping-drop")
+                        .count(),
+                    count
+                );
+                assert_eq!(
+                    drops
+                        .iter()
+                        .filter(|event| **event == "active-lease-drop")
+                        .count(),
+                    count
+                );
+                assert_eq!(
+                    events.lock().unwrap().as_slice(),
+                    &["imported-mixed-batch-drop"]
+                );
+                assert_eq!(open_fd_count(), session_fds);
+                assert_eq!(open_task_count(), session_tasks);
+                assert_eq!(open_vnext_map_count(), session_maps);
+                drop(control);
+                std::process::exit(0);
+            }
             let mut active = control
                 .activate_linux_receiver_mixed_direction_batch(committed)
                 .unwrap();
@@ -1296,6 +1354,19 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                 events.lock().unwrap().as_slice(),
                 &["imported-mixed-batch-drop"]
             );
+            if mode == "mixed-direction-coordinator-activation-failure" {
+                drop(readers);
+                drop(writers);
+                let released = control.active_lease_facts_for_test();
+                assert_eq!((released.regions, released.bytes), (0, 0));
+                let drops = active_drops.lock().unwrap();
+                assert_eq!(drops.len(), count * 2);
+                for pair in drops.chunks_exact(2) {
+                    assert_eq!(pair, &["active-mapping-drop", "active-lease-drop"]);
+                }
+                drop(control);
+                std::process::exit(0);
+            }
             control
                 .send(
                     &ControlFrame {
@@ -1319,6 +1390,11 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
             drop(writers);
             let released = control.active_lease_facts_for_test();
             assert_eq!((released.regions, released.bytes), (0, 0));
+            let drops = active_drops.lock().unwrap();
+            assert_eq!(drops.len(), count * 2);
+            for pair in drops.chunks_exact(2) {
+                assert_eq!(pair, &["active-mapping-drop", "active-lease-drop"]);
+            }
             assert_eq!(
                 events.lock().unwrap().as_slice(),
                 &["imported-mixed-batch-drop"]
@@ -2368,10 +2444,12 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
 
     for count in [1, 2, 4, 16] {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let active_drops = Arc::new(Mutex::new(Vec::new()));
         let (mut control, pid) =
             accepted_control("mixed-direction-batch", 0, count, MAX_LINUX_CONTROL_PAYLOAD);
         assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
         control.observe_linux_poison_for_test(events.clone());
+        control.observe_active_lease_drop_for_test(active_drops.clone());
         let operation_deadline = deadline();
         let mut prepared = LinuxMixedDirectionBatch::prepare(
             portable_mixed_direction_batch(count),
@@ -2380,6 +2458,7 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
         )
         .unwrap();
         prepared.observe_drop_for_test(events.clone());
+        prepared.observe_active_drop_for_test(active_drops.clone());
         {
             let mut transaction = control
                 .begin_linux_mixed_direction_batch(prepared, operation_deadline)
@@ -2435,6 +2514,11 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
             drop(writers);
             let released = control.active_lease_facts_for_test();
             assert_eq!((released.regions, released.bytes), (0, 0));
+            let drops = active_drops.lock().unwrap();
+            assert_eq!(drops.len(), count * 2);
+            for pair in drops.chunks_exact(2) {
+                assert_eq!(pair, &["active-mapping-drop", "active-lease-drop"]);
+            }
         }
         control.terminate_and_reap(deadline()).unwrap();
         drop(control);
@@ -2748,6 +2832,143 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
 fn mixed_direction_batches_share_the_accepted_owner() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_mixed_direction_batches_share_the_accepted_owner",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by mixed_direction_activation_failures_are_atomic_and_terminal"]
+fn isolated_mixed_direction_activation_failures_are_atomic_and_terminal() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+    const COUNT: usize = 16;
+
+    for failure in [1, 8, 16] {
+        let cleanup_events = Arc::new(Mutex::new(Vec::new()));
+        let active_events = Arc::new(Mutex::new(Vec::new()));
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-coordinator-activation-failure",
+            failure,
+            COUNT,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        let session_fds = open_fd_count();
+        let session_tasks = open_task_count();
+        let session_maps = open_vnext_map_count();
+        control.observe_linux_poison_for_test(active_events.clone());
+        control.observe_active_lease_drop_for_test(active_events.clone());
+        let operation_deadline = deadline();
+        let mut prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(COUNT),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        prepared.observe_drop_for_test(cleanup_events.clone());
+        prepared.observe_active_drop_for_test(active_events.clone());
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        transaction.fail_activation_at_for_test(failure);
+        transaction.prepare().unwrap();
+        let committed = transaction.commit().unwrap();
+        assert_eq!(
+            control
+                .activate_linux_coordinator_mixed_direction_batch(committed)
+                .err(),
+            Some(LinuxActivationError::Memory(MemfdError::Native(libc::EIO)))
+        );
+        assert_eq!(
+            control.receive(deadline()),
+            Err(AcceptedControlError::Control(ControlError::Poisoned))
+        );
+        let released = control.active_lease_facts_for_test();
+        assert_eq!((released.regions, released.bytes), (0, 0));
+        let active_events = active_events.lock().unwrap();
+        assert_eq!(active_events.first(), Some(&"poison"));
+        assert_eq!(
+            active_events
+                .iter()
+                .filter(|event| **event == "active-mapping-drop")
+                .count(),
+            COUNT
+        );
+        assert_eq!(
+            active_events
+                .iter()
+                .filter(|event| **event == "active-lease-drop")
+                .count(),
+            COUNT
+        );
+        let mut mappings = 0_usize;
+        let mut leases = 0_usize;
+        for event in active_events.iter().skip(1) {
+            match *event {
+                "active-mapping-drop" => mappings += 1,
+                "active-lease-drop" => leases += 1,
+                other => panic!("unexpected activation drop event {other}"),
+            }
+            assert!(leases <= mappings, "lease released before its mapping");
+        }
+        drop(active_events);
+        assert_eq!(
+            cleanup_events.lock().unwrap().as_slice(),
+            &["mixed-direction-batch-drop"]
+        );
+        assert_eq!(open_fd_count(), session_fds);
+        assert_eq!(open_task_count(), session_tasks);
+        assert_eq!(open_vnext_map_count(), session_maps);
+        control.terminate_and_reap(deadline()).unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+        assert_eq!(open_vnext_map_count(), before_maps);
+    }
+
+    for failure in [1, 8, 16] {
+        let (mut control, pid) = accepted_control(
+            "mixed-direction-receiver-activation-failure",
+            failure,
+            COUNT,
+            MAX_LINUX_CONTROL_PAYLOAD,
+        );
+        assert_eq!(control.receive(deadline()).unwrap().payload, b"ready");
+        let session_fds = open_fd_count();
+        let session_maps = open_vnext_map_count();
+        let operation_deadline = deadline();
+        let prepared = LinuxMixedDirectionBatch::prepare(
+            portable_mixed_direction_batch(COUNT),
+            control.authority_profile(),
+            operation_deadline,
+        )
+        .unwrap();
+        let mut transaction = control
+            .begin_linux_mixed_direction_batch(prepared, operation_deadline)
+            .unwrap();
+        transaction.prepare().unwrap();
+        let committed = transaction.commit().unwrap();
+        let active = control
+            .activate_linux_coordinator_mixed_direction_batch(committed)
+            .unwrap();
+        assert_eq!(active.len(), COUNT);
+        drop(active);
+        let released = control.active_lease_facts_for_test();
+        assert_eq!((released.regions, released.bytes), (0, 0));
+        assert_eq!(open_fd_count(), session_fds);
+        assert_eq!(open_vnext_map_count(), session_maps);
+        control
+            .wait_for_linux_peer_success_for_test(deadline())
+            .unwrap();
+        drop(control);
+        wait_for_baseline(before_fds, before_tasks, pid, deadline());
+        assert_eq!(open_vnext_map_count(), before_maps);
+    }
+}
+
+#[test]
+fn mixed_direction_activation_failures_are_atomic_and_terminal() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_mixed_direction_activation_failures_are_atomic_and_terminal",
     );
 }
 
