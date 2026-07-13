@@ -5,16 +5,16 @@ use core::marker::PhantomData;
 use core::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE,
-    ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED, GetLastError,
-    HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_LISTENING,
+    ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, WaitForSingleObject,
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, WaitForSingleObject};
 
 use super::vnext_memory::{WindowsMixedDirectionBatch, WindowsReceivedHandle};
 use super::{ChildChannel, ChildSession, MAX_VNEXT_RECORD_BYTES, duplicate_to};
@@ -31,10 +31,21 @@ const MAX_CAPABILITY_RECORD_BYTES: usize =
     CONTROL_FRAME_LEN + MAX_CAPABILITY_COUNT * size_of::<u64>();
 const TERMINATION_EXIT_CODE: u32 = 127;
 
+#[cfg(test)]
+thread_local! {
+    static POST_IO_DELAY_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn set_post_io_delay_for_test(milliseconds: u64) {
+    POST_IO_DELAY_MS.set(milliseconds);
+}
+
 /// Coordinator-only accepted transport retaining the exact process and Job.
 pub(crate) struct CoordinatorWindowsControlTransport {
     session: ChildSession,
     evidence: CoordinatorAcceptedEvidence,
+    remote_ledger: Vec<usize>,
     poisoned: bool,
     not_sync: PhantomData<Cell<()>>,
 }
@@ -84,6 +95,7 @@ impl CoordinatorWindowsControlTransport {
         Ok(Self {
             session,
             evidence,
+            remote_ledger: Vec::new(),
             poisoned: false,
             not_sync: PhantomData,
         })
@@ -92,6 +104,10 @@ impl CoordinatorWindowsControlTransport {
     pub(crate) fn session_parameters(&self) -> crate::backend::AcceptedSessionParameters {
         self.evidence
             .session_parameters(NativeAuthorityProfile::WindowsSectionsV1)
+    }
+
+    pub(crate) fn complete_remote_capability_transaction(&mut self) {
+        self.remote_ledger.clear();
     }
 
     fn ensure_live(&self) -> Result<(), SessionTransportError> {
@@ -245,6 +261,9 @@ impl CoordinatorCapabilityTransport for CoordinatorWindowsControlTransport {
     ) -> Result<(), SessionTransportError> {
         self.ensure_live()?;
         let result = (|| {
+            if !self.remote_ledger.is_empty() {
+                return Err(SessionTransportError::MalformedRecord);
+            }
             let sources = capabilities
                 .capability_sources()
                 .map_err(|_| SessionTransportError::MalformedRecord)?;
@@ -253,7 +272,7 @@ impl CoordinatorCapabilityTransport for CoordinatorWindowsControlTransport {
             {
                 return Err(SessionTransportError::MalformedRecord);
             }
-            let mut ledger = RemoteHandleLedger::new(self.session.process.0);
+            let mut ledger = RemoteHandleLedger::new();
             let operation = (|| {
                 for (source, access) in sources {
                     let remote = duplicate_to(source, self.session.process.0, access)
@@ -276,10 +295,10 @@ impl CoordinatorCapabilityTransport for CoordinatorWindowsControlTransport {
                     Some(self.session.process.0),
                 )
             })();
-            if operation.is_ok() {
-                ledger.disarm();
-            } else {
-                let _ = terminate_session(&mut self.session, deadline);
+            self.remote_ledger = ledger.into_handles();
+            if operation.is_err() {
+                terminate_session(&mut self.session, deadline)?;
+                self.remote_ledger.clear();
             }
             operation
         })();
@@ -316,22 +335,22 @@ impl OwnedChildLifecycle for CoordinatorWindowsControlTransport {
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionTransportError> {
         self.poisoned = true;
-        terminate_session(&mut self.session, deadline)
+        let result = terminate_session(&mut self.session, deadline);
+        if result.is_ok() {
+            self.remote_ledger.clear();
+        }
+        result
     }
 }
 
 struct RemoteHandleLedger {
-    process: HANDLE,
     handles: Vec<usize>,
-    armed: bool,
 }
 
 impl RemoteHandleLedger {
-    fn new(process: HANDLE) -> Self {
+    fn new() -> Self {
         Self {
-            process,
             handles: Vec::with_capacity(MAX_CAPABILITY_COUNT),
-            armed: true,
         }
     }
 
@@ -339,22 +358,12 @@ impl RemoteHandleLedger {
         self.handles.push(handle);
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    fn into_handles(self) -> Vec<usize> {
+        self.handles
     }
 }
 
-impl Drop for RemoteHandleLedger {
-    fn drop(&mut self) {
-        if self.armed {
-            for handle in self.handles.drain(..) {
-                close_remote_handle(self.process, handle);
-            }
-        }
-    }
-}
-
-fn adopt_capability_record(
+pub(super) fn adopt_capability_record(
     record: Vec<u8>,
     expected: &CapabilityFrame,
 ) -> Result<WindowsReceivedCapabilities, SessionTransportError> {
@@ -363,8 +372,11 @@ fn adopt_capability_record(
     let tail = record.get(CONTROL_FRAME_LEN..).unwrap_or_default();
     let mut raw = Vec::with_capacity((tail.len() / 8).min(MAX_CAPABILITY_COUNT));
     for bytes in tail.chunks_exact(8).take(MAX_CAPABILITY_COUNT) {
-        let value = usize::try_from(u64::from_le_bytes(bytes.try_into().expect("fixed chunk")))
-            .map_err(|_| SessionTransportError::MalformedRecord)?;
+        let Ok(value) = usize::try_from(u64::from_le_bytes(bytes.try_into().expect("fixed chunk")))
+        else {
+            malformed = true;
+            continue;
+        };
         if value == 0 || raw.contains(&value) {
             malformed = true;
         } else {
@@ -378,10 +390,10 @@ fn adopt_capability_record(
     for handle in raw {
         // SAFETY: the authenticated spawning coordinator installed and sent
         // each unique numeric value for this exact process and record.
-        handles.push(
-            unsafe { WindowsReceivedHandle::from_raw(handle) }
-                .map_err(|_| SessionTransportError::MalformedRecord)?,
-        );
+        match unsafe { WindowsReceivedHandle::from_raw(handle) } {
+            Ok(handle) => handles.push(handle),
+            Err(_) => malformed = true,
+        }
     }
     let exact_len = CONTROL_FRAME_LEN + expected.capability_count() * 8;
     if malformed
@@ -422,11 +434,16 @@ fn write_message(
             )
         } != 0
         {
-            return if written == length {
-                Ok(())
+            if written == length {
+                check_deadline_after_io(deadline)?;
+                return Ok(());
+            }
+            if written == 0 {
+                wait_retry(deadline)?;
             } else {
-                Err(SessionTransportError::Ambiguous)
-            };
+                return Err(SessionTransportError::Ambiguous);
+            }
+            continue;
         }
         let code = unsafe { GetLastError() };
         if is_disconnected(code) || process.is_some_and(process_exited) {
@@ -470,6 +487,7 @@ fn read_message(
                 return Err(SessionTransportError::MalformedRecord);
             }
             bytes.truncate(read as usize);
+            check_deadline_after_io(deadline)?;
             return Ok(bytes);
         }
         let code = unsafe { GetLastError() };
@@ -524,7 +542,9 @@ fn terminate_session(
     if session.reaped {
         return Ok(());
     }
-    if poll_process(session.process.0)? == PeerState::ExitedUnknown {
+    if job_active_processes(session._job.0.0)? == 0
+        && poll_process(session.process.0)? == PeerState::ExitedUnknown
+    {
         session.reaped = true;
         return Ok(());
     }
@@ -534,7 +554,9 @@ fn terminate_session(
         return Err(native_error(unsafe { GetLastError() }));
     }
     loop {
-        if poll_process(session.process.0)? == PeerState::ExitedUnknown {
+        if job_active_processes(session._job.0.0)? == 0
+            && poll_process(session.process.0)? == PeerState::ExitedUnknown
+        {
             session.reaped = true;
             return Ok(());
         }
@@ -542,24 +564,22 @@ fn terminate_session(
     }
 }
 
-fn close_remote_handle(process: HANDLE, remote: usize) {
-    let mut local: HANDLE = core::ptr::null_mut();
-    // SAFETY: the ledger contains a handle value installed in `process`; CLOSE_SOURCE
-    // removes it there while SAME_ACCESS creates one local owner to close below.
+fn job_active_processes(job: HANDLE) -> Result<u32, SessionTransportError> {
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: the held Job is live and the fixed output structure is writable.
     if unsafe {
-        DuplicateHandle(
-            process,
-            remote as HANDLE,
-            GetCurrentProcess(),
-            &mut local,
-            0,
-            0,
-            DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS,
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicAccountingInformation,
+            (&raw mut accounting).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            core::ptr::null_mut(),
         )
-    } != 0
-        && !local.is_null()
+    } == 0
     {
-        let _ = unsafe { CloseHandle(local) };
+        Err(native_error(unsafe { GetLastError() }))
+    } else {
+        Ok(accounting.ActiveProcesses)
     }
 }
 
@@ -577,6 +597,17 @@ fn check_deadline(deadline: AbsoluteDeadline) -> Result<(), SessionTransportErro
     } else {
         Ok(())
     }
+}
+
+fn check_deadline_after_io(deadline: AbsoluteDeadline) -> Result<(), SessionTransportError> {
+    #[cfg(test)]
+    POST_IO_DELAY_MS.with(|delay| {
+        let milliseconds = delay.get();
+        if milliseconds != 0 {
+            std::thread::sleep(Duration::from_millis(milliseconds));
+        }
+    });
+    check_deadline(deadline)
 }
 
 fn wait_retry(deadline: AbsoluteDeadline) -> Result<(), SessionTransportError> {
