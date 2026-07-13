@@ -172,8 +172,8 @@ be changed for the lifetime of the reference. The former is easier to audit.
 
 Locations:
 
-- [`macos.rs:122`](../../crates/native-ipc-platform/src/macos.rs#L122)
-- [`macos.rs:157`](../../crates/native-ipc-platform/src/macos.rs#L157)
+- [`macos.rs:122`](https://github.com/ro-ag/native-ipc-rs/blob/v0.4.0/crates/native-ipc-platform/src/macos.rs#L122)
+- [`macos.rs:157`](https://github.com/ro-ag/native-ipc-rs/blob/v0.4.0/crates/native-ipc-platform/src/macos.rs#L157)
 
 Mach allocation and memory entries cover the page-rounded `mapped_len`, while
 the typestate exposes a smaller logical `len`. The slack is zero-initialized,

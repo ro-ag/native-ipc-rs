@@ -55,9 +55,26 @@ jobs:
             exit 1
           }
           version="${RELEASE_TAG#v}"
-          versions="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')"
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          versions="$(jq -r '[.packages[].version] | unique | .[]' <<<"$metadata")"
           test "$versions" = "$version" || {
             echo "tag $RELEASE_TAG does not match the single workspace version: $versions" >&2
+            exit 1
+          }
+          mismatched_dependencies="$(
+            jq -r --arg version "$version" '
+              [.packages[].name] as $workspace |
+              .packages[] as $package |
+              $package.dependencies[] |
+              select(.path != null) |
+              select(.name as $dependency | $workspace | index($dependency) != null) |
+              select(.req != ("^" + $version)) |
+              "\($package.name) -> \(.name) requires \(.req), expected ^\($version)"
+            ' <<<"$metadata"
+          )"
+          test -z "$mismatched_dependencies" || {
+            echo "workspace dependency versions do not match $version:" >&2
+            echo "$mismatched_dependencies" >&2
             exit 1
           }
           git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
@@ -164,9 +181,8 @@ jobs:
           }
 
           publish_crate native-ipc-core
-          publish_crate native-ipc-platform
-          publish_crate native-ipc-testkit
           publish_crate native-ipc
+          publish_crate native-ipc-testkit
 
       - name: Create GitHub release
         env:

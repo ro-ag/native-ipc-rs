@@ -4,7 +4,6 @@ members = [
     "crates/native-ipc-core",
     "crates/native-ipc-testkit",
 ]
-exclude = ["crates/native-ipc-platform"]
 resolver = "3"
 
 [workspace.package]

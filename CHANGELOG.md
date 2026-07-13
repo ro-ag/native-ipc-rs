@@ -34,6 +34,10 @@ Versioning once a stable API is released.
 - **Breaking:** rename `PermissionPlan::executable()` to
   `library_view_executable()`. The old name incorrectly suggested a guarantee
   about every alias a malicious native-capability holder could create.
+- Retire the excluded duplicate `native-ipc-platform` source package after its
+  backends moved behind the `native-ipc` facade. The published 0.4 artifact and
+  `v0.4.0` source tag remain available. Future releases contain the normative
+  three-crate graph and publish it in dependency order.
 
 ## [0.4.0] - 2026-07-11
 
