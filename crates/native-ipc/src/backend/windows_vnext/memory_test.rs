@@ -1,6 +1,6 @@
 use super::vnext_memory::{
     WindowsBatchError, WindowsExpectedMixedDirectionBatch, WindowsMixedDirectionBatch,
-    WindowsReceivedHandle, live_views_for_test,
+    WindowsReceivedHandle, live_handles_for_test, live_views_for_test,
 };
 use super::{QuiescentRegion, duplicate_to};
 use crate::batch::{ExpectedBatch, ExpectedRegion, LocalRegionAuthority, TransferBatch};
@@ -11,7 +11,7 @@ use std::mem::zeroed;
 use std::time::Duration;
 use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(10)).unwrap()
@@ -21,15 +21,6 @@ fn page_size() -> usize {
     let mut information: SYSTEM_INFO = unsafe { zeroed() };
     unsafe { GetSystemInfo(&mut information) };
     information.dwPageSize as usize
-}
-
-fn handle_count() -> u32 {
-    let mut count = 0;
-    assert_ne!(
-        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) },
-        0
-    );
-    count
 }
 
 fn build_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
@@ -152,7 +143,7 @@ fn mixed_batches_prepare_import_and_activate_complementary_authority() {
 fn preparation_and_import_failures_restore_handle_baselines() {
     for count in [1, 2, 4, 16] {
         for failure_at in 1..=count {
-            let before = handle_count();
+            let before = live_handles_for_test();
             let views_before = live_views_for_test();
             let (batch, _) = build_batch(count);
             assert!(matches!(
@@ -163,7 +154,7 @@ fn preparation_and_import_failures_restore_handle_baselines() {
                 ),
                 Err(WindowsBatchError::WrongObject)
             ));
-            assert_eq!(handle_count(), before);
+            assert_eq!(live_handles_for_test(), before);
             assert_eq!(live_views_for_test(), views_before);
         }
 
@@ -176,7 +167,7 @@ fn preparation_and_import_failures_restore_handle_baselines() {
             )
             .unwrap();
             let transfer = manifest(prepared.manifest_entries());
-            let before = handle_count();
+            let before = live_handles_for_test();
             let views_before = live_views_for_test();
             let handles = prepared.copied_capabilities_for_test().unwrap();
             let expected = WindowsExpectedMixedDirectionBatch::new(
@@ -189,7 +180,7 @@ fn preparation_and_import_failures_restore_handle_baselines() {
                 expected.import_with_failure_for_test(&transfer, handles, failure_at),
                 Err(WindowsBatchError::WrongObject)
             ));
-            assert_eq!(handle_count(), before);
+            assert_eq!(live_handles_for_test(), before);
             assert_eq!(live_views_for_test(), views_before);
             prepared.revalidate_before_send().unwrap();
         }

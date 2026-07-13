@@ -6,9 +6,7 @@ use core::mem::{size_of, zeroed};
 use core::ptr::NonNull;
 
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
-use windows_sys::Win32::Foundation::{
-    CompareObjectHandles, ERROR_FILE_INVALID, GetLastError, HANDLE, SetLastError,
-};
+use windows_sys::Win32::Foundation::{CompareObjectHandles, HANDLE};
 use windows_sys::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, MapViewOfFile,
     PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
@@ -93,6 +91,27 @@ impl WindowsActiveRegionOwner {
 
 struct SectionView(View);
 
+struct SectionHandle(OwnedHandle);
+
+impl SectionHandle {
+    fn new(handle: OwnedHandle) -> Self {
+        #[cfg(test)]
+        LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() + 1));
+        Self(handle)
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.0.0
+    }
+}
+
+impl Drop for SectionHandle {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() - 1));
+    }
+}
+
 impl SectionView {
     fn new(view: View) -> Self {
         #[cfg(test)]
@@ -112,11 +131,17 @@ impl SectionView {
 #[cfg(test)]
 thread_local! {
     static LIVE_VNEXT_VIEWS: Cell<usize> = const { Cell::new(0) };
+    static LIVE_VNEXT_HANDLES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn live_views_for_test() -> usize {
     LIVE_VNEXT_VIEWS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn live_handles_for_test() -> usize {
+    LIVE_VNEXT_HANDLES.with(Cell::get)
 }
 
 impl Drop for SectionView {
@@ -183,13 +208,13 @@ unsafe impl ActiveWriteOwner for ActiveWriteMapping {
 
 struct CoordinatorWriterEntry {
     native: NativeRegionSpec,
-    section: OwnedHandle,
+    section: SectionHandle,
     mapping: SectionView,
 }
 
 struct ReceiverWriterEntry {
     native: NativeRegionSpec,
-    section: OwnedHandle,
+    section: SectionHandle,
     mapping: SectionView,
 }
 
@@ -201,8 +226,8 @@ enum PreparedEntry {
 impl PreparedEntry {
     fn section(&self) -> HANDLE {
         match self {
-            Self::CoordinatorWriter(entry) => entry.section.0,
-            Self::ReceiverWriter(entry) => entry.section.0,
+            Self::CoordinatorWriter(entry) => entry.section.raw(),
+            Self::ReceiverWriter(entry) => entry.section.raw(),
         }
     }
 
@@ -259,6 +284,7 @@ impl WindowsMixedDirectionBatch {
                 view,
                 logical_len: _,
             } = region;
+            let section = SectionHandle::new(section);
             let entry = match spec.writer {
                 WriterEndpoint::Coordinator => {
                     PreparedEntry::CoordinatorWriter(CoordinatorWriterEntry {
@@ -270,7 +296,7 @@ impl WindowsMixedDirectionBatch {
                 WriterEndpoint::Receiver => {
                     drop(view);
                     let mapping =
-                        SectionView::new(View::map(section.0, mapped_len, FILE_MAP_READ)?);
+                        SectionView::new(View::map(section.raw(), mapped_len, FILE_MAP_READ)?);
                     PreparedEntry::ReceiverWriter(ReceiverWriterEntry {
                         native,
                         section,
@@ -448,7 +474,7 @@ impl WindowsMixedDirectionBatch {
 }
 
 /// Immediately owned handle installed in the receiving process.
-pub(crate) struct WindowsReceivedHandle(OwnedHandle);
+pub(crate) struct WindowsReceivedHandle(SectionHandle);
 
 impl WindowsReceivedHandle {
     /// # Safety
@@ -456,11 +482,13 @@ impl WindowsReceivedHandle {
     /// `handle` must be a newly installed, non-pseudo handle owned by this
     /// process and must not have any other Rust owner.
     pub(crate) unsafe fn from_raw(handle: usize) -> Result<Self, WindowsBatchError> {
-        Ok(Self(OwnedHandle::new(handle as HANDLE)?))
+        Ok(Self(SectionHandle::new(OwnedHandle::new(
+            handle as HANDLE,
+        )?)))
     }
 
     fn raw(&self) -> HANDLE {
-        self.0.0
+        self.0.raw()
     }
 }
 
@@ -838,7 +866,6 @@ fn map_exact_unnamed_section(
     }
     let mut filename = [0_u16; 2];
     // SAFETY: current-process pseudo-handle, mapped base, and output are valid.
-    unsafe { SetLastError(0) };
     let named_file = unsafe {
         GetMappedFileNameW(
             GetCurrentProcess(),
@@ -847,7 +874,7 @@ fn map_exact_unnamed_section(
             filename.len() as u32,
         )
     };
-    if named_file != 0 || unsafe { GetLastError() } != ERROR_FILE_INVALID {
+    if named_file != 0 {
         return Err(WindowsBatchError::WrongObject);
     }
     Ok(view)
