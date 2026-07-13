@@ -204,6 +204,13 @@ pub(crate) enum CommittedRegion {
     Writer(ActiveWriter),
 }
 
+/// Endpoint-local authority expected for one committed native mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalRegionAuthority {
+    Reader,
+    Writer,
+}
+
 /// Keyed complete runtime set returned only after batch COMMIT.
 pub struct ActiveRegionSet {
     regions: BTreeMap<RegionId, CommittedRegion>,
@@ -215,24 +222,50 @@ impl ActiveRegionSet {
         pending: PendingBatch,
         regions: impl IntoIterator<Item = (RegionId, CommittedRegion)>,
     ) -> Result<Self, BatchError> {
+        let expected = pending.regions.iter().map(|region| {
+            let authority = match region.spec().writer {
+                WriterEndpoint::Coordinator => LocalRegionAuthority::Writer,
+                WriterEndpoint::Receiver => LocalRegionAuthority::Reader,
+            };
+            (region.spec().id, authority)
+        });
+        let result = Self::from_local_committed(expected, regions);
+        drop(pending);
+        result
+    }
+
+    pub(crate) fn from_local_committed(
+        expected: impl IntoIterator<Item = (RegionId, LocalRegionAuthority)>,
+        regions: impl IntoIterator<Item = (RegionId, CommittedRegion)>,
+    ) -> Result<Self, BatchError> {
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        if expected.len() > 16 {
+            return Err(BatchError::CommitMismatch);
+        }
+        expected.sort_unstable_by_key(|(id, _)| *id);
+        if let Some(duplicate) = expected
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+        {
+            return Err(BatchError::DuplicateRegionId(duplicate));
+        }
         let mut keyed = BTreeMap::new();
         for (id, region) in regions {
             if keyed.insert(id, region).is_some() {
                 return Err(BatchError::DuplicateRegionId(id));
             }
         }
-        if keyed.len() != pending.regions.len() || keyed.len() > 16 {
+        if keyed.len() != expected.len() || keyed.len() > 16 {
             return Err(BatchError::CommitMismatch);
         }
-        for expected in &pending.regions {
-            let id = expected.spec().id;
-            match (expected.spec().writer, keyed.get(&id)) {
-                (WriterEndpoint::Coordinator, Some(CommittedRegion::Writer(_)))
-                | (WriterEndpoint::Receiver, Some(CommittedRegion::Reader(_))) => {}
+        for (id, authority) in expected {
+            match (authority, keyed.get(&id)) {
+                (LocalRegionAuthority::Writer, Some(CommittedRegion::Writer(_)))
+                | (LocalRegionAuthority::Reader, Some(CommittedRegion::Reader(_))) => {}
                 _ => return Err(BatchError::CommitMismatch),
             }
         }
-        drop(pending);
         Ok(Self { regions: keyed })
     }
 

@@ -61,6 +61,17 @@ fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
 }
 
+fn mixed_direction_mapped_bytes(count: usize) -> u64 {
+    // SAFETY: sysconf has no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(page > 0);
+    let page = page as usize;
+    (1..=count)
+        .map(|id| (id * 17).div_ceil(page) * page)
+        .map(|bytes| bytes as u64)
+        .sum()
+}
+
 fn helper_arguments() -> Vec<OsString> {
     [
         "native-ipc-spawn-helper",
@@ -1256,24 +1267,35 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     unsafe { libc::pause() };
                 }
             }
-            let mut committed = transaction.commit().unwrap();
-            let imported = committed.imported_for_test();
-            assert_eq!(imported.len(), count);
-            for ordinal in 0..count {
-                let region_id = ordinal + 1;
+            let committed = transaction.commit().unwrap();
+            let mut active = control
+                .activate_linux_receiver_mixed_direction_batch(committed)
+                .unwrap();
+            assert_eq!(active.len(), count);
+            let charged = control.active_lease_facts_for_test();
+            assert_eq!(charged.regions, count as u32);
+            assert_eq!(charged.bytes, mixed_direction_mapped_bytes(count));
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+            for region_id in 1..=count {
+                let id = RegionId::new(region_id as u128).unwrap();
                 if region_id % 2 == 0 {
-                    for offset in 0..region_id * 17 {
-                        imported.write_receiver_for_test(ordinal, offset, region_id as u8);
-                    }
+                    let mut writer = active.take_writer(id).unwrap();
+                    writer.fill(0..writer.len(), region_id as u8).unwrap();
+                    writers.push(writer);
                 } else {
-                    for offset in 0..region_id * 17 {
-                        assert_eq!(
-                            imported.read_coordinator_for_test(ordinal, offset),
-                            region_id as u8
-                        );
-                    }
+                    let reader = active.take_reader(id).unwrap();
+                    let mut bytes = vec![0; reader.len()];
+                    reader.read_into(0, &mut bytes).unwrap();
+                    assert!(bytes.iter().all(|byte| *byte == region_id as u8));
+                    readers.push(reader);
                 }
             }
+            assert!(active.is_empty());
+            assert_eq!(
+                events.lock().unwrap().as_slice(),
+                &["imported-mixed-batch-drop"]
+            );
             control
                 .send(
                     &ControlFrame {
@@ -1293,7 +1315,10 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     deadline(),
                 )
                 .unwrap();
-            drop(committed);
+            drop(readers);
+            drop(writers);
+            let released = control.active_lease_facts_for_test();
+            assert_eq!((released.regions, released.bytes), (0, 0));
             assert_eq!(
                 events.lock().unwrap().as_slice(),
                 &["imported-mixed-batch-drop"]
@@ -2361,23 +2386,36 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
                 .unwrap();
             transaction.prepare().unwrap();
             let committed = transaction.commit().unwrap();
-            loop {
-                let complete = (0..count).all(|ordinal| {
-                    let region_id = ordinal + 1;
-                    region_id % 2 != 0
-                        || (0..region_id * 17).all(|offset| {
-                            committed
-                                .batch_for_test()
-                                .read_receiver_for_test(ordinal, offset)
-                                == region_id as u8
-                        })
-                });
-                if complete {
-                    break;
+            let mut active = control
+                .activate_linux_coordinator_mixed_direction_batch(committed)
+                .unwrap();
+            assert_eq!(active.len(), count);
+            let charged = control.active_lease_facts_for_test();
+            assert_eq!(charged.regions, count as u32);
+            assert_eq!(charged.bytes, mixed_direction_mapped_bytes(count));
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+            for region_id in 1..=count {
+                let id = RegionId::new(region_id as u128).unwrap();
+                if region_id % 2 == 0 {
+                    let reader = active.take_reader(id).unwrap();
+                    let mut bytes = vec![0; reader.len()];
+                    loop {
+                        reader.read_into(0, &mut bytes).unwrap();
+                        if bytes.iter().all(|byte| *byte == region_id as u8) {
+                            break;
+                        }
+                        assert!(!operation_deadline.is_expired());
+                        std::thread::yield_now();
+                    }
+                    readers.push(reader);
+                } else {
+                    let mut writer = active.take_writer(id).unwrap();
+                    writer.fill(0..writer.len(), region_id as u8).unwrap();
+                    writers.push(writer);
                 }
-                assert!(!operation_deadline.is_expired());
-                std::thread::yield_now();
             }
+            assert!(active.is_empty());
             assert_eq!(control.receive(deadline()).unwrap().payload, b"committed");
             control
                 .send(
@@ -2389,12 +2427,14 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
                 )
                 .unwrap();
             assert!(control.receive(deadline()).unwrap().payload.is_empty());
-            assert!(events.lock().unwrap().is_empty());
-            drop(committed);
             assert_eq!(
                 events.lock().unwrap().as_slice(),
                 &["mixed-direction-batch-drop"]
             );
+            drop(readers);
+            drop(writers);
+            let released = control.active_lease_facts_for_test();
+            assert_eq!((released.regions, released.bytes), (0, 0));
         }
         control.terminate_and_reap(deadline()).unwrap();
         drop(control);

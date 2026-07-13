@@ -3,10 +3,15 @@ use super::{
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
 #[cfg(target_os = "linux")]
-use crate::batch::ExpectedBatch;
+use crate::active::{ActivationError, ActiveReader, ActiveWriter};
+#[cfg(target_os = "linux")]
+use crate::batch::{
+    ActiveRegionSet, BatchError, CommittedRegion, ExpectedBatch, LocalRegionAuthority,
+};
 #[cfg(test)]
 use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
+use crate::liveness::ResourceOwner;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 #[cfg(target_os = "linux")]
 use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
@@ -32,11 +37,11 @@ enum CompletionFault {
 #[cfg(target_os = "linux")]
 use super::linux_vnext::{
     memory::{
-        LinuxCoordinatorWriterBatch, LinuxExpectedCoordinatorWriterBatch,
-        LinuxExpectedMixedDirectionBatch, LinuxExpectedReceiverWriterBatch,
-        LinuxImportedCoordinatorWriterBatch, LinuxImportedMixedDirectionBatch,
-        LinuxImportedReceiverWriterBatch, LinuxMixedDirectionBatch, LinuxReceiverWriterBatch,
-        MemfdError,
+        LinuxActiveRegionOwner, LinuxActiveRegionSpec, LinuxCoordinatorWriterBatch,
+        LinuxExpectedCoordinatorWriterBatch, LinuxExpectedMixedDirectionBatch,
+        LinuxExpectedReceiverWriterBatch, LinuxImportedCoordinatorWriterBatch,
+        LinuxImportedMixedDirectionBatch, LinuxImportedReceiverWriterBatch,
+        LinuxMixedDirectionBatch, LinuxReceiverWriterBatch, MemfdError,
     },
     spawn::{CoordinatorLinuxControlTransport, ReceiverLinuxControlTransport},
 };
@@ -57,6 +62,7 @@ pub(crate) struct AcceptedControlDispatcher<T> {
     maximum_wire_len: usize,
     parameters: AcceptedSessionParameters,
     next_transaction: u64,
+    resources: ResourceOwner,
 }
 
 /// Coordinator-owned open native transaction on the accepted session owner.
@@ -115,6 +121,8 @@ pub(crate) struct LinuxCoordinatorMixedDirectionTransaction<'a> {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
     batch: LinuxMixedDirectionBatch,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
 }
 
 #[cfg(target_os = "linux")]
@@ -122,6 +130,15 @@ pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
 pub(crate) enum LinuxCapabilityBatchError {
     Memory(MemfdError),
     Control(AcceptedControlError),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxActivationError {
+    WrongSession,
+    Memory(MemfdError),
+    Active(ActivationError),
+    Batch(BatchError),
 }
 
 /// Receiver-owned open native transaction and its immediately owned imports.
@@ -212,6 +229,8 @@ pub(crate) struct LinuxReceiverMixedDirectionTransaction<'a> {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxReceiverCommittedMixedDirectionBatch {
     batch: LinuxImportedMixedDirectionBatch,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
@@ -232,12 +251,16 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         let Some(state) = ControlState::new(nonce, maximum_payload) else {
             return Err(transport);
         };
+        let Ok(resources) = ResourceOwner::new(limits) else {
+            return Err(transport);
+        };
         Ok(Self {
             transport,
             state,
             maximum_wire_len,
             parameters,
             next_transaction: 1,
+            resources,
         })
     }
 
@@ -329,9 +352,15 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         self.parameters.authority_profile()
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_lease_facts_for_test(&self) -> crate::liveness::ActiveLeaseFacts {
+        self.resources.active_lease_facts()
+    }
+
     fn poison_both(&mut self) {
         self.state.poison();
         self.transport.poison();
+        self.resources.poison();
     }
 }
 
@@ -519,6 +548,32 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
             commit_fault: CompletionFault::None,
         })
     }
+
+    pub(crate) fn activate_linux_coordinator_mixed_direction_batch(
+        &mut self,
+        committed: LinuxCoordinatorCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, LinuxActivationError> {
+        let LinuxCoordinatorCommittedMixedDirectionBatch {
+            batch,
+            parameters,
+            deadline,
+        } = committed;
+        let result = (|| {
+            if parameters != self.parameters || batch.deadline() != deadline {
+                return Err(LinuxActivationError::WrongSession);
+            }
+            let specs = batch
+                .activation_specs()
+                .map_err(LinuxActivationError::Memory)?;
+            activate_linux_regions(&mut self.resources, specs, || {
+                batch.into_active_region_owners()
+            })
+        })();
+        if result.is_err() {
+            self.poison_both();
+        }
+        result
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -529,6 +584,32 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
         observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     ) {
         self.transport.observe_poison_for_test(observer);
+    }
+
+    pub(crate) fn activate_linux_receiver_mixed_direction_batch(
+        &mut self,
+        committed: LinuxReceiverCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, LinuxActivationError> {
+        let LinuxReceiverCommittedMixedDirectionBatch {
+            batch,
+            parameters,
+            deadline,
+        } = committed;
+        let result = (|| {
+            if parameters != self.parameters {
+                return Err(LinuxActivationError::WrongSession);
+            }
+            let specs = batch
+                .activation_specs(deadline)
+                .map_err(LinuxActivationError::Memory)?;
+            activate_linux_regions(&mut self.resources, specs, || {
+                batch.into_active_region_owners()
+            })
+        })();
+        if result.is_err() {
+            self.poison_both();
+        }
+        result
     }
 
     pub(crate) fn begin_linux_expected_coordinator_writer_batch(
@@ -655,6 +736,54 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
             acknowledge_commit_rejection: false,
         })
     }
+}
+
+#[cfg(target_os = "linux")]
+fn activate_linux_regions(
+    resources: &mut ResourceOwner,
+    specs: Vec<LinuxActiveRegionSpec>,
+    owners: impl FnOnce() -> Result<Vec<LinuxActiveRegionOwner>, MemfdError>,
+) -> Result<ActiveRegionSet, LinuxActivationError> {
+    let expected = specs
+        .iter()
+        .map(|spec| (spec.id, spec.authority))
+        .collect::<Vec<(crate::region::RegionId, LocalRegionAuthority)>>();
+    let mut reservations = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        reservations.push(
+            resources
+                .reserve(spec.mapped_len)
+                .map_err(ActivationError::Resource)
+                .map_err(LinuxActivationError::Active)?,
+        );
+    }
+    let owners = owners().map_err(LinuxActivationError::Memory)?;
+    if owners.len() != specs.len() {
+        return Err(LinuxActivationError::Memory(MemfdError::WrongProvenance));
+    }
+    let mut active = Vec::with_capacity(specs.len());
+    for ((expected_spec, owner), reservation) in specs.into_iter().zip(owners).zip(reservations) {
+        if owner.spec() != expected_spec {
+            return Err(LinuxActivationError::Memory(MemfdError::WrongProvenance));
+        }
+        let region = match (expected_spec.authority, owner) {
+            (LocalRegionAuthority::Reader, LinuxActiveRegionOwner::Reader { owner, .. }) => {
+                CommittedRegion::Reader(
+                    ActiveReader::new_leased(owner, expected_spec.logical_len, reservation)
+                        .map_err(LinuxActivationError::Active)?,
+                )
+            }
+            (LocalRegionAuthority::Writer, LinuxActiveRegionOwner::Writer { owner, .. }) => {
+                CommittedRegion::Writer(
+                    ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation)
+                        .map_err(LinuxActivationError::Active)?,
+                )
+            }
+            _ => return Err(LinuxActivationError::Memory(MemfdError::WrongProvenance)),
+        };
+        active.push((expected_spec.id, region));
+    }
+    ActiveRegionSet::from_local_committed(expected, active).map_err(LinuxActivationError::Batch)
 }
 
 #[cfg(target_os = "linux")]
@@ -867,7 +996,11 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
             self.transaction
                 .finish()
                 .map_err(LinuxCapabilityBatchError::Control)?;
-            return Ok(LinuxCoordinatorCommittedMixedDirectionBatch { batch: self.batch });
+            return Ok(LinuxCoordinatorCommittedMixedDirectionBatch {
+                batch: self.batch,
+                parameters: self.transaction.dispatcher.parameters,
+                deadline: self.transaction.deadline,
+            });
         }
         #[cfg(test)]
         if self.commit_fault != CompletionFault::None {
@@ -918,7 +1051,11 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
         self.transaction
             .finish()
             .map_err(LinuxCapabilityBatchError::Control)?;
-        Ok(LinuxCoordinatorCommittedMixedDirectionBatch { batch: self.batch })
+        Ok(LinuxCoordinatorCommittedMixedDirectionBatch {
+            batch: self.batch,
+            parameters: self.transaction.dispatcher.parameters,
+            deadline: self.transaction.deadline,
+        })
     }
 
     #[cfg(test)]
@@ -969,13 +1106,6 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
     #[cfg(test)]
     pub(crate) fn duplicate_commit_for_test(&mut self) {
         self.commit_fault = CompletionFault::Duplicate;
-    }
-}
-
-#[cfg(all(target_os = "linux", test))]
-impl LinuxCoordinatorCommittedMixedDirectionBatch {
-    pub(crate) fn batch_for_test(&self) -> &LinuxMixedDirectionBatch {
-        &self.batch
     }
 }
 
@@ -1648,7 +1778,11 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
             .imported
             .take()
             .expect("exact COMMIT releases the retained imported batch once");
-        Ok(LinuxReceiverCommittedMixedDirectionBatch { batch })
+        Ok(LinuxReceiverCommittedMixedDirectionBatch {
+            batch,
+            parameters: self.dispatcher.parameters,
+            deadline: self.deadline,
+        })
     }
 
     fn poison(&mut self) {
@@ -1720,13 +1854,6 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
     #[cfg(test)]
     pub(crate) fn acknowledge_commit_rejection_for_test(&mut self) {
         self.acknowledge_commit_rejection = true;
-    }
-}
-
-#[cfg(all(target_os = "linux", test))]
-impl LinuxReceiverCommittedMixedDirectionBatch {
-    pub(crate) fn imported_for_test(&mut self) -> &mut LinuxImportedMixedDirectionBatch {
-        &mut self.batch
     }
 }
 
