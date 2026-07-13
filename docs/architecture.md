@@ -310,7 +310,12 @@ supervisor/XPC boundary is required. The private audit-token signal path is
 also execution-scoped: a hostile authenticated child can `exec`, invalidate
 the retained PID version, and remain alive. That `ESRCH` is reported as
 incomplete cleanup rather than suppressed, but exact termination still
-requires the supervisor/XPC boundary. In the post-authentication prototype the
+requires the supervisor/XPC boundary. A preinstalled signed launchd/XPC
+service, not a library-spawned broker, is a necessary candidate; it is not
+sufficient across service crash without additional OS-enforced containment.
+The negative result and implementation gate are recorded in
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md). In the
+post-authentication prototype the
 coordinator retains an opened regular non-setid
 executable and compares its stable path identity with `proc_pidpath` after
 authentication and again through ACCEPT. This is not fd-exec, immutable

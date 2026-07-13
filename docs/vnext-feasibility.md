@@ -988,7 +988,13 @@ now compose into a public-API-shaped prototype on Apple Silicon, but actual
 public spawn/bootstrap remain fail-closed. Direct spawn has no PID-reuse-safe
 termination capability before the first audit-bearing Mach message without
 forbidden task-port transfer, so a supervisor/XPC boundary is required before
-6d conformance. The prototype coordinator opens an absolute
+6d conformance. A preinstalled signed launchd/XPC service is necessary and a
+library-spawned broker is recursive, but the service alone loses its parent/wait
+authority on crash. No documented public crash-surviving exact containment
+primitive has been identified; see
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) for the
+negative result and native evidence gate. No service artifact is implemented.
+The prototype coordinator opens an absolute
 regular non-setid executable with `O_NOFOLLOW`, retains its stable
 device/inode/size identity, launches the explicit argv/environment with
 `POSIX_SPAWN_SETSID`, and compares the live `proc_pidpath` image after

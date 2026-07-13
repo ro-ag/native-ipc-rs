@@ -768,7 +768,24 @@ The internal control abstraction MUST be replaceable by a signed XPC adapter
 without changing public session/region APIs. `PeerIdentityPolicy` includes the
 expected resolved executable identity and an optional code-signing requirement;
 when configured and available, validation fails closed. Direct private spawn is
-the baseline and no global Mach service is registered.
+the baseline and registers no service. The library itself never registers a
+global Mach service.
+
+A conforming public XPC adapter MUST connect to a preinstalled, signed,
+`launchd`-advertised private service; spawning a broker from the client merely
+recurses into the same pre-bootstrap lifecycle problem and is not conforming.
+Before any spawn effect, client and service MUST complete an
+authentication-only nonce handshake, derive dynamic code identity from the
+received messages, and check it against installed requirements. The same-user
+nonprivileged service MUST install an opaque non-PID lifecycle entry before the
+helper runs, serialize signal selection with reap-and-tombstone, accept no
+numeric PID as wire authority, reject helper audit-token PID-version changes,
+and never transfer a task port. It MUST additionally use an OS-enforced exact
+containment mechanism that survives service crash and cannot be escaped by the
+helper. No documented public macOS primitive satisfying that last condition is
+currently known, so the architecture and public adapter remain blocked. The
+analysis and native evidence gate are specified in
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
 
 ### 8.4 Windows AMD64/Arm64
 

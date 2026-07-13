@@ -52,6 +52,11 @@ Versioning once a stable API is released.
   preflight, bounded control, mixed READY/COMMIT activation, one-shot
   `receiver_main!`, and exact direct-child wait diagnostics. Public macOS
   spawn/bootstrap remain fail-closed pending pre-bootstrap exact termination.
+- Record a preinstalled signed launchd/XPC service as a necessary macOS
+  lifecycle candidate, together with its authentication, privilege, serialized
+  reap, and native evidence obligations. The investigation also proves that
+  the service alone is insufficient across supervisor crash, so the
+  architecture and public macOS path remain blocked.
 
 ### Changed
 

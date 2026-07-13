@@ -66,10 +66,14 @@ bounded cleanup diagnostics.
 The macOS Arm64 prototype reaches the same private reducer but remains
 fail-closed at public spawn/bootstrap because direct spawn cannot exactly kill a
 child silent before its first audit-bearing Mach message without forbidden task
-authority. Windows is likewise fail-closed with `BackendUnavailable`; local
-package verification is green, while a macOS supervisor/XPC boundary, Windows
-parity, exact-release packaged conformance, and release evidence are pending.
-The existing cross-platform native-memory lifecycle API remains available independently.
+authority. A preinstalled signed launchd/XPC service is a necessary candidate,
+but it does not preserve exact authority across service crash without another
+OS-enforced containment mechanism; that architecture remains blocked.
+Windows is likewise fail-closed with `BackendUnavailable`; local
+package verification is green, while the macOS lifecycle architecture,
+Windows parity, exact-release packaged conformance, and release evidence are
+pending. The existing cross-platform native-memory lifecycle API remains
+available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not
