@@ -105,7 +105,8 @@ pub(super) fn coordinator_transport(
         accepted_transcript(nonce),
     )
     .unwrap();
-    let transport = CoordinatorMacControlTransport::from_accepted(channel, evidence).unwrap();
+    let transport =
+        CoordinatorMacControlTransport::from_accepted_for_wait_test(channel, evidence).unwrap();
     assert_eq!(
         transport.session_parameters().authority_profile(),
         NativeAuthorityProfile::MacMachV1
@@ -193,14 +194,17 @@ fn accepted_evidence_must_match_the_exact_authenticated_channel() {
     )
     .unwrap();
     assert!(matches!(
-        CoordinatorMacControlTransport::from_accepted(channel, coordinator_evidence(wrong_facts)),
+        CoordinatorMacControlTransport::from_accepted_for_wait_test(
+            channel,
+            coordinator_evidence(wrong_facts)
+        ),
         Err(SessionTransportError::IdentityMismatch)
     ));
 }
 
 #[test]
-fn only_coordinator_can_terminate_and_reap_the_exact_child() {
-    let channel = spawn_helper("backend::macos::bootstrap::tests::spawned_helper_entry");
+fn only_coordinator_owns_the_exact_child_reap() {
+    let channel = spawn_helper("backend::macos::vnext_transport_test::natural_exit_helper");
     let mut transport = coordinator_transport(channel);
     transport.terminate_and_reap(deadline()).unwrap();
     assert_eq!(
@@ -211,7 +215,7 @@ fn only_coordinator_can_terminate_and_reap_the_exact_child() {
 
 #[test]
 fn cleanup_timeout_hands_reaping_off_without_blocking_drop() {
-    let channel = spawn_helper("backend::macos::bootstrap::tests::spawned_helper_entry");
+    let channel = spawn_helper("backend::macos::vnext_transport_test::natural_exit_helper");
     let mut transport = coordinator_transport(channel);
     transport.delay_reap_for_test(100);
     let short = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
@@ -229,7 +233,7 @@ fn cleanup_timeout_hands_reaping_off_without_blocking_drop() {
 
 #[test]
 fn exact_child_reaper_retries_wait_interruptions_until_cleanup_completes() {
-    let channel = spawn_helper("backend::macos::bootstrap::tests::spawned_helper_entry");
+    let channel = spawn_helper("backend::macos::vnext_transport_test::natural_exit_helper");
     let mut transport = coordinator_transport(channel);
     transport.interrupt_reap_wait_for_test(32);
     transport.terminate_and_reap(deadline()).unwrap();
@@ -237,6 +241,12 @@ fn exact_child_reaper_retries_wait_interruptions_until_cleanup_completes() {
         transport.try_poll_peer(),
         Err(SessionTransportError::Native(None))
     );
+}
+
+#[test]
+#[ignore = "spawned only by exact-child lifecycle tests"]
+fn natural_exit_helper() {
+    let _channel = bootstrap::ChildChannel::connect_from_environment().unwrap();
 }
 
 #[test]

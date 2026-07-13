@@ -239,13 +239,16 @@ A fresh implementation session can start from
 
 ## Current status
 
-The unreleased vNext branch now composes the safe public session API on Linux:
+The unreleased vNext branch composes the safe public session API on Linux:
 one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
-lease-aware close/abort, and bounded failure/cleanup diagnostics. This is Linux
-source-tree and local Arm64 container evidence only. macOS/Windows public-session
-parity, exact-tip hosted CI, packaged-crate conformance, physical Arm64 evidence,
-and release authorization remain outstanding.
+lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
+composition prototype exists privately but the public entry points remain
+fail-closed: direct spawn has no PID-reuse-safe termination authority before the
+first audit-bearing Mach message without transferring a forbidden task port.
+This is source-tree evidence with local package verification; a supervisor/XPC
+boundary, Windows parity, exact-tip hosted CI, exact-release packaged
+conformance, physical Arm64 evidence, and release authorization remain outstanding.
 
 Implemented through `0.4.0`:
 

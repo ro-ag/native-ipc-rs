@@ -981,6 +981,46 @@ diff review and local tests; R5.13 remains release-unverified until native
 hostile mutation, Miri-covered portable range code, and exact-target
 conformance pass.
 
+## Blocked macOS 6d public-session prototype
+
+The private macOS memory, transport, evidence, reducer, and activation owners
+now compose into a public-API-shaped prototype on Apple Silicon, but actual
+public spawn/bootstrap remain fail-closed. Direct spawn has no PID-reuse-safe
+termination capability before the first audit-bearing Mach message without
+forbidden task-port transfer, so a supervisor/XPC boundary is required before
+6d conformance. The prototype coordinator opens an absolute
+regular non-setid executable with `O_NOFOLLOW`, retains its stable
+device/inode/size identity, launches the explicit argv/environment with
+`POSIX_SPAWN_SETSID`, and compares the live `proc_pidpath` image after
+audit-PID-authenticated bootstrap and again after bilateral ACCEPT.
+macOS does not provide a path-independent `posix_spawn`-from-fd operation here,
+so the claim is the exact documented pre/post stable-image comparison plus a
+retained opened owner, not Linux `execveat` equivalence or replacement denial.
+
+Before the deadline-bound private-port receive, the exact child is handed to a
+durable sole-waiter worker whose Drop only requests termination. Canonical
+HELLO records bind runtime page/cache-line and lock-free atomic facts; a fresh
+challenge orders coordinator then receiver ACCEPT/REJECT. Role-scoped evidence
+is minted only after exact bilateral ACCEPT. Accepted control and mixed
+transfers use the common dispatcher and full-manifest
+IMPORTED/SEALED/READY/COMMIT reducer. A bilateral capacity preflight reports
+local preparation/active-limit status before Mach rights move, and a native
+asymmetric-limit test proves both endpoints return to Ready and remain control
+synchronized.
+
+Local Apple Silicon tests cover private production accept, both rejection
+directions, stalled post-authentication HELLO deadline, bounded duplex control,
+mixed activation, and exact `Exited(0)` direct-child facts. The public macOS
+facade has a non-ignored fail-closed regression; its success-path integration
+tests remain ignored until an exact pre-bootstrap lifecycle boundary exists.
+The audit-token signal path is execution-scoped: post-authentication `exec`
+changes the PID version, so a resulting `ESRCH` while the direct child remains
+alive is reported as incomplete cleanup and cannot establish termination.
+Fresh-session descendants remain explicitly `FreshGroupUnverified`: the worker
+owns only the exact direct-child wait and does not claim a race-resistant group
+handle or capability revocation. Exact-tip hosted, exact-release packaged,
+physical release-host, RT, and release evidence remain absent.
+
 ## Process containment
 
 - Linux: fresh session/process-group creation and exact direct-child pidfd
@@ -989,8 +1029,10 @@ conformance pass.
   PGID between any leader check and `kill(-pgid)`. Ordinary and escaped
   descendants therefore remain unverified without stronger trusted cgroup,
   broker, or namespace containment.
-- macOS: fresh group/session feasibility remains separate native work; Linux's
-  pidfd evidence does not establish a race-resistant macOS group handle.
+- macOS: the private prototype spawn establishes a fresh POSIX session, while the durable
+  worker owns only the exact direct-child wait. Linux's pidfd evidence does not
+  establish a race-resistant macOS group handle, so descendants remain
+  `FreshGroupUnverified`.
 - Windows: feasible by creating the child suspended, assigning it to an
   unnamed kill-on-close Job before resume, rejecting setup if assignment or
   required Job policy fails, and retaining process/thread/Job handles in RAII.

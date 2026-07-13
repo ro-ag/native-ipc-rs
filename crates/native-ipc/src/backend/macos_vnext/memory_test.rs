@@ -320,7 +320,7 @@ fn imported_maximum_protections_exclude_execute() {
     let imported = expected.import(&transfer, rights).unwrap();
     for owner in imported.into_active_region_owners() {
         let spec = owner.spec();
-        let (address, protection) = match spec.authority {
+        match spec.authority {
             LocalRegionAuthority::Reader => {
                 let owner = owner.into_reader().unwrap();
                 let address = owner.as_ptr() as u64;
@@ -336,27 +336,33 @@ fn imported_maximum_protections_exclude_execute() {
                     )
                 };
                 assert_ne!(write_result, super::KERN_SUCCESS);
-                (address, VM_PROT_READ | VM_PROT_EXECUTE)
+                // SAFETY: the owner remains live across this negative probe.
+                let result = unsafe {
+                    mach_vm_protect(
+                        current_task(),
+                        address,
+                        spec.mapped_len as u64,
+                        0,
+                        VM_PROT_READ | VM_PROT_EXECUTE,
+                    )
+                };
+                assert_ne!(result, super::KERN_SUCCESS);
             }
             LocalRegionAuthority::Writer => {
                 let mut owner = owner.into_writer().unwrap();
-                (
-                    owner.as_mut_ptr() as u64,
-                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
-                )
+                let address = owner.as_mut_ptr() as u64;
+                // SAFETY: the owner remains live across this negative probe.
+                let result = unsafe {
+                    mach_vm_protect(
+                        current_task(),
+                        address,
+                        spec.mapped_len as u64,
+                        0,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                    )
+                };
+                assert_ne!(result, super::KERN_SUCCESS);
             }
-        };
-        // SAFETY: this deliberately attempts an execute upgrade against the
-        // exact live mapping; the kernel-clamped maximum must reject it.
-        let result = unsafe {
-            mach_vm_protect(
-                current_task(),
-                address,
-                spec.mapped_len as u64,
-                0,
-                protection,
-            )
-        };
-        assert_ne!(result, super::KERN_SUCCESS);
+        }
     }
 }

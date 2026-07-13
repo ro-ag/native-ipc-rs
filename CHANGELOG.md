@@ -45,7 +45,13 @@ Versioning once a stable API is released.
   lease-aware recoverable close, terminal abort invalidation, and bounded
   `SessionFailure` diagnostics carrying operation/stage/reason, optional errno,
   poison and endpoint facts, and coordinator child-cleanup evidence. The public
-  session composition remains Linux-only until macOS and Windows parity lands.
+  session composition remains target-specific until Windows parity lands.
+- Add a private, public-API-shaped macOS Arm64 composition prototype with a held
+  stable-path image check, fresh-session `posix_spawn`, audit-PID-authenticated private
+  Mach bootstrap, canonical HELLO and challenged decisions, symmetric capacity
+  preflight, bounded control, mixed READY/COMMIT activation, one-shot
+  `receiver_main!`, and exact direct-child wait diagnostics. Public macOS
+  spawn/bootstrap remain fail-closed pending pre-bootstrap exact termination.
 
 ### Changed
 

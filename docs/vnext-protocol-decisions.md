@@ -150,7 +150,11 @@ before rejection. A borrow-bound pending-receive guard poisons on every
 unsuccessful finish or Drop. Successful exact payload finalization reuses that
 single owned record allocation and advances the receive sequence once. Send
 and receive sequences are independent; exhaustion, replay/reorder, malformed
-peer input, partial receive, and transaction conflict are terminal. Public
-The Linux public API exposes this transport only from an authenticated
-`Session<Ready>`. macOS and Windows public Ready-session construction remains
-fail-closed until their equivalent reducers and lifecycle owners are composed.
+peer input, partial receive, and transaction conflict are terminal. The Linux
+public API exposes this transport only from an authenticated `Session<Ready>`.
+The blocked macOS Arm64 prototype uses the same canonical wire records over an
+audit-PID/nonce-authenticated private Mach port and retains exact-child wait
+ownership plus the held image through prototype Ready; public construction
+remains fail-closed pending pre-bootstrap exact termination. Windows public
+Ready-session construction remains fail-closed until its equivalent reducer
+and lifecycle owner are composed.

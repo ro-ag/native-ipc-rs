@@ -5,7 +5,7 @@ use std::fmt;
 use std::mem::{size_of, size_of_val, zeroed};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -15,7 +15,9 @@ use crate::protocol::{
     CONTROL_FRAME_LEN, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
     TransferProvenance, mint_channel_id,
 };
-use crate::session::AbsoluteDeadline;
+use crate::session::{
+    AbsoluteDeadline, ChildCleanupFacts, ChildExitStatus, DescendantCleanupStatus,
+};
 type MachMsgReturn = c_int;
 type PosixSpawnAttr = *mut c_void;
 
@@ -53,6 +55,9 @@ const TIMEOUT_MS: u32 = 10_000;
 pub(super) const MAX_VNEXT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_VNEXT_CAPABILITIES: usize = 16;
 const WNOHANG: c_int = 1;
+const ESRCH: c_int = 3;
+const POSIX_SPAWN_SETSID: i16 = 0x0400;
+const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 
 unsafe extern "C" {
     fn mach_port_allocate(task: MachPort, right: c_int, name: *mut MachPort) -> c_int;
@@ -74,6 +79,7 @@ unsafe extern "C" {
         notify: MachPort,
     ) -> MachMsgReturn;
     fn mach_msg_destroy(message: *mut MachMsgHeader);
+    fn proc_signal_with_audittoken(token: *mut AuditToken, signal: c_int) -> c_int;
     fn task_get_special_port(task: MachPort, which: c_int, port: *mut MachPort) -> c_int;
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
@@ -82,6 +88,7 @@ unsafe extern "C" {
         port: MachPort,
         which: c_int,
     ) -> c_int;
+    fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
     fn posix_spawn(
         pid: *mut Pid,
         path: *const c_char,
@@ -203,6 +210,10 @@ pub enum BootstrapError {
     },
     /// Spawn environment was missing or malformed.
     InvalidEnvironment,
+    /// The caller-derived absolute deadline expired.
+    DeadlineExpired,
+    /// A send completed at the deadline boundary with ambiguous peer state.
+    Ambiguous,
 }
 
 impl fmt::Display for BootstrapError {
@@ -301,11 +312,41 @@ pub struct SpawnedHelper {
     pid: Pid,
     nonce: [u8; 32],
     receive: Option<ReceiveRight>,
+    lifecycle: Option<MacChildLifecycle>,
 }
 
 impl SpawnedHelper {
     /// Spawns an absolute helper path with a private bootstrap send right.
     pub fn spawn(path: &CString, arguments: &[CString]) -> Result<Self, BootstrapError> {
+        let environment = std::env::vars_os()
+            .filter(|(key, _)| key != ENV_NONCE && key != ENV_PARENT_PID)
+            .filter_map(|(key, value)| {
+                CString::new(format!(
+                    "{}={}",
+                    key.to_string_lossy(),
+                    value.to_string_lossy()
+                ))
+                .ok()
+            })
+            .collect();
+        Self::spawn_inner(path, arguments, environment, false, false)
+    }
+
+    pub(super) fn spawn_explicit(
+        path: &CString,
+        arguments: &[CString],
+        environment: &[CString],
+    ) -> Result<Self, BootstrapError> {
+        Self::spawn_inner(path, arguments, environment.to_vec(), true, true)
+    }
+
+    fn spawn_inner(
+        path: &CString,
+        arguments: &[CString],
+        mut environment: Vec<CString>,
+        fresh_session: bool,
+        arguments_include_arg0: bool,
+    ) -> Result<Self, BootstrapError> {
         let nonce = random_nonce()?;
         let receive = ReceiveRight::allocate()?;
         receive.make_send()?;
@@ -324,9 +365,22 @@ impl SpawnedHelper {
         spawn_result(unsafe {
             posix_spawnattr_setspecialport_np(&mut guard.0, receive.0, TASK_BOOTSTRAP_PORT)
         })?;
+        if fresh_session {
+            // SAFETY: attributes are initialized and the flag is defined by
+            // the macOS SDK to create a fresh session for the spawned child.
+            spawn_result(unsafe {
+                posix_spawnattr_setflags(
+                    &mut guard.0,
+                    POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT,
+                )
+            })?;
+        }
 
-        let mut argv_storage = Vec::with_capacity(arguments.len() + 1);
-        argv_storage.push(path.clone());
+        let mut argv_storage =
+            Vec::with_capacity(arguments.len() + usize::from(!arguments_include_arg0));
+        if !arguments_include_arg0 {
+            argv_storage.push(path.clone());
+        }
         argv_storage.extend(arguments.iter().cloned());
         let mut argv: Vec<*mut c_char> = argv_storage
             .iter_mut()
@@ -336,17 +390,6 @@ impl SpawnedHelper {
 
         let nonce_value = hex(&nonce);
         let parent_pid = std::process::id().to_string();
-        let mut environment: Vec<CString> = std::env::vars_os()
-            .filter(|(key, _)| key != ENV_NONCE && key != ENV_PARENT_PID)
-            .filter_map(|(key, value)| {
-                CString::new(format!(
-                    "{}={}",
-                    key.to_string_lossy(),
-                    value.to_string_lossy()
-                ))
-                .ok()
-            })
-            .collect();
         environment.push(CString::new(format!("{ENV_NONCE}={nonce_value}")).expect("hex env"));
         environment.push(CString::new(format!("{ENV_PARENT_PID}={parent_pid}")).expect("pid env"));
         let mut envp: Vec<*mut c_char> = environment
@@ -354,6 +397,10 @@ impl SpawnedHelper {
             .map(|entry| entry.as_ptr().cast_mut())
             .collect();
         envp.push(std::ptr::null_mut());
+        let lifecycle = fresh_session
+            .then(MacChildLifecycle::prepare)
+            .transpose()
+            .map_err(bootstrap_lifecycle_error)?;
         let mut pid = 0;
         // SAFETY: path/argv/envp and initialized attributes remain live for the call.
         let result = unsafe {
@@ -370,21 +417,85 @@ impl SpawnedHelper {
         // launch result is inspected; the receive right remains owned.
         deallocate_port(current_task(), receive.0);
         spawn_result(result)?;
+        if let Some(owner) = &lifecycle {
+            owner.activate(pid);
+        }
         Ok(Self {
             pid,
             nonce,
             receive: Some(receive),
+            lifecycle,
         })
     }
 
     /// Receives the helper's control port and authenticates its audit PID.
-    pub fn authenticate(mut self) -> Result<ParentChannel, BootstrapError> {
+    pub fn authenticate(self) -> Result<ParentChannel, BootstrapError> {
+        self.authenticate_inner(None)
+    }
+
+    pub(super) fn authenticate_vnext_until(
+        mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(ParentChannel, MacChildLifecycle), (BootstrapError, ChildCleanupFacts)> {
+        let Some(receive) = self.receive.take() else {
+            let cleanup = self.cleanup_vnext_until(deadline);
+            return Err((BootstrapError::InvalidMessage, cleanup));
+        };
+        let Some(lifecycle) = self.lifecycle.take() else {
+            drop(receive);
+            let cleanup = self.cleanup_vnext_until(deadline);
+            return Err((BootstrapError::InvalidMessage, cleanup));
+        };
+        let peer_pid = self.pid as u32;
+        self.pid = 0;
+        let (child_send, child_audit) = match receive_port_with_audit(
+            &receive,
+            &self.nonce,
+            peer_pid,
+            &[0; CONTROL_FRAME_LEN],
+            Some(deadline),
+        ) {
+            Ok(received) => received,
+            Err(error) => {
+                drop(receive);
+                return Err((error, lifecycle.terminate_and_reap_facts(deadline)));
+            }
+        };
+        lifecycle.install_audit_token(child_audit);
+        let channel = ParentChannel {
+            peer_send: child_send,
+            _receive: receive,
+            nonce: self.nonce,
+            peer_pid,
+            reaped: true,
+            pending_entries: Vec::new(),
+            channel_id: mint_channel_id(),
+            next_transfer_id: 1,
+            poisoned: false,
+        };
+        Ok((channel, lifecycle))
+    }
+
+    pub(super) fn cleanup_vnext_until(mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        self.receive.take();
+        self.pid = 0;
+        self.lifecycle.take().map_or_else(
+            || ChildCleanupFacts::new(None, DescendantCleanupStatus::FreshGroupUnverified, None),
+            |lifecycle| lifecycle.terminate_and_reap_facts(deadline),
+        )
+    }
+
+    fn authenticate_inner(
+        mut self,
+        deadline: Option<AbsoluteDeadline>,
+    ) -> Result<ParentChannel, BootstrapError> {
         let receive = self.receive.take().ok_or(BootstrapError::InvalidMessage)?;
         let child_send = match receive_port(
             &receive,
             &self.nonce,
             self.pid as u32,
             &[0; CONTROL_FRAME_LEN],
+            deadline,
         ) {
             Ok(right) => right,
             Err(error) => {
@@ -416,7 +527,7 @@ impl SpawnedHelper {
 
 impl Drop for SpawnedHelper {
     fn drop(&mut self) {
-        if self.pid > 0 {
+        if self.lifecycle.is_none() && self.pid > 0 {
             terminate_and_reap(self.pid);
         }
     }
@@ -446,12 +557,12 @@ pub struct ParentChannel {
 struct MacChildLifecycleState {
     reaped: bool,
     last_error: Option<i32>,
-    #[cfg(test)]
     exit_status: Option<i32>,
+    audit_token: Option<AuditToken>,
 }
 
 struct MacChildLifecycleShared {
-    pid: Pid,
+    pid: AtomicI32,
     terminate: AtomicBool,
     state: Mutex<MacChildLifecycleState>,
     changed: Condvar,
@@ -467,15 +578,15 @@ pub(super) struct MacChildLifecycle {
 }
 
 impl MacChildLifecycle {
-    fn start(pid: Pid) -> Result<Self, SessionTransportError> {
+    fn prepare() -> Result<Self, SessionTransportError> {
         let shared = Arc::new(MacChildLifecycleShared {
-            pid,
+            pid: AtomicI32::new(0),
             terminate: AtomicBool::new(false),
             state: Mutex::new(MacChildLifecycleState {
                 reaped: false,
                 last_error: None,
-                #[cfg(test)]
                 exit_status: None,
+                audit_token: None,
             }),
             changed: Condvar::new(),
             #[cfg(test)]
@@ -491,6 +602,30 @@ impl MacChildLifecycle {
         Ok(Self { shared })
     }
 
+    fn start(pid: Pid) -> Result<Self, SessionTransportError> {
+        let lifecycle = Self::prepare()?;
+        lifecycle.activate(pid);
+        Ok(lifecycle)
+    }
+
+    fn activate(&self, pid: Pid) {
+        debug_assert!(pid > 0);
+        let previous = self.shared.pid.swap(pid, Ordering::AcqRel);
+        debug_assert_eq!(previous, 0);
+        self.shared.changed.notify_all();
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.shared.pid.load(Ordering::Acquire) as u32
+    }
+
+    fn install_audit_token(&self, audit_token: AuditToken) {
+        let mut state = lock_lifecycle(&self.shared.state);
+        debug_assert!(state.audit_token.is_none());
+        state.audit_token = Some(audit_token);
+        self.shared.changed.notify_all();
+    }
+
     pub(super) fn try_poll(&self) -> Result<PeerState, SessionTransportError> {
         let state = lock_lifecycle(&self.shared.state);
         if state.reaped {
@@ -502,27 +637,63 @@ impl MacChildLifecycle {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn exited_successfully_for_test(&self) -> bool {
         lock_lifecycle(&self.shared.state).exit_status == Some(0)
+    }
+
+    pub(super) fn wait_and_reap_status(
+        &self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<i32, SessionTransportError> {
+        self.wait_for_status(deadline, false)
+    }
+
+    pub(super) fn wait_and_reap_facts(&self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        mac_child_cleanup_facts(self.wait_and_reap_status(deadline))
+    }
+
+    pub(super) fn terminate_and_reap_status(
+        &self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<i32, SessionTransportError> {
+        self.wait_for_status(deadline, true)
+    }
+
+    pub(super) fn terminate_and_reap_facts(&self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        mac_child_cleanup_facts(self.terminate_and_reap_status(deadline))
     }
 
     pub(super) fn terminate_and_reap(
         &self,
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionTransportError> {
-        self.request_termination();
+        self.terminate_and_reap_status(deadline).map(|_| ())
+    }
+
+    fn wait_for_status(
+        &self,
+        deadline: AbsoluteDeadline,
+        terminate: bool,
+    ) -> Result<i32, SessionTransportError> {
+        if terminate {
+            self.request_termination();
+        }
         let mut state = lock_lifecycle(&self.shared.state);
         loop {
             if state.reaped {
-                return Ok(());
+                return state.exit_status.ok_or(SessionTransportError::Native(None));
             }
-            if let Some(error) = state.last_error {
+            if let Some(error) = state.last_error
+                && error != ESRCH
+            {
                 return Err(SessionTransportError::Native(Some(error)));
             }
             let remaining = deadline.remaining();
             if remaining.is_zero() {
-                return Err(SessionTransportError::DeadlineExpired);
+                return Err(match state.last_error {
+                    Some(error) => SessionTransportError::Native(Some(error)),
+                    None => SessionTransportError::DeadlineExpired,
+                });
             }
             state = match self.shared.changed.wait_timeout(state, remaining) {
                 Ok((state, _)) => state,
@@ -549,9 +720,50 @@ impl MacChildLifecycle {
     }
 }
 
+fn mac_child_cleanup_facts(result: Result<i32, SessionTransportError>) -> ChildCleanupFacts {
+    let descendants = DescendantCleanupStatus::FreshGroupUnverified;
+    match result {
+        Ok(status) if status & 0x7f == 0 => ChildCleanupFacts::new(
+            Some(ChildExitStatus::Exited((status >> 8) & 0xff)),
+            descendants,
+            None,
+        ),
+        Ok(status) if status & 0x7f != 0x7f => ChildCleanupFacts::new(
+            Some(ChildExitStatus::Signaled {
+                signal: status & 0x7f,
+                dumped_core: status & 0x80 != 0,
+            }),
+            descendants,
+            None,
+        ),
+        Ok(_) => ChildCleanupFacts::new(None, descendants, None),
+        Err(SessionTransportError::Native(code)) => ChildCleanupFacts::new(None, descendants, code),
+        Err(
+            SessionTransportError::DeadlineExpired
+            | SessionTransportError::PeerExited
+            | SessionTransportError::MalformedRecord
+            | SessionTransportError::RecordTooLarge
+            | SessionTransportError::IdentityMismatch
+            | SessionTransportError::Ambiguous,
+        ) => ChildCleanupFacts::new(None, descendants, None),
+    }
+}
+
 impl Drop for MacChildLifecycle {
     fn drop(&mut self) {
-        self.request_termination();
+        // The worker retains one Arc until exact wait completion. Request
+        // cancellation/cleanup when this is the final external owner.
+        if Arc::strong_count(&self.shared) <= 2 {
+            self.request_termination();
+        }
+    }
+}
+
+impl Clone for MacChildLifecycle {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
     }
 }
 
@@ -648,6 +860,7 @@ impl ParentChannel {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn take_vnext_lifecycle(
         &mut self,
     ) -> Result<MacChildLifecycle, SessionTransportError> {
@@ -677,6 +890,7 @@ impl ParentChannel {
                 MACH_MSG_TYPE_COPY_SEND,
                 &self.nonce,
                 &transcript,
+                None,
             )?;
             self.pending_entries.push(entry);
             Ok(())
@@ -699,6 +913,7 @@ impl ParentChannel {
                 &self.nonce,
                 self.peer_pid,
                 &manifest.encode(READY_MAGIC),
+                None,
             )?);
             #[cfg(test)]
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -709,6 +924,7 @@ impl ParentChannel {
                 MACH_MSG_TYPE_MAKE_SEND,
                 &self.nonce,
                 &manifest.encode(COMMIT_MAGIC),
+                None,
             )?;
             self.pending_entries.clear();
             self.next_transfer_id = self
@@ -793,6 +1009,18 @@ pub struct ChildChannel {
 impl ChildChannel {
     /// Connects using the injected special port and authenticated environment.
     pub fn connect_from_environment() -> Result<Self, BootstrapError> {
+        Self::connect_from_environment_inner(None)
+    }
+
+    pub(super) fn connect_from_environment_until(
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, BootstrapError> {
+        Self::connect_from_environment_inner(Some(deadline))
+    }
+
+    fn connect_from_environment_inner(
+        deadline: Option<AbsoluteDeadline>,
+    ) -> Result<Self, BootstrapError> {
         let nonce = parse_nonce(
             &std::env::var(ENV_NONCE).map_err(|_| BootstrapError::InvalidEnvironment)?,
         )?;
@@ -815,6 +1043,7 @@ impl ChildChannel {
             MACH_MSG_TYPE_MAKE_SEND,
             &nonce,
             &[0; CONTROL_FRAME_LEN],
+            deadline,
         )?;
         Ok(Self {
             _parent_send: SendRight(parent),
@@ -918,7 +1147,13 @@ impl ChildChannel {
         let result = (|| {
             let entry = ManifestEntry::from_native(native, access);
             let transcript = self.single_manifest(entry)?.encode(CAPABILITY_MAGIC);
-            let right = receive_port(&self.receive, &self.nonce, self.parent_pid, &transcript)?;
+            let right = receive_port(
+                &self.receive,
+                &self.nonce,
+                self.parent_pid,
+                &transcript,
+                None,
+            )?;
             self.pending_entries.push(entry);
             Ok(right)
         })();
@@ -938,12 +1173,14 @@ impl ChildChannel {
                 MACH_MSG_TYPE_MAKE_SEND,
                 &self.nonce,
                 &manifest.encode(READY_MAGIC),
+                None,
             )?;
             drop(receive_port(
                 &self.receive,
                 &self.nonce,
                 self.parent_pid,
                 &manifest.encode(COMMIT_MAGIC),
+                None,
             )?);
             self.pending_entries.clear();
             self.next_transfer_id = self
@@ -999,6 +1236,7 @@ fn send_port(
     disposition: u8,
     nonce: &[u8; 32],
     transcript: &[u8; CONTROL_FRAME_LEN],
+    deadline: Option<AbsoluteDeadline>,
 ) -> Result<(), BootstrapError> {
     let mut message = PortMessage {
         header: MachMsgHeader {
@@ -1023,18 +1261,37 @@ fn send_port(
         nonce: *nonce,
         transcript: *transcript,
     };
-    // SAFETY: complete initialized message buffer is live for bounded send.
-    mach("mach_msg(send)", unsafe {
-        mach_msg(
-            &mut message.header,
-            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-            size_of::<PortMessage>() as u32,
-            0,
-            MACH_PORT_NULL,
-            TIMEOUT_MS,
-            MACH_PORT_NULL,
-        )
-    })
+    loop {
+        let timeout = bootstrap_timeout(deadline)?;
+        // SAFETY: complete initialized message buffer is live for bounded send.
+        let result = unsafe {
+            mach_msg(
+                &mut message.header,
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                size_of::<PortMessage>() as u32,
+                0,
+                MACH_PORT_NULL,
+                timeout,
+                MACH_PORT_NULL,
+            )
+        };
+        match result {
+            KERN_SUCCESS => break,
+            MACH_SEND_INTERRUPTED if deadline.is_some() => continue,
+            MACH_SEND_TIMED_OUT if deadline.is_some_and(|value| !value.is_expired()) => continue,
+            MACH_SEND_TIMED_OUT => return Err(BootstrapError::DeadlineExpired),
+            code => {
+                return Err(BootstrapError::Mach {
+                    operation: "mach_msg(send)",
+                    code,
+                });
+            }
+        }
+    }
+    if deadline.is_some_and(|value| value.is_expired()) {
+        return Err(BootstrapError::Ambiguous);
+    }
+    Ok(())
 }
 
 fn receive_port(
@@ -1042,32 +1299,70 @@ fn receive_port(
     nonce: &[u8; 32],
     expected_pid: u32,
     expected_transcript: &[u8; CONTROL_FRAME_LEN],
+    deadline: Option<AbsoluteDeadline>,
 ) -> Result<SendRight, BootstrapError> {
+    receive_port_with_audit(receive, nonce, expected_pid, expected_transcript, deadline)
+        .map(|(right, _)| right)
+}
+
+fn receive_port_with_audit(
+    receive: &ReceiveRight,
+    nonce: &[u8; 32],
+    expected_pid: u32,
+    expected_transcript: &[u8; CONTROL_FRAME_LEN],
+    deadline: Option<AbsoluteDeadline>,
+) -> Result<(SendRight, AuditToken), BootstrapError> {
     // SAFETY: zero is valid initialization for receive buffer/out descriptor.
     let mut buffer: ReceiveBuffer = unsafe { zeroed() };
-    // SAFETY: receive buffer is sized for message plus requested audit trailer.
-    mach("mach_msg(receive)", unsafe {
-        mach_msg(
-            &mut buffer.message.header,
-            MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_TRAILER_AUDIT,
-            0,
-            size_of::<ReceiveBuffer>() as u32,
-            receive.0,
-            TIMEOUT_MS,
-            MACH_PORT_NULL,
-        )
-    })?;
+    loop {
+        let timeout = bootstrap_timeout(deadline)?;
+        // SAFETY: receive buffer is sized for message plus requested audit trailer.
+        let result = unsafe {
+            mach_msg(
+                &mut buffer.message.header,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_TRAILER_AUDIT,
+                0,
+                size_of::<ReceiveBuffer>() as u32,
+                receive.0,
+                timeout,
+                MACH_PORT_NULL,
+            )
+        };
+        match result {
+            KERN_SUCCESS => break,
+            MACH_RCV_INTERRUPTED if deadline.is_some() => continue,
+            MACH_RCV_TIMED_OUT if deadline.is_some_and(|value| !value.is_expired()) => continue,
+            MACH_RCV_TIMED_OUT => return Err(BootstrapError::DeadlineExpired),
+            code => {
+                return Err(BootstrapError::Mach {
+                    operation: "mach_msg(receive)",
+                    code,
+                });
+            }
+        }
+    }
+    if deadline.is_some_and(|value| value.is_expired()) {
+        destroy_legacy_received_if_complex(&mut buffer);
+        return Err(BootstrapError::DeadlineExpired);
+    }
+    let expected_bits = MACH_MSGH_BITS_COMPLEX | (u32::from(MACH_MSG_TYPE_PORT_SEND) << 8);
     let complex = buffer.message.header.bits & MACH_MSGH_BITS_COMPLEX != 0;
-    if buffer.message.header.size as usize != size_of::<PortMessage>()
-        || !complex
+    if buffer.message.header.bits != expected_bits
+        || buffer.message.header.size as usize != size_of::<PortMessage>()
+        || buffer.message.header.remote_port != MACH_PORT_NULL
+        || buffer.message.header.local_port != receive.0
+        || buffer.message.header.voucher_port != MACH_PORT_NULL
         || buffer.message.header.id != MESSAGE_ID
         || buffer.message.body.descriptor_count != 1
         || buffer.message.descriptor.descriptor_type != MACH_MSG_PORT_DESCRIPTOR
         || buffer.message.descriptor.disposition != MACH_MSG_TYPE_PORT_SEND
+        || buffer.message.descriptor.pad1 != 0
+        || buffer.message.descriptor.pad2 != 0
         || buffer.message.magic != MESSAGE_MAGIC
         || buffer.message.nonce != *nonce
         || buffer.message.transcript != *expected_transcript
         || buffer.message.descriptor.name == MACH_PORT_NULL
+        || buffer.trailer.trailer_type != 0
         || buffer.trailer.trailer_size as usize != size_of::<AuditTrailer>()
     {
         if complex {
@@ -1080,13 +1375,18 @@ fn receive_port(
     // SAFETY: kernel supplied a complete audit trailer of the checked size.
     let actual = unsafe { audit_token_to_pid(buffer.trailer.audit) } as u32;
     if actual != expected_pid {
-        deallocate_port(current_task(), buffer.message.descriptor.name);
+        // SAFETY: the exact checked complex message is still wholly owned by
+        // this receive buffer; destroy every delivered right on rejection.
+        unsafe { mach_msg_destroy(&mut buffer.message.header) };
         return Err(BootstrapError::WrongPeer {
             expected: expected_pid,
             actual,
         });
     }
-    Ok(SendRight(buffer.message.descriptor.name))
+    Ok((
+        SendRight(buffer.message.descriptor.name),
+        buffer.trailer.audit,
+    ))
 }
 
 struct ReceivedVnextRecord {
@@ -1442,6 +1742,40 @@ fn deadline_timeout(deadline: AbsoluteDeadline) -> Result<u32, SessionTransportE
         .min(u32::MAX as u128) as u32)
 }
 
+fn bootstrap_timeout(deadline: Option<AbsoluteDeadline>) -> Result<u32, BootstrapError> {
+    let Some(deadline) = deadline else {
+        return Ok(TIMEOUT_MS);
+    };
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(BootstrapError::DeadlineExpired);
+    }
+    Ok(remaining
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(u32::MAX as u128) as u32)
+}
+
+fn bootstrap_lifecycle_error(error: SessionTransportError) -> BootstrapError {
+    match error {
+        SessionTransportError::DeadlineExpired => BootstrapError::DeadlineExpired,
+        SessionTransportError::IdentityMismatch => BootstrapError::InvalidMessage,
+        SessionTransportError::Native(Some(code)) => BootstrapError::Spawn(code),
+        SessionTransportError::PeerExited
+        | SessionTransportError::MalformedRecord
+        | SessionTransportError::RecordTooLarge
+        | SessionTransportError::Ambiguous
+        | SessionTransportError::Native(None) => BootstrapError::InvalidMessage,
+    }
+}
+
+fn destroy_legacy_received_if_complex(buffer: &mut ReceiveBuffer) {
+    if buffer.message.header.bits & MACH_MSGH_BITS_COMPLEX != 0 {
+        // SAFETY: the kernel delivered a complex message into this live buffer.
+        unsafe { mach_msg_destroy(&mut buffer.message.header) };
+    }
+}
+
 fn lock_lifecycle(
     state: &Mutex<MacChildLifecycleState>,
 ) -> std::sync::MutexGuard<'_, MacChildLifecycleState> {
@@ -1452,18 +1786,35 @@ fn lock_lifecycle(
 }
 
 fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
-    let mut signal_attempted = false;
+    let mut termination_attempted = false;
+    let mut pending_signal_error = None;
     loop {
-        if shared.terminate.load(Ordering::Acquire) && !signal_attempted {
-            signal_attempted = true;
-            // SAFETY: this worker is the durable owner of the exact spawned PID.
-            let result = unsafe { kill(shared.pid, 9) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(3) {
-                    let mut state = lock_lifecycle(&shared.state);
-                    state.last_error = error.raw_os_error();
-                    shared.changed.notify_all();
+        let pid = shared.pid.load(Ordering::Acquire);
+        if pid == 0 {
+            if shared.terminate.load(Ordering::Acquire) {
+                return;
+            }
+            let state = lock_lifecycle(&shared.state);
+            let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            continue;
+        }
+
+        if shared.terminate.load(Ordering::Acquire) && !termination_attempted {
+            let audit_token = lock_lifecycle(&shared.state).audit_token;
+            if let Some(mut audit_token) = audit_token {
+                termination_attempted = true;
+                // SAFETY: this kernel-supplied audit token names the exact
+                // authenticated child execution, including its PID version.
+                let result = unsafe { proc_signal_with_audittoken(&mut audit_token, 9) };
+                // ESRCH is only benign if the exact direct child is already
+                // observable below. A post-authentication exec changes the
+                // audit-token PID version while leaving the child alive, so
+                // suppressing ESRCH here would strand the sole waiter.
+                if result != 0 {
+                    pending_signal_error = Some(result);
                 }
             }
         }
@@ -1489,14 +1840,11 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
 
         let mut status = 0;
         // SAFETY: this worker is the sole waiter for the exact spawned PID.
-        let result = unsafe { waitpid(shared.pid, &mut status, WNOHANG) };
-        if result == shared.pid {
+        let result = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        if result == pid {
             let mut state = lock_lifecycle(&shared.state);
             state.reaped = true;
-            #[cfg(test)]
-            {
-                state.exit_status = Some(status);
-            }
+            state.exit_status = Some(status);
             shared.changed.notify_all();
             return;
         }
@@ -1509,6 +1857,12 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             state.last_error = error.raw_os_error();
             shared.changed.notify_all();
             return;
+        }
+
+        if let Some(error) = pending_signal_error.take() {
+            let mut state = lock_lifecycle(&shared.state);
+            state.last_error = Some(error);
+            shared.changed.notify_all();
         }
 
         let state = lock_lifecycle(&shared.state);
@@ -1536,7 +1890,7 @@ fn port_peer_state(name: MachPort) -> Result<PeerState, SessionTransportError> {
     }
 }
 
-fn random_nonce() -> Result<[u8; 32], BootstrapError> {
+pub(super) fn random_nonce() -> Result<[u8; 32], BootstrapError> {
     let mut nonce = [0_u8; 32];
     // arc4random_buf is provided by libSystem and has no failure mode.
     unsafe extern "C" {
