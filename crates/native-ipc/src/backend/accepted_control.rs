@@ -2,27 +2,27 @@ use super::{
     AcceptedSessionParameters, AuthenticatedZeroRightsTransport, CoordinatorCapabilityTransport,
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::active::{ActivationError, ActiveReader, ActiveWriter, LeaseReservation};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::PendingBatch;
 #[cfg(any(target_os = "linux", test))]
 use crate::batch::TransferBatch;
-#[cfg(target_os = "linux")]
-use crate::batch::{
-    ActiveRegionSet, BatchError, CommittedRegion, ExpectedBatch, LocalRegionAuthority,
-};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::batch::{ActiveRegionSet, BatchError, CommittedRegion, LocalRegionAuthority};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::liveness::ResourceError;
 use crate::liveness::ResourceOwner;
 #[cfg(target_os = "linux")]
 use crate::protocol::CONTROL_FRAME_LEN;
-use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 #[cfg(target_os = "linux")]
-use crate::protocol::{
-    CompletionFrame, CompletionFrameKind, CoordinatorCapacityStatus, PreparationFrameKind,
-};
+use crate::protocol::CoordinatorCapacityStatus;
+use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
 use crate::session::AbsoluteDeadline;
 #[cfg(target_os = "linux")]
 use crate::session::{ActiveLeaseFacts, AtomicCapabilities, ProtocolVersion, SessionState};
@@ -54,6 +54,15 @@ use super::linux_vnext::{
         LinuxMixedDirectionBatch, LinuxReceiverWriterBatch, MemfdError, native_page_size,
     },
     spawn::{CoordinatorLinuxControlTransport, ReceiverLinuxControlTransport},
+};
+
+#[cfg(target_os = "macos")]
+use super::macos::{
+    vnext_memory::{
+        MacActiveRegionOwner, MacBatchError, MacExpectedMixedDirectionBatch,
+        MacImportedMixedDirectionBatch, MacMixedDirectionBatch,
+    },
+    vnext_transport::{CoordinatorMacControlTransport, ReceiverMacControlTransport},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +148,68 @@ pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
     deadline: AbsoluteDeadline,
     #[cfg(test)]
     activation_failure_at: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacCoordinatorMixedDirectionTransaction<'a> {
+    transaction: CoordinatorCapabilityTransaction<'a, CoordinatorMacControlTransport>,
+    batch: MacMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    attempted: bool,
+    #[cfg(test)]
+    sealed_frame_fault: bool,
+    #[cfg(test)]
+    commit_frame_fault: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacCoordinatorCommittedMixedDirectionBatch {
+    batch: MacMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacReceiverMixedDirectionTransaction<'a> {
+    dispatcher: &'a mut AcceptedControlDispatcher<ReceiverMacControlTransport>,
+    expected: Option<MacExpectedMixedDirectionBatch>,
+    imported: Option<MacImportedMixedDirectionBatch>,
+    frame: Option<CapabilityFrame>,
+    reservations: Vec<LeaseReservation>,
+    deadline: AbsoluteDeadline,
+    transaction_id: u64,
+    attempted: bool,
+    already_poisoned: bool,
+    #[cfg(test)]
+    imported_frame_fault: bool,
+    #[cfg(test)]
+    ready_frame_fault: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacReceiverCommittedMixedDirectionBatch {
+    batch: MacImportedMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
+    parameters: AcceptedSessionParameters,
+    deadline: AbsoluteDeadline,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MacCapabilityBatchError {
+    Memory(MacBatchError),
+    Control(AcceptedControlError),
+    Resource(ResourceError),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MacActivationError {
+    WrongSession,
+    Memory(MacBatchError),
+    Active(ActivationError),
+    Batch(BatchError),
 }
 
 #[cfg(target_os = "linux")]
@@ -464,7 +535,7 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         self.poison_both();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn reserve_mapped_lengths(
         &mut self,
         mapped_lengths: Vec<u64>,
@@ -551,6 +622,153 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, 
     #[cfg(test)]
     pub(crate) fn complete_for_test(self) {
         self.transaction.complete_for_test();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AcceptedControlDispatcher<CoordinatorMacControlTransport> {
+    #[cfg(test)]
+    pub(crate) fn wait_for_macos_child_exit_for_test(
+        &self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.transport.wait_for_child_exit_for_test(deadline)
+    }
+
+    pub(crate) fn begin_macos_mixed_direction_batch(
+        &mut self,
+        batch: MacMixedDirectionBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<MacCoordinatorMixedDirectionTransaction<'_>, MacCapabilityBatchError> {
+        if self.parameters.authority_profile() != crate::protocol::NativeAuthorityProfile::MacMachV1
+            || batch.deadline() != deadline
+        {
+            return Err(MacCapabilityBatchError::Memory(
+                MacBatchError::WrongProvenance,
+            ));
+        }
+        let reservations = self
+            .reserve_mapped_lengths(batch.reservation_lengths())
+            .map_err(MacCapabilityBatchError::Resource)?;
+        let frame = self
+            .begin_native_transaction(batch.manifest_entries(), deadline)
+            .map_err(MacCapabilityBatchError::Control)?;
+        Ok(MacCoordinatorMixedDirectionTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            reservations,
+            attempted: false,
+            #[cfg(test)]
+            sealed_frame_fault: false,
+            #[cfg(test)]
+            commit_frame_fault: false,
+        })
+    }
+
+    pub(crate) fn activate_macos_coordinator_mixed_direction_batch(
+        &mut self,
+        committed: MacCoordinatorCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, MacActivationError> {
+        let MacCoordinatorCommittedMixedDirectionBatch {
+            batch,
+            reservations,
+            parameters,
+            deadline,
+        } = committed;
+        if parameters != self.parameters || batch.deadline() != deadline {
+            self.poison_both();
+            return Err(MacActivationError::WrongSession);
+        }
+        let specs = match batch.activation_specs() {
+            Ok(specs) => specs,
+            Err(error) => {
+                self.poison_both();
+                return Err(MacActivationError::Memory(error));
+            }
+        };
+        activate_mac_regions(self, specs, reservations, || {
+            batch.into_active_region_owners()
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl AcceptedControlDispatcher<ReceiverMacControlTransport> {
+    #[cfg(test)]
+    pub(crate) fn observe_macos_receiver_poison_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.transport.observe_poison_for_test(observer);
+    }
+
+    pub(crate) fn begin_macos_expected_mixed_direction_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<MacReceiverMixedDirectionTransaction<'_>, MacCapabilityBatchError> {
+        if self.parameters.authority_profile() != crate::protocol::NativeAuthorityProfile::MacMachV1
+        {
+            return Err(MacCapabilityBatchError::Memory(
+                MacBatchError::WrongProvenance,
+            ));
+        }
+        let expected =
+            MacExpectedMixedDirectionBatch::new(expected, self.parameters.limits(), deadline)
+                .map_err(MacCapabilityBatchError::Memory)?;
+        let reservations = self
+            .reserve_mapped_lengths(expected.reservation_lengths())
+            .map_err(MacCapabilityBatchError::Resource)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(MacCapabilityBatchError::Control)?;
+        Ok(MacReceiverMixedDirectionTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            frame: None,
+            reservations,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            imported_frame_fault: false,
+            #[cfg(test)]
+            ready_frame_fault: false,
+        })
+    }
+
+    pub(crate) fn activate_macos_receiver_mixed_direction_batch(
+        &mut self,
+        committed: MacReceiverCommittedMixedDirectionBatch,
+    ) -> Result<ActiveRegionSet, MacActivationError> {
+        let MacReceiverCommittedMixedDirectionBatch {
+            batch,
+            reservations,
+            parameters,
+            deadline,
+        } = committed;
+        if parameters != self.parameters {
+            self.poison_both();
+            return Err(MacActivationError::WrongSession);
+        }
+        let specs = match batch.activation_specs(deadline) {
+            Ok(specs) => specs,
+            Err(error) => {
+                self.poison_both();
+                return Err(MacActivationError::Memory(error));
+            }
+        };
+        activate_mac_regions(self, specs, reservations, || {
+            batch.into_active_region_owners()
+        })
     }
 }
 
@@ -1178,6 +1396,67 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn activate_mac_regions<T: AuthenticatedZeroRightsTransport>(
+    dispatcher: &mut AcceptedControlDispatcher<T>,
+    specs: Vec<super::macos::vnext_memory::MacActiveRegionSpec>,
+    reservations: Vec<LeaseReservation>,
+    owners: impl FnOnce() -> Vec<MacActiveRegionOwner>,
+) -> Result<ActiveRegionSet, MacActivationError> {
+    let expected = specs
+        .iter()
+        .map(|spec| (spec.id, spec.authority))
+        .collect::<Vec<_>>();
+    if reservations.len() != specs.len() {
+        dispatcher.poison_both();
+        return Err(MacActivationError::Memory(MacBatchError::WrongProvenance));
+    }
+    let owners = owners();
+    if owners.len() != specs.len() {
+        dispatcher.poison_both();
+        return Err(MacActivationError::Memory(MacBatchError::WrongProvenance));
+    }
+    let mut active = Vec::with_capacity(specs.len());
+    for ((expected_spec, owner), reservation) in specs.into_iter().zip(owners).zip(reservations) {
+        if owner.spec() != expected_spec {
+            dispatcher.poison_both();
+            return Err(MacActivationError::Memory(MacBatchError::WrongProvenance));
+        }
+        let region = match (expected_spec.authority, owner) {
+            (LocalRegionAuthority::Reader, MacActiveRegionOwner::Reader { owner, .. }) => {
+                match ActiveReader::new_leased(owner, expected_spec.logical_len, reservation) {
+                    Ok(reader) => CommittedRegion::Reader(reader),
+                    Err(error) => {
+                        dispatcher.poison_both();
+                        return Err(MacActivationError::Active(error));
+                    }
+                }
+            }
+            (LocalRegionAuthority::Writer, MacActiveRegionOwner::Writer { owner, .. }) => {
+                match ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation) {
+                    Ok(writer) => CommittedRegion::Writer(writer),
+                    Err(error) => {
+                        dispatcher.poison_both();
+                        return Err(MacActivationError::Active(error));
+                    }
+                }
+            }
+            _ => {
+                dispatcher.poison_both();
+                return Err(MacActivationError::Memory(MacBatchError::WrongProvenance));
+            }
+        };
+        active.push((expected_spec.id, region));
+    }
+    match ActiveRegionSet::from_local_committed(expected, active) {
+        Ok(active) => Ok(active),
+        Err(error) => {
+            dispatcher.poison_both();
+            Err(MacActivationError::Batch(error))
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
     dispatcher: &mut AcceptedControlDispatcher<T>,
@@ -1379,6 +1658,113 @@ impl LinuxCoordinatorReceiverWriterTransaction<'_> {
     pub(crate) fn replace_capability_with_invalid_file_for_test(&mut self, ordinal: usize) {
         self.batch
             .replace_capability_with_invalid_file_for_test(ordinal);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacCoordinatorMixedDirectionTransaction<'_> {
+    pub(crate) fn prepare(&mut self) -> Result<(), MacCapabilityBatchError> {
+        if self.attempted {
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        if let Err(error) = self.batch.revalidate_before_send() {
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Memory(error));
+        }
+        let capabilities = self.batch.capability_names();
+        self.transaction
+            .send(&capabilities)
+            .map_err(MacCapabilityBatchError::Control)?;
+        let imported = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Imported);
+        self.transaction
+            .receive_preparation(&imported)
+            .map_err(MacCapabilityBatchError::Control)?;
+        if let Err(error) = self.batch.revalidate_before_send() {
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Memory(error));
+        }
+        let sealed = self
+            .transaction
+            .frame
+            .preparation_frame(PreparationFrameKind::Sealed);
+        #[cfg(test)]
+        if self.sealed_frame_fault {
+            let mut bytes = *sealed.as_bytes();
+            bytes[56] ^= 1;
+            self.transaction
+                .send_preparation_bytes(&bytes)
+                .map_err(MacCapabilityBatchError::Control)?;
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        self.transaction
+            .send_preparation(&sealed)
+            .map_err(MacCapabilityBatchError::Control)
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<MacCoordinatorCommittedMixedDirectionBatch, MacCapabilityBatchError> {
+        if !self.attempted {
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let ready = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Ready);
+        self.transaction
+            .receive_completion(&ready)
+            .map_err(MacCapabilityBatchError::Control)?;
+        let commit = self
+            .transaction
+            .frame
+            .completion_frame(CompletionFrameKind::Commit);
+        #[cfg(test)]
+        if self.commit_frame_fault {
+            let mut bytes = *commit.as_bytes();
+            bytes[56] ^= 1;
+            self.transaction
+                .send_preparation_bytes(&bytes)
+                .map_err(MacCapabilityBatchError::Control)?;
+            self.transaction.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        self.transaction
+            .send_completion(&commit)
+            .map_err(MacCapabilityBatchError::Control)?;
+        self.transaction
+            .finish()
+            .map_err(MacCapabilityBatchError::Control)?;
+        Ok(MacCoordinatorCommittedMixedDirectionBatch {
+            batch: self.batch,
+            reservations: self.reservations,
+            parameters: self.transaction.dispatcher.parameters,
+            deadline: self.transaction.deadline,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_sealed_for_test(&mut self) {
+        self.sealed_frame_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_commit_for_test(&mut self) {
+        self.commit_frame_fault = true;
     }
 }
 
@@ -1989,6 +2375,201 @@ impl LinuxReceiverWriterTransaction<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl MacReceiverMixedDirectionTransaction<'_> {
+    pub(crate) fn prepare(&mut self) -> Result<(), MacCapabilityBatchError> {
+        if self.attempted {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        self.attempted = true;
+        let expected = self
+            .expected
+            .as_ref()
+            .expect("macOS receiver expectation remains transaction-owned");
+        let record = match self
+            .dispatcher
+            .transport
+            .receive_candidate_capability_record(expected.len(), self.deadline)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                self.poison();
+                return Err(MacCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((frame, manifest)) = CapabilityFrame::decode(&record.frame) else {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !mac_received_mixed_manifest_matches(
+            self.dispatcher.parameters,
+            self.transaction_id,
+            expected,
+            &manifest,
+        ) {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let expected = self
+            .expected
+            .take()
+            .expect("validated macOS expectation is consumed once");
+        let imported = match expected.import(&manifest, record.rights) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.poison();
+                return Err(MacCapabilityBatchError::Memory(error));
+            }
+        };
+        let imported_frame = frame.preparation_frame(PreparationFrameKind::Imported);
+        #[cfg(test)]
+        let imported_bytes = if self.imported_frame_fault {
+            let mut bytes = *imported_frame.as_bytes();
+            bytes[56] ^= 1;
+            bytes
+        } else {
+            *imported_frame.as_bytes()
+        };
+        #[cfg(not(test))]
+        let imported_bytes = *imported_frame.as_bytes();
+        if let Err(error) = self
+            .dispatcher
+            .transport
+            .send_record(&imported_bytes, self.deadline)
+        {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let sealed_frame = frame.preparation_frame(PreparationFrameKind::Sealed);
+        let sealed = match self
+            .dispatcher
+            .transport
+            .receive_record(sealed_frame.as_bytes().len(), self.deadline)
+        {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.poison();
+                return Err(MacCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !sealed_frame.matches(&sealed) {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = imported.activation_specs(self.deadline) {
+            self.poison();
+            return Err(MacCapabilityBatchError::Memory(error));
+        }
+        self.imported = Some(imported);
+        self.frame = Some(frame);
+        Ok(())
+    }
+
+    pub(crate) fn commit(
+        mut self,
+    ) -> Result<MacReceiverCommittedMixedDirectionBatch, MacCapabilityBatchError> {
+        if !self.attempted || self.imported.is_none() || self.frame.is_none() {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::ReplayOrReorder),
+            ));
+        }
+        let frame = self
+            .frame
+            .as_ref()
+            .expect("successful macOS preparation retains its frame");
+        let ready = frame.completion_frame(CompletionFrameKind::Ready);
+        #[cfg(test)]
+        let ready_bytes = if self.ready_frame_fault {
+            let mut bytes = *ready.as_bytes();
+            bytes[56] ^= 1;
+            bytes
+        } else {
+            *ready.as_bytes()
+        };
+        #[cfg(not(test))]
+        let ready_bytes = *ready.as_bytes();
+        if let Err(error) = self
+            .dispatcher
+            .transport
+            .send_record(&ready_bytes, self.deadline)
+        {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let commit = frame.completion_frame(CompletionFrameKind::Commit);
+        let committed = match self
+            .dispatcher
+            .transport
+            .receive_record(commit.as_bytes().len(), self.deadline)
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                self.poison();
+                return Err(MacCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        if !commit.matches(&committed) {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if let Err(error) = self.dispatcher.state.end_transaction() {
+            self.poison();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(error),
+            ));
+        }
+        self.already_poisoned = true;
+        Ok(MacReceiverCommittedMixedDirectionBatch {
+            batch: self
+                .imported
+                .take()
+                .expect("exact COMMIT releases the imported macOS batch"),
+            reservations: core::mem::take(&mut self.reservations),
+            parameters: self.dispatcher.parameters,
+            deadline: self.deadline,
+        })
+    }
+
+    fn poison(&mut self) {
+        if !self.already_poisoned {
+            self.dispatcher.poison_both();
+            self.already_poisoned = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_imported_for_test(&mut self) {
+        self.imported_frame_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn substitute_ready_for_test(&mut self) {
+        self.ready_frame_fault = true;
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl LinuxReceiverMixedDirectionTransaction<'_> {
     pub(crate) fn prepare(&mut self) -> Result<(), LinuxCapabilityBatchError> {
@@ -2414,6 +2995,23 @@ fn linux_received_mixed_manifest_matches(
         && expected.matches_manifest(manifest)
 }
 
+#[cfg(target_os = "macos")]
+fn mac_received_mixed_manifest_matches(
+    parameters: AcceptedSessionParameters,
+    transaction_id: u64,
+    expected: &MacExpectedMixedDirectionBatch,
+    manifest: &TransferManifest,
+) -> bool {
+    let facts = parameters.facts();
+    manifest.nonce == facts.nonce()
+        && manifest.parent_pid == facts.parent_pid()
+        && manifest.child_pid == facts.child_pid()
+        && manifest.transfer_id == transaction_id
+        && manifest.authority_profile() == parameters.authority_profile()
+        && manifest.fits_limits(parameters.limits())
+        && expected.matches_manifest(manifest)
+}
+
 #[cfg(target_os = "linux")]
 impl Drop for LinuxReceiverCoordinatorWriterTransaction<'_> {
     fn drop(&mut self) {
@@ -2430,6 +3028,13 @@ impl Drop for LinuxReceiverWriterTransaction<'_> {
 
 #[cfg(target_os = "linux")]
 impl Drop for LinuxReceiverMixedDirectionTransaction<'_> {
+    fn drop(&mut self) {
+        self.poison();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacReceiverMixedDirectionTransaction<'_> {
     fn drop(&mut self) {
         self.poison();
     }
@@ -2602,7 +3207,7 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn receive_completion(
         &mut self,
         expected: &CompletionFrame,
@@ -2629,7 +3234,7 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorCapabilityTransaction<'_, T> 
         self.send_preparation_bytes(frame.as_bytes())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn send_completion(&mut self, frame: &CompletionFrame) -> Result<(), AcceptedControlError> {
         self.send_preparation_bytes(frame.as_bytes())
     }

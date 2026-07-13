@@ -31,6 +31,8 @@ pub(crate) struct ReceiverMacControlTransport {
     channel: ChildChannel,
     _evidence: ReceiverSpawnerEvidence,
     poisoned: bool,
+    #[cfg(test)]
+    poison_observer: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -38,6 +40,11 @@ pub(crate) struct ReceiverMacControlTransport {
 pub(crate) struct MacReceivedCapabilities {
     rights: Vec<SendRight>,
     not_sync: PhantomData<Cell<()>>,
+}
+
+pub(crate) struct MacReceivedCapabilityRecord {
+    pub(crate) frame: Vec<u8>,
+    pub(crate) rights: Vec<SendRight>,
 }
 
 impl MacReceivedCapabilities {
@@ -87,6 +94,27 @@ impl CoordinatorMacControlTransport {
         self.lifecycle.interrupt_wait_for_test(count);
     }
 
+    #[cfg(test)]
+    pub(crate) fn wait_for_child_exit_for_test(
+        &self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        loop {
+            match self.lifecycle.try_poll()? {
+                PeerState::ExitedUnknown if self.lifecycle.exited_successfully_for_test() => {
+                    return Ok(());
+                }
+                PeerState::ExitedUnknown => return Err(SessionTransportError::Native(None)),
+                PeerState::Running if deadline.is_expired() => {
+                    return Err(SessionTransportError::DeadlineExpired);
+                }
+                PeerState::Running => std::thread::sleep(
+                    core::time::Duration::from_millis(1).min(deadline.remaining()),
+                ),
+            }
+        }
+    }
+
     fn ensure_live(&self) -> Result<(), SessionTransportError> {
         if self.poisoned {
             Err(SessionTransportError::Native(None))
@@ -122,6 +150,8 @@ impl ReceiverMacControlTransport {
             channel,
             _evidence: evidence,
             poisoned: false,
+            #[cfg(test)]
+            poison_observer: None,
             not_sync: PhantomData,
         })
     }
@@ -129,6 +159,14 @@ impl ReceiverMacControlTransport {
     pub(crate) fn session_parameters(&self) -> crate::backend::AcceptedSessionParameters {
         self._evidence
             .session_parameters(NativeAuthorityProfile::MacMachV1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_poison_for_test(
+        &mut self,
+        observer: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        self.poison_observer = Some(observer);
     }
 
     fn ensure_live(&self) -> Result<(), SessionTransportError> {
@@ -147,6 +185,30 @@ impl ReceiverMacControlTransport {
             self.poisoned = true;
         }
         result
+    }
+
+    pub(crate) fn receive_candidate_capability_record(
+        &mut self,
+        expected_count: usize,
+        deadline: AbsoluteDeadline,
+    ) -> Result<MacReceivedCapabilityRecord, SessionTransportError> {
+        self.ensure_live()?;
+        if !(1..=16).contains(&expected_count) {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        let result = self
+            .channel
+            .receive_vnext_capabilities(CONTROL_FRAME_LEN, deadline)
+            .and_then(|record| {
+                if record.rights.len() != expected_count {
+                    return Err(SessionTransportError::MalformedRecord);
+                }
+                Ok(MacReceivedCapabilityRecord {
+                    frame: record.bytes,
+                    rights: record.rights,
+                })
+            });
+        self.terminal(result)
     }
 }
 
@@ -173,10 +235,13 @@ impl AuthenticatedZeroRightsTransport for CoordinatorMacControlTransport {
         deadline: AbsoluteDeadline,
     ) -> Result<Vec<u8>, SessionTransportError> {
         self.ensure_live()?;
-        if maximum == 0 || maximum > super::bootstrap::MAX_VNEXT_RECORD_BYTES {
+        if maximum == 0 {
             return Err(SessionTransportError::RecordTooLarge);
         }
-        let result = self.channel.receive_vnext_zero_rights(maximum, deadline);
+        let result = self.channel.receive_vnext_zero_rights(
+            maximum.min(super::bootstrap::MAX_VNEXT_RECORD_BYTES),
+            deadline,
+        );
         self.terminal(result)
     }
 
@@ -211,10 +276,13 @@ impl AuthenticatedZeroRightsTransport for ReceiverMacControlTransport {
         deadline: AbsoluteDeadline,
     ) -> Result<Vec<u8>, SessionTransportError> {
         self.ensure_live()?;
-        if maximum == 0 || maximum > super::bootstrap::MAX_VNEXT_RECORD_BYTES {
+        if maximum == 0 {
             return Err(SessionTransportError::RecordTooLarge);
         }
-        let result = self.channel.receive_vnext_zero_rights(maximum, deadline);
+        let result = self.channel.receive_vnext_zero_rights(
+            maximum.min(super::bootstrap::MAX_VNEXT_RECORD_BYTES),
+            deadline,
+        );
         self.terminal(result)
     }
 
@@ -226,6 +294,10 @@ impl AuthenticatedZeroRightsTransport for ReceiverMacControlTransport {
 
     fn poison(&mut self) {
         self.poisoned = true;
+        #[cfg(test)]
+        if let Some(observer) = self.poison_observer.as_ref() {
+            observer.lock().unwrap().push("poison");
+        }
     }
 }
 
@@ -262,21 +334,16 @@ impl ReceiverCapabilityTransport for ReceiverMacControlTransport {
         if !(1..=16).contains(&expected.capability_count()) {
             return Err(SessionTransportError::MalformedRecord);
         }
-        let result = self
-            .channel
-            .receive_vnext_capabilities(CONTROL_FRAME_LEN, deadline)
-            .and_then(|record| {
-                if record.bytes.as_slice() != expected.as_bytes()
-                    || record.rights.len() != expected.capability_count()
-                {
-                    return Err(SessionTransportError::MalformedRecord);
-                }
-                Ok(MacReceivedCapabilities {
-                    rights: record.rights,
-                    not_sync: PhantomData,
-                })
-            });
-        self.terminal(result)
+        let record =
+            self.receive_candidate_capability_record(expected.capability_count(), deadline)?;
+        if record.frame.as_slice() != expected.as_bytes() {
+            self.poisoned = true;
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        Ok(MacReceivedCapabilities {
+            rights: record.rights,
+            not_sync: PhantomData,
+        })
     }
 }
 

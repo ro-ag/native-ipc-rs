@@ -1,9 +1,9 @@
 # Dead-code and test-seam audit
 
-This inventory records the cleanup boundary after private Linux G1l. It is not
-vNext completion evidence. Linux now privately composes READY/COMMIT,
-all-or-nothing activation, and the active-resource ledger; public
-session/control APIs and the equivalent macOS/Windows reducers remain
+This inventory records the cleanup boundary after private Linux G1l and macOS
+6c. It is not vNext completion evidence. Linux and macOS now privately compose
+READY/COMMIT, all-or-nothing activation, and the active-resource ledger;
+public macOS session/control APIs and the equivalent Windows reducer remain
 unavailable.
 
 ## Dead-code suppression inventory
@@ -15,10 +15,10 @@ yet reachable.
 
 | File | Sites | Classification | Retained reason |
 | --- | ---: | --- | --- |
-| `protocol.rs` | 15 | unfinished reducer and target-specific | Canonical capability, IMPORTED/SEALED, authority-profile, access, totals, entry, and exact-frame machinery is consumed by private Linux G1 paths but remains unreachable or intentionally unused on macOS/Windows until their accepted reducers exist. The legacy-profile manifest constructor is compiled only for macOS/Windows production and tests. |
-| `active.rs` | 11 | private activation composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are consumed by the private Linux all-or-nothing activation boundary but remain unreachable from the public API and other native reducers. |
+| `protocol.rs` | 15 | unfinished reducer and target-specific | Canonical capability, IMPORTED/SEALED, authority-profile, access, totals, entry, and exact-frame machinery is consumed by private Linux and macOS reducers but remains unreachable or intentionally unused on Windows until its accepted reducer exists. The legacy-profile manifest constructor remains compiled for unfinished target composition and tests. |
+| `active.rs` | 11 | private activation composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are consumed by the private Linux and macOS all-or-nothing activation boundaries but remain unreachable from the public macOS API and Windows reducer. |
 | `region.rs` | 5 | unfinished batch composition | Prepared native request/spec/guard fields and logical/mapped accessors cross into the private batch/native preparation owners; they are not obsolete pending accepted-session composition on every target. |
-| `batch.rs` | 5 | private READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are consumed by the private Linux reducer but remain withheld from public and other-target composition. |
+| `batch.rs` | 5 | private READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are consumed by the private Linux and macOS reducers but remain withheld from public macOS and Windows composition. |
 | `lib.rs` | 5 | four unfinished private modules; one obsolete status scaffold | `batch`, `control`, `liveness`, and `negotiation` remain private until full composition. `BackendStatus` and `windows::status` have no production consumer and are a later target-scoped cleanup candidate. |
 | `backend/mod.rs` | 4 | unfinished role evidence and target-specific | The backend-wide allowance covers unreachable role-scoped evidence and accepted transport traits; the macOS, Windows, and `linux_vnext` module allowances cover target-only compilation. The retained legacy-free Linux allocator overrides the blanket with `deny(dead_code)`. |
 | `memory.rs` | 4 | unfinished native batch composition | Incarnation, logical length, and native manifest derivation are consumed by the Linux private batch adapter and will be required by the other target adapters. |
