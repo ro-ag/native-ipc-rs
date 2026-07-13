@@ -885,6 +885,11 @@ fn map_exact_unnamed_section(
         base,
         len: mapped_len,
     });
+    let expected_protection = if access == FILE_MAP_READ {
+        PAGE_READONLY
+    } else {
+        PAGE_READWRITE
+    };
     let mut region: WIN32_MEMORY_REGION_INFORMATION = unsafe { zeroed() };
     let mut returned = 0_usize;
     // SAFETY: current-process pseudo-handle, mapped base, output, and output
@@ -908,7 +913,7 @@ fn map_exact_unnamed_section(
     // rejects data/image/physical/direct/private and reserved classifications.
     let region_flags = unsafe { region.Anonymous.Anonymous._bitfield };
     if region.AllocationBase != base.as_ptr().cast()
-        || region.AllocationProtect != PAGE_READWRITE
+        || region.AllocationProtect != expected_protection
         || region.RegionSize != mapped_len
         || region_flags != MEMORY_REGION_MAPPED_PAGE_FILE
     {
@@ -926,18 +931,13 @@ fn map_exact_unnamed_section(
     {
         return Err(WindowsBatchError::WrongObject);
     }
-    let expected_protection = if access == FILE_MAP_READ {
-        PAGE_READONLY
-    } else {
-        PAGE_READWRITE
-    };
     if information.BaseAddress != base.as_ptr().cast()
         || information.AllocationBase != base.as_ptr().cast()
         || information.RegionSize != mapped_len
         || information.State != MEM_COMMIT
         || information.Type != MEM_MAPPED
         || information.Protect != expected_protection
-        || information.AllocationProtect != PAGE_READWRITE
+        || information.AllocationProtect != expected_protection
     {
         return Err(WindowsBatchError::WrongObject);
     }
