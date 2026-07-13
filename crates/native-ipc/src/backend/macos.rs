@@ -948,9 +948,16 @@ fn observe_vnext_drop_for_test(label: &'static str) {
 #[path = "macos_vnext/memory.rs"]
 pub(crate) mod vnext_memory;
 
+#[path = "macos_vnext/transport.rs"]
+pub(crate) mod vnext_transport;
+
 #[cfg(test)]
 #[path = "macos_vnext/memory_test.rs"]
 mod vnext_memory_test;
+
+#[cfg(test)]
+#[path = "macos_vnext/transport_test.rs"]
+mod vnext_transport_test;
 
 #[cfg(test)]
 #[path = "macos_test.rs"]
