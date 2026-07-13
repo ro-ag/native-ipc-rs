@@ -681,6 +681,10 @@ struct Mapping {
     mapped_len: usize,
 }
 
+// SAFETY: `Mapping` uniquely owns one Mach VM range. Moving that owner between
+// threads neither duplicates the mapping nor creates Rust references to it.
+unsafe impl Send for Mapping {}
+
 impl Mapping {
     fn allocate(task: MachPort, mapped_len: usize) -> Result<Self, MachError> {
         let mut address = 0;
@@ -789,6 +793,8 @@ impl Mapping {
 impl Drop for Mapping {
     fn drop(&mut self) {
         deallocate_mapping(self.task, self.address(), self.mapped_len);
+        #[cfg(test)]
+        observe_vnext_drop_for_test("mapping");
     }
 }
 
@@ -862,6 +868,8 @@ impl<Access: CapabilityAccess> MemoryEntry<Access> {
 impl<Access> Drop for MemoryEntry<Access> {
     fn drop(&mut self) {
         deallocate_port(self.task, self.name);
+        #[cfg(test)]
+        observe_vnext_drop_for_test("memory-entry");
     }
 }
 
@@ -913,6 +921,36 @@ fn deallocate_port(task: MachPort, name: MachPort) {
     // SAFETY: callers pass a live memory-entry send right in this task.
     let _ = unsafe { mach_port_deallocate(task, name) };
 }
+
+#[cfg(test)]
+thread_local! {
+    static VNEXT_DROP_OBSERVER: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_vnext_drop_observer_for_test(
+    observer: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
+) {
+    VNEXT_DROP_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn observe_vnext_drop_for_test(label: &'static str) {
+    VNEXT_DROP_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.lock().unwrap().push(label);
+        }
+    });
+}
+
+#[path = "macos_vnext/memory.rs"]
+pub(crate) mod vnext_memory;
+
+#[cfg(test)]
+#[path = "macos_vnext/memory_test.rs"]
+mod vnext_memory_test;
 
 #[cfg(test)]
 #[path = "macos_test.rs"]
