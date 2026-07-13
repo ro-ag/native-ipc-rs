@@ -839,9 +839,13 @@ seal failure, first/middle/final receiver-import advice failure,
 first/middle/final post-attenuation coordinator advice failure, final-seal
 revalidation failure, a stale IMPORTED receipt, poison-before-owner-drop, and
 exact fd/map/task baselines. Strict Arm64 Clippy and the full native/workspace
-suite are green locally; exact hosted tip evidence remains pending. G1j adds no
-READY/COMMIT, transaction completion, active lease, runtime mapping exposure,
-public API, physical Arm64, or release evidence.
+suite are green locally. Exact implementation
+`d51be42faeec3031a78a1181c104453e24877184` is green in all ten hosted jobs in
+[Actions 29223882666](https://github.com/ro-ag/native-ipc-rs/actions/runs/29223882666),
+including native Linux AMD64/Arm64 and Linux AMD64 ASan; independent final
+re-review reports no P1/P2/P3. G1j adds no READY/COMMIT, transaction
+completion, active lease, runtime mapping exposure, public API, physical Arm64,
+or release evidence.
 
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
