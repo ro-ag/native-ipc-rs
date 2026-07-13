@@ -281,6 +281,29 @@ poisoned. This is private Linux source-tree and hosted-run evidence only; public
 composition, macOS/Windows reducers, physical Arm64, packaged-crate, and
 release evidence remain outstanding.
 
+Linux G1m composes those private owners into the safe public session surface.
+An executable-side ELF preinitializer validates, scrubs, marks close-on-exec,
+and reserves the inherited bootstrap before Rust application code; the
+`receiver_main!` macro transfers that one-shot authority into
+`ReceiverSession<Negotiating>`. The coordinator holds the exact executable and
+direct-child lifecycle throughout HELLO, challenged bilateral decisions, Ready
+control, batch activation, close, and abort. Public batch entry points accept
+only portable prepared/expected owners and return only keyed opaque active
+mappings. Capacity rejection is a clean bilateral return to Ready; ambiguous or
+malformed in-flight operations poison before pending native cleanup. Active
+mappings retain atomic session liveness, so abort makes later safe access fail
+without revoking the peer's independently authorized mapping.
+
+Public failures retain a bounded `SessionFailure` describing the operation,
+transaction stage, portable reason, optional errno, poison state, endpoint
+observation, and coordinator child cleanup where applicable. Socket closure is
+reported only as endpoint disconnection; exact direct-child exit is claimed
+only after coordinator reap. Graceful close returns its owner when leases or
+cleanup remain pending, and terminal abort reports any incomplete exact-child
+cleanup. This checkpoint is Linux-only. macOS/Windows public-session adapters,
+physical Arm64 and packaged evidence, exact-tip hosted CI, and release evidence
+remain outstanding.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

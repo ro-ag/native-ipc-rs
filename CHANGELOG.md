@@ -20,10 +20,12 @@ Versioning once a stable API is released.
   receiver-writer setup, an fd delegated outside the MDWE-inheriting process
   tree may also retain RW and later gain execute. This residual authority is
   explicit rather than overstated as object-level NX.
-- Add a private trusted pre-exec hook that installs exact inherited MDWE and
-  propagates setup failure before exec. It deliberately mints no witness;
-  memory preparation remains gated until exact-image, authenticated-channel,
-  pidfd, and bounded-cleanup ownership are combined.
+- Add an executable-only ELF preinitializer and `receiver_main!` entry macro.
+  The preinitializer validates fresh-session MDWE and an inherited nonblocking
+  `SOCK_SEQPACKET`, scrubs its reserved environment, installs CLOEXEC, and
+  publishes one ownership-bearing `ReceiverBootstrap` before ordinary Rust
+  application code. The public receiver session consumes that token exactly
+  once; malformed or forged startup state closes the designated descriptor.
 - Add private Linux executable evidence that opens an absolute native ELF with
   `openat2` symlink/magic-link rejection, retains its inode, opens the child's
   pidfd, executes through the held CLOEXEC descriptor, and compares
@@ -33,12 +35,17 @@ Versioning once a stable API is released.
   one best-effort attenuation pass final-seals every escaped receiver-writer fd;
   coordinator read mapping begins only after complete attenuation, and every
   failure poisons before transaction-owned fds and mappings are destroyed.
-- Complete the private Linux mixed-batch transaction with exact
-  full-manifest READY/COMMIT records, then activate only after reserving the
-  complete batch against one session-wide resource ledger. Runtime mappings
-  escape only as a complete keyed set; activation failure poisons before native
-  cleanup, exposes no partial set, rolls back every charge, and preserves
-  mapping-before-lease destruction.
+- Complete the Linux mixed-batch transaction with exact full-manifest
+  READY/COMMIT records and compose it into public role/state-typed sessions.
+  `Session<Ready>` exposes bounded opaque control and atomic mixed transfers;
+  runtime mappings escape only as a complete keyed set after full reservation.
+  Activation failure poisons before native cleanup, exposes no partial set,
+  rolls back every charge, and preserves mapping-before-lease destruction.
+- Add checked opaque active-reader/writer access, explicit off-thread prefault,
+  lease-aware recoverable close, terminal abort invalidation, and bounded
+  `SessionFailure` diagnostics carrying operation/stage/reason, optional errno,
+  poison and endpoint facts, and coordinator child-cleanup evidence. The public
+  session composition remains Linux-only until macOS and Windows parity lands.
 
 ### Changed
 

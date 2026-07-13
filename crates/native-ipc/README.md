@@ -45,8 +45,29 @@ Run the complete portable lifecycle example with:
 cargo run -p native-ipc --example common_memory
 ```
 
-The vNext READY/COMMIT capability transaction remains private until its full
-normative state machine and public session typestate are implemented.
+## Unreleased vNext session API
+
+The current source tree exposes the completed Linux vNext composition through
+role- and state-typed `CoordinatorSession<Negotiating>` and
+`ReceiverSession<Negotiating>` owners. `receiver_main!` adopts the inherited
+bootstrap exactly once before ordinary receiver code, bilateral application
+decisions yield `Session<Ready>`, and only Ready owners may exchange bounded
+opaque control records or complete an atomic mixed-direction transfer batch.
+Committed batches yield keyed `ActiveReader` and `ActiveWriter` mappings with
+checked copy/fill/prefault operations and no safe slice or native-handle escape.
+
+Ready-session failures carry a bounded `SessionFailure` record: operation,
+transaction stage, portable reason, optional native code, poison state, peer
+endpoint observation, and coordinator child-cleanup facts where available.
+Graceful close returns the live session when active leases or child cleanup
+still need attention; explicit abort invalidates retained mappings and preserves
+bounded cleanup diagnostics.
+
+This public session composition is currently implemented only by the Linux
+backend. macOS and Windows session construction remains fail-closed with
+`BackendUnavailable`; cross-platform parity, packaged-crate conformance, and
+release evidence are still pending. The existing cross-platform native-memory
+lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not

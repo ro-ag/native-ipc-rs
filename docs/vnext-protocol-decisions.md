@@ -151,5 +151,6 @@ unsuccessful finish or Drop. Successful exact payload finalization reuses that
 single owned record allocation and advances the receive sequence once. Send
 and receive sequences are independent; exhaustion, replay/reorder, malformed
 peer input, partial receive, and transaction conflict are terminal. Public
-control APIs remain unavailable until authenticated Ready session construction
-exists.
+The Linux public API exposes this transport only from an authenticated
+`Session<Ready>`. macOS and Windows public Ready-session construction remains
+fail-closed until their equivalent reducers and lifecycle owners are composed.

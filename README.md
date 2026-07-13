@@ -239,6 +239,14 @@ A fresh implementation session can start from
 
 ## Current status
 
+The unreleased vNext branch now composes the safe public session API on Linux:
+one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
+bounded opaque control, atomic mixed-direction batches, checked active mappings,
+lease-aware close/abort, and bounded failure/cleanup diagnostics. This is Linux
+source-tree and local Arm64 container evidence only. macOS/Windows public-session
+parity, exact-tip hosted CI, packaged-crate conformance, physical Arm64 evidence,
+and release authorization remain outstanding.
+
 Implemented through `0.4.0`:
 
 - generic message envelopes and explicit codec traits with allocation/record
@@ -284,11 +292,12 @@ stack-use-after-return detection are enabled, and the standard library is
 rebuilt with instrumentation so the check covers allocation boundaries beyond
 this workspace's crates.
 
-Still intentionally outside the `0.4` release line are a high-level
-negotiation/supervisor API, payload authenticity or encryption, automatic
-guard-page policy, and a stable `1.0` compatibility promise. The current crates
-are low-level building blocks for applications that explicitly own protocol
-negotiation, resource budgets, compatibility policy, and guard-page decisions.
+Still intentionally outside the published `0.4` release line are the unreleased
+vNext session/supervisor API, payload authenticity or encryption, automatic
+guard-page policy, and a stable `1.0` compatibility promise. The published
+crates remain low-level building blocks for applications that explicitly own
+protocol negotiation, resource budgets, compatibility policy, and guard-page
+decisions.
 
 ## Toolchain and validation
 
