@@ -807,6 +807,18 @@ runtime authority. Exact credentials/rights framing, full-batch attenuation,
 IMPORTED/SEALED, READY/COMMIT, active leases, public APIs, and release evidence
 remain with the later inseparable accepted reducer.
 
+The next dependency-ordered cleanup removed the older Linux filesystem
+bootstrap, `UnixStream` ancillary parser, single-region READY/COMMIT transport,
+and legacy mapping witnesses after a whole-tree consumer audit found that they
+were reachable only from their adjacent legacy tests. The public memory facade
+and private vNext preparation still consume `QuiescentRegion`, so its anonymous
+memfd allocation, page-rounded mapping, quiescent bytes, cleanup, and vNext fd
+handoff remain intact and now deny dead code locally. This is source cleanup,
+not native reducer evidence: no accepted mixed send/import, full-batch
+attenuation, READY/COMMIT, active lease, runtime, or public API state was added.
+The exact suppression and `cfg(test)` seam inventory is in
+[`dead-code-audit.md`](dead-code-audit.md).
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

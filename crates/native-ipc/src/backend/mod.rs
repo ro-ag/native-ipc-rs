@@ -304,7 +304,7 @@ pub(crate) trait OwnedChildLifecycle: sealed::Sealed {
 mod accepted_control;
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
+#[deny(dead_code)]
 pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]

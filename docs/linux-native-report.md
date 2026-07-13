@@ -292,8 +292,11 @@ items remain release-blocking:
   avoids numeric-PID reuse authority, while a `D`-state child can still make
   bounded successful reap impossible and must remain reported incomplete.
 
-The older public `backend/linux.rs` path still performs a separate
-`SO_PEERCRED` observation followed by `pidfd_open` and has blocking cleanup in
-`Drop`. That legacy behavior was not silently rewritten in this handoff. The
-private vNext path demonstrates the replacement mechanisms but is not yet
-connected to the public session API.
+At this report's exact historical revision, the older `backend/linux.rs` path
+still performed a separate `SO_PEERCRED` observation followed by `pidfd_open`
+and had blocking cleanup in `Drop`; that behavior was intentionally not
+rewritten as part of this handoff. A later dependency-ordered cleanup removed
+that filesystem/stream/single-region path after confirming it had no production
+consumer. `backend/linux.rs` now retains only the quiescent memfd allocator
+shared by the public memory facade and private vNext preparation. The vNext
+accepted mixed reducer and public session API remain incomplete.

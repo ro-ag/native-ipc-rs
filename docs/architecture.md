@@ -232,6 +232,16 @@ entries. Every partial fd and mapping remains in either the successful mixed
 owner or one consuming failure owner. Neither exposes payload/runtime methods;
 the later accepted reducer must consume them under its stored deadline.
 
+The dependency-ordered Linux cleanup after G1i-b retired the superseded
+filesystem-bootstrap, stream-framed, single-region transfer implementation.
+The public memory facade and vNext still share the legacy-named
+`QuiescentRegion` allocation primitive; that module now contains only the
+anonymous memfd allocation/mapping owner and its vNext handoff. Its
+`deny(dead_code)` boundary prevents a second unused Linux transport from
+accumulating. The complete suppression and test-seam classification is recorded
+in [`dead-code-audit.md`](dead-code-audit.md). This cleanup adds no mixed
+accepted reducer, READY/COMMIT, activation, or public session authority.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

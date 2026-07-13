@@ -60,7 +60,6 @@ pub(crate) struct NativeRegionSpec {
 }
 
 impl NativeRegionSpec {
-    #[allow(dead_code)]
     pub(crate) fn new(
         region_id: u128,
         incarnation: [u8; 16],
@@ -246,6 +245,7 @@ impl TransferManifest {
         (manifest.encode(magic).as_slice() == frame).then_some(manifest)
     }
 
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn new(
         nonce: [u8; 32],
         parent_pid: u32,

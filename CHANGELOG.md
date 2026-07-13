@@ -38,6 +38,10 @@ Versioning once a stable API is released.
   backends moved behind the `native-ipc` facade. The published 0.4 artifact and
   `v0.4.0` source tag remain available. Future releases contain the normative
   three-crate graph and publish it in dependency order.
+- Retire the obsolete Linux filesystem-bootstrap, stream-framed single-region
+  transfer backend after confirming it had no production consumer. Preserve
+  the quiescent memfd allocator shared by the public memory facade and private
+  vNext preparation, and make that retained module reject dead code locally.
 
 ## [0.4.0] - 2026-07-11
 
