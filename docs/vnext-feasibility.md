@@ -796,8 +796,11 @@ imports and initialized bytes, full-limit and wrong-direction expectation
 rejection, duplicate/wrong native objects, first/middle/final invalid-object
 failure, first/middle/final post-`mmap` advice failure, failure-owner drop order,
 stored-deadline expiry, and exact fd/vNext-map baselines after success and
-failure. The independent final adversarial review reports no P1/P2/P3. Exact
-implementation SHA and hosted CI are pending.
+failure. Exact implementation `e9fbf60b7e42bc0d1cc656c0779743473f370c14`
+is green in all ten hosted jobs in
+[Actions 29214396874](https://github.com/ro-ag/native-ipc-rs/actions/runs/29214396874),
+including native Linux AMD64/Arm64 and Linux AMD64 ASan. The independent final
+adversarial review reports no P1/P2/P3.
 
 G1i-b has no accepted send/receive path and exposes no pending payload or
 runtime authority. Exact credentials/rights framing, full-batch attenuation,
