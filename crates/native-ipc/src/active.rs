@@ -14,6 +14,8 @@ pub enum AccessError {
     OutOfBounds,
     /// The supplied range begins after its end.
     InvalidRange,
+    /// The retaining session was poisoned or closed before this access began.
+    SessionInactive,
 }
 
 impl fmt::Display for AccessError {
@@ -137,6 +139,15 @@ pub(crate) enum ActivationError {
 }
 
 impl ActiveReader {
+    fn ensure_active(&self) -> Result<(), AccessError> {
+        match self.owner.liveness_state() {
+            None | Some(LivenessState::Active) => Ok(()),
+            Some(LivenessState::Poisoned | LivenessState::Closed) => {
+                Err(AccessError::SessionInactive)
+            }
+        }
+    }
+
     fn from_owner(
         owner: Box<dyn ActiveReadOwner>,
         logical_len: usize,
@@ -190,6 +201,7 @@ impl ActiveReader {
     /// The copy is byte-volatile and may be torn or internally inconsistent.
     /// It provides memory safety and bounds checking, not payload integrity.
     pub fn read_into(&self, offset: usize, destination: &mut [u8]) -> Result<(), AccessError> {
+        self.ensure_active()?;
         checked_end(offset, destination.len(), self.logical_len)?;
         // SAFETY: the owner witness and checked range keep source bytes live;
         // the C boundary performs volatile-qualified loads into caller-owned bytes.
@@ -205,6 +217,7 @@ impl ActiveReader {
 
     /// Touches one byte per covered page off-thread.
     pub fn prefault(&self, range: Range<usize>) -> Result<PrefaultResult, AccessError> {
+        self.ensure_active()?;
         prefault_read(
             self.owner.as_ptr(),
             self.owner.page_size(),
@@ -220,10 +233,14 @@ impl ActiveReader {
     /// The caller must remain within `len`, preserve the mapping lifetime,
     /// never create references invalidated by peer mutation, accept torn bytes,
     /// and supply all alignment, synchronization, atomic-ordering, and
-    /// application-data validation required by its layout.
+    /// application-data validation required by its layout. A successful return
+    /// proves only that the session was active at this call boundary; the
+    /// caller must arrange to stop dereferencing the pointer once its session
+    /// is poisoned or closed.
     #[cfg(feature = "raw-pointer")]
-    pub unsafe fn as_ptr(&self) -> *const u8 {
-        self.owner.as_ptr()
+    pub unsafe fn as_ptr(&self) -> Result<*const u8, AccessError> {
+        self.ensure_active()?;
+        Ok(self.owner.as_ptr())
     }
 }
 
@@ -242,6 +259,15 @@ pub struct ActiveWriter {
 }
 
 impl ActiveWriter {
+    fn ensure_active(&self) -> Result<(), AccessError> {
+        match self.owner.liveness_state() {
+            None | Some(LivenessState::Active) => Ok(()),
+            Some(LivenessState::Poisoned | LivenessState::Closed) => {
+                Err(AccessError::SessionInactive)
+            }
+        }
+    }
+
     fn from_owner(
         mut owner: Box<dyn ActiveWriteOwner>,
         logical_len: usize,
@@ -297,6 +323,7 @@ impl ActiveWriter {
 
     /// Copies caller bytes into the sole writable mapping.
     pub fn write_from(&mut self, offset: usize, source: &[u8]) -> Result<(), AccessError> {
+        self.ensure_active()?;
         checked_end(offset, source.len(), self.logical_len)?;
         // SAFETY: exclusive self and the owner witness supply sole store
         // authority; checked_end proves both complete ranges.
@@ -312,6 +339,7 @@ impl ActiveWriter {
 
     /// Fills a checked logical range with one byte value.
     pub fn fill(&mut self, range: Range<usize>, value: u8) -> Result<(), AccessError> {
+        self.ensure_active()?;
         validate_range(&range, self.logical_len)?;
         let length = range.end - range.start;
         // SAFETY: range validation and the exclusive native writer witness
@@ -328,6 +356,7 @@ impl ActiveWriter {
 
     /// Touches one byte per covered page off-thread without changing contents.
     pub fn prefault(&mut self, range: Range<usize>) -> Result<PrefaultResult, AccessError> {
+        self.ensure_active()?;
         let result = prefault_read(
             self.owner.as_ptr(),
             self.owner.page_size(),
@@ -363,8 +392,9 @@ impl ActiveWriter {
     /// The caller must uphold the bounds, lifetime, aliasing, synchronization,
     /// atomic-ordering, and peer-mutation obligations in [`ActiveReader::as_ptr`].
     #[cfg(feature = "raw-pointer")]
-    pub unsafe fn as_ptr(&self) -> *const u8 {
-        self.owner.as_ptr()
+    pub unsafe fn as_ptr(&self) -> Result<*const u8, AccessError> {
+        self.ensure_active()?;
+        Ok(self.owner.as_ptr())
     }
 
     /// Returns the stable writable payload address without transferring ownership.
@@ -373,9 +403,12 @@ impl ActiveWriter {
     ///
     /// The caller must uphold bounds, alignment, initialization, lifetime,
     /// aliasing, synchronization, atomic ordering, and peer-access obligations.
+    /// A successful return proves liveness only at this call boundary; the
+    /// pointer must not be dereferenced after the session becomes inactive.
     #[cfg(feature = "raw-pointer")]
-    pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.owner.as_mut_ptr()
+    pub unsafe fn as_mut_ptr(&mut self) -> Result<*mut u8, AccessError> {
+        self.ensure_active()?;
+        Ok(self.owner.as_mut_ptr())
     }
 }
 

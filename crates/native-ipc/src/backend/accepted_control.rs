@@ -3,19 +3,29 @@ use super::{
     OwnedChildLifecycle, PeerState, ReceiverCapabilityTransport, SessionTransportError,
 };
 #[cfg(target_os = "linux")]
-use crate::active::{ActivationError, ActiveReader, ActiveWriter};
+use crate::active::{ActivationError, ActiveReader, ActiveWriter, LeaseReservation};
+#[cfg(test)]
+use crate::batch::PendingBatch;
+#[cfg(any(target_os = "linux", test))]
+use crate::batch::TransferBatch;
 #[cfg(target_os = "linux")]
 use crate::batch::{
     ActiveRegionSet, BatchError, CommittedRegion, ExpectedBatch, LocalRegionAuthority,
 };
-#[cfg(test)]
-use crate::batch::{PendingBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len};
+#[cfg(target_os = "linux")]
+use crate::liveness::ResourceError;
 use crate::liveness::ResourceOwner;
+#[cfg(target_os = "linux")]
+use crate::protocol::CONTROL_FRAME_LEN;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 #[cfg(target_os = "linux")]
-use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
+use crate::protocol::{
+    CompletionFrame, CompletionFrameKind, CoordinatorCapacityStatus, PreparationFrameKind,
+};
 use crate::session::AbsoluteDeadline;
+#[cfg(target_os = "linux")]
+use crate::session::{ActiveLeaseFacts, AtomicCapabilities, ProtocolVersion, SessionState};
 #[cfg(all(target_os = "linux", test))]
 use std::os::fd::AsRawFd;
 
@@ -109,6 +119,7 @@ pub(crate) struct LinuxCoordinatorReceiverWriterTransaction<'a> {
 pub(crate) struct LinuxCoordinatorMixedDirectionTransaction<'a> {
     transaction: CoordinatorCapabilityTransaction<'a, CoordinatorLinuxControlTransport>,
     batch: LinuxMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
     attempted: bool,
     #[cfg(test)]
     skip_sealing: bool,
@@ -123,6 +134,7 @@ pub(crate) struct LinuxCoordinatorMixedDirectionTransaction<'a> {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
     batch: LinuxMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
     parameters: AcceptedSessionParameters,
     deadline: AbsoluteDeadline,
     #[cfg(test)]
@@ -134,6 +146,39 @@ pub(crate) struct LinuxCoordinatorCommittedMixedDirectionBatch {
 pub(crate) enum LinuxCapabilityBatchError {
     Memory(MemfdError),
     Control(AcceptedControlError),
+    Resource(ResourceError),
+    ActiveLimit,
+    PeerPreparationFailed,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxBatchBeginError {
+    pub(crate) error: LinuxCapabilityBatchError,
+    pub(crate) transaction_open_on_failure: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBatchBeginError {
+    const fn before_transaction(error: LinuxCapabilityBatchError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: false,
+        }
+    }
+
+    const fn after_transaction(error: LinuxCapabilityBatchError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: true,
+        }
+    }
+
+    const fn ready_after_transaction(error: LinuxCapabilityBatchError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: false,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -210,6 +255,8 @@ pub(crate) struct LinuxReceiverMixedDirectionTransaction<'a> {
     expected: Option<LinuxExpectedMixedDirectionBatch>,
     imported: Option<LinuxImportedMixedDirectionBatch>,
     frame: Option<CapabilityFrame>,
+    preflight_frame: Option<CapabilityFrame>,
+    reservations: Vec<LeaseReservation>,
     deadline: AbsoluteDeadline,
     transaction_id: u64,
     attempted: bool,
@@ -235,6 +282,7 @@ pub(crate) struct LinuxReceiverMixedDirectionTransaction<'a> {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxReceiverCommittedMixedDirectionBatch {
     batch: LinuxImportedMixedDirectionBatch,
+    reservations: Vec<LeaseReservation>,
     parameters: AcceptedSessionParameters,
     deadline: AbsoluteDeadline,
     #[cfg(test)]
@@ -277,10 +325,19 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         frame: &ControlFrame,
         deadline: AbsoluteDeadline,
     ) -> Result<(), AcceptedControlError> {
+        self.send_parts(frame.kind, &frame.payload, deadline)
+    }
+
+    pub(crate) fn send_parts(
+        &mut self,
+        kind: u32,
+        payload: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), AcceptedControlError> {
         if self.state.is_poisoned() {
             return Err(AcceptedControlError::Control(ControlError::Poisoned));
         }
-        let wire_len = match self.state.encoded_len(frame) {
+        let wire_len = match self.state.encoded_len_parts(kind, payload.len()) {
             Ok(wire_len) => wire_len,
             Err(error @ (ControlError::TransactionConflict | ControlError::SequenceExhausted)) => {
                 self.poison_both();
@@ -292,7 +349,7 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         wire.try_reserve_exact(wire_len)
             .map_err(|_| AcceptedControlError::Control(ControlError::AllocationFailed))?;
         wire.resize(wire_len, 0);
-        if let Err(error) = self.state.encode_into(frame, &mut wire) {
+        if let Err(error) = self.state.encode_parts_into(kind, payload, &mut wire) {
             if self.state.is_poisoned() {
                 self.transport.poison();
             }
@@ -348,7 +405,11 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
             return Err(AcceptedControlError::Control(ControlError::Poisoned));
         }
         match self.transport.try_poll_peer() {
-            Ok(state) => Ok(state),
+            Ok(state @ PeerState::Running) => Ok(state),
+            Ok(state @ PeerState::ExitedUnknown) => {
+                self.poison_both();
+                Ok(state)
+            }
             Err(error) => {
                 self.poison_both();
                 Err(AcceptedControlError::Transport(error))
@@ -358,6 +419,61 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
 
     pub(crate) const fn authority_profile(&self) -> crate::protocol::NativeAuthorityProfile {
         self.parameters.authority_profile()
+    }
+
+    pub(crate) const fn limits(&self) -> crate::session::SessionLimits {
+        self.parameters.limits()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn atomics(&self) -> AtomicCapabilities {
+        self.parameters.atomics()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.parameters.protocol_version()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn session_state(&self) -> SessionState {
+        if self.state.is_poisoned()
+            || !matches!(
+                self.resources.state(),
+                crate::liveness::LivenessState::Active
+            )
+        {
+            SessionState::Poisoned
+        } else {
+            SessionState::Ready
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn active_lease_facts(&self) -> ActiveLeaseFacts {
+        self.resources.active_lease_facts()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_close_resources(&mut self) -> Result<(), ResourceError> {
+        self.resources.try_close()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poison_session(&mut self) {
+        self.poison_both();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reserve_mapped_lengths(
+        &mut self,
+        mapped_lengths: Vec<u64>,
+    ) -> Result<Vec<LeaseReservation>, ResourceError> {
+        let mut reservations = Vec::with_capacity(mapped_lengths.len());
+        for mapped_len in mapped_lengths {
+            reservations.push(self.resources.reserve(mapped_len)?);
+        }
+        Ok(reservations)
     }
 
     #[cfg(test)]
@@ -440,6 +556,97 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, 
 
 #[cfg(target_os = "linux")]
 impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
+    pub(crate) fn wait_for_linux_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> crate::session::ChildCleanupFacts {
+        let cleanup = self.transport.wait_and_reap_facts(deadline);
+        if cleanup.direct_child_complete() || cleanup.native_error().is_some() {
+            self.poison_both();
+        }
+        cleanup
+    }
+
+    pub(crate) fn abort_linux_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> crate::session::ChildCleanupFacts {
+        self.poison_both();
+        self.transport.terminate_and_reap_facts(deadline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_linux_cleanup_signal_for_test(&self, code: i32) {
+        self.transport.fail_next_cleanup_signal_for_test(code);
+    }
+
+    pub(crate) fn reserve_linux_transfer_batch(
+        &mut self,
+        batch: &TransferBatch,
+    ) -> Result<Vec<LeaseReservation>, ResourceError> {
+        self.reserve_mapped_lengths(batch.reservation_lengths())
+    }
+
+    pub(crate) fn begin_public_linux_transfer_capacity(
+        &mut self,
+        batch: &TransferBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CapabilityFrame, LinuxCapabilityBatchError> {
+        let entries = batch
+            .manifest_entries()
+            .ok_or(LinuxCapabilityBatchError::Memory(MemfdError::InvalidBatch))?;
+        self.begin_native_transaction(entries, deadline)
+            .map_err(LinuxCapabilityBatchError::Control)
+    }
+
+    pub(crate) fn exchange_public_linux_transfer_capacity(
+        &mut self,
+        frame: &CapabilityFrame,
+        local_status: CoordinatorCapacityStatus,
+        deadline: AbsoluteDeadline,
+    ) -> Result<bool, LinuxCapabilityBatchError> {
+        let local_ready = local_status == CoordinatorCapacityStatus::Ready;
+        let offer = frame.coordinator_capacity_frame(local_status);
+        if let Err(error) = self.transport.send_record(offer.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let response = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(response) => response,
+            Err(error) => {
+                self.poison_both();
+                return Err(LinuxCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let peer_ready = if frame.receiver_capacity_frame(true).matches(&response) {
+            true
+        } else if frame.receiver_capacity_frame(false).matches(&response) {
+            false
+        } else {
+            self.poison_both();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !local_ready && peer_ready {
+            self.poison_both();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if !local_ready || !peer_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(LinuxCapabilityBatchError::Control)?;
+        }
+        Ok(peer_ready)
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_linux_poison_for_test(
         &mut self,
@@ -533,6 +740,18 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
         batch: LinuxMixedDirectionBatch,
         deadline: AbsoluteDeadline,
     ) -> Result<LinuxCoordinatorMixedDirectionTransaction<'_>, LinuxCapabilityBatchError> {
+        let reservations = self
+            .reserve_mapped_lengths(batch.reservation_lengths())
+            .map_err(LinuxCapabilityBatchError::Resource)?;
+        self.begin_linux_mixed_direction_batch_reserved(batch, reservations, deadline)
+    }
+
+    pub(crate) fn begin_linux_mixed_direction_batch_reserved(
+        &mut self,
+        batch: LinuxMixedDirectionBatch,
+        reservations: Vec<LeaseReservation>,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxCoordinatorMixedDirectionTransaction<'_>, LinuxCapabilityBatchError> {
         if self.parameters.authority_profile()
             != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
         {
@@ -544,6 +763,9 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
             return Err(LinuxCapabilityBatchError::Memory(
                 MemfdError::DeadlineMismatch,
             ));
+        }
+        if reservations.len() != batch.reservation_lengths().len() {
+            return Err(LinuxCapabilityBatchError::Memory(MemfdError::InvalidBatch));
         }
         let frame = self
             .begin_native_transaction(batch.manifest_entries(), deadline)
@@ -557,6 +779,46 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
                 already_poisoned: false,
             },
             batch,
+            reservations,
+            attempted: false,
+            #[cfg(test)]
+            skip_sealing: false,
+            #[cfg(test)]
+            commit_fault: CompletionFault::None,
+            #[cfg(test)]
+            activation_failure_at: None,
+        })
+    }
+
+    pub(crate) fn begin_public_linux_mixed_direction_batch_preflighted(
+        &mut self,
+        batch: LinuxMixedDirectionBatch,
+        reservations: Vec<LeaseReservation>,
+        frame: CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxCoordinatorMixedDirectionTransaction<'_>, LinuxCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+            || batch.deadline() != deadline
+            || reservations.len() != batch.reservation_lengths().len()
+            || !self.state.is_transaction_open()
+            || !self.frame_matches_entries(&frame, batch.manifest_entries())
+        {
+            self.poison_both();
+            return Err(LinuxCapabilityBatchError::Memory(
+                MemfdError::WrongProvenance,
+            ));
+        }
+        Ok(LinuxCoordinatorMixedDirectionTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            reservations,
             attempted: false,
             #[cfg(test)]
             skip_sealing: false,
@@ -573,6 +835,7 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
     ) -> Result<ActiveRegionSet, LinuxActivationError> {
         let LinuxCoordinatorCommittedMixedDirectionBatch {
             batch,
+            reservations,
             parameters,
             deadline,
             #[cfg(test)]
@@ -598,7 +861,7 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
                 return Err(LinuxActivationError::Memory(error));
             }
         };
-        activate_linux_regions(self, specs, activation_failure_at, || {
+        activate_linux_regions(self, specs, reservations, activation_failure_at, || {
             batch.into_active_region_owners(page_size)
         })
     }
@@ -606,6 +869,25 @@ impl AcceptedControlDispatcher<CoordinatorLinuxControlTransport> {
 
 #[cfg(target_os = "linux")]
 impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
+    pub(crate) fn wait_for_linux_peer_exit(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<PeerState, SessionTransportError> {
+        match self.transport.wait_for_peer_exit(deadline) {
+            Ok(state @ PeerState::ExitedUnknown) => {
+                self.poison_both();
+                Ok(state)
+            }
+            Ok(state @ PeerState::Running) => Ok(state),
+            Err(error) => {
+                if error != SessionTransportError::DeadlineExpired {
+                    self.poison_both();
+                }
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_linux_receiver_poison_for_test(
         &mut self,
@@ -620,6 +902,7 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
     ) -> Result<ActiveRegionSet, LinuxActivationError> {
         let LinuxReceiverCommittedMixedDirectionBatch {
             batch,
+            reservations,
             parameters,
             deadline,
             #[cfg(test)]
@@ -645,7 +928,7 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
                 return Err(LinuxActivationError::Memory(error));
             }
         };
-        activate_linux_regions(self, specs, activation_failure_at, || {
+        activate_linux_regions(self, specs, reservations, activation_failure_at, || {
             batch.into_active_region_owners(page_size)
         })
     }
@@ -748,6 +1031,9 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
         let expected =
             LinuxExpectedMixedDirectionBatch::prepare(expected, self.parameters.limits(), deadline)
                 .map_err(LinuxCapabilityBatchError::Memory)?;
+        let reservations = self
+            .reserve_mapped_lengths(expected.reservation_lengths())
+            .map_err(LinuxCapabilityBatchError::Resource)?;
         let transaction_id = self
             .enter_native_transaction(deadline)
             .map_err(LinuxCapabilityBatchError::Control)?;
@@ -756,6 +1042,120 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
             expected: Some(expected),
             imported: None,
             frame: None,
+            preflight_frame: None,
+            reservations,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            import_drop_observer: None,
+            #[cfg(test)]
+            imported_rights_fault: None,
+            #[cfg(test)]
+            imported_wrong_credentials: false,
+            #[cfg(test)]
+            stale_imported: false,
+            #[cfg(test)]
+            ready_fault: CompletionFault::None,
+            #[cfg(test)]
+            acknowledge_commit_rejection: false,
+            #[cfg(test)]
+            activation_failure_at: None,
+        })
+    }
+
+    pub(crate) fn begin_public_linux_expected_mixed_direction_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<LinuxReceiverMixedDirectionTransaction<'_>, LinuxBatchBeginError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::LinuxMdweV1
+        {
+            return Err(LinuxBatchBeginError::before_transaction(
+                LinuxCapabilityBatchError::Memory(MemfdError::WrongProvenance),
+            ));
+        }
+        let expected =
+            LinuxExpectedMixedDirectionBatch::prepare(expected, self.parameters.limits(), deadline)
+                .map_err(LinuxCapabilityBatchError::Memory)
+                .map_err(LinuxBatchBeginError::before_transaction)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(LinuxCapabilityBatchError::Control)
+            .map_err(LinuxBatchBeginError::before_transaction)?;
+        let offer = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.poison_both();
+                return Err(LinuxBatchBeginError::after_transaction(
+                    LinuxCapabilityBatchError::Control(AcceptedControlError::Transport(error)),
+                ));
+            }
+        };
+        let Some((frame, manifest, coordinator_status)) =
+            CapabilityFrame::decode_coordinator_capacity(&offer)
+        else {
+            self.poison_both();
+            return Err(LinuxBatchBeginError::after_transaction(
+                LinuxCapabilityBatchError::Control(AcceptedControlError::Control(
+                    ControlError::NonCanonical,
+                )),
+            ));
+        };
+        if !linux_received_mixed_manifest_matches(
+            self.parameters,
+            transaction_id,
+            &expected,
+            &manifest,
+        ) {
+            self.poison_both();
+            return Err(LinuxBatchBeginError::after_transaction(
+                LinuxCapabilityBatchError::Control(AcceptedControlError::Control(
+                    ControlError::NonCanonical,
+                )),
+            ));
+        }
+        let coordinator_ready = coordinator_status == CoordinatorCapacityStatus::Ready;
+        let reservations = if coordinator_ready {
+            self.reserve_mapped_lengths(expected.reservation_lengths())
+                .ok()
+        } else {
+            None
+        };
+        let local_ready = coordinator_ready && reservations.is_some();
+        let response = frame.receiver_capacity_frame(local_ready);
+        if let Err(error) = self.transport.send_record(response.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(LinuxBatchBeginError::after_transaction(
+                LinuxCapabilityBatchError::Control(AcceptedControlError::Transport(error)),
+            ));
+        }
+        if !local_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(LinuxCapabilityBatchError::Control)
+                .map_err(LinuxBatchBeginError::after_transaction)?;
+            return Err(LinuxBatchBeginError::ready_after_transaction(
+                match coordinator_status {
+                    CoordinatorCapacityStatus::PreparationFailed => {
+                        LinuxCapabilityBatchError::PeerPreparationFailed
+                    }
+                    CoordinatorCapacityStatus::Ready | CoordinatorCapacityStatus::ActiveLimit => {
+                        LinuxCapabilityBatchError::ActiveLimit
+                    }
+                },
+            ));
+        }
+        Ok(LinuxReceiverMixedDirectionTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            frame: None,
+            preflight_frame: Some(frame),
+            reservations: reservations.expect("local capacity readiness retained reservations"),
             deadline,
             transaction_id,
             attempted: false,
@@ -782,6 +1182,7 @@ impl AcceptedControlDispatcher<ReceiverLinuxControlTransport> {
 fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
     dispatcher: &mut AcceptedControlDispatcher<T>,
     specs: Vec<LinuxActiveRegionSpec>,
+    reservations: Vec<LeaseReservation>,
     failure_at: Option<usize>,
     owners: impl FnOnce() -> Vec<LinuxActiveRegionOwner>,
 ) -> Result<ActiveRegionSet, LinuxActivationError> {
@@ -789,18 +1190,9 @@ fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
         .iter()
         .map(|spec| (spec.id, spec.authority))
         .collect::<Vec<(crate::region::RegionId, LocalRegionAuthority)>>();
-    let mut reservations = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        let reservation = match dispatcher.resources.reserve(spec.mapped_len) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                dispatcher.poison_both();
-                return Err(LinuxActivationError::Active(ActivationError::Resource(
-                    error,
-                )));
-            }
-        };
-        reservations.push(reservation);
+    if reservations.len() != specs.len() {
+        dispatcher.poison_both();
+        return Err(LinuxActivationError::Memory(MemfdError::WrongProvenance));
     }
     let owners = owners();
     if owners.len() != specs.len() {
@@ -1070,6 +1462,7 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
                 .map_err(LinuxCapabilityBatchError::Control)?;
             return Ok(LinuxCoordinatorCommittedMixedDirectionBatch {
                 batch: self.batch,
+                reservations: self.reservations,
                 parameters: self.transaction.dispatcher.parameters,
                 deadline: self.transaction.deadline,
                 #[cfg(test)]
@@ -1127,6 +1520,7 @@ impl LinuxCoordinatorMixedDirectionTransaction<'_> {
             .map_err(LinuxCapabilityBatchError::Control)?;
         Ok(LinuxCoordinatorCommittedMixedDirectionBatch {
             batch: self.batch,
+            reservations: self.reservations,
             parameters: self.transaction.dispatcher.parameters,
             deadline: self.transaction.deadline,
             #[cfg(test)]
@@ -1630,6 +2024,16 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
                 AcceptedControlError::Control(ControlError::NonCanonical),
             ));
         };
+        if self
+            .preflight_frame
+            .as_ref()
+            .is_some_and(|preflight| preflight.as_bytes() != frame.as_bytes())
+        {
+            self.poison();
+            return Err(LinuxCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
         if !linux_received_mixed_manifest_matches(
             self.dispatcher.parameters,
             self.transaction_id,
@@ -1862,6 +2266,7 @@ impl LinuxReceiverMixedDirectionTransaction<'_> {
             .expect("exact COMMIT releases the retained imported batch once");
         Ok(LinuxReceiverCommittedMixedDirectionBatch {
             batch,
+            reservations: core::mem::take(&mut self.reservations),
             parameters: self.dispatcher.parameters,
             deadline: self.deadline,
             #[cfg(test)]
@@ -2052,6 +2457,25 @@ impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
+    #[cfg(target_os = "linux")]
+    fn frame_matches_entries(&self, frame: &CapabilityFrame, entries: Vec<ManifestEntry>) -> bool {
+        let Some((_, manifest)) = CapabilityFrame::decode(frame.as_bytes()) else {
+            return false;
+        };
+        let facts = self.parameters.facts();
+        let Some(expected) = TransferManifest::new_with_authority(
+            facts.nonce(),
+            facts.parent_pid(),
+            facts.child_pid(),
+            manifest.transfer_id,
+            self.parameters.authority_profile(),
+            entries,
+        ) else {
+            return false;
+        };
+        manifest == expected && manifest.fits_limits(self.parameters.limits())
+    }
+
     fn begin_native_transaction(
         &mut self,
         entries: Vec<ManifestEntry>,

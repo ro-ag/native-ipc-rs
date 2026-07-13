@@ -39,16 +39,42 @@ pub(crate) enum LivenessState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ActiveLeaseFacts {
+/// Bounded counters for active mappings that still retain a session lease.
+pub struct ActiveLeaseFacts {
     pub(crate) regions: u32,
     pub(crate) bytes: u64,
     pub(crate) consistency: LeaseFactsConsistency,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LeaseFactsConsistency {
+/// Consistency of independently observed active-region and active-byte counters.
+pub enum LeaseFactsConsistency {
+    /// Both counters were observed at zero and cannot increase without the session owner.
     Exact,
+    /// A concurrent active-mapping drop may make either nonzero counter stale-high.
     ApproximateDuringConcurrentDrop,
+}
+
+impl ActiveLeaseFacts {
+    /// Number of currently charged active mappings observed.
+    pub const fn regions(self) -> u32 {
+        self.regions
+    }
+
+    /// Page-rounded mapping bytes currently charged to the session.
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the two independently observed atomic counters are exact.
+    pub const fn consistency(self) -> LeaseFactsConsistency {
+        self.consistency
+    }
+
+    /// Whether both observed counters are zero.
+    pub const fn is_empty(self) -> bool {
+        self.regions == 0 && self.bytes == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

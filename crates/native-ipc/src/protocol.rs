@@ -10,6 +10,16 @@ pub(crate) const CONTROL_FRAME_LEN: usize = 96 + MAX_TRANSFER_ENTRIES * ENTRY_LE
 )]
 pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const COORDINATOR_CAPACITY_READY_MAGIC: [u8; 8] = *b"NIPCCPR1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const COORDINATOR_CAPACITY_REJECT_MAGIC: [u8; 8] = *b"NIPCCPJ1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const COORDINATOR_PREPARATION_FAILED_MAGIC: [u8; 8] = *b"NIPCCPF1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const RECEIVER_CAPACITY_READY_MAGIC: [u8; 8] = *b"NIPCRPR1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const RECEIVER_CAPACITY_REJECT_MAGIC: [u8; 8] = *b"NIPCRPJ1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const IMPORTED_MAGIC: [u8; 8] = *b"NIPCIMP1";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
@@ -169,6 +179,20 @@ pub(crate) struct CompletionFrame {
     bytes: [u8; CONTROL_FRAME_LEN],
 }
 
+/// Manifest-bound zero-rights active-capacity preflight statement.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct CapacityFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+}
+
+/// Coordinator's manifest-bound result before any capability record exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoordinatorCapacityStatus {
+    Ready,
+    ActiveLimit,
+    PreparationFailed,
+}
+
 #[allow(
     dead_code,
     reason = "private G1b capability transport is currently implemented only on Linux"
@@ -194,6 +218,57 @@ impl CapabilityFrame {
         Some((Self::from_manifest(&manifest), manifest))
     }
 
+    pub(crate) fn coordinator_capacity_frame(
+        &self,
+        status: CoordinatorCapacityStatus,
+    ) -> CapacityFrame {
+        self.capacity_frame(match status {
+            CoordinatorCapacityStatus::Ready => COORDINATOR_CAPACITY_READY_MAGIC,
+            CoordinatorCapacityStatus::ActiveLimit => COORDINATOR_CAPACITY_REJECT_MAGIC,
+            CoordinatorCapacityStatus::PreparationFailed => COORDINATOR_PREPARATION_FAILED_MAGIC,
+        })
+    }
+
+    pub(crate) fn receiver_capacity_frame(&self, ready: bool) -> CapacityFrame {
+        self.capacity_frame(if ready {
+            RECEIVER_CAPACITY_READY_MAGIC
+        } else {
+            RECEIVER_CAPACITY_REJECT_MAGIC
+        })
+    }
+
+    fn capacity_frame(&self, magic: [u8; 8]) -> CapacityFrame {
+        let (_, manifest) = Self::decode(&self.bytes)
+            .expect("capability frames are constructed from canonical manifests");
+        CapacityFrame {
+            bytes: manifest.encode(magic),
+        }
+    }
+
+    pub(crate) fn decode_coordinator_capacity(
+        bytes: &[u8],
+    ) -> Option<(Self, TransferManifest, CoordinatorCapacityStatus)> {
+        for (magic, status) in [
+            (
+                COORDINATOR_CAPACITY_READY_MAGIC,
+                CoordinatorCapacityStatus::Ready,
+            ),
+            (
+                COORDINATOR_CAPACITY_REJECT_MAGIC,
+                CoordinatorCapacityStatus::ActiveLimit,
+            ),
+            (
+                COORDINATOR_PREPARATION_FAILED_MAGIC,
+                CoordinatorCapacityStatus::PreparationFailed,
+            ),
+        ] {
+            if let Some(manifest) = TransferManifest::decode(magic, bytes) {
+                return Some((Self::from_manifest(&manifest), manifest, status));
+            }
+        }
+        None
+    }
+
     pub(crate) fn preparation_frame(&self, kind: PreparationFrameKind) -> PreparationFrame {
         let (_, manifest) = Self::decode(&self.bytes)
             .expect("capability frames are constructed from canonical manifests");
@@ -215,6 +290,20 @@ impl CapabilityFrame {
                 CompletionFrameKind::Commit => COMMIT_MAGIC,
             }),
         }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "capacity preflight is composed only by the Linux public session adapter"
+)]
+impl CapacityFrame {
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        bytes == self.bytes
     }
 }
 

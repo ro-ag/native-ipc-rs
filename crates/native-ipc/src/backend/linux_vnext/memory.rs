@@ -1061,8 +1061,8 @@ impl LinuxMixedDirectionBatch {
             let writer = region.spec().writer;
             let mapped_len =
                 u64::try_from(region.mapped_len()).map_err(|_| MemfdError::InvalidSize)?;
-            let mut single =
-                TransferBatch::new(1, mapped_len).map_err(|_| MemfdError::InvalidBatch)?;
+            let mut single = TransferBatch::new(1, mapped_len, mapped_len)
+                .map_err(|_| MemfdError::InvalidBatch)?;
             single.add(region).map_err(|_| MemfdError::InvalidBatch)?;
             let entry = match writer {
                 WriterEndpoint::Coordinator => LinuxMixedDirectionEntry::CoordinatorWriter(
@@ -1096,6 +1096,13 @@ impl LinuxMixedDirectionBatch {
                 LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.manifest_entries(),
                 LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.manifest_entries(),
             })
+            .collect()
+    }
+
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        self.manifest_entries()
+            .into_iter()
+            .map(|entry| entry.mapped_len)
             .collect()
     }
 
@@ -1732,6 +1739,10 @@ impl LinuxExpectedMixedDirectionBatch {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        self.entries.iter().map(|entry| entry.mapped_len).collect()
     }
 
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {

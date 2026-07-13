@@ -255,7 +255,7 @@ fn mapping_fails(fd: RawFd, protection: libc::c_int, len: usize) -> bool {
 }
 
 fn portable_batch(regions: &[(u128, WriterEndpoint, usize)]) -> TransferBatch {
-    let mut batch = TransferBatch::new(16, 16 * 1024 * 1024).unwrap();
+    let mut batch = TransferBatch::new(16, 16 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
     for &(id, writer, logical_len) in regions {
         let mut region = PrivateRegion::allocate(RegionOptions::fixed(logical_len)).unwrap();
         region.initialize(|bytes| bytes.fill(id as u8));

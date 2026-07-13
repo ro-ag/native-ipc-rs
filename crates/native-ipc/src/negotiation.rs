@@ -220,6 +220,14 @@ impl AcceptedTranscriptFacts {
     pub(crate) const fn effective_limits(&self) -> SessionLimits {
         self.effective_limits
     }
+
+    pub(crate) const fn effective_atomics(&self) -> AtomicOffer {
+        self.effective_atomics
+    }
+
+    pub(crate) const fn wire_version(&self) -> (u16, u16) {
+        (self.wire_major, self.wire_minor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

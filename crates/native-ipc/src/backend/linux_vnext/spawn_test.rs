@@ -8,9 +8,15 @@ use crate::backend::accepted_control::{
     LinuxReceiverCommittedMixedDirectionBatch, LinuxReceiverMixedDirectionTransaction,
 };
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
-use crate::control::{ControlError, ControlFrame, ControlState};
+use crate::control::{APPLICATION_CONTROL_KIND_MIN, ControlError, ControlFrame, ControlState};
 use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
 use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
+use crate::session::{
+    ChildCleanupFacts, ChildExitStatus, CoordinatorCloseOutcome, CoordinatorSession,
+    DescendantCleanupStatus, ExecutableIdentityPolicy, Negotiating, NegotiationDecision,
+    NegotiationOutcome, Ready, ReceiverCloseOutcome, ReceiverSession, RejectionReason,
+    SessionCommand, SessionEndpoint, SessionError, SessionOptions,
+};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +25,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PR_GET_MDWE: libc::c_int = 66;
+
+// The unit-test harness is itself the disposable receiver executable used by
+// the private real-process cases below; ordinary library builds emit no
+// `.preinit_array` section.
+#[used]
+#[unsafe(link_section = ".preinit_array")]
+static TEST_RECEIVER_BOOTSTRAP_PREINIT: unsafe extern "C" fn(
+    libc::c_int,
+    *mut *mut libc::c_char,
+    *mut *mut libc::c_char,
+) = crate::session::__receiver_bootstrap_preinit;
 
 assert_impl_all!(UnauthenticatedLinuxSpawn: Send);
 assert_not_impl_any!(UnauthenticatedLinuxSpawn: Sync, Clone);
@@ -110,7 +127,7 @@ fn native_capability_frame(transaction: u64, count: usize) -> CapabilityFrame {
 }
 
 fn portable_coordinator_writer_batch(count: usize) -> TransferBatch {
-    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    let mut batch = TransferBatch::new(16, 1024 * 1024, 1024 * 1024).unwrap();
     for id in (1..=count).rev() {
         let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
         region.initialize(|bytes| bytes.fill(id as u8));
@@ -129,7 +146,7 @@ fn portable_coordinator_writer_batch(count: usize) -> TransferBatch {
 }
 
 fn portable_receiver_writer_batch(count: usize) -> TransferBatch {
-    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    let mut batch = TransferBatch::new(16, 1024 * 1024, 1024 * 1024).unwrap();
     for id in (1..=count).rev() {
         let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
         region.initialize(|bytes| bytes.fill(0));
@@ -148,7 +165,7 @@ fn portable_receiver_writer_batch(count: usize) -> TransferBatch {
 }
 
 fn portable_mixed_direction_batch(count: usize) -> TransferBatch {
-    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    let mut batch = TransferBatch::new(16, 1024 * 1024, 1024 * 1024).unwrap();
     for id in (1..=count).rev() {
         let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
         region.initialize(|bytes| bytes.fill(id as u8));
@@ -533,6 +550,12 @@ fn spawn(
 #[test]
 #[ignore = "exec target used only by private atomic spawn tests"]
 fn spawn_helper() {
+    if let Ok(mode) = std::env::var("NATIVE_IPC_VNEXT_PUBLIC_SESSION") {
+        assert!(std::env::var("NATIVE_IPC_VNEXT_BOOTSTRAP_FD").is_err());
+        assert!(std::env::var("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP").is_err());
+        run_public_session_receiver(&mode);
+        return;
+    }
     let raw: RawFd = std::env::var("NATIVE_IPC_VNEXT_BOOTSTRAP_FD")
         .unwrap()
         .parse()
@@ -571,7 +594,8 @@ fn spawn_helper() {
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
     }
-    // SAFETY: the trusted raw child intentionally cleared CLOEXEC on only this slot.
+    // SAFETY: private raw-child fixtures intentionally retain the exec-time
+    // cleared CLOEXEC state on only this slot.
     assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, 0);
     let mut socket_type = 0_i32;
     let mut length = core::mem::size_of::<i32>() as libc::socklen_t;
@@ -686,6 +710,315 @@ fn spawn_helper() {
     loop {
         // SAFETY: pause blocks this disposable helper until exact pidfd cleanup.
         unsafe { libc::pause() };
+    }
+}
+
+fn public_session_options(payload: &[u8], maximum_control: u32) -> SessionOptions {
+    SessionOptions::new(deadline(), ExecutableIdentityPolicy::ExactOpenedFile)
+        .with_limits(SessionLimits {
+            max_control_payload_bytes: maximum_control,
+            ..SessionLimits::default()
+        })
+        .with_application_payload(payload.to_vec())
+}
+
+fn public_single_active_region_options(payload: &[u8]) -> SessionOptions {
+    SessionOptions::new(deadline(), ExecutableIdentityPolicy::ExactOpenedFile)
+        .with_limits(SessionLimits {
+            max_active_regions: 1,
+            max_control_payload_bytes: 8,
+            ..SessionLimits::default()
+        })
+        .with_application_payload(payload.to_vec())
+}
+
+fn assert_clean_public_child_exit(facts: ChildCleanupFacts) {
+    assert_eq!(facts.direct_child(), Some(ChildExitStatus::Exited(0)));
+    assert_eq!(
+        facts.descendants(),
+        DescendantCleanupStatus::FreshGroupUnverified
+    );
+    assert_eq!(facts.native_error(), None);
+}
+
+fn close_public_coordinator(ready: CoordinatorSession<Ready>) {
+    match ready.try_close(deadline()) {
+        CoordinatorCloseOutcome::Closed(facts) => assert_clean_public_child_exit(facts),
+        _ => panic!("coordinator failed to reap a clean public child"),
+    }
+}
+
+fn run_public_session_receiver(mode: &str) {
+    let bootstrap = crate::session::__take_receiver_bootstrap()
+        .expect("pre-initialized exact receiver bootstrap");
+    let options = if matches!(
+        mode,
+        "active-limit"
+            | "asymmetric-active-limit"
+            | "reverse-asymmetric-active-limit"
+            | "coordinator-abort-active"
+            | "receiver-abort-active"
+    ) {
+        public_single_active_region_options(b"receiver-public")
+    } else {
+        public_session_options(b"receiver-public", 8)
+    };
+    let receiver = ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, options).unwrap();
+    assert_eq!(receiver.peer_application_payload(), b"coordinator-public");
+    match mode {
+        "control" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|payload| {
+                    assert_eq!(payload, b"coordinator-public");
+                    NegotiationDecision::Accept
+                })
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            assert_eq!(ready.negotiated_limits().max_control_payload_bytes, 8);
+            let expected = ExpectedBatch::try_from_regions(vec![
+                ExpectedRegion::new(RegionId::new(1).unwrap(), WriterEndpoint::Coordinator, 17),
+                ExpectedRegion::new(RegionId::new(2).unwrap(), WriterEndpoint::Receiver, 34),
+            ])
+            .unwrap();
+            let operation_deadline = deadline();
+            let mut active = ready.receive_batch(expected, operation_deadline).unwrap();
+            let reader = active.take_reader(RegionId::new(1).unwrap()).unwrap();
+            let mut writer = active.take_writer(RegionId::new(2).unwrap()).unwrap();
+            writer.fill(0..writer.len(), 4).unwrap();
+            let mut observed = vec![0; reader.len()];
+            loop {
+                reader.read_into(0, &mut observed).unwrap();
+                if observed.iter().all(|byte| *byte == 3) {
+                    break;
+                }
+                assert!(!operation_deadline.is_expired());
+                std::thread::yield_now();
+            }
+            drop((active, reader, writer));
+            let frame = ready.receive_control(deadline()).unwrap();
+            assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 7);
+            assert_eq!(frame.payload(), b"12345678");
+            ready
+                .send_control(APPLICATION_CONTROL_KIND_MIN + 8, b"", deadline())
+                .unwrap();
+            let acknowledgement = ready.receive_control(deadline()).unwrap();
+            assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 9);
+            assert!(acknowledgement.payload().is_empty());
+            assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
+        }
+        "active-limit" | "asymmetric-active-limit" | "reverse-asymmetric-active-limit" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let first = ExpectedBatch::try_from_regions(vec![ExpectedRegion::new(
+                RegionId::new(1).unwrap(),
+                WriterEndpoint::Coordinator,
+                17,
+            )])
+            .unwrap();
+            let first_active = ready.receive_batch(first, deadline()).unwrap();
+            let first_active = if mode == "reverse-asymmetric-active-limit" {
+                drop(first_active);
+                None
+            } else {
+                Some(first_active)
+            };
+            let second = ExpectedBatch::try_from_regions(vec![ExpectedRegion::new(
+                RegionId::new(2).unwrap(),
+                WriterEndpoint::Coordinator,
+                17,
+            )])
+            .unwrap();
+            let error = ready.receive_batch(second, deadline()).err().unwrap();
+            assert_eq!(error.reason(), SessionError::ActiveLimit);
+            assert_eq!(
+                error.transaction_state(),
+                crate::session::SessionTransactionState::Ready
+            );
+            assert!(!error.is_poisoned());
+            let frame = ready.receive_control(deadline()).unwrap();
+            assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 11);
+            ready
+                .send_control(APPLICATION_CONTROL_KIND_MIN + 12, b"", deadline())
+                .unwrap();
+            let acknowledgement = ready.receive_control(deadline()).unwrap();
+            assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 13);
+            if let Some(first_active) = first_active {
+                let facts = ready.active_leases();
+                assert_eq!(facts.regions(), 1);
+                ready = match ready.try_close() {
+                    ReceiverCloseOutcome::ActiveLeases { session, facts } => {
+                        assert_eq!(facts.regions(), 1);
+                        session
+                    }
+                    _ => panic!("receiver close ignored an active mapping"),
+                };
+                drop(first_active);
+            }
+            assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
+        }
+        "coordinator-abort-active" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let expected = ExpectedBatch::try_from_regions(vec![ExpectedRegion::new(
+                RegionId::new(1).unwrap(),
+                WriterEndpoint::Coordinator,
+                17,
+            )])
+            .unwrap();
+            let _active = ready.receive_batch(expected, deadline()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        "receiver-abort-active" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let expected = ExpectedBatch::try_from_regions(vec![ExpectedRegion::new(
+                RegionId::new(1).unwrap(),
+                WriterEndpoint::Coordinator,
+                17,
+            )])
+            .unwrap();
+            let mut active = ready.receive_batch(expected, deadline()).unwrap();
+            let reader = active.take_reader(RegionId::new(1).unwrap()).unwrap();
+            ready.abort();
+            assert_eq!(
+                reader.read_into(0, &mut [0]),
+                Err(crate::active::AccessError::SessionInactive)
+            );
+            #[cfg(feature = "raw-pointer")]
+            assert_eq!(
+                unsafe { reader.as_ptr() },
+                Err(crate::active::AccessError::SessionInactive)
+            );
+        }
+        "disconnect-stall" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let frame = ready.receive_control(deadline()).unwrap();
+            assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 20);
+            ready
+                .send_control(APPLICATION_CONTROL_KIND_MIN + 21, b"", deadline())
+                .unwrap();
+            let acknowledgement = ready.receive_control(deadline()).unwrap();
+            assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 24);
+            assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
+            loop {
+                std::thread::park();
+            }
+        }
+        "receiver-wait-timeout" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let short = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+            let failure = ready.wait_for_exit(short).unwrap_err();
+            assert_eq!(
+                failure.operation(),
+                crate::session::SessionOperation::WaitForExit
+            );
+            assert_eq!(
+                failure.transaction_state(),
+                crate::session::SessionTransactionState::Ready
+            );
+            assert_eq!(failure.reason(), SessionError::DeadlineExpired);
+            assert!(!failure.is_poisoned());
+            ready
+                .send_control(APPLICATION_CONTROL_KIND_MIN + 22, b"", deadline())
+                .unwrap();
+            let frame = ready.receive_control(deadline()).unwrap();
+            assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 23);
+            assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
+        }
+        "mid-transaction-disconnect" => {
+            let mut ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            let frame = ready.receive_control(deadline()).unwrap();
+            assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 30);
+            ready
+                .send_control(APPLICATION_CONTROL_KIND_MIN + 31, b"", deadline())
+                .unwrap();
+            let acknowledgement = ready.receive_control(deadline()).unwrap();
+            assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 32);
+            ready.abort();
+        }
+        "cleanup-failure" => {
+            let _ready = match receiver
+                .decide_after_coordinator(|_| NegotiationDecision::Accept)
+                .unwrap()
+            {
+                NegotiationOutcome::Accepted(ready) => ready,
+                NegotiationOutcome::Rejected { .. } => panic!("public receiver was rejected"),
+            };
+            loop {
+                std::thread::park();
+            }
+        }
+        "coordinator-reject" => {
+            match receiver
+                .decide_after_coordinator(|_| panic!("receiver decision ran before rejection"))
+                .unwrap()
+            {
+                NegotiationOutcome::Rejected { by, reason, .. } => {
+                    assert_eq!(by, SessionEndpoint::Coordinator);
+                    assert_eq!(reason, RejectionReason::APPLICATION_POLICY);
+                }
+                NegotiationOutcome::Accepted(_) => panic!("rejected receiver became ready"),
+            }
+        }
+        "receiver-reject" => {
+            match receiver
+                .decide_after_coordinator(|payload| {
+                    assert_eq!(payload, b"coordinator-public");
+                    NegotiationDecision::Reject(RejectionReason::APPLICATION_DECLINED)
+                })
+                .unwrap()
+            {
+                NegotiationOutcome::Rejected {
+                    by,
+                    reason,
+                    cleanup,
+                } => {
+                    assert_eq!(by, SessionEndpoint::Receiver);
+                    assert_eq!(reason, RejectionReason::APPLICATION_DECLINED);
+                    assert_eq!(cleanup, None);
+                }
+                NegotiationOutcome::Accepted(_) => panic!("receiver rejection became ready"),
+            }
+        }
+        _ => panic!("unknown public session mode"),
     }
 }
 
@@ -1033,7 +1366,7 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     Err(LinuxCapabilityBatchError::Control(
                         AcceptedControlError::Transport(
                             SessionTransportError::PeerExited
-                                | SessionTransportError::Native
+                                | SessionTransportError::Native(_)
                                 | SessionTransportError::DeadlineExpired
                         )
                     ))
@@ -1224,7 +1557,7 @@ fn run_accepted_control_receiver(mut evidence: ReceiverAcceptedEvidenceOwner, mo
                     prepared,
                     Err(LinuxCapabilityBatchError::Control(
                         AcceptedControlError::Transport(
-                            SessionTransportError::PeerExited | SessionTransportError::Native
+                            SessionTransportError::PeerExited | SessionTransportError::Native(_)
                         )
                     ))
                 ));
@@ -1979,7 +2312,7 @@ fn isolated_coordinator_writer_batches_share_the_accepted_owner() {
                 transaction.prepare(),
                 Err(LinuxCapabilityBatchError::Control(
                     AcceptedControlError::Transport(
-                        SessionTransportError::PeerExited | SessionTransportError::Native
+                        SessionTransportError::PeerExited | SessionTransportError::Native(_)
                     )
                 ))
             ));
@@ -2182,7 +2515,7 @@ fn isolated_receiver_writer_batches_complete_imported_sealed_pending() {
                 transaction.prepare(),
                 Err(LinuxCapabilityBatchError::Control(
                     AcceptedControlError::Transport(
-                        SessionTransportError::PeerExited | SessionTransportError::Native
+                        SessionTransportError::PeerExited | SessionTransportError::Native(_)
                     )
                 ))
             ));
@@ -2550,7 +2883,7 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
             transaction.prepare(),
             Err(LinuxCapabilityBatchError::Control(
                 AcceptedControlError::Transport(
-                    SessionTransportError::PeerExited | SessionTransportError::Native
+                    SessionTransportError::PeerExited | SessionTransportError::Native(_)
                 )
             ))
         ));
@@ -2589,7 +2922,7 @@ fn isolated_mixed_direction_batches_share_the_accepted_owner() {
                 transaction.prepare(),
                 Err(LinuxCapabilityBatchError::Control(
                     AcceptedControlError::Transport(
-                        SessionTransportError::PeerExited | SessionTransportError::Native
+                        SessionTransportError::PeerExited | SessionTransportError::Native(_)
                     )
                 ))
             ));
@@ -3153,6 +3486,26 @@ fn receiver_control_observes_socket_hup_without_inventing_exit_status() {
 }
 
 #[test]
+fn peer_observation_treats_interruption_as_no_disconnect_observed() {
+    let (_peer, receiver) = SeqPacketEndpoint::pair().unwrap();
+    let mut attempts = 0;
+    for _ in 0..2 {
+        let observed = observe_accepted_control_peer_with(
+            receiver.fd.as_raw_fd(),
+            None,
+            |_descriptors, _count, timeout| {
+                assert_eq!(timeout, 0);
+                attempts += 1;
+                Err(libc::EINTR)
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, PeerState::Running);
+    }
+    assert_eq!(attempts, 2);
+}
+
+#[test]
 #[ignore = "spawned alone by bilateral_decisions_and_rejections_restore_baselines"]
 fn isolated_bilateral_decisions_and_rejections_restore_baselines() {
     let before_fds = open_fd_count();
@@ -3208,7 +3561,7 @@ fn isolated_bilateral_decisions_and_rejections_restore_baselines() {
     };
     accepted.nonce = [0; NONCE_LEN];
     assert_eq!(
-        accepted.into_evidence().err().unwrap(),
+        accepted.into_evidence().err().unwrap().0,
         LinuxSpawnError::InvalidInput
     );
     assert_immediate_child_and_fd_cleanup(before_fds, before_tasks, pid, deadline());
@@ -3358,7 +3711,8 @@ fn isolated_decision_entropy_and_stored_deadline_restore_baselines() {
                 owner
                     .decide_with_entropy_fault(decision, fault)
                     .err()
-                    .unwrap(),
+                    .unwrap()
+                    .0,
                 LinuxSpawnError::EntropyUnavailable
             );
             wait_for_baseline(before_fds, before_tasks, pid, deadline());
@@ -3398,7 +3752,7 @@ fn isolated_decision_entropy_and_stored_deadline_restore_baselines() {
         std::thread::yield_now();
     }
     assert_eq!(
-        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::DeadlineExpired
     );
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
@@ -3445,7 +3799,7 @@ fn isolated_reexec_between_hello_and_accept_never_becomes_accepted() {
     .unwrap();
     let pid = owner.pid();
     assert_eq!(
-        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::WrongExecutable
     );
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
@@ -3484,7 +3838,7 @@ fn isolated_decision_silence_and_exit_restore_exact_baselines() {
     .unwrap();
     let pid = owner.pid();
     assert_eq!(
-        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::Packet(PacketError::DeadlineExpired)
     );
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -3506,7 +3860,7 @@ fn isolated_decision_silence_and_exit_restore_exact_baselines() {
     let pid = owner.pid();
     let started = std::time::Instant::now();
     assert_eq!(
-        owner.decide(ApplicationDecision::Accept).err().unwrap(),
+        owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::Packet(PacketError::PeerExited)
     );
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -4070,6 +4424,781 @@ fn held_path_replacement_and_occupied_fds_do_not_change_identity_or_slot() {
     run_isolated(
         "backend::linux_vnext::spawn::tests::isolated_held_path_replacement_and_occupied_fds_do_not_change_identity_or_slot",
     );
+}
+
+#[test]
+#[ignore = "spawned alone by public_ready_session_control_is_real_bounded_and_typed"]
+fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+
+    let command = |mode: &str| {
+        SessionCommand::new(std::env::current_exe().unwrap())
+            .arg0("native-ipc-spawn-helper")
+            .arg("--exact")
+            .arg("backend::linux_vnext::spawn::tests::spawn_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("NATIVE_IPC_VNEXT_PUBLIC_SESSION", mode)
+    };
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("control"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    assert_eq!(coordinator.peer_application_payload(), b"receiver-public");
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    assert_eq!(ready.negotiated_limits().max_control_payload_bytes, 8);
+    assert_eq!(ready.protocol_version().major(), 1);
+    assert_eq!(ready.protocol_version().minor(), 0);
+    assert!(ready.atomic_capabilities().atomic_u32_lock_free());
+    assert!(ready.atomic_capabilities().atomic_u64_lock_free());
+    assert_eq!(ready.state(), crate::session::SessionState::Ready);
+    assert!(ready.active_leases().is_empty());
+    assert_eq!(
+        ready.poll_peer().unwrap(),
+        crate::session::PeerStatus::Connected
+    );
+    let mut batch = ready.new_transfer_batch().unwrap();
+    for id in (1..=2).rev() {
+        let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
+        region.initialize(|bytes| bytes.fill(id as u8));
+        batch
+            .add(
+                region
+                    .prepare(RegionSpec {
+                        id: RegionId::new(id as u128).unwrap(),
+                        writer: if id == 1 {
+                            WriterEndpoint::Coordinator
+                        } else {
+                            WriterEndpoint::Receiver
+                        },
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let operation_deadline = deadline();
+    let mut active = ready.transfer_batch(batch, operation_deadline).unwrap();
+    let mut writer = active.take_writer(RegionId::new(1).unwrap()).unwrap();
+    let reader = active.take_reader(RegionId::new(2).unwrap()).unwrap();
+    writer.fill(0..writer.len(), 3).unwrap();
+    let mut observed = vec![0; reader.len()];
+    loop {
+        reader.read_into(0, &mut observed).unwrap();
+        if observed.iter().all(|byte| *byte == 4) {
+            break;
+        }
+        assert!(!operation_deadline.is_expired());
+        std::thread::yield_now();
+    }
+    drop((active, reader, writer));
+    let local_failure = ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN - 1, b"", deadline())
+        .unwrap_err();
+    assert_eq!(
+        local_failure.operation(),
+        crate::session::SessionOperation::SendControl
+    );
+    assert_eq!(
+        local_failure.transaction_state(),
+        crate::session::SessionTransactionState::Ready
+    );
+    assert_eq!(
+        local_failure.reason(),
+        SessionError::Control(ControlError::ReservedKind)
+    );
+    assert!(!local_failure.is_poisoned());
+    assert_eq!(
+        ready
+            .send_control(APPLICATION_CONTROL_KIND_MIN + 7, b"123456789", deadline(),)
+            .unwrap_err()
+            .reason(),
+        SessionError::Control(ControlError::PayloadTooLarge)
+    );
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 7, b"12345678", deadline())
+        .unwrap();
+    let response = ready.receive_control(deadline()).unwrap();
+    assert_eq!(response.kind(), APPLICATION_CONTROL_KIND_MIN + 8);
+    assert!(response.payload().is_empty());
+    let close_deadline = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+    ready = match ready.try_close(close_deadline) {
+        CoordinatorCloseOutcome::CleanupPending {
+            session,
+            facts,
+            failure,
+        } => {
+            assert!(!facts.direct_child_complete());
+            assert_eq!(failure.operation(), crate::session::SessionOperation::Close);
+            assert_eq!(failure.reason(), SessionError::DeadlineExpired);
+            assert!(!failure.is_poisoned());
+            assert_eq!(failure.cleanup(), Some(facts));
+            assert_eq!(session.state(), crate::session::SessionState::Ready);
+            session
+        }
+        _ => panic!("bounded close did not preserve a live waiting child"),
+    };
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 9, b"", deadline())
+        .unwrap();
+    close_public_coordinator(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("coordinator-reject"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    match coordinator
+        .decide(NegotiationDecision::Reject(
+            RejectionReason::APPLICATION_POLICY,
+        ))
+        .unwrap()
+    {
+        NegotiationOutcome::Rejected {
+            by,
+            reason,
+            cleanup,
+        } => {
+            assert!(cleanup.is_some());
+            assert_eq!(by, SessionEndpoint::Coordinator);
+            assert_eq!(reason, RejectionReason::APPLICATION_POLICY);
+        }
+        NegotiationOutcome::Accepted(_) => panic!("rejected coordinator became ready"),
+    }
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("receiver-reject"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Rejected {
+            by,
+            reason,
+            cleanup,
+        } => {
+            assert_eq!(by, SessionEndpoint::Receiver);
+            assert_eq!(reason, RejectionReason::APPLICATION_DECLINED);
+            assert!(cleanup.is_some_and(ChildCleanupFacts::direct_child_complete));
+        }
+        NegotiationOutcome::Accepted(_) => panic!("receiver rejection became ready"),
+    }
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn public_ready_session_control_is_real_bounded_and_typed() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_public_ready_session_control_is_real_bounded_and_typed",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by public_active_limit_preflights_before_second_transfer"]
+fn isolated_public_active_limit_preflights_before_second_transfer() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+    let command = SessionCommand::new(std::env::current_exe().unwrap())
+        .arg0("native-ipc-spawn-helper")
+        .arg("--exact")
+        .arg("backend::linux_vnext::spawn::tests::spawn_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("NATIVE_IPC_VNEXT_PUBLIC_SESSION", "active-limit");
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command,
+        public_single_active_region_options(b"coordinator-public"),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let mut first = ready.new_transfer_batch().unwrap();
+    first
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(1).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let mut first_active = ready.transfer_batch(first, deadline()).unwrap();
+    let maps_with_first_active = open_vnext_map_count();
+    let mut second = ready.new_transfer_batch().unwrap();
+    second
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(2).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let error = match ready.transfer_batch(second, deadline()) {
+        Err(error) => error,
+        Ok(_) => panic!("second transfer exceeded the one-region active limit"),
+    };
+    assert_eq!(error.reason(), SessionError::ActiveLimit);
+    assert_eq!(
+        error.transaction_state(),
+        crate::session::SessionTransactionState::Ready
+    );
+    assert!(!error.is_poisoned());
+    assert_eq!(open_vnext_map_count(), maps_with_first_active);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 11, b"", deadline())
+        .unwrap();
+    let response = ready.receive_control(deadline()).unwrap();
+    assert_eq!(response.kind(), APPLICATION_CONTROL_KIND_MIN + 12);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 13, b"", deadline())
+        .unwrap();
+    ready = match ready.try_close(deadline()) {
+        CoordinatorCloseOutcome::ActiveLeases { session, facts } => {
+            assert_eq!(facts.regions(), 1);
+            session
+        }
+        _ => panic!("coordinator close ignored an active mapping"),
+    };
+    let mut first_writer = first_active.take_writer(RegionId::new(1).unwrap()).unwrap();
+    first_writer.fill(0..1, 0x5a).unwrap();
+    drop(first_writer);
+    drop(first_active);
+    close_public_coordinator(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn public_active_limit_preflights_before_second_transfer() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_public_active_limit_preflights_before_second_transfer",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by public_lifecycle_poison_and_endpoint_status_are_exact"]
+fn isolated_public_lifecycle_poison_and_endpoint_status_are_exact() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+    let command = |mode: &str| {
+        SessionCommand::new(std::env::current_exe().unwrap())
+            .arg0("native-ipc-spawn-helper")
+            .arg("--exact")
+            .arg("backend::linux_vnext::spawn::tests::spawn_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("NATIVE_IPC_VNEXT_PUBLIC_SESSION", mode)
+    };
+
+    let invalid_image = std::env::temp_dir().join(format!(
+        "native-ipc-invalid-public-helper-{}",
+        std::process::id()
+    ));
+    let executable_header = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    // The production validator intentionally reads the complete ELF64 header.
+    std::fs::write(&invalid_image, &executable_header[..64]).unwrap();
+    std::fs::set_permissions(&invalid_image, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        SessionCommand::new(&invalid_image).arg0("invalid-public-helper"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .err()
+    .unwrap();
+    std::fs::remove_file(invalid_image).unwrap();
+    assert_eq!(failure.operation(), crate::session::SessionOperation::Spawn);
+    assert_eq!(
+        failure.transaction_state(),
+        crate::session::SessionTransactionState::Spawned
+    );
+    assert_eq!(failure.reason(), SessionError::Native);
+    assert_eq!(failure.native_code(), Some(libc::ENOEXEC));
+    assert!(failure.is_poisoned());
+    assert!(
+        failure
+            .cleanup()
+            .is_some_and(|facts| facts.direct_child_complete())
+    );
+    let activate_writer = |ready: &mut CoordinatorSession<Ready>| {
+        let mut batch = ready.new_transfer_batch().unwrap();
+        batch
+            .add(
+                PrivateRegion::allocate(RegionOptions::fixed(17))
+                    .unwrap()
+                    .prepare(RegionSpec {
+                        id: RegionId::new(1).unwrap(),
+                        writer: WriterEndpoint::Coordinator,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut active = ready.transfer_batch(batch, deadline()).unwrap();
+        let writer = active.take_writer(RegionId::new(1).unwrap()).unwrap();
+        (active, writer)
+    };
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("coordinator-abort-active"),
+        public_single_active_region_options(b"coordinator-public"),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let (active, mut writer) = activate_writer(&mut ready);
+    let abort = ready.abort(deadline());
+    assert_eq!(abort.failure(), None);
+    let cleanup = abort.cleanup();
+    assert!(cleanup.direct_child_complete());
+    assert_eq!(cleanup.native_error(), None);
+    assert_eq!(
+        writer.fill(0..1, 1),
+        Err(crate::active::AccessError::SessionInactive)
+    );
+    #[cfg(feature = "raw-pointer")]
+    assert_eq!(
+        unsafe { writer.as_mut_ptr() },
+        Err(crate::active::AccessError::SessionInactive)
+    );
+    drop((active, writer));
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("receiver-abort-active"),
+        public_single_active_region_options(b"coordinator-public"),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let (active, mut writer) = activate_writer(&mut ready);
+    let cleanup = ready.wait_for_exit(deadline());
+    assert_clean_public_child_exit(cleanup);
+    assert_eq!(ready.state(), crate::session::SessionState::Poisoned);
+    assert_eq!(
+        writer.fill(0..1, 1),
+        Err(crate::active::AccessError::SessionInactive)
+    );
+    #[cfg(feature = "raw-pointer")]
+    assert_eq!(
+        unsafe { writer.as_mut_ptr() },
+        Err(crate::active::AccessError::SessionInactive)
+    );
+    drop((active, writer));
+    drop(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("disconnect-stall"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 20, b"", deadline())
+        .unwrap();
+    let acknowledgement = ready.receive_control(deadline()).unwrap();
+    assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 21);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 24, b"", deadline())
+        .unwrap();
+    let observation_deadline = deadline();
+    while ready.poll_peer().unwrap() == crate::session::PeerStatus::Connected {
+        assert!(!observation_deadline.is_expired());
+        std::thread::yield_now();
+    }
+    let short = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
+    let incomplete = ready.wait_for_exit(short);
+    assert!(!incomplete.direct_child_complete());
+    let abort = ready.abort(deadline());
+    assert_eq!(abort.failure(), None);
+    let cleanup = abort.cleanup();
+    assert!(cleanup.direct_child_complete());
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("receiver-wait-timeout"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let frame = ready.receive_control(deadline()).unwrap();
+    assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 22);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 23, b"", deadline())
+        .unwrap();
+    close_public_coordinator(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("mid-transaction-disconnect"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 30, b"", deadline())
+        .unwrap();
+    let frame = ready.receive_control(deadline()).unwrap();
+    assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 31);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 32, b"", deadline())
+        .unwrap();
+    let mut batch = ready.new_transfer_batch().unwrap();
+    batch
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(1).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let failure = ready.transfer_batch(batch, deadline()).err().unwrap();
+    assert_eq!(
+        failure.transaction_state(),
+        crate::session::SessionTransactionState::TransactionOpen
+    );
+    assert!(failure.is_poisoned());
+    match failure.reason() {
+        SessionError::PeerDisconnected => assert_eq!(
+            failure.peer(),
+            Some(crate::session::PeerStatus::Disconnected)
+        ),
+        SessionError::Ambiguous | SessionError::Native => assert_eq!(failure.peer(), None),
+        reason => panic!("unexpected mid-transaction disconnect reason: {reason:?}"),
+    }
+    let abort = ready.abort(deadline());
+    assert_eq!(abort.failure(), None);
+    let cleanup = abort.cleanup();
+    assert!(cleanup.direct_child_complete());
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command("cleanup-failure"),
+        public_session_options(b"coordinator-public", 8),
+    )
+    .unwrap();
+    let ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    ready.fail_next_cleanup_signal_for_test(libc::EIO);
+    let abort = ready.abort(deadline());
+    let failure = abort
+        .failure()
+        .expect("injected cleanup failure was retained");
+    assert_eq!(failure.operation(), crate::session::SessionOperation::Abort);
+    assert_eq!(failure.reason(), SessionError::Native);
+    assert_eq!(failure.native_code(), Some(libc::EIO));
+    assert!(failure.is_poisoned());
+    assert_eq!(failure.cleanup(), Some(abort.cleanup()));
+    assert_eq!(abort.cleanup().native_error(), Some(libc::EIO));
+    assert!(!abort.cleanup().direct_child_complete());
+    // The isolated process is the deliberate backstop for this injected
+    // terminal lifecycle failure, matching the private lifecycle fault corpus.
+}
+
+#[test]
+fn public_lifecycle_poison_and_endpoint_status_are_exact() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_public_lifecycle_poison_and_endpoint_status_are_exact",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by public_asymmetric_active_limit_rejects_before_capability"]
+fn isolated_public_asymmetric_active_limit_rejects_before_capability() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+    let command = SessionCommand::new(std::env::current_exe().unwrap())
+        .arg0("native-ipc-spawn-helper")
+        .arg("--exact")
+        .arg("backend::linux_vnext::spawn::tests::spawn_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("NATIVE_IPC_VNEXT_PUBLIC_SESSION", "asymmetric-active-limit");
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command,
+        public_single_active_region_options(b"coordinator-public"),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let mut first = ready.new_transfer_batch().unwrap();
+    first
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(1).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let first_active = ready.transfer_batch(first, deadline()).unwrap();
+    drop(first_active);
+    let maps_after_local_drop = open_vnext_map_count();
+    let mut second = ready.new_transfer_batch().unwrap();
+    second
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(2).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let error = ready.transfer_batch(second, deadline()).err().unwrap();
+    assert_eq!(error.reason(), SessionError::ActiveLimit);
+    assert_eq!(
+        error.transaction_state(),
+        crate::session::SessionTransactionState::Ready
+    );
+    assert!(!error.is_poisoned());
+    assert_eq!(open_vnext_map_count(), maps_after_local_drop);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 11, b"", deadline())
+        .unwrap();
+    let response = ready.receive_control(deadline()).unwrap();
+    assert_eq!(response.kind(), APPLICATION_CONTROL_KIND_MIN + 12);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 13, b"", deadline())
+        .unwrap();
+    close_public_coordinator(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn public_asymmetric_active_limit_rejects_before_capability() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_public_asymmetric_active_limit_rejects_before_capability",
+    );
+}
+
+#[test]
+#[ignore = "spawned alone by public_reverse_asymmetric_active_limit_rejects_before_reservation"]
+fn isolated_public_reverse_asymmetric_active_limit_rejects_before_reservation() {
+    let before_fds = open_fd_count();
+    let before_tasks = open_task_count();
+    let before_maps = open_vnext_map_count();
+    let command = SessionCommand::new(std::env::current_exe().unwrap())
+        .arg0("native-ipc-spawn-helper")
+        .arg("--exact")
+        .arg("backend::linux_vnext::spawn::tests::spawn_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(
+            "NATIVE_IPC_VNEXT_PUBLIC_SESSION",
+            "reverse-asymmetric-active-limit",
+        );
+    let coordinator = CoordinatorSession::<Negotiating>::spawn(
+        command,
+        public_single_active_region_options(b"coordinator-public"),
+    )
+    .unwrap();
+    let pid = LAST_SPAWN_PID.with(|slot| slot.get());
+    let mut ready = match coordinator.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("public coordinator was rejected"),
+    };
+    let mut first = ready.new_transfer_batch().unwrap();
+    first
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(1).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let first_active = ready.transfer_batch(first, deadline()).unwrap();
+    let maps_with_first_active = open_vnext_map_count();
+    let mut second = ready.new_transfer_batch().unwrap();
+    second
+        .add(
+            PrivateRegion::allocate(RegionOptions::fixed(17))
+                .unwrap()
+                .prepare(RegionSpec {
+                    id: RegionId::new(2).unwrap(),
+                    writer: WriterEndpoint::Coordinator,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+    let error = ready.transfer_batch(second, deadline()).err().unwrap();
+    assert_eq!(error.reason(), SessionError::ActiveLimit);
+    assert_eq!(
+        error.transaction_state(),
+        crate::session::SessionTransactionState::Ready
+    );
+    assert!(!error.is_poisoned());
+    assert_eq!(open_vnext_map_count(), maps_with_first_active);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 11, b"", deadline())
+        .unwrap();
+    let response = ready.receive_control(deadline()).unwrap();
+    assert_eq!(response.kind(), APPLICATION_CONTROL_KIND_MIN + 12);
+    ready
+        .send_control(APPLICATION_CONTROL_KIND_MIN + 13, b"", deadline())
+        .unwrap();
+    ready = match ready.try_close(deadline()) {
+        CoordinatorCloseOutcome::ActiveLeases { session, facts } => {
+            assert_eq!(facts.regions(), 1);
+            session
+        }
+        _ => panic!("coordinator close ignored an active mapping"),
+    };
+    drop(first_active);
+    close_public_coordinator(ready);
+    wait_for_baseline(before_fds, before_tasks, pid, deadline());
+    assert_eq!(open_vnext_map_count(), before_maps);
+}
+
+#[test]
+fn public_reverse_asymmetric_active_limit_rejects_before_reservation() {
+    run_isolated(
+        "backend::linux_vnext::spawn::tests::isolated_public_reverse_asymmetric_active_limit_rejects_before_reservation",
+    );
+}
+
+#[test]
+fn public_negotiation_errors_preserve_local_io_ambiguity() {
+    assert_eq!(
+        map_public_spawn_error(LinuxSpawnError::Packet(PacketError::AmbiguousAfterSend)),
+        LinuxPublicSessionError::Ambiguous
+    );
+    assert_eq!(
+        map_public_spawn_error(LinuxSpawnError::Packet(PacketError::AmbiguousAfterReceive)),
+        LinuxPublicSessionError::Ambiguous
+    );
+    assert_eq!(
+        map_public_receiver_transaction_error(LinuxCapabilityBatchError::Memory(
+            MemfdError::WrongObject
+        )),
+        LinuxPublicSessionError::MalformedPeer
+    );
+    assert_eq!(
+        map_public_local_memory_error(MemfdError::WrongObject),
+        LinuxPublicSessionError::Native(None)
+    );
+}
+
+#[test]
+fn receiver_preinit_rejects_blocking_bootstrap_before_safe_application_code() {
+    if let Ok(raw) = std::env::var("NATIVE_IPC_VNEXT_PREINIT_FAILURE_FD") {
+        let raw = raw.parse::<RawFd>().unwrap();
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert!(
+            std::process::Command::new("/bin/true")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+
+    let mut pair = [-1; 2];
+    assert_eq!(
+        unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    let left = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+    let right = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+    let inherited = right.as_raw_fd();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "backend::linux_vnext::spawn::tests::receiver_preinit_rejects_blocking_bootstrap_before_safe_application_code",
+            "--nocapture",
+        ])
+        .env("NATIVE_IPC_VNEXT_BOOTSTRAP_FD", inherited.to_string())
+        .env("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP", "1")
+        .env(
+            "NATIVE_IPC_VNEXT_PREINIT_FAILURE_FD",
+            inherited.to_string(),
+        );
+    // SAFETY: the disposable child's pre-exec closure establishes every trusted
+    // process-entry invariant except O_NONBLOCK, and changes only its copied
+    // descriptor flag; parent ownership remains unchanged.
+    unsafe {
+        child.pre_exec(move || {
+            if libc::setsid() < 0
+                || libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) < 0
+                || libc::fcntl(inherited, libc::F_SETFD, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert!(child.status().unwrap().success());
+    drop((left, right));
 }
 
 fn run_isolated(test: &str) {

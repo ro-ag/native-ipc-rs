@@ -6,7 +6,7 @@
 
 use crate::negotiation::AcceptedTranscriptFacts;
 use crate::protocol::{CapabilityFrame, NativeAuthorityProfile};
-use crate::session::{AbsoluteDeadline, SessionLimits};
+use crate::session::{AbsoluteDeadline, AtomicCapabilities, ProtocolVersion, SessionLimits};
 use core::cell::Cell;
 use core::marker::PhantomData;
 
@@ -29,6 +29,8 @@ pub(crate) struct AcceptedSessionParameters {
     facts: SpawnIdentityFacts,
     limits: SessionLimits,
     authority_profile: NativeAuthorityProfile,
+    atomics: AtomicCapabilities,
+    protocol_version: ProtocolVersion,
 }
 
 impl AcceptedSessionParameters {
@@ -42,6 +44,14 @@ impl AcceptedSessionParameters {
 
     pub(crate) const fn authority_profile(self) -> NativeAuthorityProfile {
         self.authority_profile
+    }
+
+    pub(crate) const fn atomics(self) -> AtomicCapabilities {
+        self.atomics
+    }
+
+    pub(crate) const fn protocol_version(self) -> ProtocolVersion {
+        self.protocol_version
     }
 }
 
@@ -159,10 +169,13 @@ impl CoordinatorAcceptedEvidence {
         &self,
         authority_profile: NativeAuthorityProfile,
     ) -> AcceptedSessionParameters {
+        let (major, minor) = self.transcript.wire_version();
         AcceptedSessionParameters {
             facts: self.facts,
             limits: self.transcript.effective_limits(),
             authority_profile,
+            atomics: AtomicCapabilities::from_accepted_offer(self.transcript.effective_atomics()),
+            protocol_version: ProtocolVersion::new(major, minor),
         }
     }
 }
@@ -203,10 +216,13 @@ impl ReceiverSpawnerEvidence {
         &self,
         authority_profile: NativeAuthorityProfile,
     ) -> AcceptedSessionParameters {
+        let (major, minor) = self.transcript.wire_version();
         AcceptedSessionParameters {
             facts: self.facts,
             limits: self.transcript.effective_limits(),
             authority_profile,
+            atomics: AtomicCapabilities::from_accepted_offer(self.transcript.effective_atomics()),
+            protocol_version: ProtocolVersion::new(major, minor),
         }
     }
 }
@@ -226,7 +242,8 @@ pub(crate) enum SessionTransportError {
     MalformedRecord,
     RecordTooLarge,
     IdentityMismatch,
-    Native,
+    Ambiguous,
+    Native(Option<i32>),
 }
 
 pub(crate) mod sealed {
@@ -308,7 +325,7 @@ mod accepted_control;
 pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
-mod linux_vnext;
+pub(crate) mod linux_vnext;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) mod macos;

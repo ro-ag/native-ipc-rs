@@ -173,9 +173,9 @@ fn checked_volatile_access_and_prefault_are_bounded() {
 
     #[cfg(feature = "raw-pointer")]
     unsafe {
-        assert!(!reader.as_ptr().is_null());
-        assert!(!writer.as_ptr().is_null());
-        assert!(!writer.as_mut_ptr().is_null());
+        assert!(!reader.as_ptr().unwrap().is_null());
+        assert!(!writer.as_ptr().unwrap().is_null());
+        assert!(!writer.as_mut_ptr().unwrap().is_null());
     }
 }
 
@@ -197,6 +197,16 @@ fn active_mapping_retains_shared_liveness_until_mapping_drop_finishes() {
     assert_eq!(reader.liveness_state(), Some(LivenessState::Active));
     resources.poison();
     assert_eq!(reader.liveness_state(), Some(LivenessState::Poisoned));
+    assert_eq!(
+        reader.read_into(0, &mut [0]),
+        Err(AccessError::SessionInactive)
+    );
+    assert_eq!(reader.prefault(0..1), Err(AccessError::SessionInactive));
+    #[cfg(feature = "raw-pointer")]
+    assert_eq!(
+        unsafe { reader.as_ptr() },
+        Err(AccessError::SessionInactive)
+    );
 
     let drop_thread = std::thread::spawn(move || drop(reader));
     started.wait();
@@ -248,6 +258,24 @@ fn active_writer_retains_the_same_exact_resource_lease() {
     assert_eq!(writer.liveness_state(), Some(LivenessState::Active));
     writer.write_from(0, &[1, 2, 3, 4, 5]).unwrap();
     assert_eq!(resources.active_lease_facts().regions, 1);
+    resources.poison();
+    assert_eq!(
+        writer.write_from(0, &[9]),
+        Err(AccessError::SessionInactive)
+    );
+    assert_eq!(writer.fill(0..1, 9), Err(AccessError::SessionInactive));
+    assert_eq!(writer.prefault(0..1), Err(AccessError::SessionInactive));
+    #[cfg(feature = "raw-pointer")]
+    {
+        assert_eq!(
+            unsafe { writer.as_ptr() },
+            Err(AccessError::SessionInactive)
+        );
+        assert_eq!(
+            unsafe { writer.as_mut_ptr() },
+            Err(AccessError::SessionInactive)
+        );
+    }
     drop(writer);
     assert_eq!(resources.active_lease_facts().regions, 0);
 }

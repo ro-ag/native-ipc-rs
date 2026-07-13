@@ -12,7 +12,7 @@ const NONCE: [u8; 32] = [9; 32];
 
 fn frame(payload: &[u8]) -> ControlFrame {
     ControlFrame {
-        kind: APPLICATION_KIND_MIN + 7,
+        kind: APPLICATION_CONTROL_KIND_MIN + 7,
         payload: payload.to_vec(),
     }
 }
@@ -87,7 +87,7 @@ fn transaction_conflict_and_reserved_or_oversized_local_frames_fail_closed() {
         Err(ControlError::PayloadTooLarge)
     );
     let reserved = ControlFrame {
-        kind: APPLICATION_KIND_MIN - 1,
+        kind: APPLICATION_CONTROL_KIND_MIN - 1,
         payload: Vec::new(),
     };
     assert_eq!(
@@ -111,7 +111,7 @@ fn header_first_tokens_and_bidirectional_boundaries_are_exact() {
     let a_to_b = encode(
         &mut a,
         &ControlFrame {
-            kind: APPLICATION_KIND_MIN,
+            kind: APPLICATION_CONTROL_KIND_MIN,
             payload: b"max".to_vec(),
         },
     );
@@ -120,7 +120,7 @@ fn header_first_tokens_and_bidirectional_boundaries_are_exact() {
     assert_eq!(
         header.finish(&a_to_b[HEADER_LEN..]).unwrap(),
         ControlFrame {
-            kind: APPLICATION_KIND_MIN,
+            kind: APPLICATION_CONTROL_KIND_MIN,
             payload: b"max".to_vec(),
         }
     );

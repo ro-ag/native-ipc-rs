@@ -155,7 +155,7 @@ fn counting_reader(drops: &Arc<AtomicUsize>) -> ActiveReader {
 
 #[test]
 fn transaction_owns_mixed_regions_and_rejects_limits_and_duplicates() {
-    let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+    let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
     for (id, writer) in [
         (1, WriterEndpoint::Coordinator),
         (2, WriterEndpoint::Receiver),
@@ -176,20 +176,32 @@ fn transaction_owns_mixed_regions_and_rejects_limits_and_duplicates() {
 }
 
 #[test]
+fn per_region_limit_applies_to_logical_not_page_rounded_length() {
+    let mut batch = TransferBatch::new(16, 17, 1 << 20).unwrap();
+    batch
+        .add(prepared(1, WriterEndpoint::Coordinator, 17))
+        .unwrap();
+    assert_eq!(
+        batch.add(prepared(2, WriterEndpoint::Receiver, 18)),
+        Err(BatchError::InvalidRegionLength)
+    );
+}
+
+#[test]
 fn zero_and_seventeen_region_batches_fail_closed() {
     assert!(matches!(
-        TransferBatch::new(0, 1),
+        TransferBatch::new(0, 1, 1),
         Err(BatchError::TooManyRegions)
     ));
     assert!(matches!(
-        TransferBatch::new(17, 1),
+        TransferBatch::new(17, 1, 1),
         Err(BatchError::TooManyRegions)
     ));
     assert!(matches!(
-        TransferBatch::new(16, 1024).unwrap().into_pending(),
+        TransferBatch::new(16, 1024, 1024).unwrap().into_pending(),
         Err(BatchError::Empty)
     ));
-    let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+    let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
     for id in 1..=16 {
         batch
             .add(prepared(id, WriterEndpoint::Coordinator, 1))
@@ -205,7 +217,7 @@ fn zero_and_seventeen_region_batches_fail_closed() {
 fn committed_set_requires_exact_ids_and_directions_and_preserves_wrong_take() {
     let writer_id = RegionId::new(1).unwrap();
     let reader_id = RegionId::new(2).unwrap();
-    let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+    let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
     batch
         .add(prepared(1, WriterEndpoint::Coordinator, 8))
         .unwrap();
@@ -228,7 +240,7 @@ fn committed_set_requires_exact_ids_and_directions_and_preserves_wrong_take() {
     active.take_reader(reader_id).unwrap();
     assert!(active.is_empty());
 
-    let mut mismatch = TransferBatch::new(16, 1 << 20).unwrap();
+    let mut mismatch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
     mismatch
         .add(prepared(3, WriterEndpoint::Receiver, 8))
         .unwrap();
@@ -248,7 +260,7 @@ fn committed_set_requires_exact_ids_and_directions_and_preserves_wrong_take() {
 fn aggregate_byte_limit_rejects_without_mutating_existing_transaction() {
     let first = prepared(1, WriterEndpoint::Coordinator, 1);
     let exact_one_mapping = first.mapped_len() as u64;
-    let mut batch = TransferBatch::new(16, exact_one_mapping).unwrap();
+    let mut batch = TransferBatch::new(16, exact_one_mapping, exact_one_mapping).unwrap();
     batch.add(first).unwrap();
     assert_eq!(batch.len(), 1);
     assert_eq!(
@@ -264,7 +276,7 @@ fn commit_mismatch_drops_all_supplied_mappings() {
     let foreign_id = RegionId::new(2).unwrap();
 
     let pending = {
-        let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+        let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
         batch.add(prepared(1, WriterEndpoint::Receiver, 8)).unwrap();
         batch.into_pending().unwrap()
     };
@@ -276,7 +288,7 @@ fn commit_mismatch_drops_all_supplied_mappings() {
     assert_eq!(missing_drops.load(Ordering::Relaxed), 0);
 
     let pending = {
-        let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+        let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
         batch.add(prepared(1, WriterEndpoint::Receiver, 8)).unwrap();
         batch.into_pending().unwrap()
     };
@@ -300,7 +312,7 @@ fn commit_mismatch_drops_all_supplied_mappings() {
     assert_eq!(excess_drops.load(Ordering::Relaxed), 2);
 
     let pending = {
-        let mut batch = TransferBatch::new(16, 1 << 20).unwrap();
+        let mut batch = TransferBatch::new(16, 1 << 20, 1 << 20).unwrap();
         batch.add(prepared(1, WriterEndpoint::Receiver, 8)).unwrap();
         batch.into_pending().unwrap()
     };

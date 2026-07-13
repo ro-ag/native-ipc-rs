@@ -274,7 +274,7 @@ const REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Exact direct-child exit observed and consumed through the atomic pidfd.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExactChildExit {
+pub(super) enum ExactChildExit {
     Exited(i32),
     Signaled {
         signal: i32,
@@ -286,7 +286,7 @@ enum ExactChildExit {
 
 /// Bounded facts about the fresh Unix process group owned with the child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DescendantCleanup {
+pub(super) enum DescendantCleanup {
     /// The child never reached the trusted post-`setsid` checkpoint.
     NotEstablished,
     /// A fresh session/group exists, but Linux has no race-resistant
@@ -311,6 +311,14 @@ impl ExactChildCleanup {
 
     pub(super) const fn last_native_error(self) -> Option<i32> {
         self.last_native_error
+    }
+
+    pub(super) const fn direct_child(self) -> Option<ExactChildExit> {
+        self.direct_child
+    }
+
+    pub(super) const fn descendants(self) -> DescendantCleanup {
+        self.descendants
     }
 
     #[cfg(test)]
@@ -464,16 +472,22 @@ impl ExactChildLifecycle {
     /// state only and cannot mint image, channel, session, or memory authority.
     pub(super) fn establish_fresh_session(&self) {
         self.shared.fresh_session.store(true, Ordering::Release);
+        *lock_unpoisoned(&self.shared.descendant_cleanup) = DescendantCleanup::FreshGroupUnverified;
     }
 
-    pub(super) fn wait_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+    pub(super) fn wait_and_reap(&self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
         self.request(LIFECYCLE_WAIT);
         self.wait_for_completion(deadline)
     }
 
-    pub(super) fn terminate_and_reap(self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+    pub(super) fn terminate_and_reap(&self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
         self.request(LIFECYCLE_TERMINATE);
         self.wait_for_completion(deadline)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_signal_for_test(&self, code: i32) {
+        self.shared.signal_failure.store(code, Ordering::Release);
     }
 
     fn request(&self, request: u8) {

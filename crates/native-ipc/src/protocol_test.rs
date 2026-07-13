@@ -90,6 +90,54 @@ fn capability_frame_decode_requires_canonical_structure_and_reserved_bytes() {
 }
 
 #[test]
+fn capacity_preflight_distinguishes_limits_preparation_and_both_roles() {
+    let manifest = TransferManifest::new_with_authority(
+        [0x29; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1)],
+    )
+    .unwrap();
+    let capability = CapabilityFrame::from_manifest(&manifest);
+    let coordinator_ready = capability.coordinator_capacity_frame(CoordinatorCapacityStatus::Ready);
+    let coordinator_limit =
+        capability.coordinator_capacity_frame(CoordinatorCapacityStatus::ActiveLimit);
+    let coordinator_preparation =
+        capability.coordinator_capacity_frame(CoordinatorCapacityStatus::PreparationFailed);
+    let receiver_ready = capability.receiver_capacity_frame(true);
+    let receiver_limit = capability.receiver_capacity_frame(false);
+    let frames = [
+        coordinator_ready.as_bytes(),
+        coordinator_limit.as_bytes(),
+        coordinator_preparation.as_bytes(),
+        receiver_ready.as_bytes(),
+        receiver_limit.as_bytes(),
+    ];
+    for left in 0..frames.len() {
+        for right in 0..frames.len() {
+            assert_eq!(frames[left] == frames[right], left == right);
+        }
+    }
+    for (frame, status) in [
+        (coordinator_ready, CoordinatorCapacityStatus::Ready),
+        (coordinator_limit, CoordinatorCapacityStatus::ActiveLimit),
+        (
+            coordinator_preparation,
+            CoordinatorCapacityStatus::PreparationFailed,
+        ),
+    ] {
+        let (decoded, decoded_manifest, decoded_status) =
+            CapabilityFrame::decode_coordinator_capacity(frame.as_bytes()).unwrap();
+        assert_eq!(decoded.as_bytes(), capability.as_bytes());
+        assert_eq!(decoded_manifest, manifest);
+        assert_eq!(decoded_status, status);
+    }
+    assert!(CapabilityFrame::decode_coordinator_capacity(receiver_ready.as_bytes()).is_none());
+}
+
+#[test]
 fn preparation_frames_are_disjoint_exact_full_manifest_receipts() {
     let manifest = TransferManifest::new_with_authority(
         [0x31; 32],

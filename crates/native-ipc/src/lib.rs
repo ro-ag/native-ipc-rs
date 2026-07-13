@@ -19,7 +19,8 @@ pub use native_ipc_core as core;
 /// Checked allocation-free runtime access after batch commit.
 pub mod active;
 #[allow(dead_code)]
-mod batch;
+/// Atomic transfer-batch construction, expectations, and committed active sets.
+pub mod batch;
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
 /// Platform-neutral consuming region ownership states.
@@ -28,8 +29,8 @@ pub mod region;
 pub mod session;
 
 mod backend;
-#[allow(dead_code)]
-mod control;
+/// Bounded opaque application-control records and validation errors.
+pub mod control;
 #[allow(dead_code)]
 mod liveness;
 #[allow(dead_code)]
