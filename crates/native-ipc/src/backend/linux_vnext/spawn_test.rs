@@ -792,15 +792,19 @@ fn run_public_session_receiver(mode: &str) {
             let reader = active.take_reader(RegionId::new(1).unwrap()).unwrap();
             let mut writer = active.take_writer(RegionId::new(2).unwrap()).unwrap();
             writer.fill(0..writer.len(), 4).unwrap();
+            let coordinator_ready = ready.receive_control(public_flow_deadline()).unwrap();
+            assert_eq!(coordinator_ready.kind(), APPLICATION_CONTROL_KIND_MIN + 5);
+            assert!(coordinator_ready.payload().is_empty());
             let mut observed = vec![0; reader.len()];
-            loop {
-                reader.read_into(0, &mut observed).unwrap();
-                if observed.iter().all(|byte| *byte == 3) {
-                    break;
-                }
-                assert!(!operation_deadline.is_expired());
-                std::thread::yield_now();
-            }
+            reader.read_into(0, &mut observed).unwrap();
+            assert!(observed.iter().all(|byte| *byte == 3));
+            ready
+                .send_control(
+                    APPLICATION_CONTROL_KIND_MIN + 6,
+                    b"",
+                    public_flow_deadline(),
+                )
+                .unwrap();
             drop((active, reader, writer));
             let frame = ready.receive_control(public_flow_deadline()).unwrap();
             assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 7);
@@ -4497,15 +4501,19 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
     let mut writer = active.take_writer(RegionId::new(1).unwrap()).unwrap();
     let reader = active.take_reader(RegionId::new(2).unwrap()).unwrap();
     writer.fill(0..writer.len(), 3).unwrap();
+    ready
+        .send_control(
+            APPLICATION_CONTROL_KIND_MIN + 5,
+            b"",
+            public_flow_deadline(),
+        )
+        .unwrap();
+    let receiver_ready = ready.receive_control(public_flow_deadline()).unwrap();
+    assert_eq!(receiver_ready.kind(), APPLICATION_CONTROL_KIND_MIN + 6);
+    assert!(receiver_ready.payload().is_empty());
     let mut observed = vec![0; reader.len()];
-    loop {
-        reader.read_into(0, &mut observed).unwrap();
-        if observed.iter().all(|byte| *byte == 4) {
-            break;
-        }
-        assert!(!operation_deadline.is_expired());
-        std::thread::yield_now();
-    }
+    reader.read_into(0, &mut observed).unwrap();
+    assert!(observed.iter().all(|byte| *byte == 4));
     drop((active, reader, writer));
     let local_failure = ready
         .send_control(APPLICATION_CONTROL_KIND_MIN - 1, b"", deadline())
