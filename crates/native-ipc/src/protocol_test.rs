@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::SessionLimits;
 
 fn entry(role: u32) -> ManifestEntry {
     let spec = NativeRegionSpec::new(role.into(), [role as u8; 16], 1, 4096, 4096).unwrap();
@@ -40,12 +41,165 @@ fn canonical_manifest_is_fixed_width_sorted_and_exact() {
 }
 
 #[test]
+fn capability_frame_has_the_only_native_capability_magic() {
+    let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
+    let frame = CapabilityFrame::from_manifest(&manifest);
+    assert_eq!(&frame.as_bytes()[..8], &CAPABILITY_MAGIC);
+    assert_eq!(frame.capability_count(), 1);
+    assert_ne!(&frame.as_bytes()[..8], b"NIPCAPP1");
+    assert!(manifest.matches_frame(CAPABILITY_MAGIC, frame.as_bytes()));
+}
+
+#[test]
+fn capability_frame_decode_requires_canonical_structure_and_reserved_bytes() {
+    let manifest = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1), entry(2)],
+    )
+    .unwrap();
+    let frame = CapabilityFrame::from_manifest(&manifest);
+    let (decoded, decoded_manifest) = CapabilityFrame::decode(frame.as_bytes()).unwrap();
+    assert_eq!(decoded.as_bytes(), frame.as_bytes());
+    assert_eq!(decoded_manifest.entries(), manifest.entries());
+    assert_eq!(decoded_manifest.total_logical(), 8192);
+    assert_eq!(decoded_manifest.total_mapped(), 8192);
+    assert_eq!(
+        decoded_manifest.authority_profile(),
+        NativeAuthorityProfile::LinuxMdweV1
+    );
+
+    for offset in [0, 8, 12, 64, 68, 72, 80, 88, 148, 152, 154, 156, 224] {
+        let mut wrong = *frame.as_bytes();
+        wrong[offset] ^= 1;
+        assert!(CapabilityFrame::decode(&wrong).is_none(), "offset {offset}");
+    }
+    for offset in [16, 48, 52, 56, 76, 112, 144, 160] {
+        let mut substituted = *frame.as_bytes();
+        substituted[offset] ^= 1;
+        let (decoded, _) = CapabilityFrame::decode(&substituted).unwrap();
+        assert_eq!(decoded.as_bytes(), &substituted, "offset {offset}");
+    }
+    assert!(CapabilityFrame::decode(&frame.as_bytes()[..CONTROL_FRAME_LEN - 1]).is_none());
+    let mut oversized = frame.as_bytes().to_vec();
+    oversized.push(0);
+    assert!(CapabilityFrame::decode(&oversized).is_none());
+}
+
+#[test]
+fn preparation_frames_are_disjoint_exact_full_manifest_receipts() {
+    let manifest = TransferManifest::new_with_authority(
+        [0x31; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1), entry(2)],
+    )
+    .unwrap();
+    let capability = CapabilityFrame::from_manifest(&manifest);
+    let imported = capability.preparation_frame(PreparationFrameKind::Imported);
+    let sealed = capability.preparation_frame(PreparationFrameKind::Sealed);
+    assert_ne!(capability.as_bytes(), imported.as_bytes());
+    assert_ne!(capability.as_bytes(), sealed.as_bytes());
+    assert_ne!(imported.as_bytes(), sealed.as_bytes());
+    assert!(imported.matches(imported.as_bytes()));
+    assert!(sealed.matches(sealed.as_bytes()));
+
+    for offset in [0, 8, 12, 16, 48, 52, 56, 64, 68, 72, 76, 80, 88, 96, 112] {
+        let mut substituted = *imported.as_bytes();
+        substituted[offset] ^= 1;
+        assert!(!imported.matches(&substituted), "offset {offset}");
+    }
+    for length in 0..CONTROL_FRAME_LEN {
+        assert!(
+            !imported.matches(&imported.as_bytes()[..length]),
+            "truncation {length}"
+        );
+        assert!(
+            !sealed.matches(&sealed.as_bytes()[..length]),
+            "sealed truncation {length}"
+        );
+    }
+    let mut oversized = imported.as_bytes().to_vec();
+    oversized.push(0);
+    assert!(!imported.matches(&oversized));
+}
+
+#[test]
+fn vnext_authority_profile_is_exactly_transcript_bound() {
+    let legacy = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1)]).unwrap();
+    let linux = TransferManifest::new_with_authority(
+        [9; 32],
+        10,
+        11,
+        12,
+        NativeAuthorityProfile::LinuxMdweV1,
+        vec![entry(1)],
+    )
+    .unwrap();
+    let legacy = legacy.encode(CAPABILITY_MAGIC);
+    let linux = linux.encode(CAPABILITY_MAGIC);
+    assert_eq!(u32::from_le_bytes(legacy[76..80].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(linux[76..80].try_into().unwrap()), 1);
+    assert_ne!(legacy, linux);
+}
+
+#[test]
+fn manifest_checks_negotiated_count_region_and_batch_limits() {
+    let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1), entry(2)]).unwrap();
+    let limits = SessionLimits {
+        max_regions_per_batch: 2,
+        max_region_bytes: 4096,
+        max_batch_bytes: 8192,
+        ..SessionLimits::default()
+    };
+    assert!(manifest.fits_limits(limits));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_regions_per_batch: 1,
+        ..limits
+    }));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_region_bytes: 4095,
+        ..limits
+    }));
+    assert!(!manifest.fits_limits(SessionLimits {
+        max_batch_bytes: 8191,
+        ..limits
+    }));
+
+    let rounded = NativeRegionSpec::new(3, [3; 16], 1, 4095, 4096).unwrap();
+    let rounded = TransferManifest::new(
+        [9; 32],
+        10,
+        11,
+        12,
+        vec![ManifestEntry::from_native(rounded, PeerAccess::ReadOnly)],
+    )
+    .unwrap();
+    let rounded_limits = SessionLimits {
+        max_regions_per_batch: 1,
+        max_region_bytes: 4095,
+        max_batch_bytes: 4096,
+        ..SessionLimits::default()
+    };
+    assert!(rounded.fits_limits(rounded_limits));
+    assert!(!rounded.fits_limits(SessionLimits {
+        max_region_bytes: 4094,
+        ..rounded_limits
+    }));
+}
+
+#[test]
 fn exact_frame_rejects_every_transcript_field_and_size_change() {
     let manifest = TransferManifest::new([9; 32], 10, 11, 12, vec![entry(1), entry(2)]).unwrap();
     let magic = *b"NIPCTEST";
     let frame = manifest.encode(magic);
     for offset in [
-        0, 8, 12, 16, 48, 52, 56, 96, 112, 128, 136, 144, 148, 152, 154,
+        0, 8, 12, 16, 48, 52, 56, 76, 96, 112, 128, 136, 144, 148, 152, 154,
     ] {
         let mut wrong = frame;
         wrong[offset] ^= 1;

@@ -535,6 +535,21 @@ impl QuiescentRegion {
         unsafe { std::slice::from_raw_parts_mut(self.mapping.base.as_ptr(), self.mapping.len) }
     }
 
+    pub(crate) fn into_vnext_unmapped_parts(self) -> (OwnedFd, usize, usize) {
+        let Self {
+            fd,
+            mapping,
+            logical_len,
+        } = self;
+        let mapped_len = mapping.len;
+        drop(mapping);
+        (fd, logical_len, mapped_len)
+    }
+
+    pub(crate) fn as_raw_fd_for_vnext(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
     /// Validates, seals, and prepares the sole writer plus export capability.
     pub fn prepare_writer(
         self,

@@ -1,11 +1,45 @@
+use crate::session::SessionLimits;
+
 pub(crate) const CONTROL_VERSION: u32 = 1;
 pub(crate) const MAX_TRANSFER_ENTRIES: usize = 16;
 pub(crate) const ENTRY_LEN: usize = 64;
 pub(crate) const CONTROL_FRAME_LEN: usize = 96 + MAX_TRANSFER_ENTRIES * ENTRY_LEN;
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const IMPORTED_MAGIC: [u8; 8] = *b"NIPCIMP1";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
 const REQUIRED_ENTRY_FLAGS: u16 = ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE | ENTRY_FLAG_SIZE_FROZEN;
+
+/// Exact backend authority policy and accepted residual limitations bound into
+/// a vNext transfer transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub(crate) enum NativeAuthorityProfile {
+    /// Compatibility profile used only by the landed pre-vNext native helpers.
+    Legacy = 0,
+    /// Linux library views are non-executable, inherited MDWE refuses execute
+    /// gain, RX aliases remain possible, and a receiver-writer may delegate its
+    /// pre-seal fd outside the MDWE tree.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "Linux accepted-session profile")
+    )]
+    LinuxMdweV1 = 1,
+}
+
+impl NativeAuthorityProfile {
+    pub(crate) const fn is_vnext(self) -> bool {
+        !matches!(self, Self::Legacy)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -83,17 +117,158 @@ pub(crate) struct TransferManifest {
     pub(crate) parent_pid: u32,
     pub(crate) child_pid: u32,
     pub(crate) transfer_id: u64,
+    authority_profile: NativeAuthorityProfile,
     total_logical: u64,
     total_mapped: u64,
     entries: Vec<ManifestEntry>,
 }
 
+/// Exact canonical capability packet expected by both transaction endpoints.
+///
+/// Construction from a validated manifest keeps application framing and native
+/// transaction framing disjoint without exposing caller-selected wire magic.
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+pub(crate) struct CapabilityFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+    capability_count: usize,
+}
+
+/// Exact full-manifest Linux preparation receipt kind.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationFrameKind {
+    Imported,
+    Sealed,
+}
+
+/// Zero-rights preparation frame derived only from a canonical capability
+/// frame retained by the accepted transaction owner.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct PreparationFrame {
+    bytes: [u8; CONTROL_FRAME_LEN],
+}
+
+#[allow(
+    dead_code,
+    reason = "private G1b capability transport is currently implemented only on Linux"
+)]
+impl CapabilityFrame {
+    pub(crate) fn from_manifest(manifest: &TransferManifest) -> Self {
+        Self {
+            bytes: manifest.encode(CAPABILITY_MAGIC),
+            capability_count: manifest.entries.len(),
+        }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) const fn capability_count(&self) -> usize {
+        self.capability_count
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<(Self, TransferManifest)> {
+        let manifest = TransferManifest::decode(CAPABILITY_MAGIC, bytes)?;
+        Some((Self::from_manifest(&manifest), manifest))
+    }
+
+    pub(crate) fn preparation_frame(&self, kind: PreparationFrameKind) -> PreparationFrame {
+        let (_, manifest) = Self::decode(&self.bytes)
+            .expect("capability frames are constructed from canonical manifests");
+        PreparationFrame {
+            bytes: manifest.encode(match kind {
+                PreparationFrameKind::Imported => IMPORTED_MAGIC,
+                PreparationFrameKind::Sealed => SEALED_MAGIC,
+            }),
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PreparationFrame {
+    pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
+        &self.bytes
+    }
+
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        bytes == self.bytes
+    }
+}
+
 impl TransferManifest {
+    fn decode(magic: [u8; 8], frame: &[u8]) -> Option<Self> {
+        if frame.len() != CONTROL_FRAME_LEN
+            || frame[..8] != magic
+            || u32::from_le_bytes(frame[8..12].try_into().ok()?) != CONTROL_VERSION
+        {
+            return None;
+        }
+        let count = usize::try_from(u32::from_le_bytes(frame[12..16].try_into().ok()?)).ok()?;
+        if !(1..=MAX_TRANSFER_ENTRIES).contains(&count) {
+            return None;
+        }
+        let authority_profile = match u32::from_le_bytes(frame[76..80].try_into().ok()?) {
+            0 => NativeAuthorityProfile::Legacy,
+            1 => NativeAuthorityProfile::LinuxMdweV1,
+            _ => return None,
+        };
+        let mut entries = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = 96 + index * ENTRY_LEN;
+            let access = match u32::from_le_bytes(frame[start + 52..start + 56].try_into().ok()?) {
+                1 => PeerAccess::ReadOnly,
+                2 => PeerAccess::SoleWriter,
+                _ => return None,
+            };
+            entries.push(ManifestEntry {
+                region_id: u128::from_le_bytes(frame[start..start + 16].try_into().ok()?),
+                incarnation: frame[start + 16..start + 32].try_into().ok()?,
+                logical_len: u64::from_le_bytes(frame[start + 32..start + 40].try_into().ok()?),
+                mapped_len: u64::from_le_bytes(frame[start + 40..start + 48].try_into().ok()?),
+                writer: u32::from_le_bytes(frame[start + 48..start + 52].try_into().ok()?),
+                access,
+                ordinal: u16::from_le_bytes(frame[start + 56..start + 58].try_into().ok()?),
+                flags: u16::from_le_bytes(frame[start + 58..start + 60].try_into().ok()?),
+            });
+        }
+        let manifest = Self::new_with_authority(
+            frame[16..48].try_into().ok()?,
+            u32::from_le_bytes(frame[48..52].try_into().ok()?),
+            u32::from_le_bytes(frame[52..56].try_into().ok()?),
+            u64::from_le_bytes(frame[56..64].try_into().ok()?),
+            authority_profile,
+            entries,
+        )?;
+        (manifest.encode(magic).as_slice() == frame).then_some(manifest)
+    }
+
     pub(crate) fn new(
         nonce: [u8; 32],
         parent_pid: u32,
         child_pid: u32,
         transfer_id: u64,
+        entries: Vec<ManifestEntry>,
+    ) -> Option<Self> {
+        Self::new_with_authority(
+            nonce,
+            parent_pid,
+            child_pid,
+            transfer_id,
+            NativeAuthorityProfile::Legacy,
+            entries,
+        )
+    }
+
+    pub(crate) fn new_with_authority(
+        nonce: [u8; 32],
+        parent_pid: u32,
+        child_pid: u32,
+        transfer_id: u64,
+        authority_profile: NativeAuthorityProfile,
         mut entries: Vec<ManifestEntry>,
     ) -> Option<Self> {
         if nonce == [0; 32]
@@ -143,6 +318,7 @@ impl TransferManifest {
             parent_pid,
             child_pid,
             transfer_id,
+            authority_profile,
             total_logical,
             total_mapped,
             entries,
@@ -162,6 +338,7 @@ impl TransferManifest {
         frame[64..68].copy_from_slice(&frame_kind.to_le_bytes());
         frame[68..72].copy_from_slice(&MANIFEST_FLAG_CANONICAL.to_le_bytes());
         frame[72..76].copy_from_slice(&(CONTROL_FRAME_LEN as u32).to_le_bytes());
+        frame[76..80].copy_from_slice(&(self.authority_profile as u32).to_le_bytes());
         frame[80..88].copy_from_slice(&self.total_logical.to_le_bytes());
         frame[88..96].copy_from_slice(&self.total_mapped.to_le_bytes());
         for (index, entry) in self.entries.iter().enumerate() {
@@ -176,6 +353,36 @@ impl TransferManifest {
             frame[start + 58..start + 60].copy_from_slice(&entry.flags.to_le_bytes());
         }
         frame
+    }
+
+    pub(crate) fn fits_limits(&self, limits: SessionLimits) -> bool {
+        self.entries.len() <= usize::from(limits.max_regions_per_batch)
+            && self.total_logical <= limits.max_batch_bytes
+            && self.total_mapped <= limits.max_batch_bytes
+            && self
+                .entries
+                .iter()
+                .all(|entry| entry.logical_len <= limits.max_region_bytes)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn authority_profile(&self) -> NativeAuthorityProfile {
+        self.authority_profile
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn total_logical(&self) -> u64 {
+        self.total_logical
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const fn total_mapped(&self) -> u64 {
+        self.total_mapped
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
     }
 
     #[allow(dead_code)] // macOS compares the same fixed transcript in Mach receive validation.

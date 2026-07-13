@@ -104,6 +104,33 @@ The public constants in `session` define the implementation's finite maxima:
 application-control payload maxima. These bounds are checked before native
 import or allocation and may only change with a reviewed wire/API revision.
 
+## Native authority profile
+
+Bytes 76..80 of the fixed native transfer header are a little-endian `u32`
+authority-profile code. Zero is retained only for the landed pre-vNext native
+helpers. The private accepted vNext dispatcher rejects zero before native I/O.
+
+Profile 1 is `LinuxMdweV1`: the trusted pre-exec path installed inherited
+irreversible `PR_MDWE_REFUSE_EXEC_GAIN`; library mappings never request
+execute; the documented fresh RX-alias limitation remains; and a
+receiver-writer may delegate its pre-final-seal fd outside the MDWE tree and
+retain an upgradeable RW mapping. This is a session policy and residual-limit
+profile, not evidence that any particular object has completed import, final
+sealing, mapping, READY, or COMMIT. The complete fixed frame, including this
+profile, is compared exactly on receive.
+
+New target profiles require a reviewed wire decision. Reserved bytes outside
+defined fields remain zero.
+
+## Linux preparation frame kinds
+
+Linux receiver-writer preparation uses `NIPCIMP1` for `IMPORTED` and `NIPCSEA1`
+for `SEALED`. Each is the same fixed-size canonical full-manifest encoding as
+`NIPCCAP1`, with only the eight-byte magic/frame-kind changed by library-owned
+construction. Both carry zero rights, exact directional credentials, and no
+application payload. Callers cannot construct them, and neither frame ends a
+transaction or grants READY, COMMIT, activation, or runtime authority.
+
 ## Application control framing
 
 Application control uses magic `NIPCAPP1`, exact wire version 1.0, and a

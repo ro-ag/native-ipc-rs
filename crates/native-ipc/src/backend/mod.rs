@@ -5,7 +5,8 @@
 )]
 
 use crate::negotiation::AcceptedTranscriptFacts;
-use crate::session::AbsoluteDeadline;
+use crate::protocol::{CapabilityFrame, NativeAuthorityProfile};
+use crate::session::{AbsoluteDeadline, SessionLimits};
 use core::cell::Cell;
 use core::marker::PhantomData;
 
@@ -19,6 +20,29 @@ pub(crate) struct SpawnIdentityFacts {
     child_uid: u32,
     child_gid: u32,
     nonce: [u8; 32],
+}
+
+/// Exact accepted-session provenance and negotiated limits retained by the
+/// inseparable dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedSessionParameters {
+    facts: SpawnIdentityFacts,
+    limits: SessionLimits,
+    authority_profile: NativeAuthorityProfile,
+}
+
+impl AcceptedSessionParameters {
+    pub(crate) const fn facts(self) -> SpawnIdentityFacts {
+        self.facts
+    }
+
+    pub(crate) const fn limits(self) -> SessionLimits {
+        self.limits
+    }
+
+    pub(crate) const fn authority_profile(self) -> NativeAuthorityProfile {
+        self.authority_profile
+    }
 }
 
 impl SpawnIdentityFacts {
@@ -131,11 +155,15 @@ impl CoordinatorAcceptedEvidence {
         self.facts
     }
 
-    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
-        (
-            self.transcript.nonce(),
-            self.transcript.effective_limits().max_control_payload_bytes,
-        )
+    pub(crate) const fn session_parameters(
+        &self,
+        authority_profile: NativeAuthorityProfile,
+    ) -> AcceptedSessionParameters {
+        AcceptedSessionParameters {
+            facts: self.facts,
+            limits: self.transcript.effective_limits(),
+            authority_profile,
+        }
     }
 }
 
@@ -171,11 +199,15 @@ impl ReceiverSpawnerEvidence {
         self.facts
     }
 
-    pub(crate) const fn control_parameters(&self) -> ([u8; 32], u32) {
-        (
-            self.transcript.nonce(),
-            self.transcript.effective_limits().max_control_payload_bytes,
-        )
+    pub(crate) const fn session_parameters(
+        &self,
+        authority_profile: NativeAuthorityProfile,
+    ) -> AcceptedSessionParameters {
+        AcceptedSessionParameters {
+            facts: self.facts,
+            limits: self.transcript.effective_limits(),
+            authority_profile,
+        }
     }
 }
 
@@ -226,6 +258,39 @@ pub(crate) trait AuthenticatedZeroRightsTransport: sealed::Sealed {
     /// Permanently invalidates the transport. Every later I/O operation must
     /// fail immediately without touching native state.
     fn poison(&mut self);
+}
+
+/// Coordinator-only capability-record send operation on the accepted owner.
+///
+/// The associated value is backend-owned borrowed authority. Implementations
+/// must send exactly one canonical capability record with 1..=16 native
+/// capabilities under the supplied absolute deadline.
+pub(crate) trait CoordinatorCapabilityTransport: AuthenticatedZeroRightsTransport {
+    type Capabilities<'a>
+    where
+        Self: 'a;
+
+    fn send_capability_record(
+        &mut self,
+        frame: &CapabilityFrame,
+        capabilities: Self::Capabilities<'_>,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError>;
+}
+
+/// Receiver-only capability-record receive operation on the accepted owner.
+///
+/// The returned backend value must immediately own every installed native
+/// capability and keep it transaction-bound until that value is destroyed or
+/// consumed by a later complete import state machine.
+pub(crate) trait ReceiverCapabilityTransport: AuthenticatedZeroRightsTransport {
+    type ReceivedCapabilities;
+
+    fn receive_capability_record(
+        &mut self,
+        expected: &CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self::ReceivedCapabilities, SessionTransportError>;
 }
 
 /// Coordinator-only owned-child lifecycle operations.

@@ -3,6 +3,7 @@ use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HelloFrame, HelloPair, NegotiatedTranscript,
     SenderRole, TargetFacts,
 };
+use crate::protocol::NativeAuthorityProfile;
 use crate::session::{AtomicCapabilities, SessionLimits};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
@@ -77,6 +78,13 @@ fn coordinator_evidence_requires_exact_channel_image_and_transcript_identity() {
     let accepted =
         CoordinatorAcceptedEvidence::combine(channel, image, accepted_transcript(nonce)).unwrap();
     assert_eq!(accepted.facts(), facts(11, nonce));
+    let parameters = accepted.session_parameters(NativeAuthorityProfile::LinuxMdweV1);
+    assert_eq!(parameters.facts(), facts(11, nonce));
+    assert_eq!(parameters.limits(), SessionLimits::default());
+    assert_eq!(
+        parameters.authority_profile(),
+        NativeAuthorityProfile::LinuxMdweV1
+    );
 
     assert!(SpawnIdentityFacts::new(0, 11, 0, 0, 0, 0, nonce).is_none());
     assert!(SpawnIdentityFacts::new(10, 10, 0, 0, 0, 0, nonce).is_none());
@@ -93,6 +101,13 @@ fn receiver_evidence_is_role_scoped_and_nonce_bound() {
     }
     .unwrap();
     assert_eq!(receiver.facts, identity);
+    let parameters = receiver.session_parameters(NativeAuthorityProfile::LinuxMdweV1);
+    assert_eq!(parameters.facts(), identity);
+    assert_eq!(parameters.limits(), SessionLimits::default());
+    assert_eq!(
+        parameters.authority_profile(),
+        NativeAuthorityProfile::LinuxMdweV1
+    );
 
     // SAFETY: the mismatch is intentional and must fail before evidence exists.
     let mismatch = unsafe {

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::active::{ActiveReader, ActiveWriter};
+use crate::protocol::{ManifestEntry, PeerAccess};
 use crate::region::{PreparedRegion, RegionId, WriterEndpoint};
 
 /// Portable batch construction or active-set lookup failure.
@@ -18,6 +19,8 @@ pub enum BatchError {
     DuplicateRegionId(RegionId),
     /// Checked aggregate logical or mapped bytes overflowed or exceeded limits.
     BatchBytesExceeded,
+    /// An expected region has zero or non-native logical length.
+    InvalidRegionLength,
     /// The keyed active set does not contain this ID.
     UnknownRegion(RegionId),
     /// The requested runtime authority does not match the committed direction.
@@ -41,6 +44,60 @@ pub struct TransferBatch {
     max_batch_bytes: u64,
     total_logical: u64,
     total_mapped: u64,
+}
+
+/// Receiver-owned coordinator-relative metadata fixed before capability I/O.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpectedRegion {
+    pub(crate) id: RegionId,
+    pub(crate) writer: WriterEndpoint,
+    pub(crate) logical_len: usize,
+}
+
+/// Canonical receiver expectation that contains no coordinator-minted
+/// incarnation, native object, mapping, or transaction authority.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ExpectedBatch {
+    pub(crate) regions: Vec<ExpectedRegion>,
+    pub(crate) total_logical: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ExpectedBatch {
+    pub(crate) fn try_from_specs(mut regions: Vec<ExpectedRegion>) -> Result<Self, BatchError> {
+        if regions.is_empty() {
+            return Err(BatchError::Empty);
+        }
+        if regions.len() > 16 {
+            return Err(BatchError::TooManyRegions);
+        }
+        regions.sort_unstable_by_key(|region| region.id);
+        if let Some(duplicate) = regions
+            .windows(2)
+            .find(|pair| pair[0].id == pair[1].id)
+            .map(|pair| pair[0].id)
+        {
+            return Err(BatchError::DuplicateRegionId(duplicate));
+        }
+        let total_logical = regions.iter().try_fold(0_u64, |total, region| {
+            let logical = u64::try_from(region.logical_len)
+                .ok()
+                .filter(|logical| *logical != 0)
+                .ok_or(BatchError::InvalidRegionLength)?;
+            total
+                .checked_add(logical)
+                .ok_or(BatchError::BatchBytesExceeded)
+        })?;
+        Ok(Self {
+            regions,
+            total_logical,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.regions.len()
+    }
 }
 
 impl TransferBatch {
@@ -121,6 +178,24 @@ pub(crate) struct PendingBatch {
     pub(crate) regions: Vec<PreparedRegion>,
     pub(crate) total_logical: u64,
     pub(crate) total_mapped: u64,
+}
+
+impl PendingBatch {
+    pub(crate) fn manifest_entries(&self) -> Option<Vec<ManifestEntry>> {
+        self.regions
+            .iter()
+            .map(|region| {
+                let access = match region.spec().writer {
+                    WriterEndpoint::Coordinator => PeerAccess::ReadOnly,
+                    WriterEndpoint::Receiver => PeerAccess::SoleWriter,
+                };
+                Some(ManifestEntry::from_native(
+                    region.request.native_spec(region.spec().id.get())?,
+                    access,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[allow(dead_code)]

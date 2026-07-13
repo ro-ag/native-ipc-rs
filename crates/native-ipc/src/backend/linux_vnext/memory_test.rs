@@ -1,5 +1,8 @@
 use super::super::{PacketCredentials, PacketError, ReceivedPacket, SeqPacketEndpoint};
 use super::*;
+use crate::batch::{ExpectedBatch, ExpectedRegion};
+use crate::protocol::{CAPABILITY_MAGIC, TransferManifest};
+use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
@@ -197,6 +200,26 @@ assert_impl_all!(PeerWriterImportedReceipt: Send);
 assert_not_impl_any!(PeerWriterImportedReceipt: Sync, Clone);
 assert_impl_all!(CoordinatorReaderPrepared: Send);
 assert_not_impl_any!(CoordinatorReaderPrepared: Sync, Clone);
+assert_impl_all!(LinuxCoordinatorWriterBatch: Send);
+assert_not_impl_any!(LinuxCoordinatorWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxReceiverWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxMixedDirectionBatch: Send);
+assert_not_impl_any!(LinuxMixedDirectionBatch: Sync, Clone);
+assert_impl_all!(LinuxExpectedCoordinatorWriterBatch: Send);
+assert_not_impl_any!(LinuxExpectedCoordinatorWriterBatch: Clone);
+assert_impl_all!(LinuxExpectedReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxExpectedReceiverWriterBatch: Clone);
+assert_impl_all!(LinuxExpectedMixedDirectionBatch: Send);
+assert_not_impl_any!(LinuxExpectedMixedDirectionBatch: Clone);
+assert_impl_all!(LinuxImportedCoordinatorWriterBatch: Send);
+assert_not_impl_any!(LinuxImportedCoordinatorWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxImportedReceiverWriterBatch: Send);
+assert_not_impl_any!(LinuxImportedReceiverWriterBatch: Sync, Clone);
+assert_impl_all!(LinuxImportedMixedDirectionBatch: Send);
+assert_not_impl_any!(LinuxImportedMixedDirectionBatch: Sync, Clone);
+assert_impl_all!(LinuxMixedDirectionImportFailure: Send);
+assert_not_impl_any!(LinuxMixedDirectionImportFailure: Sync, Clone);
 
 fn binding(seed: u8) -> TransferBinding {
     TransferBinding::new(
@@ -229,6 +252,58 @@ fn mapping_fails(fd: RawFd, protection: libc::c_int, len: usize) -> bool {
         let _ = unsafe { libc::munmap(pointer, len) };
         false
     }
+}
+
+fn portable_batch(regions: &[(u128, WriterEndpoint, usize)]) -> TransferBatch {
+    let mut batch = TransferBatch::new(16, 16 * 1024 * 1024).unwrap();
+    for &(id, writer, logical_len) in regions {
+        let mut region = PrivateRegion::allocate(RegionOptions::fixed(logical_len)).unwrap();
+        region.initialize(|bytes| bytes.fill(id as u8));
+        batch
+            .add(
+                region
+                    .prepare(RegionSpec {
+                        id: RegionId::new(id).unwrap(),
+                        writer,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    batch
+}
+
+fn expected_batch(regions: &[(u128, WriterEndpoint, usize)]) -> ExpectedBatch {
+    ExpectedBatch::try_from_specs(
+        regions
+            .iter()
+            .map(|&(id, writer, logical_len)| ExpectedRegion {
+                id: RegionId::new(id).unwrap(),
+                writer,
+                logical_len,
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn duplicate_mixed_descriptors(batch: &LinuxMixedDirectionBatch) -> Vec<OwnedFd> {
+    batch
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            LinuxMixedDirectionEntry::CoordinatorWriter(batch) => {
+                duplicate(&batch.entries[0].prepared.reader_capability).unwrap()
+            }
+            LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                duplicate(&batch.entries[0].fd).unwrap()
+            }
+        })
+        .collect()
+}
+
+fn batch_deadline() -> AbsoluteDeadline {
+    AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
 }
 
 fn current_seals(fd: RawFd) -> libc::c_int {
@@ -695,4 +770,1132 @@ fn imported_receipt_binds_full_provenance_even_for_the_same_object() {
         prepared.seal_after_import(foreign),
         Err(MemfdError::WrongProvenance)
     ));
+}
+
+#[test]
+fn coordinator_writer_batches_prepare_canonical_exact_objects_for_one_to_sixteen() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| (id as u128, WriterEndpoint::Coordinator, id * 17))
+            .collect();
+        let deadline = batch_deadline();
+        let batch = LinuxCoordinatorWriterBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(batch.deadline(), deadline);
+        assert_eq!(batch.entries.len(), count);
+        assert_eq!(batch.capabilities().len(), count);
+        batch.revalidate().unwrap();
+
+        let manifest = TransferManifest::new_with_authority(
+            [0x71; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            batch.manifest_entries(),
+        )
+        .unwrap();
+        let frame = manifest.encode(CAPABILITY_MAGIC);
+        for (ordinal, entry) in batch.entries.iter().enumerate() {
+            let start = 96 + ordinal * 64;
+            assert_eq!(
+                u128::from_le_bytes(frame[start..start + 16].try_into().unwrap()),
+                entry.native.region_id
+            );
+            assert_eq!(&frame[start + 16..start + 32], &entry.native.incarnation);
+            assert_eq!(
+                u64::from_le_bytes(frame[start + 32..start + 40].try_into().unwrap()),
+                entry.native.logical_len
+            );
+            assert_eq!(
+                u64::from_le_bytes(frame[start + 40..start + 48].try_into().unwrap()),
+                entry.native.mapped_len
+            );
+            assert_eq!(
+                u16::from_le_bytes(frame[start + 56..start + 58].try_into().unwrap()) as usize,
+                ordinal
+            );
+            assert_eq!(current_seals(entry.prepared.fd.as_raw_fd()), FINAL_SEALS);
+            assert_eq!(
+                current_seals(entry.prepared.reader_capability.as_raw_fd()),
+                FINAL_SEALS
+            );
+            assert!(mapping_fails(
+                entry.prepared.reader_capability.as_raw_fd(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                entry.prepared.mapping.len
+            ));
+            // SAFETY: the retained coordinator mapping is live for the complete
+            // logical range and no mutable access overlaps this observation.
+            let initialized = unsafe {
+                core::slice::from_raw_parts(
+                    entry.prepared.mapping.base.as_ptr(),
+                    usize::try_from(entry.native.logical_len).unwrap(),
+                )
+            };
+            assert!(
+                initialized
+                    .iter()
+                    .all(|byte| *byte == entry.native.region_id as u8)
+            );
+        }
+    }
+}
+
+#[test]
+fn mixed_direction_batches_prepare_one_to_sixteen_in_canonical_capability_order() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| {
+                let writer = if id % 2 == 0 {
+                    WriterEndpoint::Coordinator
+                } else {
+                    WriterEndpoint::Receiver
+                };
+                (id as u128, writer, id * 17)
+            })
+            .collect();
+        let deadline = batch_deadline();
+        let mut batch = LinuxMixedDirectionBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(batch.deadline(), deadline);
+        assert_eq!(batch.entries.len(), count);
+        batch.revalidate_before_send().unwrap();
+        let capabilities = batch.capabilities();
+        assert_eq!(capabilities.len(), count);
+
+        let manifest = TransferManifest::new_with_authority(
+            [0x73; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            batch.manifest_entries(),
+        )
+        .unwrap();
+        for (ordinal, ((manifest, native), capability)) in manifest
+            .entries()
+            .iter()
+            .zip(&batch.entries)
+            .zip(&capabilities)
+            .enumerate()
+        {
+            assert_eq!(manifest.region_id, (ordinal + 1) as u128);
+            assert_eq!(manifest.ordinal as usize, ordinal);
+            match native {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    assert_eq!(manifest.writer, 0);
+                    assert_eq!(manifest.access, PeerAccess::ReadOnly);
+                    assert_eq!(manifest.region_id, entry.native.region_id);
+                    assert_eq!(
+                        validate_object(
+                            capability.as_raw_fd(),
+                            entry.prepared.key.mapped_len,
+                            FINAL_SEALS,
+                        ),
+                        Ok(entry.prepared.key)
+                    );
+                    assert_eq!(
+                        current_seals(entry.prepared.reader_capability.as_raw_fd()),
+                        FINAL_SEALS
+                    );
+                    assert!(mapping_fails(
+                        entry.prepared.reader_capability.as_raw_fd(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        entry.prepared.mapping.len
+                    ));
+                    for offset in 0..manifest.logical_len as usize {
+                        // SAFETY: the retained coordinator mapping is live for
+                        // the complete initialized logical range.
+                        assert_eq!(
+                            unsafe {
+                                core::ptr::read_volatile(
+                                    entry.prepared.mapping.base.as_ptr().add(offset),
+                                )
+                            },
+                            manifest.region_id as u8
+                        );
+                    }
+                }
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    assert_eq!(manifest.writer, 1);
+                    assert_eq!(manifest.access, PeerAccess::SoleWriter);
+                    assert_eq!(manifest.region_id, entry.native.region_id);
+                    assert_eq!(
+                        validate_object(capability.as_raw_fd(), entry.key.mapped_len, PREFIX_SEALS,),
+                        Ok(entry.key)
+                    );
+                    assert_eq!(current_seals(entry.fd.as_raw_fd()), PREFIX_SEALS);
+                    assert!(entry.mapping.is_none());
+                    assert!(entry.pending_mapping.is_none());
+                    let reader =
+                        VmMapping::map(entry.fd.as_raw_fd(), entry.key.mapped_len, libc::PROT_READ)
+                            .unwrap();
+                    for offset in 0..manifest.logical_len as usize {
+                        // SAFETY: the test-only read mapping covers the exact
+                        // initialized logical range and is not writable.
+                        assert_eq!(
+                            unsafe { core::ptr::read_volatile(reader.base.as_ptr().add(offset)) },
+                            manifest.region_id as u8
+                        );
+                    }
+                }
+            }
+        }
+        drop(capabilities);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        batch.observe_drop_for_test(events.clone());
+        drop(batch);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["mixed-direction-batch-drop"]
+        );
+    }
+}
+
+#[test]
+fn mixed_direction_revalidation_rejects_a_retained_coordinator_writable_view() {
+    let mut batch = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&[
+            (1, WriterEndpoint::Coordinator, 17),
+            (2, WriterEndpoint::Receiver, 34),
+        ]),
+        NativeAuthorityProfile::LinuxMdweV1,
+        batch_deadline(),
+    )
+    .unwrap();
+    let LinuxMixedDirectionEntry::ReceiverWriter(receiver) = &mut batch.entries[1] else {
+        panic!("canonical second entry is receiver-writer");
+    };
+    let entry = &mut receiver.entries[0];
+    entry.pending_mapping = Some(
+        PendingVmMapping::map(
+            entry.fd.as_raw_fd(),
+            entry.key.mapped_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(batch.revalidate_before_send(), Err(MemfdError::WrongObject));
+}
+
+#[test]
+fn mixed_receiver_import_owns_one_canonical_pending_batch_for_one_to_sixteen() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| {
+                let writer = if id % 2 == 0 {
+                    WriterEndpoint::Coordinator
+                } else {
+                    WriterEndpoint::Receiver
+                };
+                (id as u128, writer, id * 17)
+            })
+            .collect();
+        let deadline = batch_deadline();
+        let coordinator = LinuxMixedDirectionBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        let manifest = TransferManifest::new_with_authority(
+            [0x74; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            coordinator.manifest_entries(),
+        )
+        .unwrap();
+        let expected = LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&regions),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(expected.len(), count);
+        assert_eq!(expected.deadline(), deadline);
+        assert!(expected.matches_manifest(&manifest));
+        let descriptors = duplicate_mixed_descriptors(&coordinator);
+        let mut imported = expected.import(&manifest, descriptors).unwrap();
+        assert_eq!(imported.len(), count);
+
+        for (ordinal, entry) in imported.entries.iter_mut().enumerate() {
+            let id = ordinal + 1;
+            match entry {
+                LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) => {
+                    assert_eq!(entry.manifest.region_id, id as u128);
+                    assert_eq!(current_seals(entry.fd.as_raw_fd()), FINAL_SEALS);
+                    assert!(mapping_fails(
+                        entry.fd.as_raw_fd(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        entry.key.mapped_len
+                    ));
+                    for offset in 0..entry.manifest.logical_len as usize {
+                        // SAFETY: this private imported mapping is live and
+                        // read-only for its complete logical range.
+                        assert_eq!(
+                            unsafe {
+                                core::ptr::read_volatile(entry.mapping.base.as_ptr().add(offset))
+                            },
+                            id as u8
+                        );
+                    }
+                }
+                LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) => {
+                    assert_eq!(entry.manifest.region_id, id as u128);
+                    assert_eq!(current_seals(entry.fd.as_raw_fd()), PREFIX_SEALS);
+                    for offset in 0..entry.manifest.logical_len as usize {
+                        // SAFETY: this private pending mapping was established
+                        // RW before future-write sealing and remains owner-bound.
+                        assert_eq!(
+                            unsafe {
+                                core::ptr::read_volatile(entry.mapping.base.as_ptr().add(offset))
+                            },
+                            id as u8
+                        );
+                    }
+                    // SAFETY: test-only mutation remains inside the pending
+                    // owner and does not expose runtime authority.
+                    unsafe { core::ptr::write_volatile(entry.mapping.base.as_ptr(), 0xa5) };
+                    // SAFETY: same live mapping and byte as the preceding write.
+                    assert_eq!(
+                        unsafe { core::ptr::read_volatile(entry.mapping.base.as_ptr()) },
+                        0xa5
+                    );
+                }
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        imported.observe_drop_for_test(events.clone());
+        drop(imported);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["imported-mixed-batch-drop"]
+        );
+        drop(coordinator);
+    }
+}
+
+#[test]
+fn mixed_receiver_expectation_rejects_aggregate_limits_and_wrong_manifest() {
+    let regions = [
+        (1, WriterEndpoint::Coordinator, 4096),
+        (2, WriterEndpoint::Receiver, 4096),
+    ];
+    for limits in [
+        SessionLimits {
+            max_regions_per_batch: 1,
+            ..SessionLimits::default()
+        },
+        SessionLimits {
+            max_active_regions: 1,
+            ..SessionLimits::default()
+        },
+        SessionLimits {
+            max_region_bytes: 4095,
+            ..SessionLimits::default()
+        },
+        SessionLimits {
+            max_region_bytes: 4096,
+            max_batch_bytes: 8191,
+            ..SessionLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            LinuxExpectedMixedDirectionBatch::prepare(
+                expected_batch(&regions),
+                limits,
+                batch_deadline(),
+            ),
+            Err(MemfdError::InvalidBatch)
+        ));
+    }
+
+    let page = page_align(1).unwrap() as u64;
+    let page_rounded = [
+        (1, WriterEndpoint::Coordinator, 1),
+        (2, WriterEndpoint::Receiver, 1),
+    ];
+    assert!(matches!(
+        LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&page_rounded),
+            SessionLimits {
+                max_region_bytes: 1,
+                max_batch_bytes: page,
+                max_active_bytes: page * 2,
+                ..SessionLimits::default()
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    assert!(matches!(
+        LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&page_rounded),
+            SessionLimits {
+                max_region_bytes: 1,
+                max_batch_bytes: page * 2,
+                max_active_bytes: page,
+                ..SessionLimits::default()
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+
+    let deadline = batch_deadline();
+    let coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x75; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&[
+            (1, WriterEndpoint::Receiver, 4096),
+            (2, WriterEndpoint::Coordinator, 4096),
+        ]),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    assert!(!expected.matches_manifest(&manifest));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut failure = match expected.import(&manifest, duplicate_mixed_descriptors(&coordinator)) {
+        Err(failure) => failure,
+        Ok(_) => panic!("wrong mixed manifest was accepted"),
+    };
+    assert_eq!(failure.error(), MemfdError::WrongProvenance);
+    failure.observe_drop_for_test(events.clone());
+    drop(failure);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["failed-mixed-import-drop"]
+    );
+
+    let duplicate_regions = [
+        (1, WriterEndpoint::Coordinator, 4096),
+        (2, WriterEndpoint::Coordinator, 4096),
+    ];
+    let coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&duplicate_regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x79; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&duplicate_regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let mut descriptors = duplicate_mixed_descriptors(&coordinator);
+    descriptors[1] = duplicate(&descriptors[0]).unwrap();
+    let failure = match expected.import(&manifest, descriptors) {
+        Err(failure) => failure,
+        Ok(_) => panic!("duplicate mixed object was accepted"),
+    };
+    assert_eq!(failure.error(), MemfdError::WrongObject);
+
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        core::hint::spin_loop();
+    }
+    assert!(matches!(
+        LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&duplicate_regions),
+            SessionLimits::default(),
+            expired,
+        ),
+        Err(MemfdError::DeadlineExpired)
+    ));
+
+    let short = AbsoluteDeadline::after(Duration::from_millis(100)).unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&duplicate_regions),
+        SessionLimits::default(),
+        short,
+    )
+    .unwrap();
+    let descriptors = duplicate_mixed_descriptors(&coordinator);
+    while !short.is_expired() {
+        core::hint::spin_loop();
+    }
+    let failure = match expected.import(&manifest, descriptors) {
+        Err(failure) => failure,
+        Ok(_) => panic!("expired mixed import was accepted"),
+    };
+    assert_eq!(failure.error(), MemfdError::DeadlineExpired);
+}
+
+#[test]
+#[ignore = "spawned alone by mixed_receiver_import_nth_failure_restores_resources"]
+fn isolated_mixed_receiver_import_nth_failure_helper() {
+    let baseline = process_resource_baseline();
+    let regions: Vec<_> = (1..=16)
+        .rev()
+        .map(|id| {
+            let writer = if id % 2 == 0 {
+                WriterEndpoint::Coordinator
+            } else {
+                WriterEndpoint::Receiver
+            };
+            (id as u128, writer, id * 17)
+        })
+        .collect();
+    for invalid in [1, 2, 4, 16] {
+        let deadline = batch_deadline();
+        let coordinator = LinuxMixedDirectionBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        let manifest = TransferManifest::new_with_authority(
+            [0x76; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            coordinator.manifest_entries(),
+        )
+        .unwrap();
+        let expected = LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&regions),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        let mut descriptors = duplicate_mixed_descriptors(&coordinator);
+        descriptors[invalid - 1] = std::fs::File::open("/dev/null").unwrap().into();
+        let failure = match expected.import(&manifest, descriptors) {
+            Err(failure) => failure,
+            Ok(_) => panic!("invalid mixed descriptor was accepted"),
+        };
+        assert_eq!(failure.error(), MemfdError::InvalidObject);
+        drop(failure);
+        drop(coordinator);
+        assert_eq!(process_resource_baseline(), baseline, "invalid {invalid}");
+    }
+
+    for operation in [1, 17, 32] {
+        let deadline = batch_deadline();
+        let coordinator = LinuxMixedDirectionBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        let manifest = TransferManifest::new_with_authority(
+            [0x77; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            coordinator.manifest_entries(),
+        )
+        .unwrap();
+        let mut expected = LinuxExpectedMixedDirectionBatch::prepare(
+            expected_batch(&regions),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        expected.fail_advice_at_for_test(operation);
+        let failure = match expected.import(&manifest, duplicate_mixed_descriptors(&coordinator)) {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected mixed import advice failure was ignored"),
+        };
+        assert_eq!(failure.error(), MemfdError::Native(libc::EIO));
+        drop(failure);
+        drop(coordinator);
+        assert_eq!(
+            process_resource_baseline(),
+            baseline,
+            "advice operation {operation}"
+        );
+    }
+
+    let deadline = batch_deadline();
+    let coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x78; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let imported = expected
+        .import(&manifest, duplicate_mixed_descriptors(&coordinator))
+        .unwrap();
+    drop(imported);
+    drop(coordinator);
+    assert_eq!(process_resource_baseline(), baseline);
+}
+
+#[test]
+fn mixed_receiver_import_nth_failure_restores_resources() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_mixed_receiver_import_nth_failure_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "spawned alone by mixed_direction_batch_nth_failure_restores_resources"]
+fn isolated_mixed_direction_batch_nth_failure_helper() {
+    let baseline = process_resource_baseline();
+    let regions: Vec<_> = (1..=16)
+        .rev()
+        .map(|id| {
+            let writer = if id % 2 == 0 {
+                WriterEndpoint::Coordinator
+            } else {
+                WriterEndpoint::Receiver
+            };
+            (id as u128, writer, id * 17)
+        })
+        .collect();
+    for failure in [1, 2, 4, 16] {
+        assert!(matches!(
+            LinuxMixedDirectionBatch::prepare_with_failure_for_test(
+                portable_batch(&regions),
+                NativeAuthorityProfile::LinuxMdweV1,
+                batch_deadline(),
+                failure,
+            ),
+            Err(MemfdError::Native(libc::EIO))
+        ));
+        assert_eq!(process_resource_baseline(), baseline, "failure {failure}");
+    }
+
+    let prepared = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        batch_deadline(),
+    )
+    .unwrap();
+    drop(prepared);
+    assert_eq!(process_resource_baseline(), baseline);
+}
+
+#[test]
+fn mixed_direction_batch_nth_failure_restores_resources() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_mixed_direction_batch_nth_failure_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn mixed_direction_batch_rejects_profile_and_expiry_before_native_preparation() {
+    assert!(matches!(
+        LinuxMixedDirectionBatch::prepare(
+            portable_batch(&[
+                (1, WriterEndpoint::Coordinator, 1),
+                (2, WriterEndpoint::Receiver, 1),
+            ]),
+            NativeAuthorityProfile::Legacy,
+            batch_deadline(),
+        ),
+        Err(MemfdError::WrongProvenance)
+    ));
+
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        core::hint::spin_loop();
+    }
+    assert!(matches!(
+        LinuxMixedDirectionBatch::prepare(
+            portable_batch(&[
+                (1, WriterEndpoint::Coordinator, 1),
+                (2, WriterEndpoint::Receiver, 1),
+            ]),
+            NativeAuthorityProfile::LinuxMdweV1,
+            expired,
+        ),
+        Err(MemfdError::DeadlineExpired)
+    ));
+}
+
+#[test]
+fn coordinator_writer_batch_rejects_profile_direction_and_object_substitution() {
+    assert!(matches!(
+        LinuxCoordinatorWriterBatch::prepare(
+            portable_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            NativeAuthorityProfile::Legacy,
+            batch_deadline(),
+        ),
+        Err(MemfdError::WrongProvenance)
+    ));
+    assert!(matches!(
+        LinuxCoordinatorWriterBatch::prepare(
+            portable_batch(&[(1, WriterEndpoint::Receiver, 1)]),
+            NativeAuthorityProfile::LinuxMdweV1,
+            batch_deadline(),
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+
+    let mut batch = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&[
+            (1, WriterEndpoint::Coordinator, 1),
+            (2, WriterEndpoint::Coordinator, 1),
+        ]),
+        NativeAuthorityProfile::LinuxMdweV1,
+        batch_deadline(),
+    )
+    .unwrap();
+    batch.entries[0].prepared.reader_capability =
+        duplicate(&batch.entries[1].prepared.reader_capability).unwrap();
+    assert_eq!(batch.revalidate(), Err(MemfdError::WrongObject));
+}
+
+#[test]
+fn receiver_expectation_rejects_direction_limits_and_expired_deadline_locally() {
+    let limits = SessionLimits {
+        max_regions_per_batch: 2,
+        max_region_bytes: 4096,
+        max_batch_bytes: 8192,
+        ..SessionLimits::default()
+    };
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Receiver, 1)]),
+            limits,
+            batch_deadline(),
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 4097)]),
+            limits,
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[
+                (1, WriterEndpoint::Coordinator, 1),
+                (2, WriterEndpoint::Coordinator, 1),
+            ]),
+            SessionLimits {
+                max_active_regions: 1,
+                ..limits
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            SessionLimits {
+                max_active_bytes: 4095,
+                ..limits
+            },
+            batch_deadline(),
+        ),
+        Err(MemfdError::InvalidBatch)
+    ));
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        core::hint::spin_loop();
+    }
+    assert!(matches!(
+        LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            limits,
+            expired,
+        ),
+        Err(MemfdError::DeadlineExpired)
+    ));
+}
+
+#[test]
+fn receiver_imports_exact_final_sealed_objects_and_rejects_ordinal_substitution() {
+    let regions = [
+        (1, WriterEndpoint::Coordinator, 17),
+        (2, WriterEndpoint::Coordinator, 8193),
+    ];
+    let deadline = batch_deadline();
+    let coordinator = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x61; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    assert!(expected.matches_manifest(&manifest));
+    let descriptors = coordinator
+        .entries
+        .iter()
+        .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+        .collect();
+    let imported = expected.import(&manifest, descriptors).unwrap();
+    assert_eq!(imported.len(), 2);
+    for (ordinal, (id, _, logical_len)) in regions.into_iter().enumerate() {
+        for offset in 0..logical_len {
+            assert_eq!(imported.read_for_test(ordinal, offset), id as u8);
+        }
+        let (_, _, mapped_len) = imported.object_key_for_test(ordinal);
+        assert!(mapping_fails(
+            imported.descriptor_for_test(ordinal).as_raw_fd(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            mapped_len,
+        ));
+    }
+
+    let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let descriptors = coordinator
+        .entries
+        .iter()
+        .rev()
+        .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+        .collect();
+    assert!(matches!(
+        expected.import(&manifest, descriptors),
+        Err(failure) if failure.error() == MemfdError::InvalidObject
+    ));
+}
+
+#[test]
+fn receiver_writer_batches_import_before_final_sealing_for_one_to_sixteen() {
+    for count in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=count)
+            .rev()
+            .map(|id| (id as u128, WriterEndpoint::Receiver, id * 17))
+            .collect();
+        let deadline = batch_deadline();
+        let mut coordinator = LinuxReceiverWriterBatch::prepare(
+            portable_batch(&regions),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        )
+        .unwrap();
+        coordinator.revalidate_prefix().unwrap();
+        let manifest = TransferManifest::new_with_authority(
+            [0x71; 32],
+            10,
+            11,
+            1,
+            NativeAuthorityProfile::LinuxMdweV1,
+            coordinator.manifest_entries(),
+        )
+        .unwrap();
+        let canonical: Vec<_> = (1..=count)
+            .map(|id| (id as u128, WriterEndpoint::Receiver, id * 17))
+            .collect();
+        let expected = LinuxExpectedReceiverWriterBatch::prepare(
+            expected_batch(&canonical),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        assert!(expected.matches_manifest(&manifest));
+        let descriptors = coordinator
+            .entries
+            .iter()
+            .map(|entry| duplicate(&entry.fd).unwrap())
+            .collect();
+        let mut imported = expected.import(&manifest, descriptors).unwrap();
+        assert_eq!(imported.len(), count);
+        for entry in &coordinator.entries {
+            assert_eq!(current_seals(entry.fd.as_raw_fd()), PREFIX_SEALS);
+            assert!(!mapping_fails(
+                entry.fd.as_raw_fd(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                entry.key.mapped_len,
+            ));
+        }
+
+        coordinator.seal_after_import().unwrap();
+        imported.verify_final_seals(deadline).unwrap();
+        for ordinal in 0..count {
+            let logical_len = (ordinal + 1) * 17;
+            assert_eq!(
+                current_seals(imported.descriptor_for_test(ordinal).as_raw_fd()),
+                FINAL_SEALS
+            );
+            assert!(mapping_fails(
+                imported.descriptor_for_test(ordinal).as_raw_fd(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                coordinator.entries[ordinal].key.mapped_len,
+            ));
+            for offset in 0..logical_len {
+                imported.write_for_test(ordinal, offset, (ordinal + 1) as u8);
+                assert_eq!(
+                    coordinator.read_for_test(ordinal, offset),
+                    (ordinal + 1) as u8
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn receiver_writer_expectation_and_preparation_reject_wrong_direction_locally() {
+    let deadline = batch_deadline();
+    assert!(matches!(
+        LinuxReceiverWriterBatch::prepare(
+            portable_batch(&[(1, WriterEndpoint::Coordinator, 17)]),
+            NativeAuthorityProfile::LinuxMdweV1,
+            deadline,
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+    assert!(matches!(
+        LinuxExpectedReceiverWriterBatch::prepare(
+            expected_batch(&[(1, WriterEndpoint::Coordinator, 17)]),
+            SessionLimits::default(),
+            deadline,
+        ),
+        Err(MemfdError::UnsupportedDirection)
+    ));
+}
+
+#[test]
+#[ignore = "spawned alone by coordinator_writer_batch_rejects_expired_deadline_before_native_conversion"]
+fn isolated_coordinator_writer_batch_rejects_expired_deadline_before_native_conversion() {
+    let baseline = process_resource_baseline();
+    let expired = AbsoluteDeadline::after(Duration::from_millis(1)).unwrap();
+    while !expired.is_expired() {
+        core::hint::spin_loop();
+    }
+    assert!(matches!(
+        LinuxCoordinatorWriterBatch::prepare(
+            portable_batch(&[(1, WriterEndpoint::Coordinator, 1)]),
+            NativeAuthorityProfile::LinuxMdweV1,
+            expired,
+        ),
+        Err(MemfdError::DeadlineExpired)
+    ));
+    assert_eq!(process_resource_baseline(), baseline);
+}
+
+#[test]
+fn coordinator_writer_batch_rejects_expired_deadline_before_native_conversion() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_coordinator_writer_batch_rejects_expired_deadline_before_native_conversion",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn coordinator_writer_batch_drop_clears_pending_shared_bytes() {
+    let batch = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&[(1, WriterEndpoint::Coordinator, 73)]),
+        NativeAuthorityProfile::LinuxMdweV1,
+        batch_deadline(),
+    )
+    .unwrap();
+    let mapped_len = batch.entries[0].prepared.mapping.len;
+    let retained = duplicate(&batch.entries[0].prepared.reader_capability).unwrap();
+    drop(batch);
+
+    let cleared = VmMapping::map(retained.as_raw_fd(), mapped_len, libc::PROT_READ).unwrap();
+    for offset in 0..mapped_len {
+        // SAFETY: the retained read-only mapping covers this complete range.
+        assert_eq!(
+            unsafe { core::ptr::read_volatile(cleared.base.as_ptr().add(offset)) },
+            0
+        );
+    }
+}
+
+fn process_resource_baseline() -> (usize, usize) {
+    let fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        // Sanitizer runtimes may lazily add unrelated process mappings. This
+        // baseline is specifically responsible for vNext memfd VM ownership.
+        .filter(|line| line.contains("native-ipc-vnext"))
+        .count();
+    (fds, maps)
+}
+
+#[test]
+#[ignore = "spawned alone by coordinator_writer_batch_nth_failure_restores_resources"]
+fn isolated_coordinator_writer_batch_nth_failure_helper() {
+    let baseline = process_resource_baseline();
+    for failure in [1, 2, 4, 16] {
+        let regions: Vec<_> = (1..=16)
+            .map(|id| {
+                let writer = if id == failure {
+                    WriterEndpoint::Receiver
+                } else {
+                    WriterEndpoint::Coordinator
+                };
+                (id as u128, writer, id * 17)
+            })
+            .collect();
+        assert!(matches!(
+            LinuxCoordinatorWriterBatch::prepare(
+                portable_batch(&regions),
+                NativeAuthorityProfile::LinuxMdweV1,
+                batch_deadline(),
+            ),
+            Err(MemfdError::UnsupportedDirection)
+        ));
+        assert_eq!(process_resource_baseline(), baseline, "failure {failure}");
+    }
+}
+
+#[test]
+fn coordinator_writer_batch_nth_failure_restores_resources() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_coordinator_writer_batch_nth_failure_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "spawned alone by receiver_import_nth_failure_restores_resources"]
+fn isolated_receiver_import_nth_failure_helper() {
+    let regions: Vec<_> = (1..=16)
+        .map(|id| (id as u128, WriterEndpoint::Coordinator, id * 17))
+        .collect();
+    let deadline = batch_deadline();
+    let coordinator = LinuxCoordinatorWriterBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x62; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let baseline = process_resource_baseline();
+    for failure in [1, 2, 4, 16] {
+        let expected = LinuxExpectedCoordinatorWriterBatch::prepare(
+            expected_batch(&regions),
+            SessionLimits::default(),
+            deadline,
+        )
+        .unwrap();
+        let mut descriptors: Vec<OwnedFd> = coordinator
+            .entries
+            .iter()
+            .map(|entry| duplicate(&entry.prepared.reader_capability).unwrap())
+            .collect();
+        descriptors[failure - 1] = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(matches!(
+            expected.import(&manifest, descriptors),
+            Err(failure) if failure.error() == MemfdError::InvalidObject
+        ));
+        assert_eq!(process_resource_baseline(), baseline, "failure {failure}");
+    }
+}
+
+#[test]
+fn receiver_import_nth_failure_restores_resources() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "backend::linux_vnext::memory::tests::isolated_receiver_import_nth_failure_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

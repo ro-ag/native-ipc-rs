@@ -113,6 +113,124 @@ barrier transitions. This prevents two transactions from interleaving frames;
 any malformed, stale, timed-out, or ambiguous transition poisons the session
 and keeps all pending runtime wrappers private.
 
+The private Linux G1c checkpoint keeps accepted application-control and native
+capability traffic in one `AcceptedControlDispatcher`. Sealed role-specific
+transport traits let only the coordinator send the first canonical capability
+record while the receiver can only await it. A transaction guard borrows that
+owner, stores the caller's one absolute deadline, and owns every installed fd.
+The dispatcher retains the immutable accepted nonce, authenticated parent and
+child identities, and negotiated limits; it alone mints monotonically
+increasing transaction IDs and the canonical capability frame. Callers provide
+only candidate manifest entries and cannot substitute accepted provenance or a
+wire frame. Local manifest validation occurs before transaction entry and does
+not consume an ID, while negotiated transaction exhaustion poisons the owner.
+The guard never yields the socket, pidfd, executable, evidence, or descriptors.
+Until the manifest-bound import/seal and READY/COMMIT reducer exists, it has no
+production completion operation and its destruction persistently poisons the
+session. This is a terminal provenance/transport ownership checkpoint, not an
+active batch.
+
+The private Linux G1d checkpoint also binds one exact native-authority profile
+into the canonical capability transcript. Only the role-scoped accepted Linux
+evidence owners select `LinuxMdweV1`; ordinary transaction callers cannot
+provide or replace it. The profile records inherited irreversible MDWE,
+non-executable library views, and the accepted Linux RX-alias and pre-seal
+receiver-writer delegation limitations. The accepted dispatcher rejects the
+legacy zero profile before native I/O, and exact frame comparison rejects peer
+profile substitution. This session policy fact is not proof that any individual
+memfd has completed import, final sealing, mapping, READY, or COMMIT.
+
+The private Linux G1e coordinator entry point consumes one complete portable
+`TransferBatch`. It derives every manifest entry from the transaction-owned
+`PreparedRegion` metadata and retains all prepared regions beside the native
+transaction guard; the raw-entry coordinator constructor exists only in tests.
+Empty batches fail before transaction entry or ID consumption, and abandoned
+guards poison before their retained batch is destroyed. The internal send step
+receives a separately prepared native capability collection only in tests; the
+production Linux entry point is superseded by G1f. G1e alone does not prove
+descriptor-to-object identity or constitute the complete Linux prepared-memory
+adapter.
+
+Linux G1f-a converts a retained all-coordinator-writer `TransferBatch` into one
+private native batch before any capability escapes. Conversion preserves the
+initialized memfd contents, canonicalizes by `RegionId`, installs and verifies
+`F_SEAL_EXEC | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_FUTURE_WRITE |
+F_SEAL_SEAL`, and retains both the original coordinator writer mapping and one
+same-object exported descriptor per canonical ordinal. The original and export
+are revalidated against the same device/inode/length key immediately before
+send. Pending drop clears the complete shared mapping according to
+`ClearThenRelease` before closing it. Receiver-writer entries fail locally in
+this slice; their IMPORTED/SEALED ordering remains separate work.
+
+Linux G1f-b moves that native batch into a wrapper whose first field is the
+accepted-owner transaction guard and whose second field is the complete native
+batch. Thus abandonment or send failure poisons the inseparable session before
+any pending mapping or fd is destroyed. Preparation, transaction entry,
+pre-send revalidation, and native send carry one exactly equal caller-derived
+absolute deadline; replacement deadlines fail before transaction entry. The
+wrapper constructs the borrowed fd slice from its own canonical batch and never
+accepts caller-provided descriptors or exposes the endpoint. There is still no
+production completion operation, receiver native import, or READY/COMMIT.
+Independent review found and closed both production substitution paths through
+the older raw-entry and prepared-batch test scaffolds. Linux-specific event
+tests also prove transport poison precedes native-batch cleanup on abandonment
+and injected pre-send revalidation failure.
+
+Linux G1g adds the complementary terminal receiver owner for
+coordinator-writer batches. A private application-neutral `ExpectedBatch` is
+canonical and complete before receipt but contains no coordinator-minted
+incarnation or native authority. The accepted receiver alone enters the
+transaction, performs one exact credential-bound receive for the expected fd
+count, decodes the fixed capability frame, and matches accepted session facts,
+transaction ID, authority profile, negotiated batch and fresh-session active
+limits, IDs, writer/access direction, logical/page-rounded lengths, ordinals,
+flags, and totals. It then verifies final seals and anonymous-object properties,
+creates only read-only mappings, and retains every fd/mapping inside the
+terminal transaction. Failed import ownership retains partial mappings and all
+remaining installed fds until after session poison. G1g does not yet charge an
+ongoing active-resource ledger, activate mappings, support receiver-writer
+entries, or implement IMPORTED/SEALED/READY/COMMIT or public receiver APIs.
+
+Linux G1h adds the receiver-writer-only preparation subprotocol without
+activating a batch. The coordinator consumes and canonicalizes the complete
+portable batch, installs and verifies execute/grow/shrink seals, and destroys
+every coordinator writable mapping before its accepted owner can send the
+capabilities. The receiver validates the exact expected batch under prefix
+seals, creates all RW mappings, and sends `NIPCIMP1` carrying the exact full
+manifest with zero rights. Only the accepted coordinator owner can consume that
+receipt; it immediately installs and verifies future-write plus final seals,
+continuing best-effort attenuation across every remaining escaped fd if one
+seal step fails. Only after the complete batch is final-sealed does it create
+read-only pending mappings and send exact zero-rights `NIPCSEA1`. The
+receiver revalidates every final seal before retaining the still-pending batch.
+Both preparation frames are derived internally from the transaction's canonical
+capability frame, use the same caller deadline, and cannot be replaced with
+application control. Every success and failure remains terminal and poisons on
+guard destruction. G1h does not combine writer directions, end the transaction,
+charge ongoing active leases, expose mappings, or implement batch READY/COMMIT
+or public APIs.
+
+Linux G1i-a introduces the private native owner needed before mixed accepted
+transfer. `LinuxMixedDirectionBatch` consumes one complete portable batch,
+canonicalizes it by region ID, and retains every entry inside its existing
+direction-specific native owner. Its only production observations are the
+canonical manifest entries, one borrowed capability view in that same order,
+the original absolute deadline, and whole-batch pre-send revalidation. It does
+not extract an fd or mapping, send on accepted control, perform IMPORTED/SEALED,
+or expose pending/runtime authority. The later mixed accepted reducer must
+consume this owner and preserve full-batch attenuation before mapping work.
+
+Linux G1i-b adds the matching private receiver-side native pending owner, still
+without accepted-session integration. One pre-receipt mixed expectation checks
+the complete negotiated count, logical-byte, mapped-byte, and active-resource
+limits before any descriptor is accepted. Import immediately owns the complete
+descriptor vector, validates canonical direction/access/length/ordinal shape,
+rejects duplicate native objects, and creates a read-only pending mapping for
+coordinator-writer entries or a writable pending mapping for receiver-writer
+entries. Every partial fd and mapping remains in either the successful mixed
+owner or one consuming failure owner. Neither exposes payload/runtime methods;
+the later accepted reducer must consume them under its stored deadline.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte
