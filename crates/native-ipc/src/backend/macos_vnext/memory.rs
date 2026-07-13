@@ -253,6 +253,10 @@ impl MacMixedDirectionBatch {
             .collect()
     }
 
+    pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
+        self.deadline
+    }
+
     pub(crate) fn revalidate_before_send(&self) -> Result<(), MacBatchError> {
         check_deadline(self.deadline)?;
         validate_prepared_entries(&self.entries, self.deadline)
@@ -437,6 +441,17 @@ impl MacExpectedMixedDirectionBatch {
                         && received.ordinal as usize == ordinal
                 },
             )
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .map(|entry| entry.mapped_len as u64)
+            .collect()
     }
 
     pub(crate) fn import(

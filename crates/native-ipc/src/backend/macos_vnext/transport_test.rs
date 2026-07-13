@@ -46,7 +46,7 @@ assert_impl_all!(MacReceivedCapabilities: Send);
 assert_not_impl_any!(MacReceivedCapabilities: Sync);
 assert_not_impl_any!(MacReceivedCapabilities: Clone);
 
-fn deadline() -> AbsoluteDeadline {
+pub(super) fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(20)).unwrap()
 }
 
@@ -86,7 +86,9 @@ fn accepted_transcript(nonce: [u8; 32]) -> AcceptedTranscriptFacts {
     transcript.take_accepted_facts().unwrap()
 }
 
-fn coordinator_transport(channel: bootstrap::ParentChannel) -> CoordinatorMacControlTransport {
+pub(super) fn coordinator_transport(
+    channel: bootstrap::ParentChannel,
+) -> CoordinatorMacControlTransport {
     let nonce = channel.vnext_nonce();
     let facts =
         SpawnIdentityFacts::new(std::process::id(), channel.peer_pid(), 0, 0, 0, 0, nonce).unwrap();
@@ -125,7 +127,7 @@ fn coordinator_evidence(facts: SpawnIdentityFacts) -> CoordinatorAcceptedEvidenc
     .unwrap()
 }
 
-fn receiver_transport(channel: bootstrap::ChildChannel) -> ReceiverMacControlTransport {
+pub(super) fn receiver_transport(channel: bootstrap::ChildChannel) -> ReceiverMacControlTransport {
     let nonce = channel.vnext_nonce();
     let facts = SpawnIdentityFacts::new(
         channel.vnext_parent_pid(),
@@ -150,7 +152,7 @@ fn receiver_transport(channel: bootstrap::ChildChannel) -> ReceiverMacControlTra
     transport
 }
 
-fn spawn_helper(test: &str) -> bootstrap::ParentChannel {
+pub(super) fn spawn_helper(test: &str) -> bootstrap::ParentChannel {
     let executable = std::env::current_exe().unwrap();
     let path = CString::new(executable.as_os_str().as_bytes()).unwrap();
     let arguments = [

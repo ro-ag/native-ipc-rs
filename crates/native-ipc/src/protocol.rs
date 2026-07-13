@@ -19,13 +19,13 @@ const COORDINATOR_PREPARATION_FAILED_MAGIC: [u8; 8] = *b"NIPCCPF1";
 const RECEIVER_CAPACITY_READY_MAGIC: [u8; 8] = *b"NIPCRPR1";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const RECEIVER_CAPACITY_REJECT_MAGIC: [u8; 8] = *b"NIPCRPJ1";
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const IMPORTED_MAGIC: [u8; 8] = *b"NIPCIMP1";
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
@@ -156,8 +156,8 @@ pub(crate) struct CapabilityFrame {
     capability_count: usize,
 }
 
-/// Exact full-manifest Linux preparation receipt kind.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Exact full-manifest preparation receipt kind.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparationFrameKind {
     Imported,
@@ -166,13 +166,13 @@ pub(crate) enum PreparationFrameKind {
 
 /// Zero-rights preparation frame derived only from a canonical capability
 /// frame retained by the accepted transaction owner.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) struct PreparationFrame {
     bytes: [u8; CONTROL_FRAME_LEN],
 }
 
 /// Exact full-manifest transaction completion barrier kind.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompletionFrameKind {
     Ready,
@@ -181,7 +181,7 @@ pub(crate) enum CompletionFrameKind {
 
 /// Zero-rights READY or COMMIT frame derived only from the canonical
 /// capability frame retained by the accepted transaction owner.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) struct CompletionFrame {
     bytes: [u8; CONTROL_FRAME_LEN],
 }
@@ -202,7 +202,7 @@ pub(crate) enum CoordinatorCapacityStatus {
 
 #[allow(
     dead_code,
-    reason = "private G1b capability transport is currently implemented only on Linux"
+    reason = "private accepted reducers remain unreachable until public target composition"
 )]
 impl CapabilityFrame {
     pub(crate) fn from_manifest(manifest: &TransferManifest) -> Self {
@@ -287,7 +287,7 @@ impl CapabilityFrame {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     pub(crate) fn completion_frame(&self, kind: CompletionFrameKind) -> CompletionFrame {
         let (_, manifest) = Self::decode(&self.bytes)
             .expect("capability frames are constructed from canonical manifests");
@@ -314,7 +314,7 @@ impl CapacityFrame {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 impl PreparationFrame {
     pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
         &self.bytes
@@ -325,7 +325,7 @@ impl PreparationFrame {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 impl CompletionFrame {
     pub(crate) const fn as_bytes(&self) -> &[u8; CONTROL_FRAME_LEN] {
         &self.bytes

@@ -446,6 +446,8 @@ pub struct ParentChannel {
 struct MacChildLifecycleState {
     reaped: bool,
     last_error: Option<i32>,
+    #[cfg(test)]
+    exit_status: Option<i32>,
 }
 
 struct MacChildLifecycleShared {
@@ -472,6 +474,8 @@ impl MacChildLifecycle {
             state: Mutex::new(MacChildLifecycleState {
                 reaped: false,
                 last_error: None,
+                #[cfg(test)]
+                exit_status: None,
             }),
             changed: Condvar::new(),
             #[cfg(test)]
@@ -496,6 +500,11 @@ impl MacChildLifecycle {
         } else {
             Ok(PeerState::Running)
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn exited_successfully_for_test(&self) -> bool {
+        lock_lifecycle(&self.shared.state).exit_status == Some(0)
     }
 
     pub(super) fn terminate_and_reap(
@@ -1484,6 +1493,10 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
         if result == shared.pid {
             let mut state = lock_lifecycle(&shared.state);
             state.reaped = true;
+            #[cfg(test)]
+            {
+                state.exit_status = Some(status);
+            }
             shared.changed.notify_all();
             return;
         }
