@@ -10,7 +10,8 @@ use crate::session::{AbsoluteDeadline, SessionLimits};
 use std::mem::zeroed;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
-    HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE, INVALID_HANDLE_VALUE,
+    HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE, INVALID_HANDLE_VALUE,
+    SetHandleInformation,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
@@ -338,7 +339,33 @@ fn split_reserved_tail_cannot_bypass_exact_allocation_size() {
 }
 
 #[test]
-fn inherited_and_protected_handles_are_rejected_and_closed() {
+fn inherited_and_protected_raw_handles_are_rejected_and_closed() {
+    for flag in [HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE] {
+        let (batch, _) = build_batch(1);
+        let prepared = WindowsMixedDirectionBatch::prepare(
+            batch,
+            NativeAuthorityProfile::WindowsSectionsV1,
+            deadline(),
+        )
+        .unwrap();
+        let before = live_handles_for_test();
+        let raw = prepared.duplicate_raw_capability_for_test(0).unwrap();
+        let mask = HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE;
+        // SAFETY: DuplicateHandle just installed this live test-owned handle.
+        assert_ne!(
+            unsafe { SetHandleInformation(raw as HANDLE, mask, flag) },
+            0
+        );
+        assert!(matches!(
+            unsafe { WindowsReceivedHandle::from_raw(raw) },
+            Err(WindowsBatchError::WrongAccess)
+        ));
+        assert_eq!(live_handles_for_test(), before);
+    }
+}
+
+#[test]
+fn flags_added_after_adoption_are_rejected_and_closed() {
     for flag in [HANDLE_FLAG_INHERIT, HANDLE_FLAG_PROTECT_FROM_CLOSE] {
         let (batch, expected) = build_batch(1);
         let prepared = WindowsMixedDirectionBatch::prepare(

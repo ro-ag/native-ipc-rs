@@ -463,6 +463,23 @@ impl WindowsMixedDirectionBatch {
     }
 
     #[cfg(test)]
+    pub(crate) fn duplicate_raw_capability_for_test(
+        &self,
+        ordinal: usize,
+    ) -> Result<usize, WindowsBatchError> {
+        let entry = self
+            .entries
+            .get(ordinal)
+            .ok_or(WindowsBatchError::InvalidBatch)?;
+        Ok(duplicate_to(
+            entry.section(),
+            unsafe { GetCurrentProcess() },
+            entry.peer_access(),
+        )?
+        .0)
+    }
+
+    #[cfg(test)]
     pub(crate) fn write_coordinator_for_test(&mut self, ordinal: usize, offset: usize, value: u8) {
         let PreparedEntry::CoordinatorWriter(entry) = &mut self.entries[ordinal] else {
             panic!("test write requires a coordinator-writer entry");
@@ -492,19 +509,19 @@ impl WindowsReceivedHandle {
     /// `handle` must be a newly installed, non-pseudo handle owned by this
     /// process and must not have any other Rust owner.
     pub(crate) unsafe fn from_raw(handle: usize) -> Result<Self, WindowsBatchError> {
-        let handle = OwnedHandle::new(handle as HANDLE)?;
-        let flags = match handle_flags(handle.0) {
+        let handle = SectionHandle::new(OwnedHandle::new(handle as HANDLE)?);
+        let flags = match handle_flags(handle.raw()) {
             Ok(flags) => flags,
             Err(error) => {
-                clear_handle_flags(handle.0)?;
+                clear_handle_flags(handle.raw())?;
                 return Err(error);
             }
         };
         if flags != 0 {
-            clear_handle_flags(handle.0)?;
+            clear_handle_flags(handle.raw())?;
             return Err(WindowsBatchError::WrongAccess);
         }
-        Ok(Self(SectionHandle::new(handle)))
+        Ok(Self(handle))
     }
 
     fn raw(&self) -> HANDLE {
