@@ -57,6 +57,28 @@ Versioning once a stable API is released.
   reap, and native evidence obligations. The investigation also proves that
   the service alone is insufficient across supervisor crash, so the
   architecture and public macOS path remain blocked.
+- Pin the macOS helper's complete kernel audit token at private bootstrap
+  authentication and require every later vNext record to carry the identical
+  token. A helper `exec` keeps the numeric PID but changes the audit PID
+  version, so post-exec records now fail closed with an identity mismatch
+  instead of passing the PID-only trailer check. The receiver symmetrically
+  pins the coordinator token at its first authenticated record.
+- Record the primary-source public-API impossibility evidence for
+  crash-surviving exact macOS containment in
+  `docs/macos-supervisor-boundary.md`: no documented public mechanism binds a
+  reuse-proof process identity to a termination primitive, launchd cleanup is
+  process-group scoped and `setsid`-escapable, and no public sandbox
+  entitlement denies fork. Public macOS composition remains fail-closed.
+
+### Fixed
+
+- Fix a macOS private-prototype negotiation race where a receiver that sent
+  its validated ACCEPT and exited before the coordinator's live-image recheck
+  poisoned the completed negotiation with `PeerExited`. The queued bilateral
+  decision now wins: a failed live-image lookup is honored only after the
+  sole-waiter lifecycle confirms the exact child's reap, live re-exec still
+  fails closed as an identity mismatch, and only an `ESRCH` process lookup is
+  reported as peer exit.
 
 ### Changed
 

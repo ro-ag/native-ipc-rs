@@ -136,7 +136,7 @@ struct MachMsgPortDescriptor {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct AuditToken {
     values: [u32; 8],
 }
@@ -467,6 +467,7 @@ impl SpawnedHelper {
             _receive: receive,
             nonce: self.nonce,
             peer_pid,
+            peer_audit: Some(child_audit),
             reaped: true,
             pending_entries: Vec::new(),
             channel_id: mint_channel_id(),
@@ -509,6 +510,7 @@ impl SpawnedHelper {
             _receive: receive,
             nonce: self.nonce,
             peer_pid: self.pid as u32,
+            peer_audit: None,
             reaped: false,
             pending_entries: Vec::new(),
             channel_id: mint_channel_id(),
@@ -547,6 +549,7 @@ pub struct ParentChannel {
     _receive: ReceiveRight,
     nonce: [u8; 32],
     peer_pid: u32,
+    peer_audit: Option<AuditToken>,
     reaped: bool,
     pending_entries: Vec<ManifestEntry>,
     channel_id: u64,
@@ -796,6 +799,7 @@ impl ParentChannel {
             &self._receive,
             &self.nonce,
             self.peer_pid,
+            self.peer_audit.as_ref(),
             maximum,
             deadline,
         )?;
@@ -848,6 +852,7 @@ impl ParentChannel {
             &self._receive,
             &self.nonce,
             self.peer_pid,
+            self.peer_audit.as_ref(),
             maximum,
             deadline,
         )?;
@@ -1000,6 +1005,7 @@ pub struct ChildChannel {
     receive: ReceiveRight,
     nonce: [u8; 32],
     parent_pid: u32,
+    parent_audit: Option<AuditToken>,
     pending_entries: Vec<ManifestEntry>,
     channel_id: u64,
     next_transfer_id: u64,
@@ -1050,6 +1056,7 @@ impl ChildChannel {
             receive,
             nonce,
             parent_pid,
+            parent_audit: None,
             pending_entries: Vec::new(),
             channel_id: mint_channel_id(),
             next_transfer_id: 1,
@@ -1089,9 +1096,13 @@ impl ChildChannel {
             &self.receive,
             &self.nonce,
             self.parent_pid,
+            self.parent_audit.as_ref(),
             maximum,
             deadline,
         )?;
+        // Pin the coordinator execution identity at the first authenticated
+        // record; every later record must carry the identical complete token.
+        self.parent_audit.get_or_insert(record.audit);
         if record.kind != VnextRecordKind::ZeroRights || !record.rights.is_empty() {
             return Err(SessionTransportError::MalformedRecord);
         }
@@ -1123,9 +1134,13 @@ impl ChildChannel {
             &self.receive,
             &self.nonce,
             self.parent_pid,
+            self.parent_audit.as_ref(),
             maximum,
             deadline,
         )?;
+        // Pin the coordinator execution identity at the first authenticated
+        // record; every later record must carry the identical complete token.
+        self.parent_audit.get_or_insert(record.audit);
         if record.kind != VnextRecordKind::Capabilities || record.rights.is_empty() {
             return Err(SessionTransportError::MalformedRecord);
         }
@@ -1393,6 +1408,7 @@ struct ReceivedVnextRecord {
     kind: VnextRecordKind,
     bytes: Vec<u8>,
     rights: Vec<SendRight>,
+    audit: AuditToken,
 }
 
 fn send_vnext_message(
@@ -1529,6 +1545,7 @@ fn receive_vnext_message(
     receive: &ReceiveRight,
     nonce: &[u8; 32],
     expected_pid: u32,
+    expected_audit: Option<&AuditToken>,
     maximum: usize,
     deadline: AbsoluteDeadline,
 ) -> Result<ReceivedVnextRecord, SessionTransportError> {
@@ -1575,7 +1592,14 @@ fn receive_vnext_message(
         destroy_received_if_complex(bytes);
         return Err(SessionTransportError::DeadlineExpired);
     }
-    parse_vnext_message(bytes, receive.0, nonce, expected_pid, maximum)
+    parse_vnext_message(
+        bytes,
+        receive.0,
+        nonce,
+        expected_pid,
+        expected_audit,
+        maximum,
+    )
 }
 
 fn parse_vnext_message(
@@ -1583,6 +1607,7 @@ fn parse_vnext_message(
     expected_receive: MachPort,
     nonce: &[u8; 32],
     expected_pid: u32,
+    expected_audit: Option<&AuditToken>,
     maximum: usize,
 ) -> Result<ReceivedVnextRecord, SessionTransportError> {
     let header =
@@ -1628,6 +1653,14 @@ fn parse_vnext_message(
     // SAFETY: the checked complete audit trailer was supplied by the kernel.
     let actual_pid = unsafe { audit_token_to_pid(trailer.audit) } as u32;
     if actual_pid != expected_pid {
+        destroy_received_if_complex(bytes);
+        return Err(SessionTransportError::IdentityMismatch);
+    }
+    // When the channel pinned the peer's authentication-time audit token,
+    // every later record must carry the identical complete token. A helper
+    // `exec` keeps the PID but changes the PID version, so this rejects any
+    // record sent by a different execution of the same process.
+    if expected_audit.is_some_and(|expected| trailer.audit != *expected) {
         destroy_received_if_complex(bytes);
         return Err(SessionTransportError::IdentityMismatch);
     }
@@ -1684,6 +1717,7 @@ fn parse_vnext_message(
         kind,
         bytes: bytes[payload_offset..unrounded].to_vec(),
         rights,
+        audit: trailer.audit,
     })
 }
 

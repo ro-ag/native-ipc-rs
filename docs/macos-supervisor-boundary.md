@@ -7,6 +7,11 @@ a service crash. No XPC service, bundle, entitlement, signing requirement, or
 public macOS session adapter is implemented by this document. The architecture
 milestone and public macOS spawn/bootstrap remain blocked.
 
+A dedicated primary-source investigation (2026-07-13, recorded in project
+tracking) examined every public candidate for the crash-surviving gap and
+confirmed the negative result. The findings are recorded in
+[Public-API impossibility evidence](#public-api-impossibility-evidence) below.
+
 ## Decision
 
 Any viable production macOS session adapter requires an authority that exists
@@ -176,6 +181,87 @@ does so. No documented public SDK capability found in this investigation both
 survives the parent crash and provides exact, non-task-port helper authority.
 Consequently this is a narrowed conditional argument, not a complete boundary
 proof or an implementation claim.
+
+## Public-API impossibility evidence
+
+The crash-surviving requirement decomposes into three properties that must
+hold simultaneously: an exact reuse-proof identity bound to the termination
+primitive, a termination authority that survives the supervisor crash, and an
+escape-proof containment set. On current macOS (Apple Silicon, shipped SDK),
+each property fails independently under public APIs:
+
+1. **No public reuse-proof kill identity.** The kernel keeps a never-reused
+   64-bit process identity (`p_uniqueid`, with `p_idversion` for exec
+   generations), but the retrieval flavor `PROC_PIDUNIQIDENTIFIERINFO` (17)
+   lives only in the private header `bsd/sys/proc_info_private.h`; the shipped
+   SDK's `sys/proc_info.h` omits the structure and its flavor numbering skips
+   17–18. No kill/terminate-by-unique-id or compare-and-kill primitive exists
+   on any terminate path. `proc_terminate` in `libproc.h` addresses a bare
+   reusable `pid_t` and that header self-describes its contents as private
+   interfaces subject to change. `kill(2)` and every launchd kill are PID- or
+   process-group-addressed; the PID space is small (`PID_MAX` 99999, wraps to
+   100), so verify-then-kill by numeric PID remains a documented TOCTOU
+   vulnerability class. The audit token (`audit_token_t`, whose `val[7]` is the
+   PID version) is Apple's sanctioned fix for PID races, but it is an
+   IPC-sender identity available only from a live message or connection. The
+   token-addressed signal that this crate's private prototype uses while its
+   coordinator lives (`proc_signal_with_audittoken`) sits behind the same
+   private-interface disclaimer as the rest of `libproc.h`, and a token cannot
+   be reconstructed by a restarted supervisor holding only a numeric PID, so
+   neither closes the crash path.
+2. **The only crash-surviving authority cleans up inexactly.** launchd (PID 1)
+   is by construction the only termination authority that survives a
+   supervisor crash, and bundle-embedded XPC services are launched, restarted,
+   and killed by launchd rather than the client. But `launchd.plist(5)`
+   documents job-death cleanup as process-group scoped ("kills any remaining
+   processes with the same process group ID as the job",
+   `AbandonProcessGroup`), with no per-descendant or unique-identifier
+   tracking; a helper that calls `setsid(2)` or `setpgid(2)` definitionally
+   leaves the kill set, and Apple guidance (TN2083 era) historically
+   recommended exactly that call to survive job death. Termination of an XPC
+   service when its *client* crashes is not documented as a guarantee; only
+   the reverse direction (service crash observed as connection invalidation)
+   is.
+3. **No public escape-proof containment.** App Sandbox confinement survives
+   `exec` (a differently-sandboxed image traps at profile-set time) and a
+   spawned child of a sandboxed process inherits the static sandbox without
+   needing its own entitlement, but sandboxed processes may `fork`/`posix_spawn`
+   freely: the public entitlement surface restricts resources (files, network,
+   hardware, personal data), not process creation, and no supported profile
+   denies fork. Custom SBPL no-fork profiles exist only behind the deprecated
+   `sandbox_init(3)`/`sandbox-exec` interfaces. Observation mechanisms do not
+   close the gap: `kqueue` `EVFILT_PROC` attaches by numeric PID, the kqueue
+   cannot be transferred or inherited (kernel excludes `DTYPE_KQUEUE` from
+   `SCM_RIGHTS` internalization), watches die with the watcher, and
+   `NOTE_TRACK` fork-following has been unsupported since macOS 10.5; Endpoint
+   Security's `ES_EVENT_TYPE_NOTIFY_EXIT` is public SDK surface but requires
+   the restricted `com.apple.developer.endpoint-security.client` entitlement
+   plus root and is notify-only. Among Mach task-port flavors, `task_terminate`
+   accepts only the full control port (MIG conversion rejects read, inspect,
+   and name ports), so no lesser flavor provides termination either.
+
+Consequently no composition of documented public mechanisms satisfies
+"OS-enforced, crash-surviving, exact containment without task ports". The
+strongest supported approximation — launchd-owned XPC service lifecycle plus
+inherited sandbox confinement plus `EVFILT_PROC`/Endpoint Security exit
+observation plus post-hoc identity verification — is crash-surviving and
+observable but not exact: it can neither atomically close the verify-then-kill
+race nor prevent process-group escape. R8.6 and 6d therefore remain
+architecture-blocked and the public macOS composition remains fail-closed
+until Apple ships a public exact-identity termination or containment
+primitive.
+
+Additional primary references for this section:
+
+- [XPC services lifecycle under launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingXPCServices.html)
+- [App Sandbox inheritance and spawn behavior (Apple DTS)](https://developer.apple.com/forums/thread/747499)
+- [Resolving App Sandbox inheritance problems (Apple DTS)](https://developer.apple.com/forums/thread/706390)
+- [App Sandbox entitlement surface](https://developer.apple.com/documentation/xcode/configuring-the-macos-app-sandbox)
+- [Endpoint Security exit notification](https://developer.apple.com/documentation/endpointsecurity/es_event_type_notify_exit)
+- `launchd.plist(5)`, `kqueue(2)`, `setsid(2)` man pages; xnu
+  `bsd/sys/proc_info_private.h`, `bsd/kern/kern_prot.c`
+  (`set_security_token_task_internal`), `osfmk/mach/task.defs`
+  (`task_terminate`), `bsd/kern/kern_descrip.c` (`fg_sendable`).
 
 ## Required native evidence before enabling public macOS
 

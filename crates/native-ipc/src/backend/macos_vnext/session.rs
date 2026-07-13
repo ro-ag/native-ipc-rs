@@ -41,6 +41,7 @@ use crate::session::{
 };
 
 const NONCE_LEN: usize = 32;
+const ESRCH: c_int = 3;
 const O_CLOEXEC: c_int = 0x0100_0000;
 const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
@@ -172,6 +173,8 @@ pub(crate) struct MacCoordinatorNegotiatingSession {
     nonce: [u8; NONCE_LEN],
     deadline: AbsoluteDeadline,
     peer_application_payload: Vec<u8>,
+    #[cfg(test)]
+    wait_for_peer_exit_before_image_recheck: bool,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -221,7 +224,13 @@ impl HeldExecutable {
         let length =
             unsafe { proc_pidpath(pid as c_int, path.as_mut_ptr().cast(), path.len() as u32) };
         if length <= 0 {
-            return Err(MacPublicSessionError::PeerExited);
+            // Only "no such process" means the peer is gone; every other
+            // failure names a live process whose image could not be read and
+            // must not be reported as an exit.
+            return Err(match std::io::Error::last_os_error().raw_os_error() {
+                Some(ESRCH) => MacPublicSessionError::PeerExited,
+                code => MacPublicSessionError::Native(code),
+            });
         }
         path.truncate(length as usize);
         let process_path = OsStr::from_bytes(&path);
@@ -331,6 +340,8 @@ impl MacCoordinatorNegotiatingSession {
                 nonce,
                 deadline: options.deadline(),
                 peer_application_payload,
+                #[cfg(test)]
+                wait_for_peer_exit_before_image_recheck: false,
                 not_sync: PhantomData,
             })
         })();
@@ -344,6 +355,14 @@ impl MacCoordinatorNegotiatingSession {
 
     pub(crate) fn peer_application_payload(&self) -> &[u8] {
         &self.peer_application_payload
+    }
+
+    /// Forces `decide` to observe the exact child's exit between the receipt
+    /// of the receiver decision and the live-image recheck, making the
+    /// accept-then-exit ordering deterministic instead of load-dependent.
+    #[cfg(test)]
+    pub(crate) fn wait_for_peer_exit_before_image_recheck_for_test(&mut self) {
+        self.wait_for_peer_exit_before_image_recheck = true;
     }
 
     pub(crate) fn decide(
@@ -435,11 +454,71 @@ impl MacCoordinatorNegotiatingSession {
             }
             NegotiationFrame::Hello(_) => return Err(MacPublicSessionError::MalformedPeer),
         }
-        if !self
+        #[cfg(test)]
+        if self.wait_for_peer_exit_before_image_recheck {
+            let lifecycle = self
+                .lifecycle
+                .as_ref()
+                .expect("lifecycle held through negotiation");
+            while !matches!(
+                lifecycle.try_poll().map_err(map_transport_error)?,
+                crate::backend::PeerState::ExitedUnknown
+            ) {
+                if self.deadline.is_expired() {
+                    return Err(MacPublicSessionError::DeadlineExpired);
+                }
+                std::thread::sleep(core::time::Duration::from_millis(1));
+            }
+        }
+        // The receiver's validated decision is already in hand and every
+        // received record was bound to the authenticated child execution by
+        // the pinned kernel audit trailer and nonce. A child that exited
+        // after sending its decision therefore completed negotiation, and the
+        // queued decision must win over any exit observation. The live-image
+        // verdict below is only meaningful while the exact child is still the
+        // process behind `peer_pid`; once its sole waiter has reaped it, the
+        // numeric PID may name an unrelated process. Anything but a live
+        // match or a confirmed exact exit stays fail-closed.
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or(MacPublicSessionError::PeerExited)?;
+        match self
             .executable
-            .matches_process_image(self.channel.peer_pid())?
+            .matches_process_image(self.channel.peer_pid())
         {
-            return Err(MacPublicSessionError::IdentityMismatch);
+            Ok(true) => {}
+            Err(MacPublicSessionError::PeerExited) => {
+                // No live process behind the PID: the exact child exited as a
+                // zombie or was already reaped. Confirm the exact reap under
+                // the caller deadline before treating negotiation as won.
+                lifecycle
+                    .wait_and_reap_status(self.deadline)
+                    .map_err(map_transport_error)?;
+            }
+            Ok(false) => {
+                // A live process with a different image is either a re-exec
+                // of the still-running child (terminal) or an unrelated
+                // process that received the reused PID after the exact child
+                // was reaped (negotiation already complete).
+                if !matches!(
+                    lifecycle.try_poll().map_err(map_transport_error)?,
+                    crate::backend::PeerState::ExitedUnknown
+                ) {
+                    return Err(MacPublicSessionError::IdentityMismatch);
+                }
+            }
+            Err(error) => {
+                // The image could not be compared. Fail closed unless the
+                // exact child is already confirmed reaped, in which case the
+                // verdict named an unrelated reuse of the freed PID.
+                if !matches!(
+                    lifecycle.try_poll().map_err(map_transport_error)?,
+                    crate::backend::PeerState::ExitedUnknown
+                ) {
+                    return Err(error);
+                }
+            }
         }
         let transcript = self
             .transcript
@@ -460,7 +539,10 @@ impl MacCoordinatorNegotiatingSession {
         let channel_receipt =
             unsafe { CoordinatorChildChannelReceipt::from_verified_native(facts) };
         // SAFETY: the retained pre-spawn file identity matched the live process
-        // image after spawn, after channel authentication, and after ACCEPT.
+        // image after spawn and after channel authentication. After ACCEPT it
+        // either matched the still-live image, or the exact child was
+        // confirmed reaped by its sole waiter, in which case no execution
+        // remains that could carry a different image.
         let image_receipt = unsafe { CoordinatorChildImageReceipt::from_verified_native(facts) };
         let evidence =
             CoordinatorAcceptedEvidence::combine(channel_receipt, image_receipt, transcript)
