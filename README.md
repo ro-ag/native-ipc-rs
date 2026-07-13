@@ -252,9 +252,12 @@ crash-surviving OS containment. The result and native evidence gate are
 documented in
 [`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md); no
 service artifact exists. This is source-tree evidence with local package
-verification; the macOS architecture, Windows parity, exact-tip hosted CI,
-exact-release packaged conformance, physical Arm64 evidence, and release
-authorization remain outstanding.
+verification. Private Windows parity now includes unnamed-section mixed memory,
+PID-authenticated message transport, exact process/whole-Job lifecycle,
+full-manifest IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation, green on
+native Windows AMD64/Arm64 at the exact branch tip. Public Windows sessions, the
+macOS architecture, exact-release packaged conformance, physical Arm64
+evidence, and release authorization remain outstanding.
 
 Implemented through `0.4.0`:
 

@@ -69,11 +69,13 @@ child silent before its first audit-bearing Mach message without forbidden task
 authority. A preinstalled signed launchd/XPC service is a necessary candidate,
 but it does not preserve exact authority across service crash without another
 OS-enforced containment mechanism; that architecture remains blocked.
-Windows is likewise fail-closed with `BackendUnavailable`; local
-package verification is green, while the macOS lifecycle architecture,
-Windows parity, exact-release packaged conformance, and release evidence are
-pending. The existing cross-platform native-memory lifecycle API remains
-available independently.
+Windows is likewise fail-closed with `BackendUnavailable`, but its private
+unnamed-section memory owner, PID-authenticated message transport, whole-Job
+lifecycle, full-manifest reducer, and post-COMMIT active ledger now pass the
+native Windows AMD64/Arm64 source-tree corpus. Public Windows session
+composition, the macOS lifecycle architecture, exact-release packaged
+conformance, and release evidence remain pending. The existing cross-platform
+native-memory lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not
