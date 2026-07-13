@@ -33,6 +33,12 @@ Versioning once a stable API is released.
   one best-effort attenuation pass final-seals every escaped receiver-writer fd;
   coordinator read mapping begins only after complete attenuation, and every
   failure poisons before transaction-owned fds and mappings are destroyed.
+- Complete the private Linux mixed-batch transaction with exact
+  full-manifest READY/COMMIT records, then activate only after reserving the
+  complete batch against one session-wide resource ledger. Runtime mappings
+  escape only as a complete keyed set; activation failure poisons before native
+  cleanup, exposes no partial set, rolls back every charge, and preserves
+  mapping-before-lease destruction.
 
 ### Changed
 

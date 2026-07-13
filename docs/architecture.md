@@ -256,6 +256,31 @@ destruction poisons before native cleanup. This is still a terminal private
 checkpoint: it does not end the transaction, send READY/COMMIT, charge active
 leases, or expose pending/runtime/public authority.
 
+Linux G1k completes the private transaction with one exact full-manifest
+READY/COMMIT barrier. Both completion records are domain-separated from
+application control and from each other, use the transaction's stored absolute
+deadline, carry no rights, and are derived only from the retained canonical
+capability frame. Exact READY ends receiver preparation; exact COMMIT ends the
+coordinator transaction and releases a committed owner on each endpoint.
+Manifest substitution, truncation, application interleaving, and queued
+duplicate replay poison persistently while the pending native owner still
+retains cleanup authority. This remains a private Linux barrier, not a public
+`Session<Ready>` or cross-platform completion claim.
+
+Linux G1l binds one session-wide `ResourceOwner` into each accepted dispatcher
+and activates the committed mixed batch all-or-nothing. Activation revalidates
+the complete native batch, reserves every page-rounded byte before consuming
+any mapping, and constructs endpoint-local `ActiveReader` or `ActiveWriter`
+owners according to the negotiated writer direction. Runtime authority escapes
+only as a complete keyed `ActiveRegionSet`; every active charge remains until
+its native mapping is destroyed, with mapping drop ordered before lease
+release. First/middle/final injected activation failures on either endpoint
+poison before native mappings and leases unwind, expose no active set, restore
+exact fd/map/task and ledger baselines, and leave later control persistently
+poisoned. This is private Linux source-tree and hosted-run evidence only; public
+composition, macOS/Windows reducers, physical Arm64, packaged-crate, and
+release evidence remain outstanding.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

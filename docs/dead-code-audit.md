@@ -1,9 +1,10 @@
 # Dead-code and test-seam audit
 
-This inventory records the cleanup boundary after private Linux G1j. It is not
-vNext completion evidence. In particular, READY/COMMIT, activation, the
-active-resource ledger, and public session/control APIs remain intentionally
-private or unavailable.
+This inventory records the cleanup boundary after private Linux G1l. It is not
+vNext completion evidence. Linux now privately composes READY/COMMIT,
+all-or-nothing activation, and the active-resource ledger; public
+session/control APIs and the equivalent macOS/Windows reducers remain
+unavailable.
 
 ## Dead-code suppression inventory
 
@@ -15,9 +16,9 @@ yet reachable.
 | File | Sites | Classification | Retained reason |
 | --- | ---: | --- | --- |
 | `protocol.rs` | 15 | unfinished reducer and target-specific | Canonical capability, IMPORTED/SEALED, authority-profile, access, totals, entry, and exact-frame machinery is consumed by private Linux G1 paths but remains unreachable or intentionally unused on macOS/Windows until their accepted reducers exist. The legacy-profile manifest constructor is compiled only for macOS/Windows production and tests. |
-| `active.rs` | 11 | unfinished READY/COMMIT composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are required by the future all-or-nothing activation boundary. |
+| `active.rs` | 11 | private activation composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are consumed by the private Linux all-or-nothing activation boundary but remain unreachable from the public API and other native reducers. |
 | `region.rs` | 5 | unfinished batch composition | Prepared native request/spec/guard fields and logical/mapped accessors cross into the private batch/native preparation owners; they are not obsolete pending accepted-session composition on every target. |
-| `batch.rs` | 5 | unfinished READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are the withheld portable reducer boundary. |
+| `batch.rs` | 5 | private READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are consumed by the private Linux reducer but remain withheld from public and other-target composition. |
 | `lib.rs` | 5 | four unfinished private modules; one obsolete status scaffold | `batch`, `control`, `liveness`, and `negotiation` remain private until full composition. `BackendStatus` and `windows::status` have no production consumer and are a later target-scoped cleanup candidate. |
 | `backend/mod.rs` | 4 | unfinished role evidence and target-specific | The backend-wide allowance covers unreachable role-scoped evidence and accepted transport traits; the macOS, Windows, and `linux_vnext` module allowances cover target-only compilation. The retained legacy-free Linux allocator overrides the blanket with `deny(dead_code)`. |
 | `memory.rs` | 4 | unfinished native batch composition | Incarnation, logical length, and native manifest derivation are consumed by the Linux private batch adapter and will be required by the other target adapters. |
@@ -51,16 +52,17 @@ remains without a production consumer. The retained module uses
 
 ## `cfg(test)` seam inventory
 
-The production tree contains 279 `cfg(test)` gates: 19 are adjacent
-`*_test.rs` module wiring and 260 are deliberate production seams. The latter
+The production tree contains 342 `cfg(test)` gates: 19 are adjacent
+`*_test.rs` module wiring and 323 are deliberate production seams. The latter
 are concentrated as follows.
 
 | Production file | Non-wiring seams | Purpose |
 | --- | ---: | --- |
-| `backend/linux_vnext/memory.rs` | 104 | Exact Nth preparation/seal/advice failures, native-object substitution, full-mixed-batch attenuation, mapping/drop observations, and fd/map baselines. |
-| `backend/accepted_control.rs` | 108 | Exact record mutation/truncation/rights/credential/replay/interleaving faults plus mixed accepted-owner and poison-before-resource-drop observations. |
+| `backend/accepted_control.rs` | 146 | Exact record mutation/truncation/rights/credential/replay/interleaving faults plus mixed READY/COMMIT, activation, accepted-owner, and poison-before-resource-drop observations. |
+| `backend/linux_vnext/memory.rs` | 121 | Exact Nth preparation/seal/advice/activation failures, native-object substitution, full-mixed-batch attenuation, mapping/drop observations, and fd/map baselines. |
 | `backend/linux_vnext/spawn.rs` | 22 | Entropy, inherited-fd, credential, send/receive, poison, and exact-child publication faults. |
-| `backend/linux_vnext/process.rs` | 13 | Signal, poll, wait/reap, auto-reap, and terminal-cleanup fault injection. |
+| `backend/linux_vnext/process.rs` | 14 | Signal, poll, wait/reap, auto-reap, and terminal-cleanup fault injection. |
+| `liveness.rs` | 7 | Session-ledger observations, exact charge accounting, and mapping-before-lease destruction evidence. |
 | `region.rs` | 6 | Prepared-owner destruction ordering observations. |
 | `backend/linux_vnext.rs` | 5 | Packet/descriptor boundary faults and native transport observations. |
 | `backend/macos/bootstrap.rs` | 1 | Native bootstrap test behavior. |

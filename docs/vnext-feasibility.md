@@ -847,6 +847,36 @@ re-review reports no P1/P2/P3. G1j adds no READY/COMMIT, transaction
 completion, active lease, runtime mapping exposure, public API, physical Arm64,
 or release evidence.
 
+Phase 5i-G1k adds the private Linux full-batch READY/COMMIT reducer. The exact
+domain-separated READY and COMMIT records are derived from the retained
+canonical capability frame, carry no rights, and share the transaction's one
+stored absolute deadline. Neither role exposes the pending native batch before
+the exact barrier completes. Privileged Arm64 characterization covers mixed
+1/2/4/16 success, application-kind interleaving, manifest substitution,
+truncation, and duplicate READY/COMMIT replay. A queued duplicate following an
+otherwise valid completion poisons the next production control receive rather
+than relying on a test-only extra barrier read. Exact implementation
+`71442d31cdc9b6869876e89b5ae5e4301a86bbf7` is green in all ten hosted jobs in
+[Actions 29225096280](https://github.com/ro-ag/native-ipc-rs/actions/runs/29225096280).
+
+Phase 5i-G1l adds the private Linux session ledger and all-or-nothing native
+activation. Each accepted dispatcher owns one `ResourceOwner`; committed
+owners retain exact accepted parameters and the original deadline. Activation
+revalidates the complete native batch, reserves all page-rounded bytes before
+consuming mappings, constructs complementary endpoint-local active authorities,
+and returns only a complete keyed set. Exact implementation
+`d56468ae614431e49be54bcaa09745ee3ff5963d` is green in all ten hosted jobs in
+[Actions 29225675674](https://github.com/ro-ag/native-ipc-rs/actions/runs/29225675674).
+The adjacent rollback corpus injects first/middle/final activation failure at
+both endpoints after reservations and native owners exist; it proves poison
+precedes mapping/lease cleanup, no active set escapes, later control remains
+poisoned, mapping destruction precedes lease release, every charge rolls back,
+and fd/map/task baselines restore. Exact rollback implementation
+`9acc8e560f3dfbe909a3763b2f46d66d83296f8d` is green in all ten hosted jobs in
+[Actions 29226631352](https://github.com/ro-ag/native-ipc-rs/actions/runs/29226631352).
+This private Linux checkpoint still adds no public `Session<Ready>`,
+macOS/Windows reducer, physical Arm64, packaged-crate, or release evidence.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
