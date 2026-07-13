@@ -300,9 +300,33 @@ observation, and coordinator child cleanup where applicable. Socket closure is
 reported only as endpoint disconnection; exact direct-child exit is claimed
 only after coordinator reap. Graceful close returns its owner when leases or
 cleanup remain pending, and terminal abort reports any incomplete exact-child
-cleanup. This checkpoint is Linux-only. macOS/Windows public-session adapters,
-physical Arm64 and packaged evidence, exact-tip hosted CI, and release evidence
-remain outstanding.
+cleanup.
+
+The macOS 6d working branch has a private prototype shaped like the public
+typestate surface, but public macOS spawn/bootstrap remain fail-closed. Direct
+spawn cannot exactly terminate a child silent before its first audit-bearing
+Mach message without reusable-PID risk or forbidden task-port authority; a
+supervisor/XPC boundary is required. The private audit-token signal path is
+also execution-scoped: a hostile authenticated child can `exec`, invalidate
+the retained PID version, and remain alive. That `ESRCH` is reported as
+incomplete cleanup rather than suppressed, but exact termination still
+requires the supervisor/XPC boundary. In the post-authentication prototype the
+coordinator retains an opened regular non-setid
+executable and compares its stable path identity with `proc_pidpath` after
+authentication and again through ACCEPT. This is not fd-exec, immutable
+running-vnode proof, or replacement denial. Spawn launches the helper in a
+fresh POSIX session with close-on-exec default and transfers wait ownership to
+a durable nonblocking reaper before the deadline-bound Mach bootstrap receive.
+The private channel validates exact audit PID and nonce;
+only canonical bilateral HELLO and challenged ACCEPT mint role-scoped evidence.
+Prototype Ready control and mixed transfers reuse the common dispatcher, including a
+bilateral capacity preflight that returns both endpoints cleanly to Ready on an
+asymmetric active limit. Direct-child status is reported only after the sole
+waiter reaps it; descendant cleanup is `FreshGroupUnverified` because macOS has
+no retained race-resistant process-group handle here. The macOS lifecycle
+boundary, Windows public-session composition, physical Arm64 and exact-release packaged evidence, exact-tip
+hosted CI, and release evidence remain outstanding; local package verification
+is green.
 
 ## Unsafe-code policy
 

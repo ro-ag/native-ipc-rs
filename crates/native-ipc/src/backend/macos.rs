@@ -951,6 +951,9 @@ pub(crate) mod vnext_memory;
 #[path = "macos_vnext/transport.rs"]
 pub(crate) mod vnext_transport;
 
+#[path = "macos_vnext/session.rs"]
+pub(crate) mod vnext_session;
+
 #[cfg(test)]
 #[path = "macos_vnext/memory_test.rs"]
 mod vnext_memory_test;
@@ -958,6 +961,10 @@ mod vnext_memory_test;
 #[cfg(test)]
 #[path = "macos_vnext/transport_test.rs"]
 mod vnext_transport_test;
+
+#[cfg(test)]
+#[path = "macos_vnext/session_test.rs"]
+mod vnext_session_test;
 
 #[cfg(test)]
 #[path = "macos_vnext/reducer_test.rs"]

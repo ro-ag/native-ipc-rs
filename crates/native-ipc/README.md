@@ -47,8 +47,8 @@ cargo run -p native-ipc --example common_memory
 
 ## Unreleased vNext session API
 
-The current source tree exposes the completed Linux vNext composition through
-role- and state-typed `CoordinatorSession<Negotiating>` and
+The current source tree exposes the Linux vNext composition through role- and
+state-typed `CoordinatorSession<Negotiating>` and
 `ReceiverSession<Negotiating>` owners. `receiver_main!` adopts the inherited
 bootstrap exactly once before ordinary receiver code, bilateral application
 decisions yield `Session<Ready>`, and only Ready owners may exchange bounded
@@ -63,11 +63,13 @@ Graceful close returns the live session when active leases or child cleanup
 still need attention; explicit abort invalidates retained mappings and preserves
 bounded cleanup diagnostics.
 
-This public session composition is currently implemented only by the Linux
-backend. macOS and Windows session construction remains fail-closed with
-`BackendUnavailable`; cross-platform parity, packaged-crate conformance, and
-release evidence are still pending. The existing cross-platform native-memory
-lifecycle API remains available independently.
+The macOS Arm64 prototype reaches the same private reducer but remains
+fail-closed at public spawn/bootstrap because direct spawn cannot exactly kill a
+child silent before its first audit-bearing Mach message without forbidden task
+authority. Windows is likewise fail-closed with `BackendUnavailable`; local
+package verification is green, while a macOS supervisor/XPC boundary, Windows
+parity, exact-release packaged conformance, and release evidence are pending.
+The existing cross-platform native-memory lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not

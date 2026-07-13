@@ -4,13 +4,15 @@ use crate::batch::{ActiveRegionSet, BatchError, ExpectedBatch, TransferBatch};
 use crate::control::{ControlError, ControlFrame};
 use core::cell::Cell;
 use core::marker::PhantomData;
+#[cfg(target_os = "macos")]
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicI32, Ordering};
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,6 +37,8 @@ const BOOTSTRAP_INVALID: i32 = -1;
 const BOOTSTRAP_TAKEN: i32 = -3;
 #[cfg(target_os = "linux")]
 static RECEIVER_BOOTSTRAP_FD: AtomicI32 = AtomicI32::new(BOOTSTRAP_ABSENT);
+#[cfg(target_os = "macos")]
+static RECEIVER_BOOTSTRAP_TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Executable-only ELF preinitializer referenced by [`crate::receiver_main!`].
 ///
@@ -287,7 +291,7 @@ pub enum ChildExitStatus {
 pub enum DescendantCleanupStatus {
     /// The trusted fresh-session checkpoint was not established.
     NotEstablished,
-    /// A fresh process group existed, but Linux cannot verify descendant cleanup race-free.
+    /// A fresh process group existed, but this target cannot verify descendant cleanup race-free.
     FreshGroupUnverified,
 }
 
@@ -434,8 +438,9 @@ pub struct ReceiverBootstrap {
 ///
 /// The supplied closure receives `Result<ReceiverBootstrap, SessionFailure>` and
 /// runs only after the library has attempted the one-shot reservation take.
-/// The descriptor was already validated and marked close-on-exec by the ELF
-/// pre-initializer before any Rust application code ran.
+/// Linux validates and reserves its inherited descriptor in an ELF
+/// pre-initializer; macOS takes its private Mach bootstrap reservation from
+/// Rust main before invoking the supplied closure.
 #[macro_export]
 macro_rules! receiver_main {
     ($entry:expr) => {
@@ -479,13 +484,29 @@ pub fn __take_receiver_bootstrap() -> Result<ReceiverBootstrap, SessionFailure> 
             not_sync: PhantomData,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(SessionFailure::new(
             SessionOperation::Bootstrap,
             SessionTransactionState::NotEstablished,
             SessionError::BackendUnavailable,
         ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if RECEIVER_BOOTSTRAP_TAKEN.swap(true, Ordering::AcqRel)
+            || std::env::var_os("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        {
+            return Err(SessionFailure::new(
+                SessionOperation::Bootstrap,
+                SessionTransactionState::NotEstablished,
+                SessionError::InvalidInput,
+            ));
+        }
+        Ok(ReceiverBootstrap {
+            not_sync: PhantomData,
+        })
     }
 }
 
@@ -498,7 +519,19 @@ enum SessionInner {
     CoordinatorReady(crate::backend::linux_vnext::spawn::LinuxCoordinatorReadySession),
     #[cfg(target_os = "linux")]
     ReceiverReady(crate::backend::linux_vnext::spawn::LinuxReceiverReadySession),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
+    CoordinatorNegotiating(crate::backend::macos::vnext_session::MacCoordinatorNegotiatingSession),
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
+    ReceiverNegotiating(crate::backend::macos::vnext_session::MacReceiverNegotiatingSession),
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
+    CoordinatorReady(crate::backend::macos::vnext_session::MacCoordinatorReadySession),
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
+    ReceiverReady(crate::backend::macos::vnext_session::MacReceiverReadySession),
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[allow(dead_code)]
     Unavailable,
 }
@@ -506,8 +539,11 @@ enum SessionInner {
 /// Required executable-identity policy for an owned helper launch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutableIdentityPolicy {
-    /// Open the exact absolute regular executable without symlink traversal,
-    /// execute the held object, and bind the resulting process image back to it.
+    /// Open and retain one absolute regular executable without any symlink
+    /// traversal and apply the target's documented image-identity checks.
+    /// Linux executes the held object; macOS currently performs repeated
+    /// stable-path identity comparisons and does not claim fd-exec or
+    /// replacement denial.
     ExactOpenedFile,
 }
 
@@ -530,7 +566,7 @@ impl SessionCommand {
         }
     }
 
-    /// Replaces argument zero without changing the exact held executable.
+    /// Replaces argument zero without changing the selected executable path.
     pub fn arg0(mut self, argument: impl Into<OsString>) -> Self {
         self.arguments[0] = argument.into();
         self
@@ -564,21 +600,24 @@ impl SessionCommand {
 
         self.environment.iter().any(|(key, _)| {
             let key = key.as_os_str().as_bytes();
-            key == b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD" || key == RECEIVER_PUBLIC_BOOTSTRAP_ENV
+            key == b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD"
+                || key == RECEIVER_PUBLIC_BOOTSTRAP_ENV
+                || key == b"NATIVE_IPC_MACH_NONCE"
+                || key == b"NATIVE_IPC_PARENT_PID"
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
     }
@@ -632,27 +671,27 @@ impl SessionOptions {
         self
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn limits(&self) -> SessionLimits {
         self.limits
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn application_payload(&self) -> &[u8] {
         &self.application_payload
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn requires_atomic_u32(&self) -> bool {
         self.require_atomic_u32
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn requires_atomic_u64(&self) -> bool {
         self.require_atomic_u64
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
         self.deadline
     }
@@ -696,7 +735,7 @@ impl RejectionReason {
         self.0.get()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn from_wire(value: NonZeroU32) -> Option<Self> {
         match value.get() {
             1 => Some(Self::APPLICATION_DECLINED),
@@ -706,7 +745,7 @@ impl RejectionReason {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const fn as_nonzero(self) -> NonZeroU32 {
         self.0
     }
@@ -863,7 +902,7 @@ impl SessionFailure {
         self
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const fn with_optional_cleanup(mut self, cleanup: Option<ChildCleanupFacts>) -> Self {
         self.cleanup = cleanup;
         self
@@ -1172,7 +1211,7 @@ impl AbsoluteDeadline {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl<Role, State> Session<Role, State> {
     fn from_inner(inner: SessionInner) -> Self {
         Self {
@@ -1185,7 +1224,8 @@ impl<Role, State> Session<Role, State> {
 }
 
 impl Session<Coordinator, Negotiating> {
-    /// Spawns and authenticates the exact held helper through both HELLOs.
+    /// Spawns and authenticates the selected helper under the target's
+    /// documented executable-identity policy through both HELLOs.
     pub fn spawn(command: SessionCommand, options: SessionOptions) -> Result<Self, SessionFailure> {
         validate_public_options(&options).map_err(|reason| {
             SessionFailure::new(
@@ -1233,7 +1273,16 @@ impl Session<Coordinator, Negotiating> {
                 inner,
             )))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = command;
+            Err(SessionFailure::new(
+                SessionOperation::Spawn,
+                SessionTransactionState::NotEstablished,
+                SessionError::BackendUnavailable,
+            ))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = command;
             Err(SessionFailure::new(
@@ -1249,9 +1298,13 @@ impl Session<Coordinator, Negotiating> {
         match &self.inner {
             #[cfg(target_os = "linux")]
             SessionInner::CoordinatorNegotiating(inner) => inner.peer_application_payload(),
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorNegotiating(inner) => inner.peer_application_payload(),
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator negotiating typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator negotiating typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1263,7 +1316,7 @@ impl Session<Coordinator, Negotiating> {
         self,
         decision: NegotiationDecision,
     ) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = decision;
         match self.inner {
             #[cfg(target_os = "linux")]
@@ -1283,9 +1336,26 @@ impl Session<Coordinator, Negotiating> {
                     })?;
                 map_linux_coordinator_outcome(outcome)
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorNegotiating(inner) => {
+                let outcome = inner
+                    .decide(decision_rejection(decision))
+                    .map_err(|failure| {
+                        mac_session_failure(
+                            SessionOperation::Negotiate,
+                            SessionTransactionState::Negotiating,
+                            failure.error,
+                            failure.poisoned,
+                        )
+                        .with_optional_cleanup(failure.cleanup)
+                    })?;
+                map_mac_coordinator_outcome(outcome)
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator negotiating typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator negotiating typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1327,7 +1397,16 @@ impl Session<Receiver, Negotiating> {
             })?;
             Ok(Self::from_inner(SessionInner::ReceiverNegotiating(inner)))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let _bootstrap = bootstrap;
+            Err(SessionFailure::new(
+                SessionOperation::Bootstrap,
+                SessionTransactionState::NotEstablished,
+                SessionError::BackendUnavailable,
+            ))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = bootstrap;
             Err(SessionFailure::new(
@@ -1343,9 +1422,13 @@ impl Session<Receiver, Negotiating> {
         match &self.inner {
             #[cfg(target_os = "linux")]
             SessionInner::ReceiverNegotiating(inner) => inner.peer_application_payload(),
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverNegotiating(inner) => inner.peer_application_payload(),
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver negotiating typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver negotiating typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1357,7 +1440,7 @@ impl Session<Receiver, Negotiating> {
         self,
         decide: impl FnOnce(&[u8]) -> NegotiationDecision,
     ) -> Result<NegotiationOutcome<Session<Receiver, Ready>>, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = decide;
         match self.inner {
             #[cfg(target_os = "linux")]
@@ -1375,9 +1458,25 @@ impl Session<Receiver, Negotiating> {
                     })?;
                 map_linux_receiver_outcome(outcome)
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverNegotiating(inner) => {
+                let outcome = inner
+                    .decide_after_coordinator(|payload| decision_rejection(decide(payload)))
+                    .map_err(|error| {
+                        mac_session_failure(
+                            SessionOperation::Negotiate,
+                            SessionTransactionState::Negotiating,
+                            error,
+                            true,
+                        )
+                    })?;
+                map_mac_receiver_outcome(outcome)
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver negotiating typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver negotiating typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1399,11 +1498,11 @@ impl Session<Coordinator, Ready> {
     /// Effective finite limits bound into the accepted transcript.
     pub fn negotiated_limits(&self) -> SessionLimits {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.limits(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1413,11 +1512,11 @@ impl Session<Coordinator, Ready> {
     /// Effective lock-free atomic and layout alignment facts bound into ACCEPT.
     pub fn atomic_capabilities(&self) -> AtomicCapabilities {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.atomics(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1427,11 +1526,11 @@ impl Session<Coordinator, Ready> {
     /// Accepted protocol version from the exact challenged transcript.
     pub fn protocol_version(&self) -> ProtocolVersion {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.protocol_version(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1441,11 +1540,11 @@ impl Session<Coordinator, Ready> {
     /// Current local reducer/liveness state.
     pub fn state(&self) -> SessionState {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.state(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1455,11 +1554,11 @@ impl Session<Coordinator, Ready> {
     /// Bounded current active-mapping lease counters.
     pub fn active_leases(&self) -> ActiveLeaseFacts {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.active_leases(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1476,9 +1575,17 @@ impl Session<Coordinator, Ready> {
                 result
                     .map_err(|error| linux_ready_failure(SessionOperation::PollPeer, state, error))
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorReady(inner) => {
+                let result = inner.poll_peer();
+                let state = inner.state();
+                result.map_err(|error| mac_ready_failure(SessionOperation::PollPeer, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => Err(SessionFailure::new(
                 SessionOperation::PollPeer,
                 SessionTransactionState::NotEstablished,
@@ -1489,14 +1596,14 @@ impl Session<Coordinator, Ready> {
 
     /// Boundedly waits for and reaps the exact direct child without consuming the session.
     pub fn wait_for_exit(&mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = deadline;
         match &mut self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.wait_for_exit(deadline),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 ChildCleanupFacts::new(None, DescendantCleanupStatus::NotEstablished, None)
             }
@@ -1546,9 +1653,19 @@ impl Session<Coordinator, Ready> {
                     linux_ready_failure(SessionOperation::Close, state, error).with_cleanup(cleanup)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorReady(inner) => {
+                let result = inner.close_resources();
+                let state = inner.state();
+                result.map_err(|error| {
+                    mac_ready_failure(SessionOperation::Close, state, error).with_cleanup(cleanup)
+                })
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => Err(SessionFailure::new(
                 SessionOperation::Close,
                 SessionTransactionState::NotEstablished,
@@ -1567,14 +1684,14 @@ impl Session<Coordinator, Ready> {
 
     /// Terminally poisons live mappings, terminates the exact child, and returns cleanup facts.
     pub fn abort(mut self, deadline: AbsoluteDeadline) -> CoordinatorAbortOutcome {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = deadline;
         let cleanup = match &mut self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::CoordinatorReady(inner) => inner.abort(deadline),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 ChildCleanupFacts::new(None, DescendantCleanupStatus::NotEstablished, None)
             }
@@ -1617,7 +1734,7 @@ impl Session<Coordinator, Ready> {
         batch: TransferBatch,
         deadline: AbsoluteDeadline,
     ) -> Result<ActiveRegionSet, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (batch, deadline);
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1628,9 +1745,19 @@ impl Session<Coordinator, Ready> {
                     linux_ready_batch_failure(SessionOperation::TransferBatch, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorReady(inner) => {
+                let result = inner.transfer_batch(batch, deadline);
+                let state = inner.state();
+                result.map_err(|error| {
+                    mac_ready_failure(SessionOperation::TransferBatch, state, error)
+                })
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1644,7 +1771,7 @@ impl Session<Coordinator, Ready> {
         payload: &[u8],
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (kind, payload, deadline);
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1655,9 +1782,18 @@ impl Session<Coordinator, Ready> {
                     linux_ready_failure(SessionOperation::SendControl, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorReady(inner) => {
+                let result = inner.send_control(kind, payload, deadline);
+                let state = inner.state();
+                result
+                    .map_err(|error| mac_ready_failure(SessionOperation::SendControl, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1669,7 +1805,7 @@ impl Session<Coordinator, Ready> {
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<ControlFrame, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = deadline;
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1680,9 +1816,19 @@ impl Session<Coordinator, Ready> {
                     linux_ready_failure(SessionOperation::ReceiveControl, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::CoordinatorReady(inner) => {
+                let result = inner.receive_control(deadline);
+                let state = inner.state();
+                result.map_err(|error| {
+                    mac_ready_failure(SessionOperation::ReceiveControl, state, error)
+                })
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("coordinator ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1694,11 +1840,11 @@ impl Session<Receiver, Ready> {
     /// Effective finite limits bound into the accepted transcript.
     pub fn negotiated_limits(&self) -> SessionLimits {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::ReceiverReady(inner) => inner.limits(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1708,11 +1854,11 @@ impl Session<Receiver, Ready> {
     /// Effective lock-free atomic and layout alignment facts bound into ACCEPT.
     pub fn atomic_capabilities(&self) -> AtomicCapabilities {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::ReceiverReady(inner) => inner.atomics(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1722,11 +1868,11 @@ impl Session<Receiver, Ready> {
     /// Accepted protocol version from the exact challenged transcript.
     pub fn protocol_version(&self) -> ProtocolVersion {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::ReceiverReady(inner) => inner.protocol_version(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1736,11 +1882,11 @@ impl Session<Receiver, Ready> {
     /// Current local reducer/liveness state.
     pub fn state(&self) -> SessionState {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::ReceiverReady(inner) => inner.state(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1750,11 +1896,11 @@ impl Session<Receiver, Ready> {
     /// Bounded current active-mapping lease counters.
     pub fn active_leases(&self) -> ActiveLeaseFacts {
         match &self.inner {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             SessionInner::ReceiverReady(inner) => inner.active_leases(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1771,9 +1917,17 @@ impl Session<Receiver, Ready> {
                 result
                     .map_err(|error| linux_ready_failure(SessionOperation::PollPeer, state, error))
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.poll_peer();
+                let state = inner.state();
+                result.map_err(|error| mac_ready_failure(SessionOperation::PollPeer, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => Err(SessionFailure::new(
                 SessionOperation::PollPeer,
                 SessionTransactionState::NotEstablished,
@@ -1787,7 +1941,7 @@ impl Session<Receiver, Ready> {
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<PeerStatus, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = deadline;
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1798,9 +1952,18 @@ impl Session<Receiver, Ready> {
                     linux_ready_failure(SessionOperation::WaitForExit, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.wait_for_exit(deadline);
+                let state = inner.state();
+                result
+                    .map_err(|error| mac_ready_failure(SessionOperation::WaitForExit, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => Err(SessionFailure::new(
                 SessionOperation::WaitForExit,
                 SessionTransactionState::NotEstablished,
@@ -1825,9 +1988,17 @@ impl Session<Receiver, Ready> {
                 let state = inner.state();
                 result.map_err(|error| linux_ready_failure(SessionOperation::Close, state, error))
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.close_resources();
+                let state = inner.state();
+                result.map_err(|error| mac_ready_failure(SessionOperation::Close, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => Err(SessionFailure::new(
                 SessionOperation::Close,
                 SessionTransactionState::NotEstablished,
@@ -1848,9 +2019,13 @@ impl Session<Receiver, Ready> {
         match &mut self.inner {
             #[cfg(target_os = "linux")]
             SessionInner::ReceiverReady(inner) => inner.abort(),
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => inner.abort(),
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {}
         }
     }
@@ -1861,7 +2036,7 @@ impl Session<Receiver, Ready> {
         expected: ExpectedBatch,
         deadline: AbsoluteDeadline,
     ) -> Result<ActiveRegionSet, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (expected, deadline);
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1872,9 +2047,19 @@ impl Session<Receiver, Ready> {
                     linux_ready_batch_failure(SessionOperation::ReceiveBatch, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.receive_batch(expected, deadline);
+                let state = inner.state();
+                result.map_err(|error| {
+                    mac_ready_failure(SessionOperation::ReceiveBatch, state, error)
+                })
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1888,7 +2073,7 @@ impl Session<Receiver, Ready> {
         payload: &[u8],
         deadline: AbsoluteDeadline,
     ) -> Result<(), SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = (kind, payload, deadline);
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1899,9 +2084,18 @@ impl Session<Receiver, Ready> {
                     linux_ready_failure(SessionOperation::SendControl, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.send_control(kind, payload, deadline);
+                let state = inner.state();
+                result
+                    .map_err(|error| mac_ready_failure(SessionOperation::SendControl, state, error))
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1913,7 +2107,7 @@ impl Session<Receiver, Ready> {
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<ControlFrame, SessionFailure> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = deadline;
         match &mut self.inner {
             #[cfg(target_os = "linux")]
@@ -1924,9 +2118,19 @@ impl Session<Receiver, Ready> {
                     linux_ready_failure(SessionOperation::ReceiveControl, state, error)
                 })
             }
+            #[cfg(target_os = "macos")]
+            SessionInner::ReceiverReady(inner) => {
+                let result = inner.receive_control(deadline);
+                let state = inner.state();
+                result.map_err(|error| {
+                    mac_ready_failure(SessionOperation::ReceiveControl, state, error)
+                })
+            }
             #[cfg(target_os = "linux")]
             _ => unreachable!("receiver ready typestate owns its exact backend state"),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("receiver ready typestate owns its exact backend state"),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             SessionInner::Unavailable => {
                 unreachable!("unavailable backend cannot construct a session")
             }
@@ -1954,11 +2158,88 @@ fn validate_public_options(options: &SessionOptions) -> Result<(), SessionError>
         .map_err(SessionError::NativeNegotiation)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const fn decision_rejection(decision: NegotiationDecision) -> Option<NonZeroU32> {
     match decision {
         NegotiationDecision::Accept => None,
         NegotiationDecision::Reject(reason) => Some(reason.as_nonzero()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_mac_role(role: crate::backend::macos::vnext_session::MacNegotiationRole) -> SessionEndpoint {
+    match role {
+        crate::backend::macos::vnext_session::MacNegotiationRole::Coordinator => {
+            SessionEndpoint::Coordinator
+        }
+        crate::backend::macos::vnext_session::MacNegotiationRole::Receiver => {
+            SessionEndpoint::Receiver
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_mac_coordinator_outcome(
+    outcome: crate::backend::macos::vnext_session::MacNegotiationOutcome<
+        crate::backend::macos::vnext_session::MacCoordinatorReadySession,
+    >,
+) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
+    match outcome {
+        crate::backend::macos::vnext_session::MacNegotiationOutcome::Accepted(inner) => {
+            Ok(NegotiationOutcome::Accepted(Session::from_inner(
+                SessionInner::CoordinatorReady(inner),
+            )))
+        }
+        crate::backend::macos::vnext_session::MacNegotiationOutcome::Rejected {
+            by,
+            reason,
+            cleanup,
+        } => {
+            let reason = RejectionReason::from_wire(reason).ok_or_else(|| {
+                let failure = SessionFailure::new(
+                    SessionOperation::Negotiate,
+                    SessionTransactionState::Poisoned,
+                    SessionError::MalformedPeer,
+                );
+                cleanup.map_or(failure, |facts| failure.with_cleanup(facts))
+            })?;
+            Ok(NegotiationOutcome::Rejected {
+                by: map_mac_role(by),
+                reason,
+                cleanup,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_mac_receiver_outcome(
+    outcome: crate::backend::macos::vnext_session::MacNegotiationOutcome<
+        crate::backend::macos::vnext_session::MacReceiverReadySession,
+    >,
+) -> Result<NegotiationOutcome<Session<Receiver, Ready>>, SessionFailure> {
+    match outcome {
+        crate::backend::macos::vnext_session::MacNegotiationOutcome::Accepted(inner) => Ok(
+            NegotiationOutcome::Accepted(Session::from_inner(SessionInner::ReceiverReady(inner))),
+        ),
+        crate::backend::macos::vnext_session::MacNegotiationOutcome::Rejected {
+            by,
+            reason,
+            cleanup,
+        } => {
+            let reason = RejectionReason::from_wire(reason).ok_or_else(|| {
+                SessionFailure::new(
+                    SessionOperation::Negotiate,
+                    SessionTransactionState::Poisoned,
+                    SessionError::MalformedPeer,
+                )
+            })?;
+            Ok(NegotiationOutcome::Rejected {
+                by: map_mac_role(by),
+                reason,
+                cleanup,
+            })
+        }
     }
 }
 
@@ -2141,6 +2422,71 @@ impl From<crate::backend::linux_vnext::spawn::LinuxPublicSessionError> for Sessi
             }
             crate::backend::linux_vnext::spawn::LinuxPublicSessionError::Poisoned => Self::Poisoned,
             crate::backend::linux_vnext::spawn::LinuxPublicSessionError::Native(_) => Self::Native,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_session_failure(
+    operation: SessionOperation,
+    transaction_state: SessionTransactionState,
+    error: crate::backend::macos::vnext_session::MacPublicSessionError,
+    poisoned: bool,
+) -> SessionFailure {
+    SessionFailure::new(operation, transaction_state, error.into())
+        .with_native_code(mac_public_native_code(error))
+        .with_poisoned(poisoned)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_ready_failure(
+    operation: SessionOperation,
+    state: SessionState,
+    error: crate::backend::macos::vnext_session::MacPublicSessionError,
+) -> SessionFailure {
+    let poisoned = state == SessionState::Poisoned;
+    mac_session_failure(
+        operation,
+        if poisoned {
+            SessionTransactionState::Poisoned
+        } else {
+            SessionTransactionState::Ready
+        },
+        error,
+        poisoned,
+    )
+}
+
+#[cfg(target_os = "macos")]
+const fn mac_public_native_code(
+    error: crate::backend::macos::vnext_session::MacPublicSessionError,
+) -> Option<i32> {
+    match error {
+        crate::backend::macos::vnext_session::MacPublicSessionError::Native(code) => code,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::backend::macos::vnext_session::MacPublicSessionError> for SessionError {
+    fn from(error: crate::backend::macos::vnext_session::MacPublicSessionError) -> Self {
+        use crate::backend::macos::vnext_session::MacPublicSessionError as MacError;
+        match error {
+            MacError::InvalidInput => Self::InvalidInput,
+            MacError::DeadlineExpired => Self::DeadlineExpired,
+            MacError::PeerExited => Self::PeerDisconnected,
+            MacError::IdentityMismatch => Self::IdentityMismatch,
+            MacError::MalformedPeer => Self::MalformedPeer,
+            MacError::Ambiguous => Self::Ambiguous,
+            MacError::NegotiationFailed => Self::NegotiationFailed,
+            MacError::NativeNegotiation(error) => Self::NativeNegotiation(error),
+            MacError::Control(error) => Self::Control(error),
+            MacError::Batch(error) => Self::Batch(error),
+            MacError::ActiveLimit => Self::ActiveLimit,
+            MacError::PeerPreparationFailed => Self::PeerPreparationFailed,
+            MacError::ActivationFailed => Self::ActivationFailed,
+            MacError::Poisoned => Self::Poisoned,
+            MacError::Native(_) => Self::Native,
         }
     }
 }

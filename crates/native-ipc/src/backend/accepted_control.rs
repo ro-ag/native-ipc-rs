@@ -8,7 +8,7 @@ use crate::active::{ActivationError, ActiveReader, ActiveWriter, LeaseReservatio
 use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::PendingBatch;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use crate::batch::TransferBatch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::batch::{ActiveRegionSet, BatchError, CommittedRegion, LocalRegionAuthority};
@@ -16,15 +16,15 @@ use crate::control::{ControlError, ControlFrame, ControlState, control_wire_len}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::liveness::ResourceError;
 use crate::liveness::ResourceOwner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::protocol::CONTROL_FRAME_LEN;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::protocol::CoordinatorCapacityStatus;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::protocol::{CompletionFrame, CompletionFrameKind, PreparationFrameKind};
 use crate::session::AbsoluteDeadline;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::session::{ActiveLeaseFacts, AtomicCapabilities, ProtocolVersion, SessionState};
 #[cfg(all(target_os = "linux", test))]
 use std::os::fd::AsRawFd;
@@ -201,6 +201,8 @@ pub(crate) enum MacCapabilityBatchError {
     Memory(MacBatchError),
     Control(AcceptedControlError),
     Resource(ResourceError),
+    ActiveLimit,
+    PeerPreparationFailed,
 }
 
 #[cfg(target_os = "macos")]
@@ -496,17 +498,17 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         self.parameters.limits()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn atomics(&self) -> AtomicCapabilities {
         self.parameters.atomics()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
         self.parameters.protocol_version()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn session_state(&self) -> SessionState {
         if self.state.is_poisoned()
             || !matches!(
@@ -520,17 +522,17 @@ impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn active_lease_facts(&self) -> ActiveLeaseFacts {
         self.resources.active_lease_facts()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn try_close_resources(&mut self) -> Result<(), ResourceError> {
         self.resources.try_close()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn poison_session(&mut self) {
         self.poison_both();
     }
@@ -627,6 +629,128 @@ impl<T: CoordinatorCapabilityTransport> CoordinatorPreparedBatchTransaction<'_, 
 
 #[cfg(target_os = "macos")]
 impl AcceptedControlDispatcher<CoordinatorMacControlTransport> {
+    pub(crate) fn wait_for_macos_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> crate::session::ChildCleanupFacts {
+        let cleanup = self.transport.wait_and_reap_facts(deadline);
+        if cleanup.direct_child_complete() || cleanup.native_error().is_some() {
+            self.poison_both();
+        }
+        cleanup
+    }
+
+    pub(crate) fn abort_macos_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> crate::session::ChildCleanupFacts {
+        self.poison_both();
+        self.transport.terminate_and_reap_facts(deadline)
+    }
+
+    pub(crate) fn begin_public_macos_transfer_capacity(
+        &mut self,
+        batch: &TransferBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CapabilityFrame, MacCapabilityBatchError> {
+        let entries = batch
+            .manifest_entries()
+            .ok_or(MacCapabilityBatchError::Memory(MacBatchError::InvalidBatch))?;
+        self.begin_native_transaction(entries, deadline)
+            .map_err(MacCapabilityBatchError::Control)
+    }
+
+    pub(crate) fn reserve_macos_transfer_batch(
+        &mut self,
+        batch: &TransferBatch,
+    ) -> Result<Vec<LeaseReservation>, ResourceError> {
+        self.reserve_mapped_lengths(batch.reservation_lengths())
+    }
+
+    pub(crate) fn exchange_public_macos_transfer_capacity(
+        &mut self,
+        frame: &CapabilityFrame,
+        local_status: CoordinatorCapacityStatus,
+        deadline: AbsoluteDeadline,
+    ) -> Result<bool, MacCapabilityBatchError> {
+        let local_ready = local_status == CoordinatorCapacityStatus::Ready;
+        let offer = frame.coordinator_capacity_frame(local_status);
+        if let Err(error) = self.transport.send_record(offer.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let response = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(response) => response,
+            Err(error) => {
+                self.poison_both();
+                return Err(MacCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let peer_ready = if frame.receiver_capacity_frame(true).matches(&response) {
+            true
+        } else if frame.receiver_capacity_frame(false).matches(&response) {
+            false
+        } else {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !local_ready && peer_ready {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if !local_ready || !peer_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(MacCapabilityBatchError::Control)?;
+        }
+        Ok(peer_ready)
+    }
+
+    pub(crate) fn begin_public_macos_mixed_direction_batch_preflighted(
+        &mut self,
+        batch: MacMixedDirectionBatch,
+        reservations: Vec<LeaseReservation>,
+        frame: CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<MacCoordinatorMixedDirectionTransaction<'_>, MacCapabilityBatchError> {
+        if self.parameters.authority_profile() != crate::protocol::NativeAuthorityProfile::MacMachV1
+            || batch.deadline() != deadline
+            || reservations.len() != batch.reservation_lengths().len()
+            || !self.state.is_transaction_open()
+            || !self.frame_matches_entries(&frame, batch.manifest_entries())
+        {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Memory(
+                MacBatchError::WrongProvenance,
+            ));
+        }
+        Ok(MacCoordinatorMixedDirectionTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            reservations,
+            attempted: false,
+            #[cfg(test)]
+            sealed_frame_fault: false,
+            #[cfg(test)]
+            commit_frame_fault: false,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn wait_for_macos_child_exit_for_test(
         &self,
@@ -734,6 +858,97 @@ impl AcceptedControlDispatcher<ReceiverMacControlTransport> {
             imported: None,
             frame: None,
             reservations,
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            imported_frame_fault: false,
+            #[cfg(test)]
+            ready_frame_fault: false,
+        })
+    }
+
+    pub(crate) fn begin_public_macos_expected_mixed_direction_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<MacReceiverMixedDirectionTransaction<'_>, MacCapabilityBatchError> {
+        if self.parameters.authority_profile() != crate::protocol::NativeAuthorityProfile::MacMachV1
+        {
+            return Err(MacCapabilityBatchError::Memory(
+                MacBatchError::WrongProvenance,
+            ));
+        }
+        let expected =
+            MacExpectedMixedDirectionBatch::new(expected, self.parameters.limits(), deadline)
+                .map_err(MacCapabilityBatchError::Memory)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(MacCapabilityBatchError::Control)?;
+        let offer = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.poison_both();
+                return Err(MacCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((frame, manifest, coordinator_status)) =
+            CapabilityFrame::decode_coordinator_capacity(&offer)
+        else {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !mac_received_mixed_manifest_matches(
+            self.parameters,
+            transaction_id,
+            &expected,
+            &manifest,
+        ) {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let coordinator_ready = coordinator_status == CoordinatorCapacityStatus::Ready;
+        let reservations = if coordinator_ready {
+            self.reserve_mapped_lengths(expected.reservation_lengths())
+                .ok()
+        } else {
+            None
+        };
+        let local_ready = coordinator_ready && reservations.is_some();
+        let response = frame.receiver_capacity_frame(local_ready);
+        if let Err(error) = self.transport.send_record(response.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(MacCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        if !local_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(MacCapabilityBatchError::Control)?;
+            return Err(match coordinator_status {
+                CoordinatorCapacityStatus::PreparationFailed => {
+                    MacCapabilityBatchError::PeerPreparationFailed
+                }
+                CoordinatorCapacityStatus::Ready | CoordinatorCapacityStatus::ActiveLimit => {
+                    MacCapabilityBatchError::ActiveLimit
+                }
+            });
+        }
+        Ok(MacReceiverMixedDirectionTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            frame: None,
+            reservations: reservations.expect("ready capacity retains exact reservations"),
             deadline,
             transaction_id,
             attempted: false,
@@ -3062,7 +3277,7 @@ impl<T: ReceiverCapabilityTransport> AcceptedControlDispatcher<T> {
 }
 
 impl<T: AuthenticatedZeroRightsTransport> AcceptedControlDispatcher<T> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn frame_matches_entries(&self, frame: &CapabilityFrame, entries: Vec<ManifestEntry>) -> bool {
         let Some((_, manifest)) = CapabilityFrame::decode(frame.as_bytes()) else {
             return false;

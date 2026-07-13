@@ -16,6 +16,7 @@ use crate::backend::{
 };
 use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame, NativeAuthorityProfile};
 use crate::session::AbsoluteDeadline;
+use crate::session::ChildCleanupFacts;
 
 /// Coordinator-only accepted Mach transport retaining exact-child lifecycle.
 pub(crate) struct CoordinatorMacControlTransport {
@@ -58,18 +59,28 @@ impl MacReceivedCapabilities {
 }
 
 impl CoordinatorMacControlTransport {
-    pub(crate) fn from_accepted(
+    #[cfg(test)]
+    pub(crate) fn from_accepted_for_wait_test(
         mut channel: ParentChannel,
+        evidence: CoordinatorAcceptedEvidence,
+    ) -> Result<Self, SessionTransportError> {
+        let lifecycle = channel.take_vnext_lifecycle()?;
+        Self::from_accepted_with_lifecycle(channel, lifecycle, evidence)
+    }
+
+    pub(super) fn from_accepted_with_lifecycle(
+        channel: ParentChannel,
+        lifecycle: MacChildLifecycle,
         evidence: CoordinatorAcceptedEvidence,
     ) -> Result<Self, SessionTransportError> {
         let facts = evidence.facts();
         if facts.parent_pid() != std::process::id()
             || facts.child_pid() != channel.peer_pid()
+            || lifecycle.pid() != channel.peer_pid()
             || facts.nonce() != channel.vnext_nonce()
         {
             return Err(SessionTransportError::IdentityMismatch);
         }
-        let lifecycle = channel.take_vnext_lifecycle()?;
         Ok(Self {
             channel,
             lifecycle,
@@ -82,6 +93,18 @@ impl CoordinatorMacControlTransport {
     pub(crate) fn session_parameters(&self) -> crate::backend::AcceptedSessionParameters {
         self._evidence
             .session_parameters(NativeAuthorityProfile::MacMachV1)
+    }
+
+    pub(crate) fn wait_and_reap_facts(&self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        self.lifecycle.wait_and_reap_facts(deadline)
+    }
+
+    pub(crate) fn terminate_and_reap_facts(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> ChildCleanupFacts {
+        self.poisoned = true;
+        self.lifecycle.terminate_and_reap_facts(deadline)
     }
 
     #[cfg(test)]
