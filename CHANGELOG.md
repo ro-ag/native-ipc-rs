@@ -69,6 +69,11 @@ Versioning once a stable API is released.
   reuse-proof process identity to a termination primitive, launchd cleanup is
   process-group scoped and `setsid`-escapable, and no public sandbox
   entitlement denies fork. Public macOS composition remains fail-closed.
+- Adopt the standing decision that public macOS stays fail-closed instead of
+  re-scoping the contract to a weaker documented containment class or
+  depending on private interfaces. The position is revisited only when a
+  macOS SDK documents a public exact-identity termination or containment
+  mechanism.
 
 ### Fixed
 

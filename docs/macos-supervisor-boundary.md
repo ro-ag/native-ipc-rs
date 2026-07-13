@@ -12,6 +12,15 @@ tracking) examined every public candidate for the crash-surviving gap and
 confirmed the negative result. The findings are recorded in
 [Public-API impossibility evidence](#public-api-impossibility-evidence) below.
 
+Standing decision (2026-07-13): the project keeps public macOS fail-closed
+rather than re-scoping the contract to a documented weaker containment class
+or depending on private libproc/proc_info interfaces. The exactness
+requirement is not negotiable for this backend. This position is revisited
+only when a new macOS SDK documents a public mechanism that binds a
+reuse-proof process identity to termination or containment authority; until
+then the R8.6/6d chain remains architecture-blocked by decision, not by
+outstanding investigation.
+
 ## Decision
 
 Any viable production macOS session adapter requires an authority that exists
