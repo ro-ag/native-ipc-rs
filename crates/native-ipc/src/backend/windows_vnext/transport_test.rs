@@ -192,6 +192,7 @@ fn accepted_message_records_preserve_boundaries_and_maximum() {
         spawn_helper("backend::windows::vnext_transport_test::accepted_message_record_helper");
     let mut transport = coordinator_transport(session);
     transport.send_record(&[0x41], deadline()).unwrap();
+    assert_eq!(transport.receive_record(1, deadline()).unwrap(), [0x7d]);
     transport
         .send_record(&vec![0x5a; MAX_VNEXT_RECORD_BYTES], deadline())
         .unwrap();
@@ -276,6 +277,7 @@ fn accepted_message_record_helper() {
     let channel = connect_spawned_helper().unwrap();
     let mut transport = receiver_transport(channel);
     assert_eq!(transport.receive_record(1, deadline()).unwrap(), [0x41]);
+    transport.send_record(&[0x7d], deadline()).unwrap();
     assert_eq!(
         transport
             .receive_record(MAX_VNEXT_RECORD_BYTES, deadline())
