@@ -991,9 +991,12 @@ forbidden task-port transfer, so a supervisor/XPC boundary is required before
 6d conformance. A preinstalled signed launchd/XPC service is necessary and a
 library-spawned broker is recursive, but the service alone loses its parent/wait
 authority on crash. No documented public crash-surviving exact containment
-primitive has been identified; see
+primitive has been identified; a dedicated primary-source investigation
+confirmed the negative result, and a standing 2026-07-13 decision keeps public
+macOS fail-closed rather than re-scoping the contract or depending on private
+interfaces. See
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) for the
-negative result and native evidence gate. No service artifact is implemented.
+evidence and native gate. No service artifact is implemented.
 The prototype coordinator opens an absolute
 regular non-setid executable with `O_NOFOLLOW`, retains its stable
 device/inode/size identity, launches the explicit argv/environment with

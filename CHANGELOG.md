@@ -74,6 +74,12 @@ Versioning once a stable API is released.
   depending on private interfaces. The position is revisited only when a
   macOS SDK documents a public exact-identity termination or containment
   mechanism.
+- Record packaged-crate conformance: the three release-order `cargo package`
+  artifacts rebuild from extracted sources and pass the all-feature and
+  no-default workspace suites natively on physical Apple Silicon. Reconcile
+  the traceability progress ledger (hosted macOS reducer evidence, blocked-by-
+  decision 6d state) and the README/architecture/feasibility macOS status
+  text with the standing fail-closed decision.
 
 ### Fixed
 

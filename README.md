@@ -248,11 +248,15 @@ fail-closed: direct spawn has no PID-reuse-safe termination authority before the
 first audit-bearing Mach message without transferring a forbidden task port.
 A preinstalled signed launchd/XPC service is a necessary candidate boundary,
 but it is insufficient across supervisor crash without additional
-crash-surviving OS containment. The result and native evidence gate are
-documented in
-[`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md); no
-service artifact exists. This is source-tree evidence with local package
-verification. Private Windows parity now includes unnamed-section mixed memory,
+crash-surviving OS containment. A primary-source investigation confirmed no documented
+public mechanism provides crash-surviving exact containment without task
+ports, and a standing decision keeps public macOS fail-closed rather than
+re-scoping the contract; both are documented in
+[`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md). No
+service artifact exists. This is source-tree evidence plus packaged-crate
+conformance: the three extracted `cargo package` crates rebuild and pass the
+all-feature and no-default workspace suites natively on physical Apple
+Silicon at the current head. Private Windows parity now includes unnamed-section mixed memory,
 PID-authenticated message transport, exact process/whole-Job lifecycle,
 full-manifest IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation, green on
 native Windows AMD64/Arm64 at the exact branch tip. Public Windows sessions, the
