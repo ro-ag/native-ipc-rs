@@ -54,6 +54,19 @@ fn build_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
     (batch, ExpectedBatch::try_from_regions(expected).unwrap())
 }
 
+#[test]
+fn received_handle_accounting_survives_cross_thread_drop() {
+    let (batch, _) = build_batch(1);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let handle = prepared.duplicate_capability_for_test(0).unwrap();
+    std::thread::spawn(move || drop(handle)).join().unwrap();
+}
+
 fn manifest(entries: Vec<crate::protocol::ManifestEntry>) -> TransferManifest {
     TransferManifest::new_with_authority(
         [7; 32],

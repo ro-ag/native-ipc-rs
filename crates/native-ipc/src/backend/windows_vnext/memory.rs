@@ -5,6 +5,11 @@ use core::marker::PhantomData;
 use core::mem::{size_of, zeroed};
 use core::ptr::NonNull;
 
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows_sys::Win32::Foundation::{
     CompareObjectHandles, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
@@ -93,15 +98,21 @@ impl WindowsActiveRegionOwner {
     }
 }
 
-struct SectionView(Option<View>);
+struct SectionView(Option<View>, #[cfg(test)] Arc<AtomicUsize>);
 
-struct SectionHandle(Option<OwnedHandle>);
+struct SectionHandle(Option<OwnedHandle>, #[cfg(test)] Arc<AtomicUsize>);
 
 impl SectionHandle {
     fn new(handle: OwnedHandle) -> Self {
         #[cfg(test)]
-        LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() + 1));
-        Self(Some(handle))
+        let live = LIVE_VNEXT_HANDLES.with(Arc::clone);
+        #[cfg(test)]
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(
+            Some(handle),
+            #[cfg(test)]
+            live,
+        )
     }
 
     fn raw(&self) -> HANDLE {
@@ -114,7 +125,8 @@ impl Drop for SectionHandle {
         let _released = self.0.take().is_none_or(|handle| handle.close().is_ok());
         #[cfg(test)]
         if _released {
-            LIVE_VNEXT_HANDLES.with(|count| count.set(count.get() - 1));
+            let previous = self.1.fetch_sub(1, Ordering::Relaxed);
+            assert!(previous > 0, "live Windows handle accounting underflow");
         }
     }
 }
@@ -122,8 +134,14 @@ impl Drop for SectionHandle {
 impl SectionView {
     fn new(view: View) -> Self {
         #[cfg(test)]
-        LIVE_VNEXT_VIEWS.with(|count| count.set(count.get() + 1));
-        Self(Some(view))
+        let live = LIVE_VNEXT_VIEWS.with(Arc::clone);
+        #[cfg(test)]
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(
+            Some(view),
+            #[cfg(test)]
+            live,
+        )
     }
 
     fn base(&self) -> NonNull<u8> {
@@ -137,18 +155,18 @@ impl SectionView {
 
 #[cfg(test)]
 thread_local! {
-    static LIVE_VNEXT_VIEWS: Cell<usize> = const { Cell::new(0) };
-    static LIVE_VNEXT_HANDLES: Cell<usize> = const { Cell::new(0) };
+    static LIVE_VNEXT_VIEWS: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    static LIVE_VNEXT_HANDLES: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 }
 
 #[cfg(test)]
 pub(crate) fn live_views_for_test() -> usize {
-    LIVE_VNEXT_VIEWS.with(Cell::get)
+    LIVE_VNEXT_VIEWS.with(|live| live.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
 pub(crate) fn live_handles_for_test() -> usize {
-    LIVE_VNEXT_HANDLES.with(Cell::get)
+    LIVE_VNEXT_HANDLES.with(|live| live.load(Ordering::Relaxed))
 }
 
 impl Drop for SectionView {
@@ -156,7 +174,8 @@ impl Drop for SectionView {
         let _released = self.0.take().is_none_or(|view| view.unmap().is_ok());
         #[cfg(test)]
         if _released {
-            LIVE_VNEXT_VIEWS.with(|count| count.set(count.get() - 1));
+            let previous = self.1.fetch_sub(1, Ordering::Relaxed);
+            assert!(previous > 0, "live Windows view accounting underflow");
         }
     }
 }
@@ -355,6 +374,15 @@ impl WindowsMixedDirectionBatch {
         validate_prepared_entries(&self.entries, self.deadline)
     }
 
+    pub(crate) fn capability_sources(&self) -> Result<Vec<(HANDLE, u32)>, WindowsBatchError> {
+        self.revalidate_before_send()?;
+        Ok(self
+            .entries
+            .iter()
+            .map(|entry| (entry.section(), entry.peer_access()))
+            .collect())
+    }
+
     pub(crate) fn activation_specs(
         &self,
     ) -> Result<Vec<WindowsActiveRegionSpec>, WindowsBatchError> {
@@ -502,6 +530,11 @@ impl WindowsMixedDirectionBatch {
 
 /// Immediately owned handle installed in the receiving process.
 pub(crate) struct WindowsReceivedHandle(SectionHandle);
+
+// SAFETY: this value uniquely owns one process-local handle and transfers only
+// that ownership; all use and destruction remains serialized by `&mut self` or
+// consuming operations.
+unsafe impl Send for WindowsReceivedHandle {}
 
 impl WindowsReceivedHandle {
     /// # Safety

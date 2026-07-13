@@ -13,16 +13,23 @@ use native_ipc_core::mapping::{
     BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    CloseHandle, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
     GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, GetLengthSid,
+    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, IsValidSid,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_GROUPS, TOKEN_QUERY,
+    TokenLogonSid,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
-    WriteFile,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -34,15 +41,15 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-    PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
-    SetNamedPipeHandleState,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_MESSAGE, SetNamedPipeHandleState,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
-    GetCurrentProcessId, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    GetCurrentProcessId, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
+    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::BackendStatus;
@@ -387,6 +394,7 @@ const AUTH_MAGIC: [u8; 8] = *b"NIPCAUT1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
 const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+const MAX_VNEXT_RECORD_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
 const WAIT_MS: u32 = 10_000;
 #[cfg(test)]
@@ -402,6 +410,114 @@ struct BootstrapFrame {
 }
 
 const CAPABILITY_FRAME_LEN: usize = 40 + CONTROL_FRAME_LEN;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+struct PipeSecurity {
+    _descriptor: Box<SECURITY_DESCRIPTOR>,
+    _acl: Vec<usize>,
+    attributes: SECURITY_ATTRIBUTES,
+}
+
+impl PipeSecurity {
+    fn for_current_logon() -> Result<Self, WindowsError> {
+        let mut token = core::ptr::null_mut();
+        // SAFETY: current-process pseudo handle is valid and output is writable.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(last_os("OpenProcessToken"));
+        }
+        let token = OwnedHandle::new(token)?;
+        let mut token_bytes = 0_u32;
+        // SAFETY: null output asks for the exact TokenLogonSid byte count.
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenLogonSid,
+                core::ptr::null_mut(),
+                0,
+                &mut token_bytes,
+            )
+        } != 0
+            || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+            || token_bytes < size_of::<TOKEN_GROUPS>() as u32
+        {
+            return Err(last_os("GetTokenInformation(size)"));
+        }
+        let word = size_of::<usize>();
+        let mut token_buffer = vec![0_usize; (token_bytes as usize).div_ceil(word)];
+        // SAFETY: the aligned buffer has the exact byte capacity requested above.
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenLogonSid,
+                token_buffer.as_mut_ptr().cast(),
+                token_bytes,
+                &mut token_bytes,
+            )
+        } == 0
+        {
+            return Err(last_os("GetTokenInformation(TokenLogonSid)"));
+        }
+        let groups = unsafe { &*token_buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+        if groups.GroupCount != 1 || groups.Groups[0].Sid.is_null() {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let sid = groups.Groups[0].Sid;
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let sid_len = unsafe { GetLengthSid(sid) } as usize;
+        let acl_len = size_of::<ACL>()
+            .checked_add(size_of::<ACCESS_ALLOWED_ACE>())
+            .and_then(|value| value.checked_add(sid_len))
+            .and_then(|value| value.checked_sub(size_of::<u32>()))
+            .ok_or(WindowsError::InvalidBootstrap)?;
+        let mut acl = vec![0_usize; acl_len.div_ceil(word)];
+        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+        let acl_bytes = u32::try_from(acl_len).map_err(|_| WindowsError::InvalidBootstrap)?;
+        // SAFETY: the aligned ACL allocation remains owned by PipeSecurity.
+        if unsafe { InitializeAcl(acl_ptr, acl_bytes, ACL_REVISION) } == 0 {
+            return Err(last_os("InitializeAcl"));
+        }
+        // SAFETY: AddAccessAllowedAceEx copies the validated logon SID into the ACL.
+        if unsafe {
+            AddAccessAllowedAceEx(
+                acl_ptr,
+                ACL_REVISION,
+                0,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                sid,
+            )
+        } == 0
+        {
+            return Err(last_os("AddAccessAllowedAceEx"));
+        }
+        let mut descriptor = Box::new(SECURITY_DESCRIPTOR::default());
+        // SAFETY: descriptor storage is writable and remains pinned by Box allocation.
+        if unsafe {
+            InitializeSecurityDescriptor(
+                (&raw mut *descriptor).cast(),
+                SECURITY_DESCRIPTOR_REVISION,
+            )
+        } == 0
+        {
+            return Err(last_os("InitializeSecurityDescriptor"));
+        }
+        // SAFETY: descriptor and ACL remain live together in PipeSecurity.
+        if unsafe { SetSecurityDescriptorDacl((&raw mut *descriptor).cast(), 1, acl_ptr, 0) } == 0 {
+            return Err(last_os("SetSecurityDescriptorDacl"));
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (&raw mut *descriptor).cast(),
+            bInheritHandle: 0,
+        };
+        Ok(Self {
+            _descriptor: descriptor,
+            _acl: acl,
+            attributes,
+        })
+    }
+}
 
 fn encode_capability_frame(
     reader: RemoteHandle,
@@ -454,7 +570,8 @@ impl ChildSession {
         let nonce = session_nonce()?;
         let name = format!(r"\\.\pipe\native-ipc-{}", hex(&nonce));
         let pipe_name = wide_null(OsStr::new(&name));
-        // SAFETY: name is terminated; null security creates a non-inheritable handle.
+        let pipe_security = PipeSecurity::for_current_logon()?;
+        // SAFETY: name and explicit logon-SID-only security attributes remain live.
         let pipe = unsafe {
             CreateNamedPipeW(
                 pipe_name.as_ptr(),
@@ -464,10 +581,10 @@ impl ChildSession {
                     | PIPE_NOWAIT
                     | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                4096,
-                4096,
+                MAX_VNEXT_RECORD_BYTES as u32,
+                MAX_VNEXT_RECORD_BYTES as u32,
                 WAIT_MS,
-                std::ptr::null(),
+                &raw const pipe_security.attributes,
             )
         };
         let pipe = OwnedHandle::new(pipe)?;
@@ -517,17 +634,21 @@ impl ChildSession {
             return Err(error);
         }
         drop(thread);
-        connect_pipe(pipe.0, process.0)?;
-        // SAFETY: the server pipe is connected and the expected PID is held live.
-        unsafe { authenticate_pipe_client(pipe.0, information.dwProcessId)? };
+        let bootstrap_deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+        connect_authenticated_pipe(
+            pipe.0,
+            process.0,
+            information.dwProcessId,
+            bootstrap_deadline,
+        )?;
         let hello = BootstrapFrame {
             magic: BOOTSTRAP_MAGIC,
             nonce,
             parent_pid,
             child_pid: information.dwProcessId,
         };
-        write_frame(pipe.0, &hello)?;
-        let ready = read_frame(pipe.0)?;
+        write_frame_until(pipe.0, &hello, bootstrap_deadline)?;
+        let ready = read_frame_until(pipe.0, bootstrap_deadline)?;
         if ready.magic != AUTH_MAGIC
             || ready.nonce != nonce
             || ready.parent_pid != parent_pid
@@ -555,6 +676,9 @@ impl ChildSession {
     /// Kernel-created child process ID authenticated on the private pipe.
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+    pub(crate) const fn vnext_nonce(&self) -> [u8; 32] {
+        self.nonce
     }
     /// Sends the two exact-rights handle values and their complete mapped lengths.
     fn send_capabilities(
@@ -700,19 +824,8 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
         .parse::<u32>()
         .map_err(|_| WindowsError::InvalidBootstrap)?;
     let name = wide_null(&name);
-    // SAFETY: terminated name; no sharing or inheritance and existing pipe only.
-    let pipe = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    let pipe = OwnedHandle::new(pipe)?;
+    let bootstrap_deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    let pipe = open_pipe_until(name.as_ptr(), bootstrap_deadline)?;
     let mode = PIPE_READMODE_MESSAGE | PIPE_NOWAIT;
     // SAFETY: connected client pipe and mode pointer are valid.
     if unsafe { SetNamedPipeHandleState(pipe.0, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
@@ -720,7 +833,7 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
     }
     // SAFETY: connected pipe client and exact expected parent from spawn environment.
     unsafe { authenticate_pipe_server(pipe.0, parent_pid)? };
-    let hello = read_frame(pipe.0)?;
+    let hello = read_frame_until(pipe.0, bootstrap_deadline)?;
     let child_pid = unsafe { GetCurrentProcessId() };
     if hello.magic != BOOTSTRAP_MAGIC
         || hello.nonce != nonce
@@ -729,12 +842,13 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
     {
         return Err(WindowsError::InvalidBootstrap);
     }
-    write_frame(
+    write_frame_until(
         pipe.0,
         &BootstrapFrame {
             magic: AUTH_MAGIC,
             ..hello
         },
+        bootstrap_deadline,
     )?;
     Ok(ChildChannel {
         pipe,
@@ -761,6 +875,9 @@ impl ChildChannel {
     /// Held authenticated parent PID.
     pub const fn parent_pid(&self) -> u32 {
         self.parent_pid
+    }
+    pub(crate) const fn vnext_nonce(&self) -> [u8; 32] {
+        self.nonce
     }
     /// Raw pipe handle for a bounded manifest protocol owned by the caller.
     pub const fn pipe_handle(&self) -> HANDLE {
@@ -1159,13 +1276,21 @@ fn pod_bytes<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast(), size_of::<T>()) }
 }
 
-fn write_frame(pipe: HANDLE, frame: &BootstrapFrame) -> Result<(), WindowsError> {
-    write_pod(pipe, frame)
+fn write_frame_until(
+    pipe: HANDLE,
+    frame: &BootstrapFrame,
+    deadline: Instant,
+) -> Result<(), WindowsError> {
+    write_pod_until(pipe, frame, deadline)
 }
 
 fn write_pod<T>(pipe: HANDLE, value: &T) -> Result<(), WindowsError> {
-    let bytes = pod_bytes(value);
     let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    write_pod_until(pipe, value, deadline)
+}
+
+fn write_pod_until<T>(pipe: HANDLE, value: &T, deadline: Instant) -> Result<(), WindowsError> {
+    let bytes = pod_bytes(value);
     loop {
         let mut written = 0;
         // SAFETY: pipe is live, bytes are valid, and nonblocking operation is synchronous.
@@ -1179,11 +1304,10 @@ fn write_pod<T>(pipe: HANDLE, value: &T) -> Result<(), WindowsError> {
             )
         } != 0
         {
-            return if written as usize == bytes.len() {
-                Ok(())
-            } else {
-                Err(WindowsError::InvalidBootstrap)
-            };
+            if written as usize != bytes.len() || Instant::now() >= deadline {
+                return Err(WindowsError::InvalidBootstrap);
+            }
+            return Ok(());
         }
         let code = unsafe { GetLastError() };
         if code != ERROR_NO_DATA && code != ERROR_PIPE_LISTENING {
@@ -1196,12 +1320,16 @@ fn write_pod<T>(pipe: HANDLE, value: &T) -> Result<(), WindowsError> {
     }
 }
 
-fn read_frame(pipe: HANDLE) -> Result<BootstrapFrame, WindowsError> {
-    read_pod(pipe)
+fn read_frame_until(pipe: HANDLE, deadline: Instant) -> Result<BootstrapFrame, WindowsError> {
+    read_pod_until(pipe, deadline)
 }
 
 fn read_pod<T>(pipe: HANDLE) -> Result<T, WindowsError> {
     let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    read_pod_until(pipe, deadline)
+}
+
+fn read_pod_until<T>(pipe: HANDLE, deadline: Instant) -> Result<T, WindowsError> {
     loop {
         let mut value: T = unsafe { zeroed() };
         let mut read = 0;
@@ -1216,11 +1344,10 @@ fn read_pod<T>(pipe: HANDLE) -> Result<T, WindowsError> {
             )
         } != 0
         {
-            return if read as usize == size_of::<T>() {
-                Ok(value)
-            } else {
-                Err(WindowsError::InvalidBootstrap)
-            };
+            if read as usize != size_of::<T>() || Instant::now() >= deadline {
+                return Err(WindowsError::InvalidBootstrap);
+            }
+            return Ok(value);
         }
         let code = unsafe { GetLastError() };
         if code != ERROR_NO_DATA && code != ERROR_PIPE_LISTENING {
@@ -1233,15 +1360,60 @@ fn read_pod<T>(pipe: HANDLE) -> Result<T, WindowsError> {
     }
 }
 
-fn connect_pipe(pipe: HANDLE, process: HANDLE) -> Result<(), WindowsError> {
-    let deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+fn connect_authenticated_pipe(
+    pipe: HANDLE,
+    process: HANDLE,
+    expected_pid: u32,
+    deadline: Instant,
+) -> Result<(), WindowsError> {
     loop {
+        check_instant_deadline(deadline, "authenticated pipe connect")?;
+        connect_pipe_until(pipe, process, deadline)?;
+        // SAFETY: the server pipe is connected and the expected PID is held live.
+        match unsafe { authenticate_pipe_client(pipe, expected_pid) } {
+            Ok(()) => {
+                check_instant_deadline(deadline, "authenticated pipe connect")?;
+                return Ok(());
+            }
+            Err(WindowsError::WrongPeer) => {
+                // SAFETY: this server owns the connected one-instance pipe.
+                if unsafe { DisconnectNamedPipe(pipe) } == 0 {
+                    let code = unsafe { GetLastError() };
+                    if code != ERROR_PIPE_NOT_CONNECTED && code != ERROR_BROKEN_PIPE {
+                        return Err(WindowsError::Os {
+                            operation: "DisconnectNamedPipe",
+                            code,
+                        });
+                    }
+                }
+                wait_retry(deadline, "authenticated pipe connect")?;
+            }
+            Err(WindowsError::Os { code, .. })
+                if code == ERROR_PIPE_NOT_CONNECTED || code == ERROR_BROKEN_PIPE =>
+            {
+                let _ = unsafe { DisconnectNamedPipe(pipe) };
+                wait_retry(deadline, "authenticated pipe connect")?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn connect_pipe_until(
+    pipe: HANDLE,
+    process: HANDLE,
+    deadline: Instant,
+) -> Result<(), WindowsError> {
+    loop {
+        check_instant_deadline(deadline, "pipe connect")?;
         // SAFETY: server pipe is nonblocking and no OVERLAPPED operation is requested.
         if unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) } != 0 {
+            check_instant_deadline(deadline, "pipe connect")?;
             return Ok(());
         }
         let code = unsafe { GetLastError() };
         if code == ERROR_PIPE_CONNECTED {
+            check_instant_deadline(deadline, "pipe connect")?;
             return Ok(());
         }
         if code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA {
@@ -1263,11 +1435,49 @@ fn connect_pipe(pipe: HANDLE, process: HANDLE) -> Result<(), WindowsError> {
     }
 }
 
+fn open_pipe_until(name: *const u16, deadline: Instant) -> Result<OwnedHandle, WindowsError> {
+    loop {
+        check_instant_deadline(deadline, "pipe open")?;
+        // SAFETY: terminated name; no sharing or inheritance and existing pipe only.
+        let pipe = unsafe {
+            CreateFileW(
+                name,
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if pipe != INVALID_HANDLE_VALUE && !pipe.is_null() {
+            let pipe = OwnedHandle::new(pipe)?;
+            check_instant_deadline(deadline, "pipe open")?;
+            return Ok(pipe);
+        }
+        let code = unsafe { GetLastError() };
+        if code != ERROR_PIPE_BUSY {
+            return Err(WindowsError::Os {
+                operation: "CreateFileW(pipe)",
+                code,
+            });
+        }
+        wait_retry(deadline, "pipe open")?;
+    }
+}
+
 fn wait_retry(deadline: Instant, operation: &'static str) -> Result<(), WindowsError> {
+    check_instant_deadline(deadline, operation)?;
+    std::thread::sleep(
+        Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+    );
+    check_instant_deadline(deadline, operation)
+}
+
+fn check_instant_deadline(deadline: Instant, operation: &'static str) -> Result<(), WindowsError> {
     if Instant::now() >= deadline {
         Err(WindowsError::TimedOut(operation))
     } else {
-        std::thread::sleep(Duration::from_millis(1));
         Ok(())
     }
 }
@@ -1312,9 +1522,16 @@ pub const fn status() -> BackendStatus {
 #[path = "windows_vnext/memory.rs"]
 pub(crate) mod vnext_memory;
 
+#[path = "windows_vnext/transport.rs"]
+pub(crate) mod vnext_transport;
+
 #[cfg(test)]
 #[path = "windows_vnext/memory_test.rs"]
 mod vnext_memory_test;
+
+#[cfg(test)]
+#[path = "windows_vnext/transport_test.rs"]
+mod vnext_transport_test;
 
 #[cfg(test)]
 #[path = "windows_test.rs"]

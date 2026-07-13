@@ -3,6 +3,7 @@ use native_ipc_core::layout::{
     AcknowledgementRouteSpec, Endpoint, LayoutLimits, RegionSpec, RoleId,
 };
 use std::time::Duration;
+use std::{ffi::OsStr, process::Command};
 use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
 
 fn topology() -> (RegionSetLayout, RoleId, RoleId) {
@@ -85,6 +86,140 @@ fn native(
 fn nonce_is_nonzero_and_job_is_constructible() {
     assert_ne!(session_nonce().unwrap(), [0; 32]);
     let _job = ChildJob::new().unwrap();
+}
+
+#[test]
+fn named_pipe_security_is_one_noninheritable_logon_sid_ace() {
+    let security = PipeSecurity::for_current_logon().unwrap();
+    let acl = unsafe { &*security._acl.as_ptr().cast::<ACL>() };
+    assert_eq!(acl.AceCount, 1);
+    assert_eq!(security.attributes.bInheritHandle, 0);
+    let ace = unsafe {
+        &*security
+            ._acl
+            .as_ptr()
+            .cast::<u8>()
+            .add(size_of::<ACL>())
+            .cast::<ACCESS_ALLOWED_ACE>()
+    };
+    assert_eq!(ace.Mask, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+}
+
+fn authenticated_test_pipe(name: &[u16]) -> OwnedHandle {
+    let security = PipeSecurity::for_current_logon().unwrap();
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            4096,
+            4096,
+            WAIT_MS,
+            &raw const security.attributes,
+        )
+    };
+    OwnedHandle::new(pipe).unwrap()
+}
+
+fn spawn_wrong_pipe_client(name: &OsStr) -> std::process::Child {
+    let executable = std::env::current_exe().unwrap();
+    Command::new(executable)
+        .args([
+            "--exact",
+            "backend::windows::tests::wrong_pipe_client_entry",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("NATIVE_IPC_WRONG_PIPE", name)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn wrong_local_client_is_disconnected_before_the_expected_pid_connects() {
+    let nonce = session_nonce().unwrap();
+    let name = OsString::from(format!(r"\\.\pipe\native-ipc-wrong-client-{}", hex(&nonce)));
+    let wide = wide_null(&name);
+    let pipe = authenticated_test_pipe(&wide);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut wrong = spawn_wrong_pipe_client(&name);
+    connect_pipe_until(pipe.0, unsafe { GetCurrentProcess() }, deadline).unwrap();
+
+    let real_name = wide.clone();
+    let real = std::thread::spawn(move || {
+        let client = open_pipe_until(real_name.as_ptr(), deadline).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drop(client);
+    });
+    connect_authenticated_pipe(
+        pipe.0,
+        unsafe { GetCurrentProcess() },
+        unsafe { GetCurrentProcessId() },
+        deadline,
+    )
+    .unwrap();
+    real.join().unwrap();
+    assert!(wrong.wait().unwrap().success());
+}
+
+#[test]
+fn continuous_wrong_client_cannot_replace_the_accept_deadline() {
+    let nonce = session_nonce().unwrap();
+    let name = OsString::from(format!(
+        r"\\.\pipe\native-ipc-wrong-deadline-{}",
+        hex(&nonce)
+    ));
+    let wide = wide_null(&name);
+    let pipe = authenticated_test_pipe(&wide);
+    let initial_deadline = Instant::now() + Duration::from_secs(2);
+    let mut wrong = spawn_wrong_pipe_client(&name);
+    connect_pipe_until(pipe.0, unsafe { GetCurrentProcess() }, initial_deadline).unwrap();
+    let result = connect_authenticated_pipe(
+        pipe.0,
+        unsafe { GetCurrentProcess() },
+        unsafe { GetCurrentProcessId() },
+        Instant::now() + Duration::from_millis(20),
+    );
+    assert!(matches!(result, Err(WindowsError::TimedOut(_))));
+    assert!(wrong.wait().unwrap().success());
+}
+
+#[test]
+fn an_already_connected_expected_client_cannot_bypass_expiry() {
+    let nonce = session_nonce().unwrap();
+    let name = OsString::from(format!(
+        r"\\.\pipe\native-ipc-expired-connect-{}",
+        hex(&nonce)
+    ));
+    let wide = wide_null(&name);
+    let pipe = authenticated_test_pipe(&wide);
+    let client_name = wide.clone();
+    let client = std::thread::spawn(move || {
+        let owner = open_pipe_until(
+            client_name.as_ptr(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drop(owner);
+    });
+    connect_pipe_until(
+        pipe.0,
+        unsafe { GetCurrentProcess() },
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        connect_authenticated_pipe(
+            pipe.0,
+            unsafe { GetCurrentProcess() },
+            unsafe { GetCurrentProcessId() },
+            Instant::now(),
+        ),
+        Err(WindowsError::TimedOut("authenticated pipe connect"))
+    ));
+    client.join().unwrap();
 }
 
 #[test]
@@ -204,6 +339,17 @@ fn helper_stall_before_auth_is_bounded() {
     ];
     let result = ChildSession::spawn(&executable, &arguments);
     assert!(matches!(result, Err(WindowsError::TimedOut("pipe read"))));
+}
+
+#[test]
+#[ignore = "spawned only by wrong-client accept-loop tests"]
+fn wrong_pipe_client_entry() {
+    let name = std::env::var_os("NATIVE_IPC_WRONG_PIPE").unwrap();
+    let wide = wide_null(&name);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let pipe = open_pipe_until(wide.as_ptr(), deadline).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(pipe);
 }
 
 #[test]
