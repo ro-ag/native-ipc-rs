@@ -981,6 +981,17 @@ impl OwnedHandle {
             Ok(Self(handle))
         }
     }
+
+    fn close(self) -> Result<(), WindowsError> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: ManuallyDrop suppresses the destructor, so this is the one
+        // close attempt for the uniquely owned real handle.
+        if unsafe { CloseHandle(this.0) } == 0 {
+            Err(last_os("CloseHandle"))
+        } else {
+            Ok(())
+        }
+    }
 }
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -999,6 +1010,22 @@ impl View {
         let address = unsafe { MapViewOfFile(section, access, 0, 0, len) };
         let base = NonNull::new(address.Value.cast()).ok_or_else(|| last_os("MapViewOfFile"))?;
         Ok(Self { base, len })
+    }
+
+    fn unmap(self) -> Result<(), WindowsError> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: ManuallyDrop suppresses the destructor, so this is the one
+        // unmap attempt for the uniquely owned complete view.
+        if unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: this.base.as_ptr().cast(),
+            })
+        } == 0
+        {
+            Err(last_os("UnmapViewOfFile"))
+        } else {
+            Ok(())
+        }
     }
 }
 impl Drop for View {
@@ -1281,6 +1308,13 @@ fn last_os(operation: &'static str) -> WindowsError {
 pub const fn status() -> BackendStatus {
     BackendStatus::Available
 }
+
+#[path = "windows_vnext/memory.rs"]
+pub(crate) mod vnext_memory;
+
+#[cfg(test)]
+#[path = "windows_vnext/memory_test.rs"]
+mod vnext_memory_test;
 
 #[cfg(test)]
 #[path = "windows_test.rs"]

@@ -54,6 +54,13 @@ pub(crate) enum NativeAuthorityProfile {
         allow(dead_code, reason = "macOS accepted-session profile")
     )]
     MacMachV1 = 2,
+    /// Windows paging-file sections are duplicated with one exact,
+    /// non-inheritable access mask and library mappings exclude execute.
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "Windows accepted-session profile")
+    )]
+    WindowsSectionsV1 = 3,
 }
 
 impl NativeAuthorityProfile {
@@ -352,6 +359,7 @@ impl TransferManifest {
             0 => NativeAuthorityProfile::Legacy,
             1 => NativeAuthorityProfile::LinuxMdweV1,
             2 => NativeAuthorityProfile::MacMachV1,
+            3 => NativeAuthorityProfile::WindowsSectionsV1,
             _ => return None,
         };
         let mut entries = Vec::with_capacity(count);
