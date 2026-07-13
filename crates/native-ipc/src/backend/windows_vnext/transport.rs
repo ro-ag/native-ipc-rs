@@ -542,7 +542,7 @@ fn terminate_session(
     if session.reaped {
         return Ok(());
     }
-    if job_active_processes(session._job.0.0)? == 0
+    if job_is_empty(session._job.0.0)?
         && poll_process(session.process.0)? == PeerState::ExitedUnknown
     {
         session.reaped = true;
@@ -554,7 +554,7 @@ fn terminate_session(
         return Err(native_error(unsafe { GetLastError() }));
     }
     loop {
-        if job_active_processes(session._job.0.0)? == 0
+        if job_is_empty(session._job.0.0)?
             && poll_process(session.process.0)? == PeerState::ExitedUnknown
         {
             session.reaped = true;
@@ -564,7 +564,7 @@ fn terminate_session(
     }
 }
 
-fn job_active_processes(job: HANDLE) -> Result<u32, SessionTransportError> {
+fn job_is_empty(job: HANDLE) -> Result<bool, SessionTransportError> {
     let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
     // SAFETY: the held Job is live and the fixed output structure is writable.
     if unsafe {
@@ -579,7 +579,7 @@ fn job_active_processes(job: HANDLE) -> Result<u32, SessionTransportError> {
     {
         Err(native_error(unsafe { GetLastError() }))
     } else {
-        Ok(accounting.ActiveProcesses)
+        Ok(accounting.ActiveProcesses == 0)
     }
 }
 

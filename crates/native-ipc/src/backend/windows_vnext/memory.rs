@@ -7,6 +7,8 @@ use core::ptr::NonNull;
 
 #[cfg(test)]
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 
 use windows_sys::Wdk::Foundation::{NtQueryObject, ObjectBasicInformation};
 use windows_sys::Win32::Foundation::{
@@ -96,15 +98,21 @@ impl WindowsActiveRegionOwner {
     }
 }
 
-struct SectionView(Option<View>);
+struct SectionView(Option<View>, #[cfg(test)] Arc<AtomicUsize>);
 
-struct SectionHandle(Option<OwnedHandle>);
+struct SectionHandle(Option<OwnedHandle>, #[cfg(test)] Arc<AtomicUsize>);
 
 impl SectionHandle {
     fn new(handle: OwnedHandle) -> Self {
         #[cfg(test)]
-        LIVE_VNEXT_HANDLES.fetch_add(1, Ordering::Relaxed);
-        Self(Some(handle))
+        let live = LIVE_VNEXT_HANDLES.with(Arc::clone);
+        #[cfg(test)]
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(
+            Some(handle),
+            #[cfg(test)]
+            live,
+        )
     }
 
     fn raw(&self) -> HANDLE {
@@ -117,7 +125,7 @@ impl Drop for SectionHandle {
         let _released = self.0.take().is_none_or(|handle| handle.close().is_ok());
         #[cfg(test)]
         if _released {
-            let previous = LIVE_VNEXT_HANDLES.fetch_sub(1, Ordering::Relaxed);
+            let previous = self.1.fetch_sub(1, Ordering::Relaxed);
             assert!(previous > 0, "live Windows handle accounting underflow");
         }
     }
@@ -126,8 +134,14 @@ impl Drop for SectionHandle {
 impl SectionView {
     fn new(view: View) -> Self {
         #[cfg(test)]
-        LIVE_VNEXT_VIEWS.fetch_add(1, Ordering::Relaxed);
-        Self(Some(view))
+        let live = LIVE_VNEXT_VIEWS.with(Arc::clone);
+        #[cfg(test)]
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(
+            Some(view),
+            #[cfg(test)]
+            live,
+        )
     }
 
     fn base(&self) -> NonNull<u8> {
@@ -140,18 +154,19 @@ impl SectionView {
 }
 
 #[cfg(test)]
-static LIVE_VNEXT_VIEWS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static LIVE_VNEXT_HANDLES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static LIVE_VNEXT_VIEWS: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    static LIVE_VNEXT_HANDLES: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+}
 
 #[cfg(test)]
 pub(crate) fn live_views_for_test() -> usize {
-    LIVE_VNEXT_VIEWS.load(Ordering::Relaxed)
+    LIVE_VNEXT_VIEWS.with(|live| live.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
 pub(crate) fn live_handles_for_test() -> usize {
-    LIVE_VNEXT_HANDLES.load(Ordering::Relaxed)
+    LIVE_VNEXT_HANDLES.with(|live| live.load(Ordering::Relaxed))
 }
 
 impl Drop for SectionView {
@@ -159,7 +174,7 @@ impl Drop for SectionView {
         let _released = self.0.take().is_none_or(|view| view.unmap().is_ok());
         #[cfg(test)]
         if _released {
-            let previous = LIVE_VNEXT_VIEWS.fetch_sub(1, Ordering::Relaxed);
+            let previous = self.1.fetch_sub(1, Ordering::Relaxed);
             assert!(previous > 0, "live Windows view accounting underflow");
         }
     }

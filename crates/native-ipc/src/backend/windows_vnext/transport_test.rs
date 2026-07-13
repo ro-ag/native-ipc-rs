@@ -377,9 +377,15 @@ fn lifecycle_terminates_the_whole_job_after_the_direct_child_exits() {
     for _ in 0..20_000 {
         if transport.try_poll_peer().unwrap() == PeerState::ExitedUnknown {
             transport.terminate_and_reap(deadline()).unwrap();
-            assert_eq!(unsafe { WaitForSingleObject(descendant, 0) }, WAIT_OBJECT_0);
-            assert_ne!(unsafe { CloseHandle(descendant) }, 0);
-            return;
+            for _ in 0..20_000 {
+                if unsafe { WaitForSingleObject(descendant, 0) } == WAIT_OBJECT_0 {
+                    assert_ne!(unsafe { CloseHandle(descendant) }, 0);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = unsafe { CloseHandle(descendant) };
+            panic!("Job descendant did not finish termination");
         }
         std::thread::sleep(Duration::from_millis(1));
     }

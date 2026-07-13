@@ -13,9 +13,10 @@ use native_ipc_core::mapping::{
     BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -1366,15 +1367,31 @@ fn connect_authenticated_pipe(
     deadline: Instant,
 ) -> Result<(), WindowsError> {
     loop {
+        check_instant_deadline(deadline, "authenticated pipe connect")?;
         connect_pipe_until(pipe, process, deadline)?;
         // SAFETY: the server pipe is connected and the expected PID is held live.
         match unsafe { authenticate_pipe_client(pipe, expected_pid) } {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                check_instant_deadline(deadline, "authenticated pipe connect")?;
+                return Ok(());
+            }
             Err(WindowsError::WrongPeer) => {
                 // SAFETY: this server owns the connected one-instance pipe.
                 if unsafe { DisconnectNamedPipe(pipe) } == 0 {
-                    return Err(last_os("DisconnectNamedPipe"));
+                    let code = unsafe { GetLastError() };
+                    if code != ERROR_PIPE_NOT_CONNECTED && code != ERROR_BROKEN_PIPE {
+                        return Err(WindowsError::Os {
+                            operation: "DisconnectNamedPipe",
+                            code,
+                        });
+                    }
                 }
+                wait_retry(deadline, "authenticated pipe connect")?;
+            }
+            Err(WindowsError::Os { code, .. })
+                if code == ERROR_PIPE_NOT_CONNECTED || code == ERROR_BROKEN_PIPE =>
+            {
+                let _ = unsafe { DisconnectNamedPipe(pipe) };
                 wait_retry(deadline, "authenticated pipe connect")?;
             }
             Err(error) => return Err(error),
@@ -1388,12 +1405,15 @@ fn connect_pipe_until(
     deadline: Instant,
 ) -> Result<(), WindowsError> {
     loop {
+        check_instant_deadline(deadline, "pipe connect")?;
         // SAFETY: server pipe is nonblocking and no OVERLAPPED operation is requested.
         if unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) } != 0 {
+            check_instant_deadline(deadline, "pipe connect")?;
             return Ok(());
         }
         let code = unsafe { GetLastError() };
         if code == ERROR_PIPE_CONNECTED {
+            check_instant_deadline(deadline, "pipe connect")?;
             return Ok(());
         }
         if code != ERROR_PIPE_LISTENING && code != ERROR_NO_DATA {
@@ -1417,6 +1437,7 @@ fn connect_pipe_until(
 
 fn open_pipe_until(name: *const u16, deadline: Instant) -> Result<OwnedHandle, WindowsError> {
     loop {
+        check_instant_deadline(deadline, "pipe open")?;
         // SAFETY: terminated name; no sharing or inheritance and existing pipe only.
         let pipe = unsafe {
             CreateFileW(
@@ -1430,7 +1451,9 @@ fn open_pipe_until(name: *const u16, deadline: Instant) -> Result<OwnedHandle, W
             )
         };
         if pipe != INVALID_HANDLE_VALUE && !pipe.is_null() {
-            return OwnedHandle::new(pipe);
+            let pipe = OwnedHandle::new(pipe)?;
+            check_instant_deadline(deadline, "pipe open")?;
+            return Ok(pipe);
         }
         let code = unsafe { GetLastError() };
         if code != ERROR_PIPE_BUSY {
@@ -1444,10 +1467,17 @@ fn open_pipe_until(name: *const u16, deadline: Instant) -> Result<OwnedHandle, W
 }
 
 fn wait_retry(deadline: Instant, operation: &'static str) -> Result<(), WindowsError> {
+    check_instant_deadline(deadline, operation)?;
+    std::thread::sleep(
+        Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
+    );
+    check_instant_deadline(deadline, operation)
+}
+
+fn check_instant_deadline(deadline: Instant, operation: &'static str) -> Result<(), WindowsError> {
     if Instant::now() >= deadline {
         Err(WindowsError::TimedOut(operation))
     } else {
-        std::thread::sleep(Duration::from_millis(1));
         Ok(())
     }
 }

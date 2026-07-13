@@ -186,6 +186,43 @@ fn continuous_wrong_client_cannot_replace_the_accept_deadline() {
 }
 
 #[test]
+fn an_already_connected_expected_client_cannot_bypass_expiry() {
+    let nonce = session_nonce().unwrap();
+    let name = OsString::from(format!(
+        r"\\.\pipe\native-ipc-expired-connect-{}",
+        hex(&nonce)
+    ));
+    let wide = wide_null(&name);
+    let pipe = authenticated_test_pipe(&wide);
+    let client_name = wide.clone();
+    let client = std::thread::spawn(move || {
+        let owner = open_pipe_until(
+            client_name.as_ptr(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drop(owner);
+    });
+    connect_pipe_until(
+        pipe.0,
+        unsafe { GetCurrentProcess() },
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(matches!(
+        connect_authenticated_pipe(
+            pipe.0,
+            unsafe { GetCurrentProcess() },
+            unsafe { GetCurrentProcessId() },
+            Instant::now(),
+        ),
+        Err(WindowsError::TimedOut("authenticated pipe connect"))
+    ));
+    client.join().unwrap();
+}
+
+#[test]
 fn unnamed_section_is_page_rounded_and_zeroed() {
     let region = QuiescentRegion::new(37).unwrap();
     assert!(region.len() >= 37);
