@@ -110,8 +110,9 @@ The backend implementation moves into private modules of the published facade;
 this avoids an impossible cross-crate private trait and lets the facade remain
 publishable without depending on an unpublished path crate. No vNext
 `native-ipc-platform` orchestration crate is published or re-exported. The old
-0.4 package is documented as superseded; it cannot be retroactively removed.
-Raw interop remains feature-gated unsafe API.
+0.4 package is documented as superseded and remains available from crates.io
+and the `v0.4.0` source tag; published artifacts cannot be retroactively
+removed. Raw interop remains feature-gated unsafe API.
 
 ## 4. Security model and honest claims
 

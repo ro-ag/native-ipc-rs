@@ -109,10 +109,8 @@ git diff --check
 nix run nixpkgs#actionlint -- .github/workflows/ci.yml
 nix flake check --all-systems
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo clippy --manifest-path crates/native-ipc-platform/Cargo.toml --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked -- --test-threads=1
 cargo test --workspace --all-targets --no-default-features --locked -- --test-threads=1
-cargo test --manifest-path crates/native-ipc-platform/Cargo.toml --all-targets --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 ```
 
@@ -121,8 +119,9 @@ Results:
 - workspace all-feature and no-default test passes each reported 73 passing
   `native-ipc` tests with 25 process-helper tests ignored, 16 passing core
   tests, and 3 passing testkit integration tests;
-- standalone `native-ipc-platform` reported 12 passed and 4 helper tests
-  ignored;
+- the then-standalone `native-ipc-platform` package reported 12 passed and 4
+  helper tests ignored; its source and exact validation commands remain
+  available at the historical evidence commit;
 - warning-free rustdoc and strict Clippy passed;
 - all-feature and no-default cross-checks passed for Linux Arm64 at the final
   implementation tip; the macOS Arm64 and Windows AMD64/Arm64 checks passed

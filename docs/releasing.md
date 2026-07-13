@@ -1,11 +1,13 @@
 # Releasing
 
-Releases are published from a clean, fully validated `main` checkout. The four
+Releases are published from a clean, fully validated `main` checkout. The three
 crates share one version and are tagged together.
 
 ## Prerequisites
 
 - The changelog has a dated section for the workspace version.
+- The workspace version and all three intra-workspace dependency requirements
+  in `native-ipc` and `native-ipc-testkit` match the release version.
 - The GitHub `crates-io` environment has a `CARGO_REGISTRY_TOKEN` secret with
   publish permission.
 - GitHub CLI authentication can create tags and releases in `ro-ag/native-ipc-rs`.
@@ -40,15 +42,10 @@ missing crates in dependency order, waits for crates.io indexing, and creates
 the GitHub Release from the matching changelog section. It is idempotent and can
 be rerun with `workflow_dispatch` against the existing tag.
 
-For recovery only, the equivalent manual publish order is:
+There is no local/manual publish fallback. Recovery reruns the tag-triggered
+workflow against the existing tag after correcting the failure through the
+normal reviewed source flow.
 
-```sh
-cargo publish -p native-ipc-core --locked
-cargo publish -p native-ipc-platform --locked
-cargo publish -p native-ipc-testkit --locked
-cargo publish -p native-ipc --locked
-```
-
-Finally, verify all four crates, their docs.rs pages, the GitHub tag, and the
-GitHub Release. A failed intermediate publish must be reported without tagging;
-published crates cannot be overwritten or deleted.
+Finally, verify all three crates, their docs.rs pages, the GitHub tag, and the
+GitHub Release. A failed intermediate publish must be reported; published
+crates cannot be overwritten or deleted.

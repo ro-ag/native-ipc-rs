@@ -85,8 +85,8 @@ The workspace contains:
 - `native-ipc-testkit`: golden-vector and adversarial conformance helpers.
 
 Native backends are private modules of `native-ipc`. The superseded 0.4
-`native-ipc-platform` package remains in the repository for historical source
-and migration reference, but is not a vNext workspace package or public API.
+`native-ipc-platform` package remains available from the `v0.4.0` tag and its
+published crate, but is not a vNext workspace package or public API.
 
 ## How memory is accessed
 
@@ -191,8 +191,6 @@ before native capability transfer:
 ```sh
 cargo run -p native-ipc-core --example bounded_codec
 cargo run -p native-ipc-core --example checked_layout
-cargo run --manifest-path crates/native-ipc-platform/Cargo.toml --example quiescent_region
-cargo run --manifest-path crates/native-ipc-platform/Cargo.toml --example ready_commit
 cargo run -p native-ipc-testkit --example hostile_inputs
 cargo run -p native-ipc --example common_memory
 ```
@@ -203,12 +201,6 @@ cargo run -p native-ipc --example common_memory
 - [`checked_layout.rs`](crates/native-ipc-core/examples/checked_layout.rs)
   composes two directional, single-writer regions with exact acknowledgement
   routes and bounded capacities.
-- [`quiescent_region.rs`](crates/native-ipc-platform/examples/quiescent_region.rs)
-  allocates the current OS's zeroed native capability and demonstrates that
-  mutable slices exist only before the consuming transfer transition.
-- [`ready_commit.rs`](crates/native-ipc-platform/examples/ready_commit.rs)
-  shows the consuming transaction signatures that withhold runtime mappings
-  until the authenticated READY/COMMIT barrier completes.
 - [`hostile_inputs.rs`](crates/native-ipc-testkit/examples/hostile_inputs.rs)
   generates bounded truncation, bit-mutation, and boundary-value corpora.
 - [`common_memory.rs`](crates/native-ipc/examples/common_memory.rs) uses the
@@ -282,8 +274,8 @@ Implemented through `0.4.0`:
 | Windows | AMD64 | `x86_64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 
-The public facade and native platform crate fail compilation on other target
-combinations. The platform-neutral `native-ipc-core` crate remains usable
+The public facade fails compilation on other target combinations. The
+platform-neutral `native-ipc-core` crate remains usable
 wherever its documented 64-bit atomic requirement is met. CI runs the full
 workspace and native permission/helper-process tests on all five targets; no
 Intel macOS support is claimed. Linux AMD64 additionally runs every workspace

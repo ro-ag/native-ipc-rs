@@ -5,13 +5,11 @@ API for least-authority shared memory across Linux, macOS, and Windows. There
 is no portable OS primitive for sealed anonymous shared memory — `memfd_create`
 exists only on Linux, macOS uses Mach memory-entry rights, and Windows uses
 exact-rights section handles — so this crate consolidates the three native
-mechanisms behind a single interface and security contract. It re-exports:
+mechanisms behind a single interface and security contract. Native backends
+remain private implementation details. The facade re-exports:
 
 - `native-ipc-core` for pointer-free codecs, checked shared-memory layouts,
-  sequencing, and audited reader/writer bindings; and
-- `native-ipc-platform` for least-authority native mappings, authenticated
-  capability transfer, and owned helper-process lifecycles on Linux, macOS,
-  and Windows.
+  sequencing, and audited reader/writer bindings.
 
 Supported targets are Linux and Windows on ARM64 or AMD64, and macOS on ARM64:
 `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
@@ -47,9 +45,8 @@ Run the complete portable lifecycle example with:
 cargo run -p native-ipc --example common_memory
 ```
 
-The lower-level READY/COMMIT capability transaction is documented by
-[`native-ipc-platform`](https://docs.rs/native-ipc-platform) and its
-[`ready_commit` example](https://github.com/ro-ag/native-ipc-rs/blob/main/crates/native-ipc-platform/examples/ready_commit.rs).
+The vNext READY/COMMIT capability transaction remains private until its full
+normative state machine and public session typestate are implemented.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not
