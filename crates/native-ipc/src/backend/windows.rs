@@ -1534,5 +1534,9 @@ mod vnext_memory_test;
 mod vnext_transport_test;
 
 #[cfg(test)]
+#[path = "windows_vnext/reducer_test.rs"]
+mod vnext_reducer_test;
+
+#[cfg(test)]
 #[path = "windows_test.rs"]
 mod tests;

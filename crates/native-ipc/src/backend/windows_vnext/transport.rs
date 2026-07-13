@@ -14,6 +14,8 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+#[cfg(test)]
+use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, WaitForSingleObject};
 
 use super::vnext_memory::{WindowsMixedDirectionBatch, WindowsReceivedHandle};
@@ -108,6 +110,37 @@ impl CoordinatorWindowsControlTransport {
 
     pub(crate) fn complete_remote_capability_transaction(&mut self) {
         self.remote_ledger.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_capability_count_for_test(&self) -> usize {
+        self.remote_ledger.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_child_exit_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        loop {
+            if poll_process(self.session.process.0)? == PeerState::Running
+                || !job_is_empty(self.session._job.0.0)?
+            {
+                wait_retry(deadline)?;
+                continue;
+            }
+            let mut code = 0;
+            // SAFETY: the exact held process is signaled and the output is writable.
+            if unsafe { GetExitCodeProcess(self.session.process.0, &mut code) } == 0 {
+                return Err(native_error(unsafe { GetLastError() }));
+            }
+            if code != 0 {
+                return Err(native_error(code));
+            }
+            self.session.reaped = true;
+            self.remote_ledger.clear();
+            return Ok(());
+        }
     }
 
     fn ensure_live(&self) -> Result<(), SessionTransportError> {
@@ -318,13 +351,17 @@ impl ReceiverCapabilityTransport for ReceiverWindowsControlTransport {
         if !(1..=MAX_CAPABILITY_COUNT).contains(&expected.capability_count()) {
             return Err(SessionTransportError::MalformedRecord);
         }
-        let result = read_message(
+        let result = read_message_before_postcheck(
             self.channel.pipe.0,
             MAX_CAPABILITY_RECORD_BYTES,
             deadline,
             None,
         )
-        .and_then(|record| adopt_capability_record(record, expected));
+        .and_then(|record| {
+            let received = adopt_capability_record(record, expected)?;
+            check_deadline_after_io(deadline)?;
+            Ok(received)
+        });
         self.terminal(result)
     }
 }
@@ -462,6 +499,25 @@ fn read_message(
     deadline: AbsoluteDeadline,
     process: Option<HANDLE>,
 ) -> Result<Vec<u8>, SessionTransportError> {
+    read_message_inner(pipe, maximum, deadline, process, true)
+}
+
+fn read_message_before_postcheck(
+    pipe: HANDLE,
+    maximum: usize,
+    deadline: AbsoluteDeadline,
+    process: Option<HANDLE>,
+) -> Result<Vec<u8>, SessionTransportError> {
+    read_message_inner(pipe, maximum, deadline, process, false)
+}
+
+fn read_message_inner(
+    pipe: HANDLE,
+    maximum: usize,
+    deadline: AbsoluteDeadline,
+    process: Option<HANDLE>,
+    postcheck: bool,
+) -> Result<Vec<u8>, SessionTransportError> {
     if maximum == 0 {
         return Err(SessionTransportError::RecordTooLarge);
     }
@@ -487,7 +543,9 @@ fn read_message(
                 return Err(SessionTransportError::MalformedRecord);
             }
             bytes.truncate(read as usize);
-            check_deadline_after_io(deadline)?;
+            if postcheck {
+                check_deadline_after_io(deadline)?;
+            }
             return Ok(bytes);
         }
         let code = unsafe { GetLastError() };
