@@ -355,6 +355,15 @@ impl WindowsMixedDirectionBatch {
         validate_prepared_entries(&self.entries, self.deadline)
     }
 
+    pub(crate) fn capability_sources(&self) -> Result<Vec<(HANDLE, u32)>, WindowsBatchError> {
+        self.revalidate_before_send()?;
+        Ok(self
+            .entries
+            .iter()
+            .map(|entry| (entry.section(), entry.peer_access()))
+            .collect())
+    }
+
     pub(crate) fn activation_specs(
         &self,
     ) -> Result<Vec<WindowsActiveRegionSpec>, WindowsBatchError> {
@@ -502,6 +511,11 @@ impl WindowsMixedDirectionBatch {
 
 /// Immediately owned handle installed in the receiving process.
 pub(crate) struct WindowsReceivedHandle(SectionHandle);
+
+// SAFETY: this value uniquely owns one process-local handle and transfers only
+// that ownership; all use and destruction remains serialized by `&mut self` or
+// consuming operations.
+unsafe impl Send for WindowsReceivedHandle {}
 
 impl WindowsReceivedHandle {
     /// # Safety

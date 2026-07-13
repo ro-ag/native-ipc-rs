@@ -387,6 +387,7 @@ const AUTH_MAGIC: [u8; 8] = *b"NIPCAUT1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
 const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
 const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
+const MAX_VNEXT_RECORD_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
 const WAIT_MS: u32 = 10_000;
 #[cfg(test)]
@@ -464,8 +465,8 @@ impl ChildSession {
                     | PIPE_NOWAIT
                     | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                4096,
-                4096,
+                MAX_VNEXT_RECORD_BYTES as u32,
+                MAX_VNEXT_RECORD_BYTES as u32,
                 WAIT_MS,
                 std::ptr::null(),
             )
@@ -555,6 +556,9 @@ impl ChildSession {
     /// Kernel-created child process ID authenticated on the private pipe.
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+    pub(crate) const fn vnext_nonce(&self) -> [u8; 32] {
+        self.nonce
     }
     /// Sends the two exact-rights handle values and their complete mapped lengths.
     fn send_capabilities(
@@ -761,6 +765,9 @@ impl ChildChannel {
     /// Held authenticated parent PID.
     pub const fn parent_pid(&self) -> u32 {
         self.parent_pid
+    }
+    pub(crate) const fn vnext_nonce(&self) -> [u8; 32] {
+        self.nonce
     }
     /// Raw pipe handle for a bounded manifest protocol owned by the caller.
     pub const fn pipe_handle(&self) -> HANDLE {
@@ -1312,9 +1319,16 @@ pub const fn status() -> BackendStatus {
 #[path = "windows_vnext/memory.rs"]
 pub(crate) mod vnext_memory;
 
+#[path = "windows_vnext/transport.rs"]
+pub(crate) mod vnext_transport;
+
 #[cfg(test)]
 #[path = "windows_vnext/memory_test.rs"]
 mod vnext_memory_test;
+
+#[cfg(test)]
+#[path = "windows_vnext/transport_test.rs"]
+mod vnext_transport_test;
 
 #[cfg(test)]
 #[path = "windows_test.rs"]
