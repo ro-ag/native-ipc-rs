@@ -807,6 +807,76 @@ runtime authority. Exact credentials/rights framing, full-batch attenuation,
 IMPORTED/SEALED, READY/COMMIT, active leases, public APIs, and release evidence
 remain with the later inseparable accepted reducer.
 
+The next dependency-ordered cleanup removed the older Linux filesystem
+bootstrap, `UnixStream` ancillary parser, single-region READY/COMMIT transport,
+and legacy mapping witnesses after a whole-tree consumer audit found that they
+were reachable only from their adjacent legacy tests. The public memory facade
+and private vNext preparation still consume `QuiescentRegion`, so its anonymous
+memfd allocation, page-rounded mapping, quiescent bytes, cleanup, and vNext fd
+handoff remain intact and now deny dead code locally. This is source cleanup,
+not native reducer evidence: no accepted mixed send/import, full-batch
+attenuation, READY/COMMIT, active lease, runtime, or public API state was added.
+The exact suppression and `cfg(test)` seam inventory is in
+[`dead-code-audit.md`](dead-code-audit.md).
+
+Phase 5i-G1j composes the mixed coordinator preparation and receiver import
+owners inside the accepted Linux dispatcher. One role-scoped transaction now
+derives and transfers the canonical full manifest and capability order, runs
+the full-manifest IMPORTED/SEALED preparation exchange when any
+receiver-writer entry exists, and retains every fd and mapping until terminal
+owner destruction. The coordinator revalidates all direction-specific object
+states, continues best-effort final sealing across every remaining
+receiver-writer fd after the first failure, and starts no coordinator read
+mapping until that complete attenuation pass succeeds. The receiver then
+revalidates final seals across both directions before retaining the pending
+mixed import.
+
+Arm64 Linux characterization covers reverse-input 1/2/4/16 batches, exact
+initialized coordinator-writer bytes and receiver-writer mutation, replacement
+deadline rejection before transaction entry, exact manifest mismatch,
+IMPORTED rights and credential rejection, replay, first/middle/final synthetic
+seal failure, first/middle/final receiver-import advice failure,
+first/middle/final post-attenuation coordinator advice failure, final-seal
+revalidation failure, a stale IMPORTED receipt, poison-before-owner-drop, and
+exact fd/map/task baselines. Strict Arm64 Clippy and the full native/workspace
+suite are green locally. Exact implementation
+`d51be42faeec3031a78a1181c104453e24877184` is green in all ten hosted jobs in
+[Actions 29223882666](https://github.com/ro-ag/native-ipc-rs/actions/runs/29223882666),
+including native Linux AMD64/Arm64 and Linux AMD64 ASan; independent final
+re-review reports no P1/P2/P3. G1j adds no READY/COMMIT, transaction
+completion, active lease, runtime mapping exposure, public API, physical Arm64,
+or release evidence.
+
+Phase 5i-G1k adds the private Linux full-batch READY/COMMIT reducer. The exact
+domain-separated READY and COMMIT records are derived from the retained
+canonical capability frame, carry no rights, and share the transaction's one
+stored absolute deadline. Neither role exposes the pending native batch before
+the exact barrier completes. Privileged Arm64 characterization covers mixed
+1/2/4/16 success, application-kind interleaving, manifest substitution,
+truncation, and duplicate READY/COMMIT replay. A queued duplicate following an
+otherwise valid completion poisons the next production control receive rather
+than relying on a test-only extra barrier read. Exact implementation
+`71442d31cdc9b6869876e89b5ae5e4301a86bbf7` is green in all ten hosted jobs in
+[Actions 29225096280](https://github.com/ro-ag/native-ipc-rs/actions/runs/29225096280).
+
+Phase 5i-G1l adds the private Linux session ledger and all-or-nothing native
+activation. Each accepted dispatcher owns one `ResourceOwner`; committed
+owners retain exact accepted parameters and the original deadline. Activation
+revalidates the complete native batch, reserves all page-rounded bytes before
+consuming mappings, constructs complementary endpoint-local active authorities,
+and returns only a complete keyed set. Exact implementation
+`d56468ae614431e49be54bcaa09745ee3ff5963d` is green in all ten hosted jobs in
+[Actions 29225675674](https://github.com/ro-ag/native-ipc-rs/actions/runs/29225675674).
+The adjacent rollback corpus injects first/middle/final activation failure at
+both endpoints after reservations and native owners exist; it proves poison
+precedes mapping/lease cleanup, no active set escapes, later control remains
+poisoned, mapping destruction precedes lease release, every charge rolls back,
+and fd/map/task baselines restore. Exact rollback implementation
+`9acc8e560f3dfbe909a3763b2f46d66d83296f8d` is green in all ten hosted jobs in
+[Actions 29226631352](https://github.com/ro-ag/native-ipc-rs/actions/runs/29226631352).
+This private Linux checkpoint still adds no public `Session<Ready>`,
+macOS/Windows reducer, physical Arm64, packaged-crate, or release evidence.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness

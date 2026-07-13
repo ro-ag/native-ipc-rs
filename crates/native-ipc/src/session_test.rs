@@ -1,4 +1,75 @@
 use super::*;
+use static_assertions::{assert_impl_all, assert_not_impl_any};
+
+assert_impl_all!(Session<Coordinator, Negotiating>: Send);
+assert_not_impl_any!(Session<Coordinator, Negotiating>: Sync, Clone);
+assert_impl_all!(Session<Receiver, Negotiating>: Send);
+assert_not_impl_any!(Session<Receiver, Negotiating>: Sync, Clone);
+assert_impl_all!(Session<Coordinator, Ready>: Send);
+assert_not_impl_any!(Session<Coordinator, Ready>: Sync, Clone);
+assert_impl_all!(Session<Receiver, Ready>: Send);
+assert_not_impl_any!(Session<Receiver, Ready>: Sync, Clone);
+assert_impl_all!(ReceiverBootstrap: Send);
+assert_not_impl_any!(ReceiverBootstrap: Sync, Clone, Copy);
+
+#[test]
+fn public_session_inputs_are_explicit_bounded_and_role_typed() {
+    let command = SessionCommand::new("/absolute/helper")
+        .arg("--mode")
+        .env("KEY", "first")
+        .env("KEY", "replacement");
+    assert_eq!(command.executable, PathBuf::from("/absolute/helper"));
+    assert_eq!(command.arguments.len(), 2);
+    assert_eq!(command.environment.len(), 1);
+    assert_eq!(command.environment[0].1, OsString::from("replacement"));
+
+    let deadline = AbsoluteDeadline::after(Duration::from_secs(1)).unwrap();
+    let options = SessionOptions::new(deadline, ExecutableIdentityPolicy::ExactOpenedFile)
+        .with_limits(SessionLimits::default())
+        .with_application_payload(b"opaque".to_vec())
+        .require_atomic_u32()
+        .require_atomic_u64();
+    assert_eq!(options.deadline, deadline);
+    assert_eq!(options.application_payload, b"opaque");
+    assert!(options.require_atomic_u32 && options.require_atomic_u64);
+
+    assert_eq!(RejectionReason::APPLICATION_DECLINED.get(), 1);
+    assert_eq!(RejectionReason::INCOMPATIBLE_APPLICATION_PROTOCOL.get(), 2);
+    assert_eq!(RejectionReason::APPLICATION_POLICY.get(), 3);
+    assert!(RejectionReason::application_specific(0x7fff_ffff).is_none());
+    assert_eq!(
+        RejectionReason::application_specific(0x8000_0042)
+            .unwrap()
+            .get(),
+        0x8000_0042
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            SessionCommand::new("/absolute/helper")
+                .env("NATIVE_IPC_VNEXT_BOOTSTRAP_FD", "7")
+                .has_reserved_environment()
+        );
+        assert!(
+            SessionCommand::new("/absolute/helper")
+                .env("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP", "1")
+                .has_reserved_environment()
+        );
+        assert_eq!(
+            RejectionReason::from_wire(NonZeroU32::new(3).unwrap()),
+            Some(RejectionReason::APPLICATION_POLICY)
+        );
+        assert_eq!(
+            RejectionReason::from_wire(NonZeroU32::new(4).unwrap()),
+            None
+        );
+        assert_eq!(
+            RejectionReason::from_wire(NonZeroU32::new(0x8000_0042).unwrap()),
+            RejectionReason::application_specific(0x8000_0042)
+        );
+    }
+}
 
 #[test]
 fn limits_are_finite_validated_and_negotiated_by_minimum() {

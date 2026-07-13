@@ -6,16 +6,35 @@ const MAGIC: [u8; 8] = *b"NIPCAPP1";
 const VERSION_MAJOR: u16 = 1;
 const VERSION_MINOR: u16 = 0;
 pub(crate) const CONTROL_HEADER_LEN: usize = 72;
-const APPLICATION_KIND_MIN: u32 = 0x8000_0000;
+/// Lowest application-owned control kind; smaller values are library-reserved.
+pub const APPLICATION_CONTROL_KIND_MIN: u32 = 0x8000_0000;
 
 pub(crate) const fn control_wire_len(payload_len: usize) -> Option<usize> {
     CONTROL_HEADER_LEN.checked_add(payload_len)
 }
 
+/// One bounded opaque application-control record received from the peer.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ControlFrame {
+pub struct ControlFrame {
     pub(crate) kind: u32,
     pub(crate) payload: Vec<u8>,
+}
+
+impl ControlFrame {
+    /// Application-owned record kind.
+    pub const fn kind(&self) -> u32 {
+        self.kind
+    }
+
+    /// Opaque record payload.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Consumes the frame and returns its opaque payload allocation.
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
 }
 
 pub(crate) struct ControlState {
@@ -49,14 +68,33 @@ impl ControlState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn encoded_len(&self, frame: &ControlFrame) -> Result<usize, ControlError> {
-        self.check_local(frame)?;
-        control_wire_len(frame.payload.len()).ok_or(ControlError::LengthOverflow)
+        self.encoded_len_parts(frame.kind, frame.payload.len())
     }
 
+    pub(crate) fn encoded_len_parts(
+        &self,
+        kind: u32,
+        payload_len: usize,
+    ) -> Result<usize, ControlError> {
+        self.check_local_parts(kind, payload_len)?;
+        control_wire_len(payload_len).ok_or(ControlError::LengthOverflow)
+    }
+
+    #[cfg(test)]
     pub(crate) fn encode_into(
         &mut self,
         frame: &ControlFrame,
+        destination: &mut [u8],
+    ) -> Result<usize, ControlError> {
+        self.encode_parts_into(frame.kind, &frame.payload, destination)
+    }
+
+    pub(crate) fn encode_parts_into(
+        &mut self,
+        kind: u32,
+        payload: &[u8],
         destination: &mut [u8],
     ) -> Result<usize, ControlError> {
         if self.transaction_open || self.pending_receive {
@@ -67,7 +105,7 @@ impl ControlState {
             self.poisoned = true;
             return Err(ControlError::SequenceExhausted);
         }
-        let required = self.encoded_len(frame)?;
+        let required = self.encoded_len_parts(kind, payload.len())?;
         if destination.len() < required {
             return Err(ControlError::DestinationTooSmall);
         }
@@ -84,12 +122,12 @@ impl ControlState {
         put_u32(
             destination,
             20,
-            u32::try_from(frame.payload.len()).map_err(|_| ControlError::LengthOverflow)?,
+            u32::try_from(payload.len()).map_err(|_| ControlError::LengthOverflow)?,
         );
-        put_u32(destination, 24, frame.kind);
+        put_u32(destination, 24, kind);
         destination[32..64].copy_from_slice(&self.nonce);
         put_u64(destination, 64, self.next_send);
-        destination[CONTROL_HEADER_LEN..required].copy_from_slice(&frame.payload);
+        destination[CONTROL_HEADER_LEN..required].copy_from_slice(payload);
         self.next_send = self
             .next_send
             .checked_add(1)
@@ -97,6 +135,7 @@ impl ControlState {
         Ok(required)
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(&mut self, source: &[u8]) -> Result<ControlFrame, ControlError> {
         if source.len() < CONTROL_HEADER_LEN {
             self.poisoned = true;
@@ -184,18 +223,17 @@ impl ControlState {
         self.transaction_open
     }
 
-    fn check_local(&self, frame: &ControlFrame) -> Result<(), ControlError> {
+    fn check_local_parts(&self, kind: u32, payload_len: usize) -> Result<(), ControlError> {
         if self.poisoned {
             return Err(ControlError::Poisoned);
         }
         if self.transaction_open {
             return Err(ControlError::TransactionConflict);
         }
-        if frame.kind < APPLICATION_KIND_MIN {
+        if kind < APPLICATION_CONTROL_KIND_MIN {
             return Err(ControlError::ReservedKind);
         }
-        let payload_len =
-            u32::try_from(frame.payload.len()).map_err(|_| ControlError::LengthOverflow)?;
+        let payload_len = u32::try_from(payload_len).map_err(|_| ControlError::LengthOverflow)?;
         if payload_len > self.maximum_payload || payload_len > HARD_MAX_CONTROL_PAYLOAD_BYTES {
             return Err(ControlError::PayloadTooLarge);
         }
@@ -238,7 +276,7 @@ impl ControlState {
             return Err(ControlError::PayloadTooLarge);
         }
         let kind = get_u32(source, 24);
-        if kind < APPLICATION_KIND_MIN {
+        if kind < APPLICATION_CONTROL_KIND_MIN {
             return Err(ControlError::ReservedKind);
         }
         if source[32..64] != self.nonce {
@@ -271,6 +309,7 @@ impl PendingControlReceive<'_> {
         self.payload_len as usize
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(self, payload_source: &[u8]) -> Result<ControlFrame, ControlError> {
         if payload_source.len() != self.payload_len as usize {
             return Err(ControlError::NonCanonical);
@@ -310,23 +349,46 @@ impl Drop for PendingControlReceive<'_> {
     }
 }
 
+/// Bounded application-control validation or state failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ControlError {
+pub enum ControlError {
+    /// The session is terminally poisoned.
     Poisoned,
+    /// The peer record ended before its canonical length.
     Truncated,
+    /// The peer record did not use the application-control magic.
     BadMagic,
+    /// The peer selected an unsupported control wire version.
     BadVersion,
+    /// The peer record was not the one canonical encoding.
     NonCanonical,
+    /// The peer record carried another session nonce.
     WrongSession,
+    /// The local or peer kind is reserved for library framing.
     ReservedKind,
+    /// The payload exceeds the negotiated finite maximum.
     PayloadTooLarge,
+    /// The peer sequence was stale, future, replayed, or reordered.
     ReplayOrReorder,
+    /// Application control conflicted with an open native transaction.
     TransactionConflict,
+    /// A direction exhausted its monotonic sequence space.
     SequenceExhausted,
+    /// A checked wire-length computation overflowed.
     LengthOverflow,
+    /// The bounded receive or encode allocation failed.
     AllocationFailed,
+    /// An internal caller supplied less than the precomputed wire length.
     DestinationTooSmall,
 }
+
+impl core::fmt::Display for ControlError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "application control failed: {self:?}")
+    }
+}
+
+impl std::error::Error for ControlError {}
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

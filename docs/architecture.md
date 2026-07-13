@@ -232,6 +232,78 @@ entries. Every partial fd and mapping remains in either the successful mixed
 owner or one consuming failure owner. Neither exposes payload/runtime methods;
 the later accepted reducer must consume them under its stored deadline.
 
+The dependency-ordered Linux cleanup after G1i-b retired the superseded
+filesystem-bootstrap, stream-framed, single-region transfer implementation.
+The public memory facade and vNext still share the legacy-named
+`QuiescentRegion` allocation primitive; that module now contains only the
+anonymous memfd allocation/mapping owner and its vNext handoff. Its
+`deny(dead_code)` boundary prevents a second unused Linux transport from
+accumulating. The complete suppression and test-seam classification is recorded
+in [`dead-code-audit.md`](dead-code-audit.md). This cleanup adds no mixed
+accepted reducer, READY/COMMIT, activation, or public session authority.
+
+Linux G1j consumes both mixed native owners into the role-scoped accepted
+dispatcher. The coordinator alone mints and sends one canonical capability
+frame; the receiver alone fixes the complete expectation, imports every fd,
+and returns the exact full-manifest `IMPORTED` receipt. The coordinator then
+revalidates the complete mixed object set and final-seals every receiver-writer
+fd in one best-effort attenuation pass before attempting any new read mapping.
+Only a completely attenuated batch can produce exact `SEALED`; the receiver
+revalidates final seals for every direction before retaining the pending mixed
+owner. Both sides use the same stored absolute deadline and keep transport,
+manifest, fds, mappings, and accepted evidence inseparable. Failure or guard
+destruction poisons before native cleanup. This is still a terminal private
+checkpoint: it does not end the transaction, send READY/COMMIT, charge active
+leases, or expose pending/runtime/public authority.
+
+Linux G1k completes the private transaction with one exact full-manifest
+READY/COMMIT barrier. Both completion records are domain-separated from
+application control and from each other, use the transaction's stored absolute
+deadline, carry no rights, and are derived only from the retained canonical
+capability frame. Exact READY ends receiver preparation; exact COMMIT ends the
+coordinator transaction and releases a committed owner on each endpoint.
+Manifest substitution, truncation, application interleaving, and queued
+duplicate replay poison persistently while the pending native owner still
+retains cleanup authority. This remains a private Linux barrier, not a public
+`Session<Ready>` or cross-platform completion claim.
+
+Linux G1l binds one session-wide `ResourceOwner` into each accepted dispatcher
+and activates the committed mixed batch all-or-nothing. Activation revalidates
+the complete native batch, reserves every page-rounded byte before consuming
+any mapping, and constructs endpoint-local `ActiveReader` or `ActiveWriter`
+owners according to the negotiated writer direction. Runtime authority escapes
+only as a complete keyed `ActiveRegionSet`; every active charge remains until
+its native mapping is destroyed, with mapping drop ordered before lease
+release. First/middle/final injected activation failures on either endpoint
+poison before native mappings and leases unwind, expose no active set, restore
+exact fd/map/task and ledger baselines, and leave later control persistently
+poisoned. This is private Linux source-tree and hosted-run evidence only; public
+composition, macOS/Windows reducers, physical Arm64, packaged-crate, and
+release evidence remain outstanding.
+
+Linux G1m composes those private owners into the safe public session surface.
+An executable-side ELF preinitializer validates, scrubs, marks close-on-exec,
+and reserves the inherited bootstrap before Rust application code; the
+`receiver_main!` macro transfers that one-shot authority into
+`ReceiverSession<Negotiating>`. The coordinator holds the exact executable and
+direct-child lifecycle throughout HELLO, challenged bilateral decisions, Ready
+control, batch activation, close, and abort. Public batch entry points accept
+only portable prepared/expected owners and return only keyed opaque active
+mappings. Capacity rejection is a clean bilateral return to Ready; ambiguous or
+malformed in-flight operations poison before pending native cleanup. Active
+mappings retain atomic session liveness, so abort makes later safe access fail
+without revoking the peer's independently authorized mapping.
+
+Public failures retain a bounded `SessionFailure` describing the operation,
+transaction stage, portable reason, optional errno, poison state, endpoint
+observation, and coordinator child cleanup where applicable. Socket closure is
+reported only as endpoint disconnection; exact direct-child exit is claimed
+only after coordinator reap. Graceful close returns its owner when leases or
+cleanup remain pending, and terminal abort reports any incomplete exact-child
+cleanup. This checkpoint is Linux-only. macOS/Windows public-session adapters,
+physical Arm64 and packaged evidence, exact-tip hosted CI, and release evidence
+remain outstanding.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

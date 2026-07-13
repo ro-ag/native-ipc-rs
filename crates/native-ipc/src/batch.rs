@@ -41,15 +41,15 @@ impl std::error::Error for BatchError {}
 pub struct TransferBatch {
     regions: Vec<PreparedRegion>,
     max_regions: usize,
+    max_region_bytes: u64,
     max_batch_bytes: u64,
     total_logical: u64,
     total_mapped: u64,
 }
 
 /// Receiver-owned coordinator-relative metadata fixed before capability I/O.
-#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ExpectedRegion {
+pub struct ExpectedRegion {
     pub(crate) id: RegionId,
     pub(crate) writer: WriterEndpoint,
     pub(crate) logical_len: usize,
@@ -57,15 +57,40 @@ pub(crate) struct ExpectedRegion {
 
 /// Canonical receiver expectation that contains no coordinator-minted
 /// incarnation, native object, mapping, or transaction authority.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) struct ExpectedBatch {
+pub struct ExpectedBatch {
     pub(crate) regions: Vec<ExpectedRegion>,
     pub(crate) total_logical: u64,
 }
 
-#[cfg(any(target_os = "linux", test))]
+impl ExpectedRegion {
+    /// Fixes the expected identity, coordinator-relative writer, and length.
+    pub const fn new(id: RegionId, writer: WriterEndpoint, logical_len: usize) -> Self {
+        Self {
+            id,
+            writer,
+            logical_len,
+        }
+    }
+
+    /// Expected opaque identity.
+    pub const fn id(self) -> RegionId {
+        self.id
+    }
+
+    /// Expected coordinator-relative writer direction.
+    pub const fn writer(self) -> WriterEndpoint {
+        self.writer
+    }
+
+    /// Expected logical application-visible length.
+    pub const fn logical_len(self) -> usize {
+        self.logical_len
+    }
+}
+
 impl ExpectedBatch {
-    pub(crate) fn try_from_specs(mut regions: Vec<ExpectedRegion>) -> Result<Self, BatchError> {
+    /// Validates a complete receiver expectation before any capability I/O.
+    pub fn try_from_regions(mut regions: Vec<ExpectedRegion>) -> Result<Self, BatchError> {
         if regions.is_empty() {
             return Err(BatchError::Empty);
         }
@@ -95,24 +120,39 @@ impl ExpectedBatch {
         })
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Number of expected regions.
+    pub fn len(&self) -> usize {
         self.regions.len()
+    }
+
+    /// Whether the expectation is empty (always false after construction).
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    pub(crate) fn try_from_specs(regions: Vec<ExpectedRegion>) -> Result<Self, BatchError> {
+        Self::try_from_regions(regions)
     }
 }
 
 impl TransferBatch {
     #[allow(dead_code)]
-    pub(crate) fn new(max_regions: u16, max_batch_bytes: u64) -> Result<Self, BatchError> {
+    pub(crate) fn new(
+        max_regions: u16,
+        max_region_bytes: u64,
+        max_batch_bytes: u64,
+    ) -> Result<Self, BatchError> {
         let max_regions = usize::from(max_regions);
         if max_regions == 0 || max_regions > 16 {
             return Err(BatchError::TooManyRegions);
         }
-        if max_batch_bytes == 0 {
+        if max_region_bytes == 0 || max_batch_bytes == 0 {
             return Err(BatchError::InvalidLimits);
         }
         Ok(Self {
             regions: Vec::new(),
             max_regions,
+            max_region_bytes,
             max_batch_bytes,
             total_logical: 0,
             total_mapped: 0,
@@ -132,6 +172,9 @@ impl TransferBatch {
             u64::try_from(region.logical_len()).map_err(|_| BatchError::BatchBytesExceeded)?;
         let mapped =
             u64::try_from(region.mapped_len()).map_err(|_| BatchError::BatchBytesExceeded)?;
+        if logical > self.max_region_bytes {
+            return Err(BatchError::InvalidRegionLength);
+        }
         let total_logical = self
             .total_logical
             .checked_add(logical)
@@ -157,6 +200,37 @@ impl TransferBatch {
     /// Whether no region has been added yet.
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
+    }
+
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        let mut lengths = self
+            .regions
+            .iter()
+            .map(|region| {
+                (
+                    region.spec().id,
+                    u64::try_from(region.mapped_len()).expect("prepared length is native"),
+                )
+            })
+            .collect::<Vec<_>>();
+        lengths.sort_unstable_by_key(|(id, _)| *id);
+        lengths.into_iter().map(|(_, length)| length).collect()
+    }
+
+    pub(crate) fn manifest_entries(&self) -> Option<Vec<ManifestEntry>> {
+        self.regions
+            .iter()
+            .map(|region| {
+                let access = match region.spec().writer {
+                    WriterEndpoint::Coordinator => PeerAccess::ReadOnly,
+                    WriterEndpoint::Receiver => PeerAccess::SoleWriter,
+                };
+                Some(ManifestEntry::from_native(
+                    region.request.native_spec(region.spec().id.get())?,
+                    access,
+                ))
+            })
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -204,6 +278,13 @@ pub(crate) enum CommittedRegion {
     Writer(ActiveWriter),
 }
 
+/// Endpoint-local authority expected for one committed native mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalRegionAuthority {
+    Reader,
+    Writer,
+}
+
 /// Keyed complete runtime set returned only after batch COMMIT.
 pub struct ActiveRegionSet {
     regions: BTreeMap<RegionId, CommittedRegion>,
@@ -215,24 +296,50 @@ impl ActiveRegionSet {
         pending: PendingBatch,
         regions: impl IntoIterator<Item = (RegionId, CommittedRegion)>,
     ) -> Result<Self, BatchError> {
+        let expected = pending.regions.iter().map(|region| {
+            let authority = match region.spec().writer {
+                WriterEndpoint::Coordinator => LocalRegionAuthority::Writer,
+                WriterEndpoint::Receiver => LocalRegionAuthority::Reader,
+            };
+            (region.spec().id, authority)
+        });
+        let result = Self::from_local_committed(expected, regions);
+        drop(pending);
+        result
+    }
+
+    pub(crate) fn from_local_committed(
+        expected: impl IntoIterator<Item = (RegionId, LocalRegionAuthority)>,
+        regions: impl IntoIterator<Item = (RegionId, CommittedRegion)>,
+    ) -> Result<Self, BatchError> {
+        let mut expected = expected.into_iter().collect::<Vec<_>>();
+        if expected.len() > 16 {
+            return Err(BatchError::CommitMismatch);
+        }
+        expected.sort_unstable_by_key(|(id, _)| *id);
+        if let Some(duplicate) = expected
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+        {
+            return Err(BatchError::DuplicateRegionId(duplicate));
+        }
         let mut keyed = BTreeMap::new();
         for (id, region) in regions {
             if keyed.insert(id, region).is_some() {
                 return Err(BatchError::DuplicateRegionId(id));
             }
         }
-        if keyed.len() != pending.regions.len() || keyed.len() > 16 {
+        if keyed.len() != expected.len() || keyed.len() > 16 {
             return Err(BatchError::CommitMismatch);
         }
-        for expected in &pending.regions {
-            let id = expected.spec().id;
-            match (expected.spec().writer, keyed.get(&id)) {
-                (WriterEndpoint::Coordinator, Some(CommittedRegion::Writer(_)))
-                | (WriterEndpoint::Receiver, Some(CommittedRegion::Reader(_))) => {}
+        for (id, authority) in expected {
+            match (authority, keyed.get(&id)) {
+                (LocalRegionAuthority::Writer, Some(CommittedRegion::Writer(_)))
+                | (LocalRegionAuthority::Reader, Some(CommittedRegion::Reader(_))) => {}
                 _ => return Err(BatchError::CommitMismatch),
             }
         }
-        drop(pending);
         Ok(Self { regions: keyed })
     }
 
@@ -246,7 +353,7 @@ impl ActiveRegionSet {
         self.regions.is_empty()
     }
 
-    /// Removes the coordinator-writer mapping for `id`.
+    /// Removes the endpoint-local writable mapping for `id`.
     pub fn take_writer(&mut self, id: RegionId) -> Result<ActiveWriter, BatchError> {
         match self.regions.get(&id) {
             None => return Err(BatchError::UnknownRegion(id)),
@@ -260,7 +367,7 @@ impl ActiveRegionSet {
         }
     }
 
-    /// Removes the coordinator-reader mapping for `id`.
+    /// Removes the endpoint-local read-only mapping for `id`.
     pub fn take_reader(&mut self, id: RegionId) -> Result<ActiveReader, BatchError> {
         match self.regions.get(&id) {
             None => return Err(BatchError::UnknownRegion(id)),

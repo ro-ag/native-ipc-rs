@@ -196,6 +196,13 @@ impl SeqPacketEndpoint {
         }
     }
 
+    fn from_inherited_owned(fd: OwnedFd) -> Result<Self, PacketError> {
+        set_cloexec(fd.as_raw_fd())?;
+        enable_passcred(fd.as_raw_fd())?;
+        configure_packet_buffers(fd.as_raw_fd())?;
+        Ok(Self::from_owned(fd))
+    }
+
     /// # Safety
     ///
     /// `raw` must be the uniquely owned inherited end of a vNext socket pair.
@@ -205,10 +212,7 @@ impl SeqPacketEndpoint {
         }
         // SAFETY: caller transfers unique ownership of the inherited endpoint.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        set_cloexec(fd.as_raw_fd())?;
-        enable_passcred(fd.as_raw_fd())?;
-        configure_packet_buffers(fd.as_raw_fd())?;
-        Ok(Self::from_owned(fd))
+        Self::from_inherited_owned(fd)
     }
 
     fn send(&mut self, bytes: &[u8], descriptors: &[RawFd]) -> Result<(), PacketError> {
@@ -637,7 +641,6 @@ impl ProcessBoundEndpoint {
             return Err(PacketError::Poisoned);
         }
         loop {
-            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
             if deadline.is_expired() {
                 return Err(PacketError::DeadlineExpired);
             }
@@ -676,7 +679,6 @@ impl ProcessBoundEndpoint {
             return Err(PacketError::Poisoned);
         }
         loop {
-            ensure_running(self.peer_pidfd.as_raw_fd(), deadline)?;
             if deadline.is_expired() {
                 return Err(PacketError::DeadlineExpired);
             }
@@ -791,6 +793,10 @@ fn poll_until(
         }
         if deadline.is_expired() {
             return Err(PacketError::DeadlineExpired);
+        }
+        let readable = requested & libc::POLLIN != 0 && descriptors[0].revents & libc::POLLIN != 0;
+        if readable {
+            return Ok(());
         }
         if descriptors[1].revents != 0 {
             return Err(PacketError::PeerExited);

@@ -11,23 +11,38 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use crate::backend::accepted_control::AcceptedControlDispatcher;
+use crate::backend::accepted_control::{
+    AcceptedControlDispatcher, AcceptedControlError, LinuxActivationError, LinuxBatchBeginError,
+    LinuxCapabilityBatchError,
+};
 use crate::backend::{
     AuthenticatedZeroRightsTransport, CoordinatorAcceptedEvidence, CoordinatorCapabilityTransport,
     CoordinatorChildChannelReceipt, CoordinatorChildImageReceipt, OwnedChildLifecycle, PeerState,
     ReceiverCapabilityTransport, ReceiverSpawnerEvidence, SessionTransportError,
     SpawnIdentityFacts, sealed,
 };
-use crate::control::CONTROL_HEADER_LEN;
+use crate::batch::{ActiveRegionSet, BatchError, ExpectedBatch, TransferBatch};
+use crate::control::{CONTROL_HEADER_LEN, ControlError, ControlFrame};
+use crate::liveness::ResourceError;
 use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
     decode_frame,
 };
-use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame, NativeAuthorityProfile};
-use crate::session::{AbsoluteDeadline, NegotiationError, SessionLimits};
+use crate::protocol::{
+    CONTROL_FRAME_LEN, CapabilityFrame, CoordinatorCapacityStatus, NativeAuthorityProfile,
+};
+use crate::session::{
+    AbsoluteDeadline, ActiveLeaseFacts, AtomicCapabilities, ChildCleanupFacts, ChildExitStatus,
+    DescendantCleanupStatus, NegotiationError, PeerStatus, ProtocolVersion, SessionCommand,
+    SessionLimits, SessionOptions, SessionState,
+};
 
-use super::process::{ExactChildLifecycle, HeldExecutable, PreparedExactChildLifecycle};
+use super::memory::{LinuxMixedDirectionBatch, MemfdError};
+use super::process::{
+    DescendantCleanup, ExactChildCleanup, ExactChildExit, ExactChildLifecycle, HeldExecutable,
+    PreparedExactChildLifecycle,
+};
 use super::{
     MAX_ZERO_RIGHTS_PACKET_BYTES, PacketCredentials, PacketError, SeqPacketEndpoint,
     discover_atomic_capabilities,
@@ -42,6 +57,7 @@ const NONCE_LEN: usize = 32;
 const MAX_LINUX_HELLO_PAYLOAD: usize = MAX_ZERO_RIGHTS_PACKET_BYTES - HEADER_LEN;
 const MAX_LINUX_CONTROL_PAYLOAD: u32 = (MAX_ZERO_RIGHTS_PACKET_BYTES - CONTROL_HEADER_LEN) as u32;
 const BOOTSTRAP_ENV: &[u8] = b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD";
+const PUBLIC_BOOTSTRAP_ENV: &str = "NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP";
 #[cfg(test)]
 std::thread_local! {
     static LAST_SPAWN_PID: Cell<libc::pid_t> = const { Cell::new(0) };
@@ -82,6 +98,53 @@ enum LinuxSpawnError {
     Negotiation(NegotiationWireError),
     NativeNegotiation(NegotiationError),
     Native(i32),
+}
+
+#[derive(Debug)]
+struct LinuxCoordinatorSpawnFailure {
+    error: LinuxSpawnError,
+    cleanup: Option<ExactChildCleanup>,
+    state: LinuxCoordinatorFailureState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxCoordinatorFailureState {
+    NotEstablished,
+    Spawned,
+    Negotiating,
+}
+
+#[cfg(test)]
+impl PartialEq<LinuxSpawnError> for LinuxCoordinatorSpawnFailure {
+    fn eq(&self, other: &LinuxSpawnError) -> bool {
+        self.error == *other
+    }
+}
+
+impl LinuxCoordinatorSpawnFailure {
+    const fn before_child(error: LinuxSpawnError) -> Self {
+        Self {
+            error,
+            cleanup: None,
+            state: LinuxCoordinatorFailureState::NotEstablished,
+        }
+    }
+
+    const fn after_spawn(error: LinuxSpawnError, cleanup: ExactChildCleanup) -> Self {
+        Self {
+            error,
+            cleanup: Some(cleanup),
+            state: LinuxCoordinatorFailureState::Spawned,
+        }
+    }
+
+    const fn during_negotiation(error: LinuxSpawnError, cleanup: ExactChildCleanup) -> Self {
+        Self {
+            error,
+            cleanup: Some(cleanup),
+            state: LinuxCoordinatorFailureState::Negotiating,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +280,80 @@ impl LinuxReceivedCapabilities {
 type CoordinatorAcceptedControl = AcceptedControlDispatcher<CoordinatorLinuxControlTransport>;
 type ReceiverAcceptedControl = AcceptedControlDispatcher<ReceiverLinuxControlTransport>;
 
+pub(crate) struct LinuxCoordinatorNegotiatingSession(NegotiatingLinuxSpawn);
+pub(crate) struct LinuxReceiverNegotiatingSession(ReceiverNegotiatingState);
+pub(crate) struct LinuxCoordinatorReadySession(CoordinatorAcceptedControl);
+pub(crate) struct LinuxReceiverReadySession(ReceiverAcceptedControl);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxNegotiationRole {
+    Coordinator,
+    Receiver,
+}
+
+pub(crate) enum LinuxNegotiationOutcome<T> {
+    Accepted(T),
+    Rejected {
+        by: LinuxNegotiationRole,
+        reason: NonZeroU32,
+        cleanup: Option<ChildCleanupFacts>,
+    },
+}
+
+pub(crate) struct LinuxCoordinatorSessionFailure {
+    pub(crate) error: LinuxPublicSessionError,
+    pub(crate) cleanup: Option<ChildCleanupFacts>,
+    pub(crate) state: LinuxCoordinatorFailureState,
+    pub(crate) poisoned: bool,
+}
+
+pub(crate) struct LinuxPublicReadyFailure {
+    pub(crate) error: LinuxPublicSessionError,
+    pub(crate) transaction_open_on_failure: bool,
+}
+
+impl LinuxPublicReadyFailure {
+    fn before_transaction(error: LinuxPublicSessionError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: false,
+        }
+    }
+
+    fn after_transaction(error: LinuxPublicSessionError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: true,
+        }
+    }
+
+    fn ready_after_transaction(error: LinuxPublicSessionError) -> Self {
+        Self {
+            error,
+            transaction_open_on_failure: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinuxPublicSessionError {
+    InvalidInput,
+    DeadlineExpired,
+    PeerExited,
+    IdentityMismatch,
+    MalformedPeer,
+    Ambiguous,
+    NegotiationFailed,
+    NativeNegotiation(NegotiationError),
+    Control(ControlError),
+    Batch(BatchError),
+    ActiveLimit,
+    PeerPreparationFailed,
+    ActivationFailed(Option<i32>),
+    Poisoned,
+    Native(Option<i32>),
+}
+
 struct ReceiverDecisionPending {
     endpoint: SeqPacketEndpoint,
     transcript: NegotiatedTranscript,
@@ -278,10 +415,11 @@ impl UnauthenticatedLinuxSpawn {
         self.lifecycle.as_ref().expect("live spawn owner").pidfd()
     }
 
-    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
-        if let Some(lifecycle) = self.lifecycle.take() {
-            let _ = lifecycle.terminate_and_reap(deadline);
-        }
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.lifecycle
+            .take()
+            .expect("live negotiating owner retains exact child lifecycle")
+            .terminate_and_reap(deadline)
     }
 }
 
@@ -300,16 +438,20 @@ impl NegotiatingLinuxSpawn {
             .pidfd()
     }
 
-    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
-        if let Some(lifecycle) = self.lifecycle.take() {
-            let _ = lifecycle.terminate_and_reap(deadline);
-        }
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.lifecycle
+            .take()
+            .expect("live negotiating owner retains exact child lifecycle")
+            .terminate_and_reap(deadline)
     }
 
     fn decide(
         self,
         decision: ApplicationDecision,
-    ) -> Result<DecisionOutcome<AcceptedLinuxSpawn>, LinuxSpawnError> {
+    ) -> Result<
+        DecisionOutcome<AcceptedLinuxSpawn, ExactChildCleanup>,
+        (LinuxSpawnError, ExactChildCleanup),
+    > {
         self.decide_with_entropy_fault(decision, EntropyFault::None)
     }
 
@@ -317,7 +459,10 @@ impl NegotiatingLinuxSpawn {
         mut self,
         decision: ApplicationDecision,
         entropy_fault: EntropyFault,
-    ) -> Result<DecisionOutcome<AcceptedLinuxSpawn>, LinuxSpawnError> {
+    ) -> Result<
+        DecisionOutcome<AcceptedLinuxSpawn, ExactChildCleanup>,
+        (LinuxSpawnError, ExactChildCleanup),
+    > {
         let deadline = self.deadline;
         let result = (|| {
             let challenge = generate_decision_challenge(deadline, entropy_fault)?;
@@ -411,16 +556,16 @@ impl NegotiatingLinuxSpawn {
                 reason,
                 state: (),
             }) => {
-                self.terminate_and_reap(deadline);
+                let cleanup = self.terminate_and_reap(deadline);
                 Ok(DecisionOutcome::Rejected {
                     by,
                     reason,
-                    state: (),
+                    state: cleanup,
                 })
             }
             Err(error) => {
-                self.terminate_and_reap(deadline);
-                Err(error)
+                let cleanup = self.terminate_and_reap(deadline);
+                Err((error, cleanup))
             }
         }
     }
@@ -525,13 +670,16 @@ impl AcceptedLinuxSpawn {
         self.lifecycle.as_ref().expect("live accepted owner").pid()
     }
 
-    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
-        if let Some(lifecycle) = self.lifecycle.take() {
-            let _ = lifecycle.terminate_and_reap(deadline);
-        }
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.lifecycle
+            .take()
+            .expect("live accepted owner retains exact child lifecycle")
+            .terminate_and_reap(deadline)
     }
 
-    fn into_evidence(mut self) -> Result<CoordinatorAcceptedEvidenceOwner, LinuxSpawnError> {
+    fn into_evidence(
+        mut self,
+    ) -> Result<CoordinatorAcceptedEvidenceOwner, (LinuxSpawnError, ExactChildCleanup)> {
         let evidence = (|| {
             let transcript = self
                 .transcript
@@ -566,8 +714,8 @@ impl AcceptedLinuxSpawn {
             Ok(evidence) => evidence,
             Err(error) => {
                 let deadline = self.deadline;
-                self.terminate_and_reap(deadline);
-                return Err(error);
+                let cleanup = self.terminate_and_reap(deadline);
+                return Err((error, cleanup));
             }
         };
         Ok(CoordinatorAcceptedEvidenceOwner {
@@ -618,13 +766,17 @@ impl CoordinatorAcceptedEvidenceOwner {
         self.evidence.facts()
     }
 
-    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) {
-        if let Some(lifecycle) = self.lifecycle.take() {
-            let _ = lifecycle.terminate_and_reap(deadline);
-        }
+    #[cfg(test)]
+    fn terminate_and_reap(mut self, deadline: AbsoluteDeadline) -> ExactChildCleanup {
+        self.lifecycle
+            .take()
+            .expect("live evidence owner retains exact child lifecycle")
+            .terminate_and_reap(deadline)
     }
 
-    fn into_control(self) -> Result<CoordinatorAcceptedControl, LinuxSpawnError> {
+    fn into_control(
+        self,
+    ) -> Result<CoordinatorAcceptedControl, (LinuxSpawnError, ChildCleanupFacts)> {
         let facts = self.evidence.facts();
         let parameters = self
             .evidence
@@ -647,8 +799,8 @@ impl CoordinatorAcceptedEvidenceOwner {
         match AcceptedControlDispatcher::new(transport, parameters) {
             Ok(dispatcher) => Ok(dispatcher),
             Err(mut transport) => {
-                let _ = transport.terminate_and_reap(self.deadline);
-                Err(LinuxSpawnError::InvalidInput)
+                let cleanup = transport.terminate_and_reap_facts(self.deadline);
+                Err((LinuxSpawnError::InvalidInput, cleanup))
             }
         }
     }
@@ -679,6 +831,553 @@ impl ReceiverAcceptedEvidenceOwner {
         };
         AcceptedControlDispatcher::new(transport, parameters)
             .map_err(|_| LinuxSpawnError::InvalidInput)
+    }
+}
+
+impl LinuxCoordinatorNegotiatingSession {
+    pub(crate) fn spawn(
+        command: &SessionCommand,
+        options: &SessionOptions,
+    ) -> Result<Self, LinuxCoordinatorSessionFailure> {
+        let offer = public_linux_offer(
+            options.limits(),
+            options.application_payload().to_vec(),
+            options.requires_atomic_u32(),
+            options.requires_atomic_u64(),
+        );
+        let mut public_environment = command.environment().to_vec();
+        public_environment.push((OsString::from(PUBLIC_BOOTSTRAP_ENV), OsString::from("1")));
+        spawn_negotiating(
+            command.executable(),
+            command.arguments(),
+            &public_environment,
+            offer,
+            options.deadline(),
+        )
+        .map(Self)
+        .map_err(|failure| LinuxCoordinatorSessionFailure {
+            error: map_public_spawn_error(failure.error),
+            cleanup: failure.cleanup.map(map_child_cleanup),
+            state: failure.state,
+            poisoned: failure.cleanup.is_some(),
+        })
+    }
+
+    pub(crate) fn peer_application_payload(&self) -> &[u8] {
+        &self.0._peer_application_payload
+    }
+
+    pub(crate) fn decide(
+        self,
+        rejection: Option<NonZeroU32>,
+    ) -> Result<LinuxNegotiationOutcome<LinuxCoordinatorReadySession>, LinuxCoordinatorSessionFailure>
+    {
+        let decision = rejection.map_or(ApplicationDecision::Accept, ApplicationDecision::Reject);
+        match self.0.decide(decision).map_err(|(error, cleanup)| {
+            LinuxCoordinatorSessionFailure {
+                error: map_public_spawn_error(error),
+                cleanup: Some(map_child_cleanup(cleanup)),
+                state: LinuxCoordinatorFailureState::Negotiating,
+                poisoned: true,
+            }
+        })? {
+            DecisionOutcome::Accepted(accepted) => {
+                let evidence = accepted.into_evidence().map_err(|(error, cleanup)| {
+                    LinuxCoordinatorSessionFailure {
+                        error: map_public_spawn_error(error),
+                        cleanup: Some(map_child_cleanup(cleanup)),
+                        state: LinuxCoordinatorFailureState::Negotiating,
+                        poisoned: true,
+                    }
+                })?;
+                let control = evidence.into_control().map_err(|(error, cleanup)| {
+                    LinuxCoordinatorSessionFailure {
+                        error: map_public_spawn_error(error),
+                        cleanup: Some(cleanup),
+                        state: LinuxCoordinatorFailureState::Negotiating,
+                        poisoned: true,
+                    }
+                })?;
+                Ok(LinuxNegotiationOutcome::Accepted(
+                    LinuxCoordinatorReadySession(control),
+                ))
+            }
+            DecisionOutcome::Rejected {
+                by,
+                reason,
+                state: cleanup,
+            } => Ok(LinuxNegotiationOutcome::Rejected {
+                by: map_negotiation_role(by),
+                reason,
+                cleanup: Some(map_child_cleanup(cleanup)),
+            }),
+        }
+    }
+}
+
+impl LinuxReceiverNegotiatingSession {
+    pub(crate) fn from_inherited_bootstrap(
+        inherited: OwnedFd,
+        limits: SessionLimits,
+        application_payload: Vec<u8>,
+        require_atomic_u32: bool,
+        require_atomic_u64: bool,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, LinuxPublicSessionError> {
+        let offer = public_linux_offer(
+            limits,
+            application_payload,
+            require_atomic_u32,
+            require_atomic_u64,
+        );
+        receive_inherited_hello_owned(inherited, offer, deadline)
+            .map(Self)
+            .map_err(map_public_spawn_error)
+    }
+
+    pub(crate) fn peer_application_payload(&self) -> &[u8] {
+        &self.0._peer_application_payload
+    }
+
+    pub(crate) fn decide_after_coordinator(
+        self,
+        decide: impl FnOnce(&[u8]) -> Option<NonZeroU32>,
+    ) -> Result<LinuxNegotiationOutcome<LinuxReceiverReadySession>, LinuxPublicSessionError> {
+        let mut state = self.0;
+        let peer_application_payload = core::mem::take(&mut state._peer_application_payload);
+        match state
+            .await_coordinator_decision()
+            .map_err(map_public_spawn_error)?
+        {
+            CoordinatorDecisionOutcome::Rejected { reason, .. } => {
+                Ok(LinuxNegotiationOutcome::Rejected {
+                    by: LinuxNegotiationRole::Coordinator,
+                    reason,
+                    cleanup: None,
+                })
+            }
+            CoordinatorDecisionOutcome::Pending(pending) => {
+                let decision = decide(&peer_application_payload)
+                    .map_or(ApplicationDecision::Accept, ApplicationDecision::Reject);
+                match pending.decide(decision).map_err(map_public_spawn_error)? {
+                    DecisionOutcome::Accepted(accepted) => {
+                        let evidence = accepted.into_evidence().map_err(map_public_spawn_error)?;
+                        let control = evidence.into_control().map_err(map_public_spawn_error)?;
+                        Ok(LinuxNegotiationOutcome::Accepted(
+                            LinuxReceiverReadySession(control),
+                        ))
+                    }
+                    DecisionOutcome::Rejected { by, reason, .. } => {
+                        Ok(LinuxNegotiationOutcome::Rejected {
+                            by: map_negotiation_role(by),
+                            reason,
+                            cleanup: None,
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl LinuxCoordinatorReadySession {
+    pub(crate) const fn limits(&self) -> SessionLimits {
+        self.0.limits()
+    }
+
+    pub(crate) const fn atomics(&self) -> AtomicCapabilities {
+        self.0.atomics()
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.0.protocol_version()
+    }
+
+    pub(crate) fn state(&self) -> SessionState {
+        self.0.session_state()
+    }
+
+    pub(crate) fn active_leases(&self) -> ActiveLeaseFacts {
+        self.0.active_lease_facts()
+    }
+
+    pub(crate) fn poll_peer(&mut self) -> Result<PeerStatus, LinuxPublicSessionError> {
+        self.0
+            .try_poll_peer()
+            .map(|state| match state {
+                PeerState::Running => PeerStatus::Connected,
+                PeerState::ExitedUnknown => PeerStatus::Disconnected,
+            })
+            .map_err(map_public_control_error)
+    }
+
+    pub(crate) fn wait_for_exit(&mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        self.0.wait_for_linux_child(deadline)
+    }
+
+    pub(crate) fn close_resources(&mut self) -> Result<(), LinuxPublicSessionError> {
+        self.0
+            .try_close_resources()
+            .map_err(map_close_resource_error)
+    }
+
+    pub(crate) fn abort(&mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        self.0.abort_linux_child(deadline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_signal_for_test(&self, code: i32) {
+        self.0.fail_next_linux_cleanup_signal_for_test(code);
+    }
+
+    pub(crate) fn send_control(
+        &mut self,
+        kind: u32,
+        payload: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), LinuxPublicSessionError> {
+        self.0
+            .send_parts(kind, payload, deadline)
+            .map_err(map_public_control_error)
+    }
+
+    pub(crate) fn receive_control(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ControlFrame, LinuxPublicSessionError> {
+        self.0.receive(deadline).map_err(map_public_control_error)
+    }
+
+    pub(crate) fn transfer_batch(
+        &mut self,
+        batch: TransferBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ActiveRegionSet, LinuxPublicReadyFailure> {
+        if deadline.is_expired() {
+            return Err(LinuxPublicReadyFailure::before_transaction(
+                LinuxPublicSessionError::DeadlineExpired,
+            ));
+        }
+        let frame = self
+            .0
+            .begin_public_linux_transfer_capacity(&batch, deadline)
+            .map_err(map_public_batch_transaction_error)
+            .map_err(LinuxPublicReadyFailure::before_transaction)?;
+        let reservations = self.0.reserve_linux_transfer_batch(&batch);
+        let preparation = reservations.as_ref().ok().map(|_| {
+            LinuxMixedDirectionBatch::prepare(batch, self.0.authority_profile(), deadline)
+        });
+        let local_status = if reservations.is_err() {
+            CoordinatorCapacityStatus::ActiveLimit
+        } else if preparation
+            .as_ref()
+            .is_some_and(|prepared| prepared.is_err())
+        {
+            CoordinatorCapacityStatus::PreparationFailed
+        } else {
+            CoordinatorCapacityStatus::Ready
+        };
+        let peer_ready = self
+            .0
+            .exchange_public_linux_transfer_capacity(&frame, local_status, deadline)
+            .map_err(map_public_batch_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        let reservations = reservations
+            .map_err(|_| LinuxPublicSessionError::ActiveLimit)
+            .map_err(LinuxPublicReadyFailure::ready_after_transaction)?;
+        let prepared = preparation
+            .expect("successful reservation attempts native preparation")
+            .map_err(map_public_local_memory_error)
+            .map_err(LinuxPublicReadyFailure::ready_after_transaction)?;
+        if !peer_ready {
+            return Err(LinuxPublicReadyFailure::ready_after_transaction(
+                LinuxPublicSessionError::ActiveLimit,
+            ));
+        }
+        let mut transaction = self
+            .0
+            .begin_public_linux_mixed_direction_batch_preflighted(
+                prepared,
+                reservations,
+                frame,
+                deadline,
+            )
+            .map_err(map_public_batch_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        transaction
+            .prepare()
+            .map_err(map_public_batch_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        let committed = transaction
+            .commit()
+            .map_err(map_public_batch_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        self.0
+            .activate_linux_coordinator_mixed_direction_batch(committed)
+            .map_err(map_public_activation_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)
+    }
+}
+
+impl LinuxReceiverReadySession {
+    pub(crate) const fn limits(&self) -> SessionLimits {
+        self.0.limits()
+    }
+
+    pub(crate) const fn atomics(&self) -> AtomicCapabilities {
+        self.0.atomics()
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.0.protocol_version()
+    }
+
+    pub(crate) fn state(&self) -> SessionState {
+        self.0.session_state()
+    }
+
+    pub(crate) fn active_leases(&self) -> ActiveLeaseFacts {
+        self.0.active_lease_facts()
+    }
+
+    pub(crate) fn poll_peer(&mut self) -> Result<PeerStatus, LinuxPublicSessionError> {
+        self.0
+            .try_poll_peer()
+            .map(|state| match state {
+                PeerState::Running => PeerStatus::Connected,
+                PeerState::ExitedUnknown => PeerStatus::Disconnected,
+            })
+            .map_err(map_public_control_error)
+    }
+
+    pub(crate) fn wait_for_exit(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<PeerStatus, LinuxPublicSessionError> {
+        self.0
+            .wait_for_linux_peer_exit(deadline)
+            .map(|state| match state {
+                PeerState::Running => PeerStatus::Connected,
+                PeerState::ExitedUnknown => PeerStatus::Disconnected,
+            })
+            .map_err(map_public_transport_error)
+    }
+
+    pub(crate) fn close_resources(&mut self) -> Result<(), LinuxPublicSessionError> {
+        self.0
+            .try_close_resources()
+            .map_err(map_close_resource_error)
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.0.poison_session();
+    }
+
+    pub(crate) fn send_control(
+        &mut self,
+        kind: u32,
+        payload: &[u8],
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), LinuxPublicSessionError> {
+        self.0
+            .send_parts(kind, payload, deadline)
+            .map_err(map_public_control_error)
+    }
+
+    pub(crate) fn receive_control(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ControlFrame, LinuxPublicSessionError> {
+        self.0.receive(deadline).map_err(map_public_control_error)
+    }
+
+    pub(crate) fn receive_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<ActiveRegionSet, LinuxPublicReadyFailure> {
+        let mut transaction = self
+            .0
+            .begin_public_linux_expected_mixed_direction_batch(expected, deadline)
+            .map_err(
+                |LinuxBatchBeginError {
+                     error,
+                     transaction_open_on_failure,
+                 }| LinuxPublicReadyFailure {
+                    error: map_public_receiver_begin_error(error),
+                    transaction_open_on_failure,
+                },
+            )?;
+        transaction
+            .prepare()
+            .map_err(map_public_receiver_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        let committed = transaction
+            .commit()
+            .map_err(map_public_receiver_transaction_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)?;
+        self.0
+            .activate_linux_receiver_mixed_direction_batch(committed)
+            .map_err(map_public_activation_error)
+            .map_err(LinuxPublicReadyFailure::after_transaction)
+    }
+}
+
+fn public_linux_offer(
+    limits: SessionLimits,
+    application_payload: Vec<u8>,
+    require_atomic_u32: bool,
+    require_atomic_u64: bool,
+) -> LinuxHelloOffer {
+    let required = u64::from(require_atomic_u32) | (u64::from(require_atomic_u64) << 1);
+    LinuxHelloOffer {
+        supported_features: FeatureBits([3, 0]),
+        required_features: FeatureBits([required, 0]),
+        limits,
+        application_payload,
+    }
+}
+
+fn map_negotiation_role(role: SenderRole) -> LinuxNegotiationRole {
+    match role {
+        SenderRole::Coordinator => LinuxNegotiationRole::Coordinator,
+        SenderRole::Receiver => LinuxNegotiationRole::Receiver,
+    }
+}
+
+fn map_public_spawn_error(error: LinuxSpawnError) -> LinuxPublicSessionError {
+    match error {
+        LinuxSpawnError::InvalidInput => LinuxPublicSessionError::InvalidInput,
+        LinuxSpawnError::DeadlineExpired => LinuxPublicSessionError::DeadlineExpired,
+        LinuxSpawnError::ExitedBeforeConfirmation => LinuxPublicSessionError::PeerExited,
+        LinuxSpawnError::WrongExecutable => LinuxPublicSessionError::IdentityMismatch,
+        LinuxSpawnError::Negotiation(_) => LinuxPublicSessionError::NegotiationFailed,
+        LinuxSpawnError::NativeNegotiation(error) => {
+            LinuxPublicSessionError::NativeNegotiation(error)
+        }
+        LinuxSpawnError::Packet(error) => match error {
+            PacketError::DeadlineExpired => LinuxPublicSessionError::DeadlineExpired,
+            PacketError::PeerExited => LinuxPublicSessionError::PeerExited,
+            PacketError::WrongPeer => LinuxPublicSessionError::IdentityMismatch,
+            PacketError::Poisoned => LinuxPublicSessionError::Poisoned,
+            PacketError::AmbiguousAfterSend | PacketError::AmbiguousAfterReceive => {
+                LinuxPublicSessionError::Ambiguous
+            }
+            PacketError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
+            _ => LinuxPublicSessionError::MalformedPeer,
+        },
+        LinuxSpawnError::MalformedChildError => LinuxPublicSessionError::MalformedPeer,
+        LinuxSpawnError::Child { errno, .. } => LinuxPublicSessionError::Native(Some(errno)),
+        LinuxSpawnError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
+        LinuxSpawnError::EntropyUnavailable => LinuxPublicSessionError::Native(None),
+    }
+}
+
+fn map_public_control_error(error: AcceptedControlError) -> LinuxPublicSessionError {
+    match error {
+        AcceptedControlError::Control(error) => LinuxPublicSessionError::Control(error),
+        AcceptedControlError::Transport(error) => map_public_transport_error(error),
+    }
+}
+
+fn map_public_local_memory_error(error: MemfdError) -> LinuxPublicSessionError {
+    match error {
+        MemfdError::DeadlineExpired => LinuxPublicSessionError::DeadlineExpired,
+        MemfdError::InvalidSize
+        | MemfdError::InvalidBatch
+        | MemfdError::UnsupportedDirection
+        | MemfdError::DeadlineMismatch => LinuxPublicSessionError::InvalidInput,
+        MemfdError::InvalidObject
+        | MemfdError::WrongObject
+        | MemfdError::WrongProvenance
+        | MemfdError::ExecutableAuthorityUnsupported => LinuxPublicSessionError::Native(None),
+        MemfdError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
+    }
+}
+
+fn map_public_batch_transaction_error(error: LinuxCapabilityBatchError) -> LinuxPublicSessionError {
+    match error {
+        LinuxCapabilityBatchError::Memory(error) => map_public_local_memory_error(error),
+        LinuxCapabilityBatchError::Control(error) => map_public_control_error(error),
+        LinuxCapabilityBatchError::Resource(_) => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::ActiveLimit => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::PeerPreparationFailed => {
+            LinuxPublicSessionError::PeerPreparationFailed
+        }
+    }
+}
+
+fn map_public_receiver_begin_error(error: LinuxCapabilityBatchError) -> LinuxPublicSessionError {
+    match error {
+        LinuxCapabilityBatchError::Memory(error) => map_public_local_memory_error(error),
+        LinuxCapabilityBatchError::Control(error) => map_public_control_error(error),
+        LinuxCapabilityBatchError::Resource(_) => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::ActiveLimit => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::PeerPreparationFailed => {
+            LinuxPublicSessionError::PeerPreparationFailed
+        }
+    }
+}
+
+fn map_public_receiver_transaction_error(
+    error: LinuxCapabilityBatchError,
+) -> LinuxPublicSessionError {
+    match error {
+        LinuxCapabilityBatchError::Memory(error) => match error {
+            MemfdError::DeadlineExpired => LinuxPublicSessionError::DeadlineExpired,
+            MemfdError::InvalidSize
+            | MemfdError::InvalidBatch
+            | MemfdError::UnsupportedDirection
+            | MemfdError::DeadlineMismatch
+            | MemfdError::InvalidObject
+            | MemfdError::WrongObject
+            | MemfdError::WrongProvenance
+            | MemfdError::ExecutableAuthorityUnsupported => LinuxPublicSessionError::MalformedPeer,
+            MemfdError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
+        },
+        LinuxCapabilityBatchError::Control(error) => map_public_control_error(error),
+        LinuxCapabilityBatchError::Resource(_) => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::ActiveLimit => LinuxPublicSessionError::ActiveLimit,
+        LinuxCapabilityBatchError::PeerPreparationFailed => {
+            LinuxPublicSessionError::PeerPreparationFailed
+        }
+    }
+}
+
+fn map_public_activation_error(error: LinuxActivationError) -> LinuxPublicSessionError {
+    match error {
+        LinuxActivationError::Batch(error) => LinuxPublicSessionError::Batch(error),
+        LinuxActivationError::Memory(MemfdError::Native(code)) => {
+            LinuxPublicSessionError::ActivationFailed(Some(code))
+        }
+        LinuxActivationError::WrongSession
+        | LinuxActivationError::Memory(_)
+        | LinuxActivationError::Active(_) => LinuxPublicSessionError::ActivationFailed(None),
+    }
+}
+
+fn map_close_resource_error(error: ResourceError) -> LinuxPublicSessionError {
+    match error {
+        ResourceError::ActiveLeases(_) | ResourceError::ActiveLimit => {
+            LinuxPublicSessionError::ActiveLimit
+        }
+        ResourceError::Poisoned | ResourceError::Closed => LinuxPublicSessionError::Poisoned,
+        ResourceError::InvalidLimits | ResourceError::MappedLengthMismatch { .. } => {
+            LinuxPublicSessionError::Native(None)
+        }
+    }
+}
+
+fn map_public_transport_error(error: SessionTransportError) -> LinuxPublicSessionError {
+    match error {
+        SessionTransportError::DeadlineExpired => LinuxPublicSessionError::DeadlineExpired,
+        SessionTransportError::PeerExited => LinuxPublicSessionError::PeerExited,
+        SessionTransportError::MalformedRecord | SessionTransportError::RecordTooLarge => {
+            LinuxPublicSessionError::MalformedPeer
+        }
+        SessionTransportError::IdentityMismatch => LinuxPublicSessionError::IdentityMismatch,
+        SessionTransportError::Ambiguous => LinuxPublicSessionError::Ambiguous,
+        SessionTransportError::Native(code) => LinuxPublicSessionError::Native(code),
     }
 }
 
@@ -727,7 +1426,7 @@ impl AuthenticatedZeroRightsTransport for CoordinatorLinuxControlTransport {
 
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
         if self.poisoned {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         let pidfd = self
             .lifecycle
@@ -746,11 +1445,84 @@ impl AuthenticatedZeroRightsTransport for CoordinatorLinuxControlTransport {
     }
 }
 
-#[cfg(test)]
 impl CoordinatorLinuxControlTransport {
+    pub(crate) fn wait_and_reap_facts(&mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return ChildCleanupFacts::new(
+                Some(ChildExitStatus::AlreadyReaped),
+                DescendantCleanupStatus::NotEstablished,
+                None,
+            );
+        };
+        map_child_cleanup(lifecycle.wait_and_reap(deadline))
+    }
+
+    pub(crate) fn terminate_and_reap_facts(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> ChildCleanupFacts {
+        self.poisoned = true;
+        let Some(lifecycle) = self.lifecycle.take() else {
+            return ChildCleanupFacts::new(
+                Some(ChildExitStatus::AlreadyReaped),
+                DescendantCleanupStatus::NotEstablished,
+                None,
+            );
+        };
+        map_child_cleanup(lifecycle.terminate_and_reap(deadline))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_signal_for_test(&self, code: i32) {
+        self.lifecycle
+            .as_ref()
+            .expect("live coordinator transport retains exact child lifecycle")
+            .fail_next_signal_for_test(code);
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_poison_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.poison_observer = Some(observer);
     }
+
+    #[cfg(test)]
+    pub(crate) fn wait_and_reap_clean_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.poisoned = true;
+        let lifecycle = self
+            .lifecycle
+            .take()
+            .ok_or(SessionTransportError::PeerExited)?;
+        let cleanup = lifecycle.wait_and_reap(deadline);
+        if cleanup.direct_child_succeeded() {
+            Ok(())
+        } else if let Some(code) = cleanup.last_native_error() {
+            Err(SessionTransportError::Native(Some(code)))
+        } else {
+            Err(SessionTransportError::DeadlineExpired)
+        }
+    }
+}
+
+fn map_child_cleanup(cleanup: ExactChildCleanup) -> ChildCleanupFacts {
+    let direct_child = cleanup.direct_child().map(|exit| match exit {
+        ExactChildExit::Exited(code) => ChildExitStatus::Exited(code),
+        ExactChildExit::Signaled {
+            signal,
+            dumped_core,
+        } => ChildExitStatus::Signaled {
+            signal,
+            dumped_core,
+        },
+        ExactChildExit::AlreadyReaped => ChildExitStatus::AlreadyReaped,
+    });
+    let descendants = match cleanup.descendants() {
+        DescendantCleanup::NotEstablished => DescendantCleanupStatus::NotEstablished,
+        DescendantCleanup::FreshGroupUnverified => DescendantCleanupStatus::FreshGroupUnverified,
+    };
+    ChildCleanupFacts::new(direct_child, descendants, cleanup.last_native_error())
 }
 
 impl OwnedChildLifecycle for CoordinatorLinuxControlTransport {
@@ -766,8 +1538,8 @@ impl OwnedChildLifecycle for CoordinatorLinuxControlTransport {
         let cleanup = lifecycle.terminate_and_reap(deadline);
         if cleanup.direct_child_complete() {
             Ok(())
-        } else if cleanup.last_native_error().is_some() {
-            Err(SessionTransportError::Native)
+        } else if let Some(code) = cleanup.last_native_error() {
+            Err(SessionTransportError::Native(Some(code)))
         } else {
             Err(SessionTransportError::DeadlineExpired)
         }
@@ -838,7 +1610,7 @@ impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
 
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
         if self.poisoned {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         observe_accepted_control_peer(self.endpoint.fd.as_raw_fd(), None)
     }
@@ -872,6 +1644,49 @@ impl ReceiverCapabilityTransport for ReceiverLinuxControlTransport {
 }
 
 impl ReceiverLinuxControlTransport {
+    pub(crate) fn wait_for_peer_exit(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<PeerState, SessionTransportError> {
+        if self.poisoned {
+            return Err(SessionTransportError::Native(None));
+        }
+        loop {
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Err(SessionTransportError::DeadlineExpired);
+            }
+            let timeout = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as libc::c_int;
+            let mut event = libc::pollfd {
+                fd: self.endpoint.fd.as_raw_fd(),
+                events: 0,
+                revents: 0,
+            };
+            // SAFETY: event is one initialized descriptor for bounded poll.
+            let result = unsafe { libc::poll(&mut event, 1, timeout) };
+            if result < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(SessionTransportError::Native(
+                    io::Error::last_os_error().raw_os_error(),
+                ));
+            }
+            if deadline.is_expired() || result == 0 {
+                return Err(SessionTransportError::DeadlineExpired);
+            }
+            if event.revents & libc::POLLNVAL != 0 {
+                return Err(SessionTransportError::Native(Some(libc::EBADF)));
+            }
+            if event.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                return Ok(PeerState::ExitedUnknown);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_poison_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.poison_observer = Some(observer);
@@ -935,7 +1750,9 @@ impl ReceiverLinuxControlTransport {
         // through the inherited endpoint and exits without Rust teardown.
         let child = unsafe { libc::fork() };
         if child < 0 {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(
+                io::Error::last_os_error().raw_os_error(),
+            ));
         }
         if child == 0 {
             let status = i32::from(self.endpoint.send_zero_rights(bytes).is_err());
@@ -952,12 +1769,14 @@ impl ReceiverLinuxControlTransport {
             if waited < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(
+                io::Error::last_os_error().raw_os_error(),
+            ));
         }
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
             Ok(())
         } else {
-            Err(SessionTransportError::Native)
+            Err(SessionTransportError::Native(None))
         }
     }
 }
@@ -970,7 +1789,7 @@ fn send_accepted_control_record(
     deadline: AbsoluteDeadline,
 ) -> Result<(), SessionTransportError> {
     if *poisoned {
-        return Err(SessionTransportError::Native);
+        return Err(SessionTransportError::Native(None));
     }
     if bytes.is_empty() || bytes.len() > MAX_ZERO_RIGHTS_PACKET_BYTES {
         return Err(SessionTransportError::RecordTooLarge);
@@ -1012,15 +1831,13 @@ fn receive_accepted_control_record(
     deadline: AbsoluteDeadline,
 ) -> Result<Vec<u8>, SessionTransportError> {
     if *poisoned {
-        return Err(SessionTransportError::Native);
+        return Err(SessionTransportError::Native(None));
     }
     if maximum == 0 || maximum > MAX_ZERO_RIGHTS_PACKET_BYTES {
         return Err(SessionTransportError::RecordTooLarge);
     }
     loop {
-        if let Some(pidfd) = peer_pidfd {
-            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
-        } else if deadline.is_expired() {
+        if deadline.is_expired() {
             return Err(SessionTransportError::DeadlineExpired);
         }
         match endpoint.receive_zero_rights_bounded(maximum, peer) {
@@ -1051,7 +1868,7 @@ fn send_accepted_capability_record(
     deadline: AbsoluteDeadline,
 ) -> Result<(), SessionTransportError> {
     if *poisoned {
-        return Err(SessionTransportError::Native);
+        return Err(SessionTransportError::Native(None));
     }
     if capabilities.is_empty()
         || capabilities.len() > super::MAX_PACKET_FDS
@@ -1120,15 +1937,13 @@ fn receive_candidate_capability_record(
     deadline: AbsoluteDeadline,
 ) -> Result<LinuxReceivedCapabilityRecord, SessionTransportError> {
     if *poisoned {
-        return Err(SessionTransportError::Native);
+        return Err(SessionTransportError::Native(None));
     }
     if !(1..=super::MAX_PACKET_FDS).contains(&expected_descriptors) {
         return Err(SessionTransportError::MalformedRecord);
     }
     loop {
-        if let Some(pidfd) = peer_pidfd {
-            super::ensure_running(pidfd, deadline).map_err(map_packet_transport_error)?;
-        } else if deadline.is_expired() {
+        if deadline.is_expired() {
             return Err(SessionTransportError::DeadlineExpired);
         }
         match endpoint.receive(CONTROL_FRAME_LEN, peer, expected_descriptors) {
@@ -1170,6 +1985,22 @@ fn observe_accepted_control_peer(
     socket: RawFd,
     peer_pidfd: Option<RawFd>,
 ) -> Result<PeerState, SessionTransportError> {
+    observe_accepted_control_peer_with(socket, peer_pidfd, |descriptors, count, timeout| {
+        // SAFETY: the caller supplies `count` initialized writable pollfd entries.
+        let result = unsafe { libc::poll(descriptors, count, timeout) };
+        if result < 0 {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        } else {
+            Ok(result)
+        }
+    })
+}
+
+fn observe_accepted_control_peer_with(
+    socket: RawFd,
+    peer_pidfd: Option<RawFd>,
+    mut poll_once: impl FnMut(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> Result<libc::c_int, i32>,
+) -> Result<PeerState, SessionTransportError> {
     let mut descriptors = [
         libc::pollfd {
             fd: socket,
@@ -1183,13 +2014,13 @@ fn observe_accepted_control_peer(
         },
     ];
     let count = if peer_pidfd.is_some() { 2 } else { 1 };
-    // SAFETY: `count` selects initialized entries from the live array.
-    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), count, 0) };
-    if result < 0 {
-        return Err(SessionTransportError::Native);
+    match poll_once(descriptors.as_mut_ptr(), count, 0) {
+        Ok(_) => {}
+        Err(libc::EINTR) => return Ok(PeerState::Running),
+        Err(code) => return Err(SessionTransportError::Native(Some(code))),
     }
     if descriptors[0].revents & libc::POLLNVAL != 0 {
-        return Err(SessionTransportError::Native);
+        return Err(SessionTransportError::Native(Some(libc::EBADF)));
     }
     if descriptors[0].revents & (libc::POLLERR | libc::POLLHUP) != 0
         || (peer_pidfd.is_some() && descriptors[1].revents != 0)
@@ -1209,12 +2040,13 @@ fn map_packet_transport_error(error: PacketError) -> SessionTransportError {
         | PacketError::Truncated
         | PacketError::MalformedAncillary
         | PacketError::WrongDescriptorCount => SessionTransportError::MalformedRecord,
-        PacketError::WouldBlock
-        | PacketError::Interrupted
-        | PacketError::AmbiguousAfterSend
-        | PacketError::AmbiguousAfterReceive
-        | PacketError::Poisoned
-        | PacketError::Native(_) => SessionTransportError::Native,
+        PacketError::AmbiguousAfterSend | PacketError::AmbiguousAfterReceive => {
+            SessionTransportError::Ambiguous
+        }
+        PacketError::WouldBlock | PacketError::Interrupted | PacketError::Poisoned => {
+            SessionTransportError::Native(None)
+        }
+        PacketError::Native(code) => SessionTransportError::Native(Some(code)),
     }
 }
 
@@ -1223,7 +2055,10 @@ fn map_spawn_transport_error(error: LinuxSpawnError) -> SessionTransportError {
         LinuxSpawnError::DeadlineExpired => SessionTransportError::DeadlineExpired,
         LinuxSpawnError::ExitedBeforeConfirmation => SessionTransportError::PeerExited,
         LinuxSpawnError::Packet(error) => map_packet_transport_error(error),
-        _ => SessionTransportError::Native,
+        LinuxSpawnError::Child { errno, .. } | LinuxSpawnError::Native(errno) => {
+            SessionTransportError::Native(Some(errno))
+        }
+        _ => SessionTransportError::Native(None),
     }
 }
 
@@ -1253,16 +2088,21 @@ fn spawn_negotiating(
     environment: &[(OsString, OsString)],
     offer: LinuxHelloOffer,
     deadline: AbsoluteDeadline,
-) -> Result<NegotiatingLinuxSpawn, LinuxSpawnError> {
-    spawn_negotiating_with_fault(
+) -> Result<NegotiatingLinuxSpawn, LinuxCoordinatorSpawnFailure> {
+    let offer = validate_linux_offer(offer).map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    let atomics = discover_atomic_capabilities()
+        .map_err(LinuxSpawnError::NativeNegotiation)
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    let nonce = generate_nonce(deadline, EntropyFault::None)
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    let owner = spawn_unauthenticated_diagnostic(
         executable,
         arguments,
         environment,
-        offer,
         SpawnFault::None,
-        EntropyFault::None,
         deadline,
-    )
+    )?;
+    exchange_coordinator_hello_diagnostic(owner, offer, atomics, nonce, deadline)
 }
 
 fn spawn_negotiating_with_fault(
@@ -1285,6 +2125,87 @@ fn spawn_negotiating_with_fault(
         deadline,
     )?;
     exchange_coordinator_hello(owner, offer, atomics, nonce, deadline)
+}
+
+fn spawn_unauthenticated_diagnostic(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    fault: SpawnFault,
+    deadline: AbsoluteDeadline,
+) -> Result<UnauthenticatedLinuxSpawn, LinuxCoordinatorSpawnFailure> {
+    if deadline.is_expired() || arguments.is_empty() {
+        return Err(LinuxCoordinatorSpawnFailure::before_child(
+            if deadline.is_expired() {
+                LinuxSpawnError::DeadlineExpired
+            } else {
+                LinuxSpawnError::InvalidInput
+            },
+        ));
+    }
+    let held = HeldExecutable::open(executable)
+        .map_err(|_| LinuxCoordinatorSpawnFailure::before_child(LinuxSpawnError::InvalidInput))?;
+    reject_credential_changing_mode(&held).map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    spawn_held_with_fault_diagnostic(held, arguments, environment, fault, deadline)
+}
+
+fn exchange_coordinator_hello_diagnostic(
+    mut owner: UnauthenticatedLinuxSpawn,
+    offer: LinuxHelloOffer,
+    atomics: crate::session::AtomicCapabilities,
+    nonce: [u8; NONCE_LEN],
+    deadline: AbsoluteDeadline,
+) -> Result<NegotiatingLinuxSpawn, LinuxCoordinatorSpawnFailure> {
+    let result = (|| {
+        let coordinator = make_hello(SenderRole::Coordinator, nonce, offer, atomics)?;
+        let encoded = encode_hello(&coordinator)?;
+        send_with_exact_child(&mut owner, &encoded, deadline)?;
+        let expected_peer = PacketCredentials {
+            pid: u32::try_from(owner.pid()).map_err(|_| LinuxSpawnError::InvalidInput)?,
+            // SAFETY: scalar credential queries have no pointer arguments.
+            uid: unsafe { libc::getuid() },
+            // SAFETY: scalar credential queries have no pointer arguments.
+            gid: unsafe { libc::getgid() },
+        };
+        let packet = receive_with_exact_child(&mut owner, expected_peer, deadline)?;
+        let receiver = match decode_frame(
+            &packet.bytes,
+            SenderRole::Receiver,
+            nonce,
+            MAX_LINUX_HELLO_PAYLOAD as u32,
+        )
+        .map_err(LinuxSpawnError::Negotiation)?
+        {
+            NegotiationFrame::Hello(frame) => frame,
+            NegotiationFrame::Accept(_) | NegotiationFrame::Reject(_) => {
+                return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
+            }
+        };
+        let peer_application_payload = receiver.application_payload.clone();
+        let transcript =
+            NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
+                .map_err(LinuxSpawnError::Negotiation)?;
+        Ok((transcript, peer_application_payload))
+    })();
+    let (transcript, peer_application_payload) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let cleanup = owner.terminate_and_reap(deadline);
+            return Err(LinuxCoordinatorSpawnFailure::during_negotiation(
+                error, cleanup,
+            ));
+        }
+    };
+    Ok(NegotiatingLinuxSpawn {
+        lifecycle: owner.lifecycle.take(),
+        endpoint: owner.endpoint,
+        executable: owner.executable,
+        transcript,
+        nonce,
+        deadline,
+        _peer_application_payload: peer_application_payload,
+        not_sync: PhantomData,
+    })
 }
 
 fn exchange_coordinator_hello(
@@ -1351,11 +2272,20 @@ fn receive_inherited_hello(
     offer: LinuxHelloOffer,
     deadline: AbsoluteDeadline,
 ) -> Result<ReceiverNegotiatingState, LinuxSpawnError> {
+    // SAFETY: private callers transfer the unique inherited endpoint.
+    let inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+    receive_inherited_hello_owned(inherited, offer, deadline)
+}
+
+fn receive_inherited_hello_owned(
+    inherited: OwnedFd,
+    offer: LinuxHelloOffer,
+    deadline: AbsoluteDeadline,
+) -> Result<ReceiverNegotiatingState, LinuxSpawnError> {
     let offer = validate_linux_offer(offer)?;
     let atomics = discover_atomic_capabilities().map_err(LinuxSpawnError::NativeNegotiation)?;
-    // SAFETY: this entry consumes the unique inherited bootstrap descriptor.
     let mut endpoint =
-        unsafe { SeqPacketEndpoint::from_inherited(inherited) }.map_err(LinuxSpawnError::Packet)?;
+        SeqPacketEndpoint::from_inherited_owned(inherited).map_err(LinuxSpawnError::Packet)?;
     // Capture the directional sender identity after exec. A reparenting race
     // fails closed because the received kernel credential must match exactly.
     let expected_parent = PacketCredentials {
@@ -1449,16 +2379,30 @@ fn spawn_held_with_fault(
     fault: SpawnFault,
     deadline: AbsoluteDeadline,
 ) -> Result<UnauthenticatedLinuxSpawn, LinuxSpawnError> {
-    let prepared_lifecycle =
-        PreparedExactChildLifecycle::new().map_err(|_| LinuxSpawnError::Native(-1))?;
-    let (parent_endpoint, child_endpoint) = SeqPacketEndpoint::pair().map_err(packet_native)?;
+    spawn_held_with_fault_diagnostic(held, arguments, environment, fault, deadline)
+        .map_err(|failure| failure.error)
+}
+
+fn spawn_held_with_fault_diagnostic(
+    held: HeldExecutable,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    fault: SpawnFault,
+    deadline: AbsoluteDeadline,
+) -> Result<UnauthenticatedLinuxSpawn, LinuxCoordinatorSpawnFailure> {
+    let prepared_lifecycle = PreparedExactChildLifecycle::new()
+        .map_err(|_| LinuxSpawnError::Native(-1))
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    let (parent_endpoint, child_endpoint) = SeqPacketEndpoint::pair()
+        .map_err(packet_native)
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
 
     // A new descriptor chosen by the kernel cannot collide with the held image,
     // socketpair, error pipe, or any caller-owned descriptor.
     let inherited_raw =
         unsafe { libc::fcntl(child_endpoint.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if inherited_raw < 0 {
-        return Err(last_native());
+        return Err(LinuxCoordinatorSpawnFailure::before_child(last_native()));
     }
     // SAFETY: F_DUPFD_CLOEXEC returned a new uniquely owned descriptor.
     let inherited = unsafe { OwnedFd::from_raw_fd(inherited_raw) };
@@ -1466,7 +2410,7 @@ fn spawn_held_with_fault(
     let mut pipe = [-1; 2];
     // SAFETY: output has room for exactly two descriptors.
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(last_native());
+        return Err(LinuxCoordinatorSpawnFailure::before_child(last_native()));
     }
     // SAFETY: successful pipe2 returned two distinct owned descriptors.
     let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
@@ -1475,8 +2419,9 @@ fn spawn_held_with_fault(
     let reader_raw = reader.as_raw_fd();
     let writer_raw = writer.as_raw_fd();
     let held_raw = held.raw_fd();
-    let argv = encode_arguments(arguments)?;
-    let env = encode_environment(environment, inherited_raw)?;
+    let argv = encode_arguments(arguments).map_err(LinuxCoordinatorSpawnFailure::before_child)?;
+    let env = encode_environment(environment, inherited_raw)
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
     #[cfg(test)]
     let env = {
         let mut env = env;
@@ -1511,7 +2456,9 @@ fn spawn_held_with_fault(
     // Argument/environment preparation and native acquisition must not turn an
     // already-expired operation into process creation.
     if deadline.is_expired() {
-        return Err(LinuxSpawnError::DeadlineExpired);
+        return Err(LinuxCoordinatorSpawnFailure::before_child(
+            LinuxSpawnError::DeadlineExpired,
+        ));
     }
 
     let mut raw_pidfd = -1;
@@ -1607,7 +2554,7 @@ fn spawn_held_with_fault(
         }
     }
     if pid < 0 || raw_pidfd < 0 {
-        return Err(last_native());
+        return Err(LinuxCoordinatorSpawnFailure::before_child(last_native()));
     }
     #[cfg(test)]
     LAST_SPAWN_PID.with(|slot| slot.set(pid));
@@ -1615,7 +2562,8 @@ fn spawn_held_with_fault(
     let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
     let lifecycle = prepared_lifecycle
         .arm(pid, pidfd)
-        .map_err(|_| LinuxSpawnError::Native(-1))?;
+        .map_err(|_| LinuxSpawnError::Native(-1))
+        .map_err(LinuxCoordinatorSpawnFailure::before_child)?;
     drop(writer);
     drop(inherited);
     drop(child_endpoint);
@@ -1628,8 +2576,8 @@ fn spawn_held_with_fault(
 
     let result = await_exec_result(&reader, &mut owner, deadline);
     if let Err(error) = result {
-        owner.terminate_and_reap(deadline);
-        return Err(error);
+        let cleanup = owner.terminate_and_reap(deadline);
+        return Err(LinuxCoordinatorSpawnFailure::after_spawn(error, cleanup));
     }
     Ok(owner)
 }
@@ -1940,7 +2888,9 @@ fn receive_with_exact_child_fields(
     deadline: AbsoluteDeadline,
 ) -> Result<super::ReceivedPacket, LinuxSpawnError> {
     loop {
-        super::ensure_running(pidfd, deadline).map_err(LinuxSpawnError::Packet)?;
+        if deadline.is_expired() {
+            return Err(LinuxSpawnError::DeadlineExpired);
+        }
         match endpoint.receive_zero_rights(expected_peer) {
             Ok(packet) => {
                 if deadline.is_expired() {
@@ -2037,6 +2987,10 @@ fn poll_socket(
         }
         if deadline.is_expired() {
             return Err(LinuxSpawnError::DeadlineExpired);
+        }
+        let readable = requested & libc::POLLIN != 0 && event.revents & libc::POLLIN != 0;
+        if readable {
+            return Ok(());
         }
         if event.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(LinuxSpawnError::Packet(PacketError::PeerExited));

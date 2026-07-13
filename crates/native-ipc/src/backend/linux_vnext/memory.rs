@@ -10,13 +10,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+use crate::active::{ActiveReadOwner, ActiveWriteOwner};
 use crate::backend::linux::QuiescentRegion;
-use crate::batch::{ExpectedBatch, TransferBatch};
+use crate::batch::{ExpectedBatch, LocalRegionAuthority, TransferBatch};
 use crate::memory::CleanupPolicy;
 use crate::protocol::{
     ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess, TransferManifest,
 };
-use crate::region::WriterEndpoint;
+use crate::region::{RegionId, WriterEndpoint};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const MFD_NOEXEC_SEAL: libc::c_uint = 0x0008;
@@ -121,6 +122,42 @@ struct PendingVmMapping {
     clear_on_drop: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinuxActiveRegionSpec {
+    pub(crate) id: RegionId,
+    pub(crate) authority: LocalRegionAuthority,
+    pub(crate) logical_len: usize,
+    pub(crate) mapped_len: u64,
+}
+
+pub(crate) enum LinuxActiveRegionOwner {
+    Reader {
+        spec: LinuxActiveRegionSpec,
+        owner: Box<dyn ActiveReadOwner>,
+    },
+    Writer {
+        spec: LinuxActiveRegionSpec,
+        owner: Box<dyn ActiveWriteOwner>,
+    },
+}
+
+struct LinuxActiveReadMapping {
+    mapping: Option<VmMapping>,
+    _fd: OwnedFd,
+    page_size: usize,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
+struct LinuxActiveWriteMapping {
+    mapping: Option<VmMapping>,
+    _fd: OwnedFd,
+    page_size: usize,
+    _not_sync: PhantomData<Cell<()>>,
+    #[cfg(test)]
+    drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+}
+
 pub(crate) struct LinuxCoordinatorWriterBatch {
     entries: Vec<LinuxCoordinatorWriterEntry>,
     deadline: AbsoluteDeadline,
@@ -149,6 +186,12 @@ pub(crate) struct LinuxMixedDirectionBatch {
     deadline: AbsoluteDeadline,
     #[cfg(test)]
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    active_drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    seal_failure_at: Option<usize>,
+    #[cfg(test)]
+    advice_failure_at: Option<usize>,
 }
 
 enum LinuxMixedDirectionEntry {
@@ -214,7 +257,11 @@ pub(crate) struct LinuxImportedReceiverWriterBatch {
 pub(crate) struct LinuxImportedMixedDirectionBatch {
     entries: Vec<LinuxImportedMixedDirectionEntry>,
     #[cfg(test)]
+    sealed_verified: bool,
+    #[cfg(test)]
     drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    active_drop_observer: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 enum LinuxImportedMixedDirectionEntry {
@@ -297,6 +344,91 @@ unsafe impl Send for VmMapping {}
 // SAFETY: PendingVmMapping uniquely owns one local VM range. Moving that owner
 // neither duplicates the mapping nor creates Rust references to its address.
 unsafe impl Send for PendingVmMapping {}
+
+// SAFETY: this owner contains one immutable local mapping. Peer mutation is
+// accessed only through the volatile byte boundary required by ActiveReader;
+// no Rust reference is formed from the shared pointer.
+unsafe impl Sync for LinuxActiveReadMapping {}
+
+// SAFETY: each wrapper uniquely owns the exact mmap range and destroys it
+// synchronously in VmMapping::drop. mmap returned page-aligned storage, and
+// the retained descriptor does not duplicate local mapping ownership.
+unsafe impl ActiveReadOwner for LinuxActiveReadMapping {
+    fn as_ptr(&self) -> *const u8 {
+        self.mapping().base.as_ptr().cast_const()
+    }
+
+    fn len(&self) -> usize {
+        self.mapping().len
+    }
+
+    fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+// SAFETY: this wrapper uniquely owns the sole local writable mmap range. Its
+// Cell marker keeps the capability non-Sync, and exclusive ActiveWriter access
+// is required for every store operation.
+unsafe impl ActiveWriteOwner for LinuxActiveWriteMapping {
+    fn as_ptr(&self) -> *const u8 {
+        self.mapping().base.as_ptr().cast_const()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.mapping().base.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.mapping().len
+    }
+
+    fn page_size(&self) -> usize {
+        self.page_size
+    }
+}
+
+impl LinuxActiveReadMapping {
+    fn mapping(&self) -> &VmMapping {
+        self.mapping
+            .as_ref()
+            .expect("active read mapping remains live until owner drop")
+    }
+}
+
+impl LinuxActiveWriteMapping {
+    fn mapping(&self) -> &VmMapping {
+        self.mapping
+            .as_ref()
+            .expect("active write mapping remains live until owner drop")
+    }
+}
+
+impl Drop for LinuxActiveReadMapping {
+    fn drop(&mut self) {
+        drop(self.mapping.take());
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer
+                .lock()
+                .expect("test active-drop observer mutex is not poisoned")
+                .push("active-mapping-drop");
+        }
+    }
+}
+
+impl Drop for LinuxActiveWriteMapping {
+    fn drop(&mut self) {
+        drop(self.mapping.take());
+        #[cfg(test)]
+        if let Some(observer) = &self.drop_observer {
+            observer
+                .lock()
+                .expect("test active-drop observer mutex is not poisoned")
+                .push("active-mapping-drop");
+        }
+    }
+}
 
 impl TransferBinding {
     fn new(
@@ -929,8 +1061,8 @@ impl LinuxMixedDirectionBatch {
             let writer = region.spec().writer;
             let mapped_len =
                 u64::try_from(region.mapped_len()).map_err(|_| MemfdError::InvalidSize)?;
-            let mut single =
-                TransferBatch::new(1, mapped_len).map_err(|_| MemfdError::InvalidBatch)?;
+            let mut single = TransferBatch::new(1, mapped_len, mapped_len)
+                .map_err(|_| MemfdError::InvalidBatch)?;
             single.add(region).map_err(|_| MemfdError::InvalidBatch)?;
             let entry = match writer {
                 WriterEndpoint::Coordinator => LinuxMixedDirectionEntry::CoordinatorWriter(
@@ -948,6 +1080,12 @@ impl LinuxMixedDirectionBatch {
             deadline,
             #[cfg(test)]
             drop_observer: None,
+            #[cfg(test)]
+            active_drop_observer: None,
+            #[cfg(test)]
+            seal_failure_at: None,
+            #[cfg(test)]
+            advice_failure_at: None,
         })
     }
 
@@ -958,6 +1096,13 @@ impl LinuxMixedDirectionBatch {
                 LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.manifest_entries(),
                 LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.manifest_entries(),
             })
+            .collect()
+    }
+
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        self.manifest_entries()
+            .into_iter()
+            .map(|entry| entry.mapped_len)
             .collect()
     }
 
@@ -983,6 +1128,141 @@ impl LinuxMixedDirectionBatch {
         Ok(())
     }
 
+    pub(crate) fn requires_imported_sealed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, LinuxMixedDirectionEntry::ReceiverWriter(_)))
+    }
+
+    pub(crate) fn seal_after_import(&mut self) -> Result<(), MemfdError> {
+        let mut first_error = check_deadline(self.deadline).err();
+
+        // Revalidate the complete mixed object set before attenuation. One bad
+        // entry is remembered without preventing best-effort sealing of every
+        // receiver-writer fd that has already escaped.
+        for entry in &self.entries {
+            let (fd, key, seals) = match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    (
+                        entry.prepared.fd.as_raw_fd(),
+                        entry.prepared.key,
+                        FINAL_SEALS,
+                    )
+                }
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    let entry = &batch.entries[0];
+                    (entry.fd.as_raw_fd(), entry.key, PREFIX_SEALS)
+                }
+            };
+            let validation = validate_object(fd, key.mapped_len, seals).and_then(|validated| {
+                if validated == key {
+                    Ok(())
+                } else {
+                    Err(MemfdError::WrongObject)
+                }
+            });
+            if first_error.is_none() {
+                first_error = validation.err();
+            }
+        }
+
+        #[cfg(test)]
+        let mut seal_ordinal = 0_usize;
+        for entry in &mut self.entries {
+            let LinuxMixedDirectionEntry::ReceiverWriter(batch) = entry else {
+                continue;
+            };
+            for entry in &mut batch.entries {
+                if first_error.is_none() {
+                    first_error = check_deadline(self.deadline).err();
+                }
+                #[cfg(test)]
+                {
+                    seal_ordinal += 1;
+                    if self.seal_failure_at == Some(seal_ordinal) {
+                        if first_error.is_none() {
+                            first_error = Some(MemfdError::Native(libc::EIO));
+                        }
+                        continue;
+                    }
+                }
+                if let Err(error) = add_seals(
+                    entry.fd.as_raw_fd(),
+                    libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SEAL,
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+                let validation =
+                    validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS)
+                        .and_then(|validated| {
+                            if validated == entry.key {
+                                Ok(())
+                            } else {
+                                Err(MemfdError::WrongObject)
+                            }
+                        });
+                if first_error.is_none() {
+                    first_error = validation.err();
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // All escaped writer fds are final-sealed before the first coordinator
+        // read mapping is attempted.
+        #[cfg(test)]
+        let mut advice_operation = 0_usize;
+        for entry in &mut self.entries {
+            let LinuxMixedDirectionEntry::ReceiverWriter(batch) = entry else {
+                continue;
+            };
+            for entry in &mut batch.entries {
+                check_deadline(self.deadline)?;
+                let pending = PendingVmMapping::map(
+                    entry.fd.as_raw_fd(),
+                    entry.key.mapped_len,
+                    libc::PROT_READ,
+                    false,
+                )?;
+                entry.pending_mapping = Some(pending);
+                check_deadline(self.deadline)?;
+                for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
+                    #[cfg(test)]
+                    {
+                        advice_operation += 1;
+                        if self.advice_failure_at == Some(advice_operation) {
+                            return Err(MemfdError::Native(libc::EIO));
+                        }
+                    }
+                    entry
+                        .pending_mapping
+                        .as_ref()
+                        .expect("pending mixed mapping remains batch-owned")
+                        .advise(advice)?;
+                    check_deadline(self.deadline)?;
+                }
+                let pending = entry
+                    .pending_mapping
+                    .take()
+                    .expect("validated mixed mapping remains batch-owned");
+                entry.mapping = Some(match pending.into_mapping() {
+                    Ok(mapping) => mapping,
+                    Err((error, pending)) => {
+                        entry.pending_mapping = Some(pending);
+                        return Err(error);
+                    }
+                });
+            }
+        }
+        check_deadline(self.deadline)
+    }
+
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
         self.deadline
     }
@@ -1001,6 +1281,52 @@ impl LinuxMixedDirectionBatch {
     #[cfg(test)]
     pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_active_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.active_drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_seal_at_for_test(&mut self, ordinal: usize) {
+        assert!(ordinal > 0);
+        self.seal_failure_at = Some(ordinal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_advice_at_for_test(&mut self, operation: usize) {
+        assert!(operation > 0);
+        self.advice_failure_at = Some(operation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn all_final_sealed_for_test(&self) -> bool {
+        self.entries.iter().all(|entry| match entry {
+            LinuxMixedDirectionEntry::CoordinatorWriter(batch) => batch.revalidate().is_ok(),
+            LinuxMixedDirectionEntry::ReceiverWriter(batch) => batch.all_final_sealed_for_test(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_counts_for_test(&self) -> (usize, usize) {
+        self.entries
+            .iter()
+            .fold((0, 0), |(prefix, final_sealed), entry| match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(_) => (prefix, final_sealed + 1),
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    let (entry_prefix, entry_final) = batch.seal_counts_for_test();
+                    (prefix + entry_prefix, final_sealed + entry_final)
+                }
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_receiver_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        let LinuxMixedDirectionEntry::ReceiverWriter(batch) = &self.entries[ordinal] else {
+            panic!("test read requires a receiver-writer entry");
+        };
+        batch.read_for_test(0, offset)
     }
 }
 
@@ -1415,8 +1741,18 @@ impl LinuxExpectedMixedDirectionBatch {
         self.entries.len()
     }
 
+    pub(crate) fn reservation_lengths(&self) -> Vec<u64> {
+        self.entries.iter().map(|entry| entry.mapped_len).collect()
+    }
+
     pub(crate) const fn deadline(&self) -> AbsoluteDeadline {
         self.deadline
+    }
+
+    pub(crate) fn requires_imported_sealed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.writer == WriterEndpoint::Receiver)
     }
 
     pub(crate) fn matches_manifest(&self, manifest: &TransferManifest) -> bool {
@@ -1558,7 +1894,11 @@ impl LinuxExpectedMixedDirectionBatch {
         Ok(LinuxImportedMixedDirectionBatch {
             entries: imported,
             #[cfg(test)]
+            sealed_verified: false,
+            #[cfg(test)]
             drop_observer: None,
+            #[cfg(test)]
+            active_drop_observer: None,
         })
     }
 
@@ -1743,14 +2083,293 @@ impl LinuxImportedReceiverWriterBatch {
 }
 
 impl LinuxImportedMixedDirectionBatch {
+    pub(crate) fn verify_final_seals(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), MemfdError> {
+        check_deadline(deadline)?;
+        for entry in &self.entries {
+            entry.validate(FINAL_SEALS)?;
+            check_deadline(deadline)?;
+        }
+        #[cfg(test)]
+        {
+            self.sealed_verified = true;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     #[cfg(test)]
+    pub(crate) fn read_coordinator_for_test(&self, ordinal: usize, offset: usize) -> u8 {
+        assert!(self.sealed_verified);
+        let LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) = &self.entries[ordinal]
+        else {
+            panic!("test read requires a coordinator-writer entry");
+        };
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: the final-sealed imported mapping remains mixed-batch-owned.
+        unsafe { core::ptr::read_volatile(entry.mapping.base.as_ptr().add(offset)) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_receiver_for_test(&mut self, ordinal: usize, offset: usize, value: u8) {
+        assert!(self.sealed_verified);
+        let LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) = &mut self.entries[ordinal]
+        else {
+            panic!("test write requires a receiver-writer entry");
+        };
+        assert!(offset < entry.manifest.logical_len as usize);
+        // SAFETY: this mapping was established writable before final sealing
+        // and remains the receiver's transaction-owned sole-writer view.
+        unsafe { core::ptr::write_volatile(entry.mapping.base.as_ptr().add(offset), value) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn descriptor_for_test(&self, ordinal: usize) -> BorrowedFd<'_> {
+        match &self.entries[ordinal] {
+            LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) => entry.fd.as_fd(),
+            LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) => entry.fd.as_fd(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
         self.drop_observer = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_active_drop_for_test(&mut self, observer: Arc<Mutex<Vec<&'static str>>>) {
+        self.active_drop_observer = Some(observer);
+    }
+}
+
+impl LinuxActiveRegionOwner {
+    pub(crate) const fn spec(&self) -> LinuxActiveRegionSpec {
+        match self {
+            Self::Reader { spec, .. } | Self::Writer { spec, .. } => *spec,
+        }
+    }
+}
+
+impl LinuxMixedDirectionBatch {
+    pub(crate) fn activation_specs(&self) -> Result<Vec<LinuxActiveRegionSpec>, MemfdError> {
+        check_deadline(self.deadline)?;
+        let mut specs = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let spec = match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(batch) => {
+                    if batch.entries.len() != 1 {
+                        return Err(MemfdError::WrongProvenance);
+                    }
+                    let entry = &batch.entries[0];
+                    entry.prepared.revalidate(self.deadline)?;
+                    native_active_spec(
+                        entry.native,
+                        0,
+                        LocalRegionAuthority::Writer,
+                        &entry.prepared.mapping,
+                    )?
+                }
+                LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
+                    if batch.entries.len() != 1 {
+                        return Err(MemfdError::WrongProvenance);
+                    }
+                    let entry = &batch.entries[0];
+                    if entry.pending_mapping.is_some()
+                        || validate_object(entry.fd.as_raw_fd(), entry.key.mapped_len, FINAL_SEALS)?
+                            != entry.key
+                    {
+                        return Err(MemfdError::WrongObject);
+                    }
+                    let mapping = entry.mapping.as_ref().ok_or(MemfdError::WrongObject)?;
+                    native_active_spec(entry.native, 1, LocalRegionAuthority::Reader, mapping)?
+                }
+            };
+            specs.push(spec);
+            check_deadline(self.deadline)?;
+        }
+        validate_active_specs(&specs)?;
+        Ok(specs)
+    }
+
+    pub(crate) fn into_active_region_owners(
+        mut self,
+        page_size: usize,
+    ) -> Vec<LinuxActiveRegionOwner> {
+        #[cfg(test)]
+        let drop_observer = self.active_drop_observer.clone();
+        let entries = core::mem::take(&mut self.entries);
+        let mut active = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                LinuxMixedDirectionEntry::CoordinatorWriter(mut batch) => {
+                    let entries = core::mem::take(&mut batch.entries);
+                    assert_eq!(entries.len(), 1, "activation preflight fixed the batch");
+                    let entry = entries
+                        .into_iter()
+                        .next()
+                        .expect("validated single coordinator-writer entry");
+                    let CoordinatorWriterPrepared {
+                        fd,
+                        mapping,
+                        reader_capability,
+                        key: _,
+                        not_sync: _,
+                    } = entry.prepared;
+                    drop(reader_capability);
+                    let spec =
+                        native_active_spec(entry.native, 0, LocalRegionAuthority::Writer, &mapping)
+                            .expect("activation preflight validated coordinator-writer metadata");
+                    active.push(LinuxActiveRegionOwner::Writer {
+                        spec,
+                        owner: Box::new(LinuxActiveWriteMapping {
+                            mapping: Some(mapping),
+                            _fd: fd,
+                            page_size,
+                            _not_sync: PhantomData,
+                            #[cfg(test)]
+                            drop_observer: drop_observer.clone(),
+                        }),
+                    });
+                }
+                LinuxMixedDirectionEntry::ReceiverWriter(mut batch) => {
+                    let entries = core::mem::take(&mut batch.entries);
+                    assert_eq!(entries.len(), 1, "activation preflight fixed the batch");
+                    let mut entry = entries
+                        .into_iter()
+                        .next()
+                        .expect("validated single receiver-writer entry");
+                    assert!(
+                        entry.pending_mapping.is_none(),
+                        "activation preflight rejected a pending mapping"
+                    );
+                    let mapping = entry
+                        .mapping
+                        .take()
+                        .expect("activation preflight retained the final mapping");
+                    let spec =
+                        native_active_spec(entry.native, 1, LocalRegionAuthority::Reader, &mapping)
+                            .expect("activation preflight validated receiver-writer metadata");
+                    active.push(LinuxActiveRegionOwner::Reader {
+                        spec,
+                        owner: Box::new(LinuxActiveReadMapping {
+                            mapping: Some(mapping),
+                            _fd: entry.fd,
+                            page_size,
+                            #[cfg(test)]
+                            drop_observer: drop_observer.clone(),
+                        }),
+                    });
+                }
+            }
+        }
+        active
+    }
+}
+
+impl LinuxImportedMixedDirectionBatch {
+    pub(crate) fn activation_specs(
+        &self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<Vec<LinuxActiveRegionSpec>, MemfdError> {
+        check_deadline(deadline)?;
+        #[cfg(test)]
+        if !self.sealed_verified {
+            return Err(MemfdError::WrongObject);
+        }
+        let mut specs = Vec::with_capacity(self.entries.len());
+        for (ordinal, entry) in self.entries.iter().enumerate() {
+            entry.validate(FINAL_SEALS)?;
+            let spec = match entry {
+                LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) => {
+                    if entry.manifest.ordinal as usize != ordinal
+                        || entry.manifest.writer != 0
+                        || entry.manifest.access != PeerAccess::ReadOnly
+                    {
+                        return Err(MemfdError::WrongProvenance);
+                    }
+                    manifest_active_spec(
+                        entry.manifest,
+                        LocalRegionAuthority::Reader,
+                        &entry.mapping,
+                    )?
+                }
+                LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) => {
+                    if entry.manifest.ordinal as usize != ordinal
+                        || entry.manifest.writer != 1
+                        || entry.manifest.access != PeerAccess::SoleWriter
+                    {
+                        return Err(MemfdError::WrongProvenance);
+                    }
+                    manifest_active_spec(
+                        entry.manifest,
+                        LocalRegionAuthority::Writer,
+                        &entry.mapping,
+                    )?
+                }
+            };
+            specs.push(spec);
+            check_deadline(deadline)?;
+        }
+        validate_active_specs(&specs)?;
+        Ok(specs)
+    }
+
+    pub(crate) fn into_active_region_owners(
+        mut self,
+        page_size: usize,
+    ) -> Vec<LinuxActiveRegionOwner> {
+        #[cfg(test)]
+        let drop_observer = self.active_drop_observer.clone();
+        let entries = core::mem::take(&mut self.entries);
+        let mut active = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                LinuxImportedMixedDirectionEntry::CoordinatorWriter(entry) => {
+                    let spec = manifest_active_spec(
+                        entry.manifest,
+                        LocalRegionAuthority::Reader,
+                        &entry.mapping,
+                    )
+                    .expect("activation preflight validated imported reader metadata");
+                    active.push(LinuxActiveRegionOwner::Reader {
+                        spec,
+                        owner: Box::new(LinuxActiveReadMapping {
+                            mapping: Some(entry.mapping),
+                            _fd: entry.fd,
+                            page_size,
+                            #[cfg(test)]
+                            drop_observer: drop_observer.clone(),
+                        }),
+                    });
+                }
+                LinuxImportedMixedDirectionEntry::ReceiverWriter(entry) => {
+                    let spec = manifest_active_spec(
+                        entry.manifest,
+                        LocalRegionAuthority::Writer,
+                        &entry.mapping,
+                    )
+                    .expect("activation preflight validated imported writer metadata");
+                    active.push(LinuxActiveRegionOwner::Writer {
+                        spec,
+                        owner: Box::new(LinuxActiveWriteMapping {
+                            mapping: Some(entry.mapping),
+                            _fd: entry.fd,
+                            page_size,
+                            _not_sync: PhantomData,
+                            #[cfg(test)]
+                            drop_observer: drop_observer.clone(),
+                        }),
+                    });
+                }
+            }
+        }
+        active
     }
 }
 
@@ -2079,16 +2698,82 @@ fn duplicate(fd: &OwnedFd) -> Result<OwnedFd, MemfdError> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+fn native_active_spec(
+    native: NativeRegionSpec,
+    expected_writer: u32,
+    authority: LocalRegionAuthority,
+    mapping: &VmMapping,
+) -> Result<LinuxActiveRegionSpec, MemfdError> {
+    if native.writer != expected_writer {
+        return Err(MemfdError::WrongProvenance);
+    }
+    active_region_spec(
+        native.region_id,
+        authority,
+        native.logical_len,
+        native.mapped_len,
+        mapping,
+    )
+}
+
+fn manifest_active_spec(
+    manifest: ManifestEntry,
+    authority: LocalRegionAuthority,
+    mapping: &VmMapping,
+) -> Result<LinuxActiveRegionSpec, MemfdError> {
+    active_region_spec(
+        manifest.region_id,
+        authority,
+        manifest.logical_len,
+        manifest.mapped_len,
+        mapping,
+    )
+}
+
+fn active_region_spec(
+    region_id: u128,
+    authority: LocalRegionAuthority,
+    logical_len: u64,
+    mapped_len: u64,
+    mapping: &VmMapping,
+) -> Result<LinuxActiveRegionSpec, MemfdError> {
+    let id = RegionId::new(region_id).ok_or(MemfdError::WrongProvenance)?;
+    let logical_len = usize::try_from(logical_len).map_err(|_| MemfdError::InvalidSize)?;
+    let native_mapped_len = usize::try_from(mapped_len).map_err(|_| MemfdError::InvalidSize)?;
+    if logical_len == 0 || logical_len > native_mapped_len || mapping.len != native_mapped_len {
+        return Err(MemfdError::WrongObject);
+    }
+    Ok(LinuxActiveRegionSpec {
+        id,
+        authority,
+        logical_len,
+        mapped_len,
+    })
+}
+
+fn validate_active_specs(specs: &[LinuxActiveRegionSpec]) -> Result<(), MemfdError> {
+    if specs.is_empty() || specs.len() > 16 || specs.windows(2).any(|pair| pair[0].id >= pair[1].id)
+    {
+        return Err(MemfdError::WrongProvenance);
+    }
+    Ok(())
+}
+
+pub(crate) fn native_page_size() -> Result<usize, MemfdError> {
+    // SAFETY: sysconf has no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = usize::try_from(page)
+        .ok()
+        .filter(|page| page.is_power_of_two())
+        .ok_or_else(last_native)?;
+    Ok(page)
+}
+
 fn page_align(size: usize) -> Result<usize, MemfdError> {
     if size == 0 {
         return Err(MemfdError::InvalidSize);
     }
-    // SAFETY: sysconf has no pointer arguments.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
-        return Err(last_native());
-    }
-    let page = page as usize;
+    let page = native_page_size()?;
     size.checked_add(page - 1)
         .map(|value| value & !(page - 1))
         .filter(|value| *value <= libc::off_t::MAX as usize && *value <= isize::MAX as usize)

@@ -56,3 +56,8 @@ targets = [
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
 ]
+
+[[test]]
+name = "receiver-main-downstream"
+path = "tests/receiver_main_downstream.rs"
+harness = false

@@ -13,7 +13,7 @@ use crate::protocol::{
     TransferManifest,
 };
 use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
-use crate::session::SessionLimits;
+use crate::session::{AtomicCapabilities, ProtocolVersion, SessionLimits};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,7 +82,7 @@ impl AuthenticatedZeroRightsTransport for MockTransport {
     ) -> Result<(), SessionTransportError> {
         let mut facts = self.0.0.lock().unwrap();
         if facts.poisoned {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         facts.send_calls += 1;
         if let Some(error) = facts.send_error.take() {
@@ -99,7 +99,7 @@ impl AuthenticatedZeroRightsTransport for MockTransport {
     ) -> Result<Vec<u8>, SessionTransportError> {
         let mut facts = self.0.0.lock().unwrap();
         if facts.poisoned {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         facts.receive_calls += 1;
         if let Some(error) = facts.receive_error.take() {
@@ -118,7 +118,7 @@ impl AuthenticatedZeroRightsTransport for MockTransport {
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
         let mut facts = self.0.0.lock().unwrap();
         if facts.poisoned {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         facts.poll_calls += 1;
         if let Some(error) = facts.poll_error.take() {
@@ -150,7 +150,7 @@ impl CoordinatorCapabilityTransport for MockTransport {
         facts.capability_send_calls += 1;
         facts.capability_deadline = Some(deadline);
         if facts.capability_error_on_call == Some(facts.capability_send_calls) {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         if capabilities != frame.capability_count() {
             return Err(SessionTransportError::MalformedRecord);
@@ -174,7 +174,7 @@ impl ReceiverCapabilityTransport for MockTransport {
         facts.capability_receive_calls += 1;
         facts.capability_deadline = Some(deadline);
         if facts.capability_error_on_call == Some(facts.capability_receive_calls) {
-            return Err(SessionTransportError::Native);
+            return Err(SessionTransportError::Native(None));
         }
         let record = facts
             .capability_incoming
@@ -217,6 +217,8 @@ fn parameters(nonce: [u8; 32], maximum: u32, max_transactions: u64) -> AcceptedS
             ..SessionLimits::default()
         },
         authority_profile: NativeAuthorityProfile::LinuxMdweV1,
+        atomics: AtomicCapabilities::from_verified_native(4096, 64, true, true).unwrap(),
+        protocol_version: ProtocolVersion::new(1, 0),
     }
 }
 
@@ -395,7 +397,7 @@ fn prepared_batch_with_observer(
     regions: &[(u128, WriterEndpoint)],
     observer: Option<Arc<Mutex<Vec<&'static str>>>>,
 ) -> (TransferBatch, Vec<NativeRegionSpec>) {
-    let mut batch = TransferBatch::new(16, 1024 * 1024).unwrap();
+    let mut batch = TransferBatch::new(16, 1024 * 1024, 1024 * 1024).unwrap();
     let mut expected = Vec::new();
     for &(id, writer) in regions {
         let mut prepared = PrivateRegion::allocate(RegionOptions::fixed(1))
@@ -667,7 +669,7 @@ fn wrong_rights_replay_substitution_and_first_operation_failure_poison_once() {
         assert_eq!(
             transaction.send(1),
             Err(AcceptedControlError::Transport(
-                SessionTransportError::Native
+                SessionTransportError::Native(None)
             ))
         );
     }
@@ -858,7 +860,7 @@ fn prepared_batch_poison_precedes_release_on_abandonment_and_send_failure() {
 #[test]
 fn empty_prepared_batch_fails_before_transaction_or_id_consumption() {
     let (mut coordinator, handle) = dispatcher(MAXIMUM);
-    let empty = TransferBatch::new(16, 1024).unwrap();
+    let empty = TransferBatch::new(16, 1024, 1024).unwrap();
     assert!(matches!(
         coordinator.begin_prepared_batch(empty, deadline()),
         Err(AcceptedControlError::Control(ControlError::NonCanonical))
@@ -897,7 +899,7 @@ fn nth_capability_operation_failure_is_terminal_without_followup_io() {
         assert_eq!(
             second.send(1),
             Err(AcceptedControlError::Transport(
-                SessionTransportError::Native
+                SessionTransportError::Native(None)
             ))
         );
     }
@@ -933,6 +935,8 @@ fn local_manifest_limit_and_expired_deadline_fail_before_transaction() {
             facts: SpawnIdentityFacts::new(10, 11, 1, 1, 1, 1, NONCE).unwrap(),
             limits,
             authority_profile: NativeAuthorityProfile::LinuxMdweV1,
+            atomics: AtomicCapabilities::from_verified_native(4096, 64, true, true).unwrap(),
+            protocol_version: ProtocolVersion::new(1, 0),
         },
     )
     .ok()
@@ -1107,11 +1111,11 @@ fn hostile_control_records_poison_persistently() {
 #[test]
 fn ambiguous_receive_error_poisons_without_retry() {
     let (mut dispatcher, handle) = dispatcher(MAXIMUM);
-    handle.0.lock().unwrap().receive_error = Some(SessionTransportError::Native);
+    handle.0.lock().unwrap().receive_error = Some(SessionTransportError::Native(None));
     assert_eq!(
         dispatcher.receive(deadline()),
         Err(AcceptedControlError::Transport(
-            SessionTransportError::Native
+            SessionTransportError::Native(None)
         ))
     );
     assert_eq!(handle.0.lock().unwrap().receive_calls, 1);
@@ -1145,11 +1149,11 @@ fn peer_observation_never_claims_an_exit_code() {
 #[test]
 fn peer_poll_error_poisons_without_a_second_observation() {
     let (mut dispatcher, handle) = dispatcher(MAXIMUM);
-    handle.0.lock().unwrap().poll_error = Some(SessionTransportError::Native);
+    handle.0.lock().unwrap().poll_error = Some(SessionTransportError::Native(None));
     assert_eq!(
         dispatcher.try_poll_peer(),
         Err(AcceptedControlError::Transport(
-            SessionTransportError::Native
+            SessionTransportError::Native(None)
         ))
     );
     assert_eq!(handle.0.lock().unwrap().poll_calls, 1);
