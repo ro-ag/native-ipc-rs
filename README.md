@@ -246,9 +246,15 @@ lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
 composition prototype exists privately but the public entry points remain
 fail-closed: direct spawn has no PID-reuse-safe termination authority before the
 first audit-bearing Mach message without transferring a forbidden task port.
-This is source-tree evidence with local package verification; a supervisor/XPC
-boundary, Windows parity, exact-tip hosted CI, exact-release packaged
-conformance, physical Arm64 evidence, and release authorization remain outstanding.
+A preinstalled signed launchd/XPC service is a necessary candidate boundary,
+but it is insufficient across supervisor crash without additional
+crash-surviving OS containment. The result and native evidence gate are
+documented in
+[`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md); no
+service artifact exists. This is source-tree evidence with local package
+verification; the macOS architecture, Windows parity, exact-tip hosted CI,
+exact-release packaged conformance, physical Arm64 evidence, and release
+authorization remain outstanding.
 
 Implemented through `0.4.0`:
 

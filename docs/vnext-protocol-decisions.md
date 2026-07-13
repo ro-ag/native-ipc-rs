@@ -158,3 +158,18 @@ ownership plus the held image through prototype Ready; public construction
 remains fail-closed pending pre-bootstrap exact termination. Windows public
 Ready-session construction remains fail-closed until its equivalent reducer
 and lifecycle owner are composed.
+
+## macOS supervisor lifecycle candidate
+
+Any viable public macOS construction needs a preinstalled signed launchd/XPC
+service, not a broker spawned by the client library. An authentication-only
+nonce exchange and explicit code-requirement checks precede the spawn-bearing
+request, which carries bounded command/image/nonce/deadline policy. Lifecycle
+commands carry only a fresh opaque session identifier; numeric helper PIDs and
+task ports are never wire authority. The service serializes signal selection
+with reap-and-tombstone and compares the complete helper audit execution
+identity on every Mach record. The candidate is insufficient across service
+crash because the parent wait authority and in-memory table disappear; no
+documented public crash-surviving exact containment primitive has been
+identified. Public macOS remains architecture-blocked and fail-closed; see
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).

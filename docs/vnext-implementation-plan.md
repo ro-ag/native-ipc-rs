@@ -81,6 +81,16 @@ Tests: every header/descriptor/trailer mutation, extra installed rights, audit
 PID, maximum-protection upgrade rejection, process lifecycle and Nth faults.
 Validation: native macOS Arm64; Intel macOS compile-fail.
 
+Public lifecycle subphase: first resolve the crash-surviving containment blocker
+in [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md), then implement
+the preinstalled signed launchd/XPC service contract.
+The service must own the sole-waiter child entry before resume, expose only an
+opaque session identifier, reject audit PID-version changes, and complete exact
+reap before terminal acknowledgement. A client-spawned broker is nonconforming.
+Public macOS remains fail-closed until an OS-enforced containment design
+survives service crash without helper escape and the signed deployment and
+complete native fault/baseline corpus pass.
+
 ## Phase 7 — Windows AMD64/Arm64 backend
 
 Invariant: unnamed sections, exact access duplication, suspended pre-Job spawn,
