@@ -242,6 +242,20 @@ accumulating. The complete suppression and test-seam classification is recorded
 in [`dead-code-audit.md`](dead-code-audit.md). This cleanup adds no mixed
 accepted reducer, READY/COMMIT, activation, or public session authority.
 
+Linux G1j consumes both mixed native owners into the role-scoped accepted
+dispatcher. The coordinator alone mints and sends one canonical capability
+frame; the receiver alone fixes the complete expectation, imports every fd,
+and returns the exact full-manifest `IMPORTED` receipt. The coordinator then
+revalidates the complete mixed object set and final-seals every receiver-writer
+fd in one best-effort attenuation pass before attempting any new read mapping.
+Only a completely attenuated batch can produce exact `SEALED`; the receiver
+revalidates final seals for every direction before retaining the pending mixed
+owner. Both sides use the same stored absolute deadline and keep transport,
+manifest, fds, mappings, and accepted evidence inseparable. Failure or guard
+destruction poisons before native cleanup. This is still a terminal private
+checkpoint: it does not end the transaction, send READY/COMMIT, charge active
+leases, or expose pending/runtime/public authority.
+
 ## Unsafe-code policy
 
 Unsafe is restricted to native ABI calls, construction of quiescent byte

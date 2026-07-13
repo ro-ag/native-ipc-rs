@@ -1,9 +1,9 @@
 # Dead-code and test-seam audit
 
-This inventory records the cleanup boundary after private Linux G1i-b. It is
-not vNext completion evidence. In particular, the unfinished accepted-session
-mixed reducer, READY/COMMIT, activation, active-resource ledger, and public
-session/control APIs remain intentionally private or unavailable.
+This inventory records the cleanup boundary after private Linux G1j. It is not
+vNext completion evidence. In particular, READY/COMMIT, activation, the
+active-resource ledger, and public session/control APIs remain intentionally
+private or unavailable.
 
 ## Dead-code suppression inventory
 
@@ -51,14 +51,14 @@ remains without a production consumer. The retained module uses
 
 ## `cfg(test)` seam inventory
 
-The production tree contains 232 `cfg(test)` gates: 19 are adjacent
-`*_test.rs` module wiring and 213 are deliberate production seams. The latter
+The production tree contains 279 `cfg(test)` gates: 19 are adjacent
+`*_test.rs` module wiring and 260 are deliberate production seams. The latter
 are concentrated as follows.
 
 | Production file | Non-wiring seams | Purpose |
 | --- | ---: | --- |
-| `backend/linux_vnext/memory.rs` | 85 | Exact Nth preparation/seal/advice failures, native-object substitution, mapping/drop observations, and fd/map baselines. |
-| `backend/accepted_control.rs` | 80 | Exact record mutation/truncation/rights/credential/replay/interleaving faults plus poison-before-resource-drop observations. |
+| `backend/linux_vnext/memory.rs` | 104 | Exact Nth preparation/seal/advice failures, native-object substitution, full-mixed-batch attenuation, mapping/drop observations, and fd/map baselines. |
+| `backend/accepted_control.rs` | 108 | Exact record mutation/truncation/rights/credential/replay/interleaving faults plus mixed accepted-owner and poison-before-resource-drop observations. |
 | `backend/linux_vnext/spawn.rs` | 22 | Entropy, inherited-fd, credential, send/receive, poison, and exact-child publication faults. |
 | `backend/linux_vnext/process.rs` | 13 | Signal, poll, wait/reap, auto-reap, and terminal-cleanup fault injection. |
 | `region.rs` | 6 | Prepared-owner destruction ordering observations. |

@@ -28,6 +28,11 @@ Versioning once a stable API is released.
   `openat2` symlink/magic-link rejection, retains its inode, opens the child's
   pidfd, executes through the held CLOEXEC descriptor, and compares
   `/proc/PID/exe` before any image receipt can be minted.
+- Compose arbitrary mixed-direction Linux batches inside the authenticated
+  accepted-session owner. The full batch is imported and manifest-bound before
+  one best-effort attenuation pass final-seals every escaped receiver-writer fd;
+  coordinator read mapping begins only after complete attenuation, and every
+  failure poisons before transaction-owned fds and mappings are destroyed.
 
 ### Changed
 

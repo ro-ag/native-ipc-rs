@@ -819,6 +819,30 @@ attenuation, READY/COMMIT, active lease, runtime, or public API state was added.
 The exact suppression and `cfg(test)` seam inventory is in
 [`dead-code-audit.md`](dead-code-audit.md).
 
+Phase 5i-G1j composes the mixed coordinator preparation and receiver import
+owners inside the accepted Linux dispatcher. One role-scoped transaction now
+derives and transfers the canonical full manifest and capability order, runs
+the full-manifest IMPORTED/SEALED preparation exchange when any
+receiver-writer entry exists, and retains every fd and mapping until terminal
+owner destruction. The coordinator revalidates all direction-specific object
+states, continues best-effort final sealing across every remaining
+receiver-writer fd after the first failure, and starts no coordinator read
+mapping until that complete attenuation pass succeeds. The receiver then
+revalidates final seals across both directions before retaining the pending
+mixed import.
+
+Arm64 Linux characterization covers reverse-input 1/2/4/16 batches, exact
+initialized coordinator-writer bytes and receiver-writer mutation, replacement
+deadline rejection before transaction entry, exact manifest mismatch,
+IMPORTED rights and credential rejection, replay, first/middle/final synthetic
+seal failure, first/middle/final receiver-import advice failure,
+first/middle/final post-attenuation coordinator advice failure, final-seal
+revalidation failure, a stale IMPORTED receipt, poison-before-owner-drop, and
+exact fd/map/task baselines. Strict Arm64 Clippy and the full native/workspace
+suite are green locally; exact hosted tip evidence remains pending. G1j adds no
+READY/COMMIT, transaction completion, active lease, runtime mapping exposure,
+public API, physical Arm64, or release evidence.
+
 The first exact hosted tip, `2f21c59`, is not completion evidence: run
 [29198888250](https://github.com/ro-ag/native-ipc-rs/actions/runs/29198888250)
 failed only its Linux AMD64 ASan job because the containment test harness
