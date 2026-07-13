@@ -6,7 +6,7 @@ pub(crate) const ENTRY_LEN: usize = 64;
 pub(crate) const CONTROL_FRAME_LEN: usize = 96 + MAX_TRANSFER_ENTRIES * ENTRY_LEN;
 #[allow(
     dead_code,
-    reason = "private G1b capability transport is currently implemented only on Linux"
+    reason = "private accepted capability transports remain unreachable until public target composition"
 )]
 pub(crate) const CAPABILITY_MAGIC: [u8; 8] = *b"NIPCCAP1";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -149,7 +149,7 @@ pub(crate) struct TransferManifest {
 /// transaction framing disjoint without exposing caller-selected wire magic.
 #[allow(
     dead_code,
-    reason = "private G1b capability transport is currently implemented only on Linux"
+    reason = "private accepted capability transports remain unreachable until public target composition"
 )]
 pub(crate) struct CapabilityFrame {
     bytes: [u8; CONTROL_FRAME_LEN],
