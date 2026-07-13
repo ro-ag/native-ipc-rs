@@ -299,3 +299,134 @@ fn memory_entry_helper() {
     }
     panic!("parent never published payload");
 }
+
+fn canonical_zero_rights_record(
+    nonce: &[u8; 32],
+    receive_port: MachPort,
+    audit: AuditToken,
+    payload: &[u8],
+) -> Vec<u64> {
+    let unrounded = size_of::<MachMsgHeader>() + size_of::<VnextEnvelope>() + payload.len();
+    let message_size = round_message(unrounded).unwrap();
+    let total = message_size + size_of::<AuditTrailer>();
+    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
+    let bytes = slice_as_bytes_mut(&mut storage);
+    write_value(
+        bytes,
+        0,
+        MachMsgHeader {
+            bits: u32::from(MACH_MSG_TYPE_PORT_SEND) << 8,
+            size: message_size as u32,
+            remote_port: MACH_PORT_NULL,
+            local_port: receive_port,
+            voucher_port: MACH_PORT_NULL,
+            id: VNEXT_MESSAGE_ID,
+        },
+    );
+    write_value(
+        bytes,
+        size_of::<MachMsgHeader>(),
+        VnextEnvelope {
+            magic: VNEXT_MESSAGE_MAGIC,
+            nonce: *nonce,
+            kind: 1,
+            payload_len: payload.len() as u32,
+        },
+    );
+    let payload_offset = size_of::<MachMsgHeader>() + size_of::<VnextEnvelope>();
+    bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+    write_value(
+        bytes,
+        message_size,
+        AuditTrailer {
+            trailer_type: 0,
+            trailer_size: size_of::<AuditTrailer>() as u32,
+            sequence: 0,
+            sender_security: [0; 2],
+            audit,
+        },
+    );
+    storage
+}
+
+#[test]
+fn parse_vnext_message_enforces_pinned_audit_token_continuity() {
+    let nonce = [7_u8; 32];
+    let receive_port: MachPort = 0x1234;
+    let pid = 43_210_u32;
+    let sender = AuditToken {
+        values: [1, 501, 20, 501, 20, pid, 9, 4],
+    };
+
+    // A record whose kernel trailer matches the pinned token parses.
+    let mut storage = canonical_zero_rights_record(&nonce, receive_port, sender, b"hello");
+    let record = parse_vnext_message(
+        slice_as_bytes_mut(&mut storage),
+        receive_port,
+        &nonce,
+        pid,
+        Some(&sender),
+        64,
+    )
+    .unwrap();
+    assert_eq!(record.bytes, b"hello");
+    assert!(record.audit == sender);
+
+    // A changed PID version (helper exec) keeps the PID but must reject.
+    let mut execed = sender;
+    execed.values[7] += 1;
+    let mut storage = canonical_zero_rights_record(&nonce, receive_port, execed, b"hello");
+    assert!(matches!(
+        parse_vnext_message(
+            slice_as_bytes_mut(&mut storage),
+            receive_port,
+            &nonce,
+            pid,
+            Some(&sender),
+            64,
+        ),
+        Err(SessionTransportError::IdentityMismatch)
+    ));
+
+    // Any other credential change in the token must also reject.
+    let mut setuid = sender;
+    setuid.values[1] = 0;
+    let mut storage = canonical_zero_rights_record(&nonce, receive_port, setuid, b"hello");
+    assert!(matches!(
+        parse_vnext_message(
+            slice_as_bytes_mut(&mut storage),
+            receive_port,
+            &nonce,
+            pid,
+            Some(&sender),
+            64,
+        ),
+        Err(SessionTransportError::IdentityMismatch)
+    ));
+
+    // Without a pinned token the exact audit PID check still applies.
+    let mut storage = canonical_zero_rights_record(&nonce, receive_port, sender, b"hello");
+    assert!(
+        parse_vnext_message(
+            slice_as_bytes_mut(&mut storage),
+            receive_port,
+            &nonce,
+            pid,
+            None,
+            64,
+        )
+        .is_ok()
+    );
+    let mut storage = canonical_zero_rights_record(&nonce, receive_port, sender, b"hello");
+    assert!(matches!(
+        parse_vnext_message(
+            slice_as_bytes_mut(&mut storage),
+            receive_port,
+            &nonce,
+            pid + 1,
+            None,
+            64,
+        ),
+        Err(SessionTransportError::IdentityMismatch)
+    ));
+}

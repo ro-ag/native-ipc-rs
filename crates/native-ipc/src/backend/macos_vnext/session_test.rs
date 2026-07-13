@@ -94,6 +94,23 @@ fn production_spawn_binds_image_hellos_and_bilateral_accept() {
 }
 
 #[test]
+fn production_accept_wins_over_receiver_exit_before_image_recheck() {
+    let command = helper_command("backend::macos::vnext_session_test::production_receiver_helper")
+        .env("NATIVE_IPC_VNEXT_TEST_DECISION", "accept");
+    let options = SessionOptions::new(deadline(), ExecutableIdentityPolicy::ExactOpenedFile)
+        .with_application_payload(b"coordinator-hello".to_vec())
+        .require_atomic_u32()
+        .require_atomic_u64();
+    let mut negotiating = MacCoordinatorNegotiatingSession::spawn(&command, &options).unwrap();
+    negotiating.wait_for_peer_exit_before_image_recheck_for_test();
+    let accepted = match negotiating.decide(None).unwrap() {
+        MacNegotiationOutcome::Accepted(accepted) => accepted,
+        MacNegotiationOutcome::Rejected { .. } => panic!("receiver rejected valid negotiation"),
+    };
+    accepted.wait_for_child_exit_for_test(deadline()).unwrap();
+}
+
+#[test]
 fn coordinator_rejection_is_canonical_and_bounded() {
     let command = helper_command("backend::macos::vnext_session_test::production_receiver_helper")
         .env("NATIVE_IPC_VNEXT_TEST_DECISION", "coordinator-reject");
