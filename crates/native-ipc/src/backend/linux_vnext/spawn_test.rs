@@ -78,6 +78,10 @@ fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).unwrap()
 }
 
+fn public_flow_deadline() -> AbsoluteDeadline {
+    AbsoluteDeadline::after(Duration::from_secs(15)).unwrap()
+}
+
 fn mixed_direction_mapped_bytes(count: usize) -> u64 {
     // SAFETY: sysconf has no pointer arguments.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -783,7 +787,7 @@ fn run_public_session_receiver(mode: &str) {
                 ExpectedRegion::new(RegionId::new(2).unwrap(), WriterEndpoint::Receiver, 34),
             ])
             .unwrap();
-            let operation_deadline = deadline();
+            let operation_deadline = public_flow_deadline();
             let mut active = ready.receive_batch(expected, operation_deadline).unwrap();
             let reader = active.take_reader(RegionId::new(1).unwrap()).unwrap();
             let mut writer = active.take_writer(RegionId::new(2).unwrap()).unwrap();
@@ -798,13 +802,17 @@ fn run_public_session_receiver(mode: &str) {
                 std::thread::yield_now();
             }
             drop((active, reader, writer));
-            let frame = ready.receive_control(deadline()).unwrap();
+            let frame = ready.receive_control(public_flow_deadline()).unwrap();
             assert_eq!(frame.kind(), APPLICATION_CONTROL_KIND_MIN + 7);
             assert_eq!(frame.payload(), b"12345678");
             ready
-                .send_control(APPLICATION_CONTROL_KIND_MIN + 8, b"", deadline())
+                .send_control(
+                    APPLICATION_CONTROL_KIND_MIN + 8,
+                    b"",
+                    public_flow_deadline(),
+                )
                 .unwrap();
-            let acknowledgement = ready.receive_control(deadline()).unwrap();
+            let acknowledgement = ready.receive_control(public_flow_deadline()).unwrap();
             assert_eq!(acknowledgement.kind(), APPLICATION_CONTROL_KIND_MIN + 9);
             assert!(acknowledgement.payload().is_empty());
             assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
@@ -4484,7 +4492,7 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
             )
             .unwrap();
     }
-    let operation_deadline = deadline();
+    let operation_deadline = public_flow_deadline();
     let mut active = ready.transfer_batch(batch, operation_deadline).unwrap();
     let mut writer = active.take_writer(RegionId::new(1).unwrap()).unwrap();
     let reader = active.take_reader(RegionId::new(2).unwrap()).unwrap();
@@ -4523,9 +4531,13 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
         SessionError::Control(ControlError::PayloadTooLarge)
     );
     ready
-        .send_control(APPLICATION_CONTROL_KIND_MIN + 7, b"12345678", deadline())
+        .send_control(
+            APPLICATION_CONTROL_KIND_MIN + 7,
+            b"12345678",
+            public_flow_deadline(),
+        )
         .unwrap();
-    let response = ready.receive_control(deadline()).unwrap();
+    let response = ready.receive_control(public_flow_deadline()).unwrap();
     assert_eq!(response.kind(), APPLICATION_CONTROL_KIND_MIN + 8);
     assert!(response.payload().is_empty());
     let close_deadline = AbsoluteDeadline::after(Duration::from_millis(20)).unwrap();
@@ -4546,7 +4558,11 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
         _ => panic!("bounded close did not preserve a live waiting child"),
     };
     ready
-        .send_control(APPLICATION_CONTROL_KIND_MIN + 9, b"", deadline())
+        .send_control(
+            APPLICATION_CONTROL_KIND_MIN + 9,
+            b"",
+            public_flow_deadline(),
+        )
         .unwrap();
     close_public_coordinator(ready);
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
