@@ -269,15 +269,18 @@ fn atomic_facts_and_absolute_deadline_fail_closed() {
     assert_eq!(fixed.remaining(), Duration::ZERO);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "macOS public composition is blocked on pre-bootstrap exact termination"]
-fn macos_public_typestate_negotiates_controls_and_reports_exact_exit() {
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS public composition is blocked on pre-bootstrap exact termination"
+)]
+fn public_typestate_negotiates_controls_and_reports_exact_exit() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
-        .arg0("native-ipc-macos-public-helper")
+        .arg0("native-ipc-public-helper")
         .arg("--exact")
-        .arg("session::tests::macos_public_receiver_helper")
+        .arg("session::tests::public_receiver_helper")
         .arg("--ignored")
         .arg("--nocapture");
     let options = SessionOptions::new(
@@ -326,16 +329,22 @@ fn macos_public_typestate_negotiates_controls_and_reports_exact_exit() {
         .unwrap();
     let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap());
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
+    #[cfg(target_os = "macos")]
     assert_eq!(
         cleanup.descendants(),
         DescendantCleanupStatus::FreshGroupUnverified
     );
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::ContainedProcessTreeComplete
+    );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "spawned alone by the public macOS typestate integration test"]
-fn macos_public_receiver_helper() {
+#[ignore = "spawned alone by the public typestate integration test"]
+fn public_receiver_helper() {
     let bootstrap = __take_receiver_bootstrap().unwrap();
     assert!(__take_receiver_bootstrap().is_err());
     let options = SessionOptions::new(
@@ -498,8 +507,8 @@ fn macos_public_abort_helper() {
     std::thread::sleep(Duration::from_secs(30));
 }
 
-#[cfg(target_os = "macos")]
-fn macos_public_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn public_native_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
     use crate::batch::{ExpectedBatch, ExpectedRegion};
     use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
 
@@ -526,17 +535,20 @@ fn macos_public_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
     (batch, ExpectedBatch::try_from_regions(expected).unwrap())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "macOS public composition is blocked on pre-bootstrap exact termination"]
-fn macos_public_ready_activates_one_mixed_batch_atomically() {
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS public composition is blocked on pre-bootstrap exact termination"
+)]
+fn public_ready_activates_one_mixed_batch_atomically() {
     use crate::region::RegionId;
 
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
-        .arg0("native-ipc-macos-public-batch-helper")
+        .arg0("native-ipc-public-batch-helper")
         .arg("--exact")
-        .arg("session::tests::macos_public_batch_receiver_helper")
+        .arg("session::tests::public_batch_receiver_helper")
         .arg("--ignored")
         .arg("--nocapture");
     let options = SessionOptions::new(
@@ -548,7 +560,7 @@ fn macos_public_ready_activates_one_mixed_batch_atomically() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("valid batch helper rejected"),
     };
-    let (batch, _) = macos_public_batch(4);
+    let (batch, _) = public_native_batch(4);
     let mut active = ready
         .transfer_batch(
             batch,
@@ -588,10 +600,10 @@ fn macos_public_ready_activates_one_mixed_batch_atomically() {
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "spawned alone by the public macOS mixed-batch integration test"]
-fn macos_public_batch_receiver_helper() {
+#[ignore = "spawned alone by the public mixed-batch integration test"]
+fn public_batch_receiver_helper() {
     use crate::region::RegionId;
 
     let bootstrap = __take_receiver_bootstrap().unwrap();
@@ -607,7 +619,7 @@ fn macos_public_batch_receiver_helper() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("coordinator rejected batch helper"),
     };
-    let (_, expected) = macos_public_batch(4);
+    let (_, expected) = public_native_batch(4);
     let mut active = ready
         .receive_batch(
             expected,
@@ -646,8 +658,8 @@ fn macos_public_batch_receiver_helper() {
     assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
 }
 
-#[cfg(target_os = "macos")]
-fn macos_one_active_region_options() -> SessionOptions {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn one_active_region_options() -> SessionOptions {
     SessionOptions::new(
         AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
@@ -659,25 +671,27 @@ fn macos_one_active_region_options() -> SessionOptions {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "macOS public composition is blocked on pre-bootstrap exact termination"]
-fn macos_public_capacity_rejection_keeps_both_sessions_synchronized() {
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS public composition is blocked on pre-bootstrap exact termination"
+)]
+fn public_capacity_rejection_keeps_both_sessions_synchronized() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
-        .arg0("native-ipc-macos-capacity-helper")
+        .arg0("native-ipc-capacity-helper")
         .arg("--exact")
-        .arg("session::tests::macos_public_capacity_receiver_helper")
+        .arg("session::tests::public_capacity_receiver_helper")
         .arg("--ignored")
         .arg("--nocapture");
     let negotiating =
-        CoordinatorSession::<Negotiating>::spawn(command, macos_one_active_region_options())
-            .unwrap();
+        CoordinatorSession::<Negotiating>::spawn(command, one_active_region_options()).unwrap();
     let mut ready = match negotiating.decide(NegotiationDecision::Accept).unwrap() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("valid capacity helper rejected"),
     };
-    let (first, _) = macos_public_batch(1);
+    let (first, _) = public_native_batch(1);
     let active = ready
         .transfer_batch(
             first,
@@ -692,7 +706,7 @@ fn macos_public_capacity_rejection_keeps_both_sessions_synchronized() {
             AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
         )
         .unwrap();
-    let (second, _) = macos_public_batch(1);
+    let (second, _) = public_native_batch(1);
     let failure = match ready.transfer_batch(
         second,
         AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
@@ -718,16 +732,14 @@ fn macos_public_capacity_rejection_keeps_both_sessions_synchronized() {
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[ignore = "spawned alone by the public macOS capacity-preflight test"]
-fn macos_public_capacity_receiver_helper() {
+#[ignore = "spawned alone by the public capacity-preflight test"]
+fn public_capacity_receiver_helper() {
     let bootstrap = __take_receiver_bootstrap().unwrap();
-    let negotiating = ReceiverSession::<Negotiating>::from_bootstrap(
-        bootstrap,
-        macos_one_active_region_options(),
-    )
-    .unwrap();
+    let negotiating =
+        ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, one_active_region_options())
+            .unwrap();
     let mut ready = match negotiating
         .decide_after_coordinator(|_| NegotiationDecision::Accept)
         .unwrap()
@@ -735,7 +747,7 @@ fn macos_public_capacity_receiver_helper() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("coordinator rejected capacity helper"),
     };
-    let (_, first) = macos_public_batch(1);
+    let (_, first) = public_native_batch(1);
     let active = ready
         .receive_batch(
             first,
@@ -746,7 +758,7 @@ fn macos_public_capacity_receiver_helper() {
         .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
         .unwrap();
     assert_eq!(notification.kind, 0x8000_0061);
-    let (_, second) = macos_public_batch(1);
+    let (_, second) = public_native_batch(1);
     let failure = match ready.receive_batch(
         second,
         AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),

@@ -69,12 +69,13 @@ child silent before its first audit-bearing Mach message without forbidden task
 authority. A preinstalled signed launchd/XPC service is a necessary candidate,
 but it does not preserve exact authority across service crash without another
 OS-enforced containment mechanism; that architecture remains blocked.
-Windows is likewise fail-closed with `BackendUnavailable`, but its private
-unnamed-section memory owner, PID-authenticated message transport, whole-Job
-lifecycle, full-manifest reducer, and post-COMMIT active ledger now pass the
-native Windows AMD64/Arm64 source-tree corpus. Public Windows session
-composition, the macOS lifecycle architecture, exact-release packaged
-conformance, and release evidence remain pending. The existing cross-platform
+Windows publicly composes the same Negotiating/Ready typestate surface over its
+unnamed-section memory owner, PID-authenticated message transport, held image,
+whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and
+post-COMMIT active ledger. Native Windows AMD64 source-tree and extracted-package
+all-feature/no-default suites pass in the recorded working tree. Native Windows
+Arm64 runtime, exact-release packaged conformance, the macOS lifecycle
+architecture, and release evidence remain pending. The existing cross-platform
 native-memory lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy

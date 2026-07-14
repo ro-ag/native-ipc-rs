@@ -45,7 +45,13 @@ Versioning once a stable API is released.
   lease-aware recoverable close, terminal abort invalidation, and bounded
   `SessionFailure` diagnostics carrying operation/stage/reason, optional errno,
   poison and endpoint facts, and coordinator child-cleanup evidence. The public
-  session composition remains target-specific until Windows parity lands.
+  session composition remains target-specific while macOS stays fail-closed.
+- Compose the public Windows `Negotiating` and `Ready` session surface over the
+  exact-PID named-pipe transport, held executable identity, kill-on-close Job,
+  full-manifest mixed reducer, bilateral capacity recovery, bounded control,
+  active mappings, and exact whole-Job exit/abort diagnostics. The downstream
+  `receiver_main!` path and extracted release-order crates now run the same
+  all-feature and no-default Windows AMD64 corpus as the source workspace.
 - Add a private, public-API-shaped macOS Arm64 composition prototype with a held
   stable-path image check, fresh-session `posix_spawn`, audit-PID-authenticated private
   Mach bootstrap, canonical HELLO and challenged decisions, symmetric capacity

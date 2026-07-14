@@ -14,7 +14,6 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-#[cfg(test)]
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, WaitForSingleObject};
 
@@ -117,11 +116,10 @@ impl CoordinatorWindowsControlTransport {
         self.remote_ledger.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_for_child_exit_for_test(
+    pub(crate) fn wait_for_child_exit(
         &mut self,
         deadline: AbsoluteDeadline,
-    ) -> Result<(), SessionTransportError> {
+    ) -> Result<u32, SessionTransportError> {
         loop {
             if poll_process(self.session.process.0)? == PeerState::Running
                 || !job_is_empty(self.session._job.0.0)?
@@ -134,12 +132,22 @@ impl CoordinatorWindowsControlTransport {
             if unsafe { GetExitCodeProcess(self.session.process.0, &mut code) } == 0 {
                 return Err(native_error(unsafe { GetLastError() }));
             }
-            if code != 0 {
-                return Err(native_error(code));
-            }
             self.session.reaped = true;
             self.remote_ledger.clear();
-            return Ok(());
+            return Ok(code);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_child_exit_for_test(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        let code = self.wait_for_child_exit(deadline)?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(native_error(code))
         }
     }
 
@@ -446,7 +454,7 @@ pub(super) fn adopt_capability_record(
     })
 }
 
-fn write_message(
+pub(super) fn write_message(
     pipe: HANDLE,
     bytes: &[u8],
     deadline: AbsoluteDeadline,
@@ -493,7 +501,7 @@ fn write_message(
     }
 }
 
-fn read_message(
+pub(super) fn read_message(
     pipe: HANDLE,
     maximum: usize,
     deadline: AbsoluteDeadline,

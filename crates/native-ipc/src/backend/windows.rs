@@ -3,7 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -28,7 +28,9 @@ use windows_sys::Win32::Security::{
     TokenLogonSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, GetFileInformationByHandle,
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::JobObjects::{
@@ -48,8 +50,8 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
-    GetCurrentProcessId, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
-    STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcessId, GetExitCodeProcess, OpenProcessToken, PROCESS_INFORMATION,
+    QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::BackendStatus;
@@ -57,6 +59,7 @@ use crate::protocol::{
     CONTROL_FRAME_LEN, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
     TransferProvenance, mint_channel_id,
 };
+use crate::session::AbsoluteDeadline;
 
 /// Windows section, bootstrap, lifecycle, or binding failure.
 #[derive(Debug)]
@@ -389,6 +392,7 @@ impl ChildJob {
 const PIPE_ENV: &str = "NATIVE_IPC_WINDOWS_PIPE";
 const NONCE_ENV: &str = "NATIVE_IPC_WINDOWS_NONCE";
 const PARENT_ENV: &str = "NATIVE_IPC_PARENT_PID";
+const PUBLIC_BOOTSTRAP_ENV: &str = "NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP";
 const BOOTSTRAP_MAGIC: [u8; 8] = *b"NIPCWIN1";
 const AUTH_MAGIC: [u8; 8] = *b"NIPCAUT1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
@@ -562,11 +566,114 @@ pub struct ChildSession {
     reaped: bool,
     next_transfer_id: u64,
     pending_manifest: Option<TransferManifest>,
+    _executable: Option<HeldExecutable>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    file_size: u64,
+    last_write: u64,
+}
+
+struct HeldExecutable {
+    _handle: OwnedHandle,
+    identity: ExecutableIdentity,
+}
+
+impl HeldExecutable {
+    fn open(path: &Path) -> Result<Self, WindowsError> {
+        let path = wide_null(path.as_os_str());
+        // SAFETY: the absolute terminated path is live. Sharing read only
+        // prevents later writers or replacement while the identity is held.
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let handle = OwnedHandle::new(handle)?;
+        let identity = executable_identity(handle.0)?;
+        if identity.file_size == 0 {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        Ok(Self {
+            _handle: handle,
+            identity,
+        })
+    }
+
+    fn verify_process_image(&self, process: HANDLE) -> Result<(), WindowsError> {
+        let mut path = vec![0_u16; 32_768];
+        let mut length = path.len() as u32;
+        // SAFETY: held exact process and writable UTF-16 output are valid.
+        if unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } == 0 {
+            return Err(last_os("QueryFullProcessImageNameW"));
+        }
+        let length = usize::try_from(length).map_err(|_| WindowsError::InvalidBootstrap)?;
+        if length == 0 || length > path.len() {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let image = OsString::from_wide(&path[..length]);
+        let observed = Self::open(Path::new(&image))?;
+        if observed.identity == self.identity {
+            Ok(())
+        } else {
+            Err(WindowsError::WrongPeer)
+        }
+    }
+}
+
+fn executable_identity(handle: HANDLE) -> Result<ExecutableIdentity, WindowsError> {
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    // SAFETY: held file handle and exact output structure are valid.
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err(last_os("GetFileInformationByHandle"));
+    }
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(WindowsError::InvalidBootstrap);
+    }
+    Ok(ExecutableIdentity {
+        volume_serial: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+        file_size: (u64::from(information.nFileSizeHigh) << 32)
+            | u64::from(information.nFileSizeLow),
+        last_write: (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(information.ftLastWriteTime.dwLowDateTime),
+    })
 }
 
 impl ChildSession {
     /// Creates a one-instance local pipe and launches the helper suspended.
     pub fn spawn(path: &Path, arguments: &[OsString]) -> Result<Self, WindowsError> {
+        let deadline = AbsoluteDeadline::after(Duration::from_millis(WAIT_MS.into()))
+            .map_err(|_| WindowsError::InvalidBootstrap)?;
+        let arguments = std::iter::once(path.as_os_str().to_owned())
+            .chain(arguments.iter().cloned())
+            .collect::<Vec<_>>();
+        Self::spawn_until(path, &arguments, &[], deadline)
+    }
+
+    /// Creates a public-session child under one caller-owned absolute deadline
+    /// and an explicit environment that starts empty.
+    pub(crate) fn spawn_until(
+        path: &Path,
+        arguments: &[OsString],
+        environment: &[(OsString, OsString)],
+        deadline: AbsoluteDeadline,
+    ) -> Result<Self, WindowsError> {
+        if deadline.is_expired() || arguments.is_empty() || !path.is_absolute() {
+            return Err(WindowsError::TimedOut("public spawn"));
+        }
+        let executable = HeldExecutable::open(path)?;
         let nonce = session_nonce()?;
         let name = format!(r"\\.\pipe\native-ipc-{}", hex(&nonce));
         let pipe_name = wide_null(OsStr::new(&name));
@@ -591,13 +698,17 @@ impl ChildSession {
         let job = ChildJob::new()?;
 
         let application = wide_null(path.as_os_str());
-        let mut command = command_line(path.as_os_str(), arguments);
+        let mut command = command_line_exact(arguments);
         let parent_pid = unsafe { GetCurrentProcessId() };
-        let environment = environment_block(&[
-            (PIPE_ENV, name),
-            (NONCE_ENV, hex(&nonce)),
-            (PARENT_ENV, parent_pid.to_string()),
-        ]);
+        let environment = environment_block_exact(
+            environment,
+            &[
+                (PIPE_ENV, name),
+                (NONCE_ENV, hex(&nonce)),
+                (PARENT_ENV, parent_pid.to_string()),
+                (PUBLIC_BOOTSTRAP_ENV, "1".to_owned()),
+            ],
+        )?;
         let mut startup: STARTUPINFOW = unsafe { zeroed() };
         startup.cb = size_of::<STARTUPINFOW>() as u32;
         let mut information: PROCESS_INFORMATION = unsafe { zeroed() };
@@ -627,6 +738,11 @@ impl ChildSession {
             let _ = unsafe { TerminateProcess(process.0, 127) };
             return Err(error);
         }
+        if let Err(error) = executable.verify_process_image(process.0) {
+            // SAFETY: exact held child is still suspended and contained by the Job.
+            let _ = unsafe { TerminateProcess(process.0, 127) };
+            return Err(error);
+        }
         // SAFETY: thread is the exact suspended primary thread.
         if unsafe { ResumeThread(thread.0) } == u32::MAX {
             let error = last_os("ResumeThread");
@@ -634,7 +750,7 @@ impl ChildSession {
             return Err(error);
         }
         drop(thread);
-        let bootstrap_deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+        let bootstrap_deadline = Instant::now() + deadline.remaining();
         connect_authenticated_pipe(
             pipe.0,
             process.0,
@@ -666,6 +782,7 @@ impl ChildSession {
             reaped: false,
             next_transfer_id: 1,
             pending_manifest: None,
+            _executable: Some(executable),
         })
     }
 
@@ -816,6 +933,19 @@ impl Drop for ChildSession {
 
 /// Connects a spawned helper from its authenticated bootstrap environment.
 pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
+    let deadline = AbsoluteDeadline::after(Duration::from_millis(WAIT_MS.into()))
+        .map_err(|_| WindowsError::InvalidBootstrap)?;
+    connect_spawned_helper_until(deadline)
+}
+
+// SAFETY: the owner uniquely retains its process, pipe, and Job handles. Moving
+// the complete non-Sync owner between threads does not duplicate authority.
+unsafe impl Send for ChildSession {}
+
+/// Connects the public receiver bootstrap under the caller's absolute deadline.
+pub(crate) fn connect_spawned_helper_until(
+    deadline: AbsoluteDeadline,
+) -> Result<ChildChannel, WindowsError> {
     let name = std::env::var_os(PIPE_ENV).ok_or(WindowsError::InvalidBootstrap)?;
     let nonce =
         parse_nonce(&std::env::var(NONCE_ENV).map_err(|_| WindowsError::InvalidBootstrap)?)?;
@@ -823,8 +953,19 @@ pub fn connect_spawned_helper() -> Result<ChildChannel, WindowsError> {
         .map_err(|_| WindowsError::InvalidBootstrap)?
         .parse::<u32>()
         .map_err(|_| WindowsError::InvalidBootstrap)?;
+    if std::env::var(PUBLIC_BOOTSTRAP_ENV).as_deref() != Ok("1") {
+        return Err(WindowsError::InvalidBootstrap);
+    }
+    // SAFETY: bootstrap environment is process-local startup state. Scrubbing
+    // it before application-controlled process creation prevents delegation.
+    unsafe {
+        std::env::remove_var(PIPE_ENV);
+        std::env::remove_var(NONCE_ENV);
+        std::env::remove_var(PARENT_ENV);
+        std::env::remove_var(PUBLIC_BOOTSTRAP_ENV);
+    }
     let name = wide_null(&name);
-    let bootstrap_deadline = Instant::now() + Duration::from_millis(WAIT_MS.into());
+    let bootstrap_deadline = Instant::now() + deadline.remaining();
     let pipe = open_pipe_until(name.as_ptr(), bootstrap_deadline)?;
     let mode = PIPE_READMODE_MESSAGE | PIPE_NOWAIT;
     // SAFETY: connected client pipe and mode pointer are valid.
@@ -1240,6 +1381,68 @@ fn command_line(path: &OsStr, arguments: &[OsString]) -> Vec<u16> {
     result.push(0);
     result
 }
+// SAFETY: the channel uniquely owns its authenticated pipe handle and mutable
+// protocol state. It is moved as one non-Sync value.
+unsafe impl Send for ChildChannel {}
+
+fn command_line_exact(arguments: &[OsString]) -> Vec<u16> {
+    let mut result = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            result.push(b' ' as u16);
+        }
+        quote_argument(argument, &mut result);
+    }
+    result.push(0);
+    result
+}
+
+fn environment_block_exact(
+    explicit: &[(OsString, OsString)],
+    bootstrap: &[(&str, String)],
+) -> Result<Vec<u16>, WindowsError> {
+    let mut values = explicit.to_vec();
+    for (name, value) in bootstrap {
+        if values
+            .iter()
+            .any(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        values.push((OsString::from(name), OsString::from(value)));
+    }
+    values.sort_by(|left, right| {
+        left.0
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_string_lossy().to_ascii_lowercase())
+    });
+    if values.windows(2).any(|pair| {
+        pair[0]
+            .0
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&pair[1].0.to_string_lossy())
+    }) {
+        return Err(WindowsError::InvalidBootstrap);
+    }
+    let mut block = Vec::new();
+    for (key, value) in values {
+        let key = key.to_string_lossy();
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        let value = value.to_string_lossy();
+        if value.contains('\0') {
+            return Err(WindowsError::InvalidBootstrap);
+        }
+        block.extend(key.encode_utf16());
+        block.push(b'=' as u16);
+        block.extend(value.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
 
 fn environment_block(overrides: &[(&str, String)]) -> Vec<u16> {
     let mut values: Vec<(OsString, OsString)> = std::env::vars_os()
@@ -1524,6 +1727,9 @@ pub(crate) mod vnext_memory;
 
 #[path = "windows_vnext/transport.rs"]
 pub(crate) mod vnext_transport;
+
+#[path = "windows_vnext/session.rs"]
+pub(crate) mod vnext_session;
 
 #[cfg(test)]
 #[path = "windows_vnext/memory_test.rs"]

@@ -239,7 +239,7 @@ A fresh implementation session can start from
 
 ## Current status
 
-The unreleased vNext branch composes the safe public session API on Linux:
+The unreleased vNext branch composes the safe public session API on Linux and Windows:
 one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
 lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
@@ -253,15 +253,14 @@ public mechanism provides crash-surviving exact containment without task
 ports, and a standing decision keeps public macOS fail-closed rather than
 re-scoping the contract; both are documented in
 [`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md). No
-service artifact exists. This is source-tree evidence plus packaged-crate
-conformance: the three extracted `cargo package` crates rebuild and pass the
-all-feature and no-default workspace suites natively on physical Apple
-Silicon at the current head. Private Windows parity now includes unnamed-section mixed memory,
-PID-authenticated message transport, exact process/whole-Job lifecycle,
-full-manifest IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation, green on
-native Windows AMD64/Arm64 at the exact branch tip. Public Windows sessions, the
-macOS architecture, exact-release packaged conformance, physical Arm64
-evidence, and release authorization remain outstanding.
+service artifact exists. The three extracted `cargo package` crates rebuild and
+pass the all-feature and no-default workspace suites on physical Apple Silicon
+at its recorded head and on native Windows AMD64 in this working tree. Windows
+public sessions bind held executable identity, PID-authenticated message
+transport, exact process/whole-Job lifecycle, full-manifest
+IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation. Exact-release reruns,
+native Windows Arm64 runtime evidence, physical Linux Arm64 evidence, the macOS
+architecture, and release authorization remain outstanding.
 
 Implemented through `0.4.0`:
 
