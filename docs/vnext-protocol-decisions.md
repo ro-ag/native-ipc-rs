@@ -155,9 +155,10 @@ public API exposes this transport only from an authenticated `Session<Ready>`.
 The blocked macOS Arm64 prototype uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
 ownership plus the held image through prototype Ready; public construction
-remains fail-closed pending pre-bootstrap exact termination. Windows public
-Ready-session construction remains fail-closed until its equivalent reducer
-and lifecycle owner are composed.
+remains fail-closed pending pre-bootstrap exact termination. Windows publicly
+composes the canonical records over its exact-PID named pipe, held suspended
+image, and kill-on-close Job. Its Negotiating/Ready owners expose only the same
+portable control, mixed-batch, active-mapping, and lifecycle surface as Linux.
 
 ## macOS supervisor lifecycle candidate
 

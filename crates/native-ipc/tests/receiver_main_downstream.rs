@@ -1,11 +1,11 @@
 //! Downstream executable regression for the public receiver entry-point macro.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use native_ipc::control::APPLICATION_CONTROL_KIND_MIN;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use native_ipc::session::{
     AbsoluteDeadline, CoordinatorCloseOutcome, CoordinatorSession, ExecutableIdentityPolicy,
     Negotiating, NegotiationDecision, NegotiationOutcome, ReceiverCloseOutcome, ReceiverSession,
@@ -15,12 +15,12 @@ use native_ipc::session::{ReceiverBootstrap, SessionFailure};
 
 const RECEIVER_ARG: &str = "--native-ipc-downstream-receiver";
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn deadline() -> AbsoluteDeadline {
     AbsoluteDeadline::after(Duration::from_secs(5)).expect("fixture deadline")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn options(payload: &[u8]) -> SessionOptions {
     SessionOptions::new(deadline(), ExecutableIdentityPolicy::ExactOpenedFile)
         .with_limits(SessionLimits {
@@ -30,7 +30,7 @@ fn options(payload: &[u8]) -> SessionOptions {
         .with_application_payload(payload.to_vec())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run_receiver(bootstrap: ReceiverBootstrap) {
     let receiver =
         ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, options(b"downstream-receiver"))
@@ -58,7 +58,7 @@ fn run_receiver(bootstrap: ReceiverBootstrap) {
     assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run_driver() {
     let command = SessionCommand::new(std::env::current_exe().expect("fixture executable"))
         .arg0("native-ipc-receiver-main-downstream")
@@ -97,12 +97,12 @@ fn run_driver() {
 
 native_ipc::receiver_main!(|bootstrap: Result<ReceiverBootstrap, SessionFailure>| {
     let receiver_invocation = std::env::args().any(|argument| argument == RECEIVER_ARG);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if receiver_invocation {
         return run_receiver(bootstrap.expect("receiver preinit bootstrap"));
     }
     assert!(!receiver_invocation);
     assert!(bootstrap.is_err());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     run_driver();
 });

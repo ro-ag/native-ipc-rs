@@ -294,6 +294,17 @@ malformed in-flight operations poison before pending native cleanup. Active
 mappings retain atomic session liveness, so abort makes later safe access fail
 without revoking the peer's independently authorized mapping.
 
+Windows composes the same public typestate and portable ownership surface over
+its target-specific proof. The coordinator holds an absolute regular image
+with replacement-denying sharing, compares the suspended process image's stable
+file identity before resume, assigns the exact child to a kill-on-close Job,
+and authenticates both named-pipe endpoint PIDs plus the nonce. Accepted owners
+then run the canonical challenged negotiation, bounded control, bilateral
+capacity preflight, complete IMPORTED/SEALED/READY/COMMIT mixed reducer, and
+all-or-nothing activation. Normal wait reports the exact exit code only after
+the process is signaled and the Job is empty; abort terminates the contained
+tree and retains incomplete containment facts on failure.
+
 Public failures retain a bounded `SessionFailure` describing the operation,
 transaction stage, portable reason, optional errno, poison state, endpoint
 observation, and coordinator child cleanup where applicable. Socket closure is
@@ -331,9 +342,10 @@ bilateral capacity preflight that returns both endpoints cleanly to Ready on an
 asymmetric active limit. Direct-child status is reported only after the sole
 waiter reaps it; descendant cleanup is `FreshGroupUnverified` because macOS has
 no retained race-resistant process-group handle here. The macOS lifecycle
-boundary, Windows public-session composition, physical Arm64 and exact-release packaged evidence, exact-tip
-hosted CI, and release evidence remain outstanding; local package verification
-is green.
+boundary, native Windows Arm64 runtime, physical Arm64 and exact-release
+packaged evidence, exact-tip hosted CI, and release evidence remain
+outstanding; local Windows AMD64 source and extracted-package verification are
+green.
 
 ## Unsafe-code policy
 

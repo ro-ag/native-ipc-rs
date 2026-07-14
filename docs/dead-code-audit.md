@@ -1,12 +1,11 @@
 # Dead-code and test-seam audit
 
-This inventory records the cleanup boundary after public Linux G1m and the
-blocked macOS 6d prototype. It is not vNext completion evidence. Linux composes
-the safe public session/control surface. macOS privately composes READY/COMMIT,
-all-or-nothing activation, and the active-resource ledger, but public
-spawn/bootstrap remain fail-closed pending exact pre-bootstrap termination.
-Windows privately composes the mixed memory owner, accepted transport, full
-reducer, and active-resource ledger, while its public session remains unavailable.
+This inventory records the cleanup boundary after public Linux G1m, public
+Windows composition, and the blocked macOS 6d prototype. It is not vNext
+completion evidence. Linux and Windows compose the safe public session/control
+surface. macOS privately composes READY/COMMIT, all-or-nothing activation, and
+the active-resource ledger, but public spawn/bootstrap remain fail-closed
+pending exact pre-bootstrap termination.
 
 ## Dead-code suppression inventory
 
@@ -18,13 +17,13 @@ yet reachable.
 | File | Sites | Classification | Retained reason |
 | --- | ---: | --- | --- |
 | `protocol.rs` | 17 | unfinished public composition and target-specific | Canonical capability, IMPORTED/SEALED, READY/COMMIT, authority-profile, access, totals, entry, and exact-frame machinery is consumed by the Linux public and macOS/Windows private reducers. The legacy-profile manifest constructor remains compiled for unfinished target composition and tests. |
-| `active.rs` | 11 | target activation composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are consumed by the public Linux and private macOS/Windows all-or-nothing activation boundaries, while non-Linux public session composition remains unavailable. |
+| `active.rs` | 11 | target activation composition | Leased reader/writer owners, reservations, activation failures, liveness observations, and ordered mapping-before-lease destruction are consumed by the public Linux/Windows and private macOS all-or-nothing activation boundaries. |
 | `region.rs` | 5 | unfinished batch composition | Prepared native request/spec/guard fields and logical/mapped accessors cross into the private batch/native preparation owners; they are not obsolete pending accepted-session composition on every target. |
-| `batch.rs` | 5 | target READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are consumed by the public Linux reducer and private macOS/Windows reducers but remain withheld from non-Linux public composition. |
+| `batch.rs` | 5 | target READY/COMMIT composition | Transfer construction, pending ownership, committed direction variants, and keyed active-set construction are consumed by the public Linux/Windows reducers and private macOS reducer. |
 | `lib.rs` | 4 | unfinished private modules | `batch`, `control`, `liveness`, and `negotiation` remain private until full composition. |
 | `backend/mod.rs` | 3 | unfinished role evidence and target-specific | The backend-wide allowance covers unreachable role-scoped evidence and accepted transport traits; target-only compilation retains the macOS and `linux_vnext` module allowances. The retained legacy-free Linux allocator overrides the blanket with `deny(dead_code)`. |
 | `memory.rs` | 4 | unfinished native batch composition | Incarnation, logical length, and native manifest derivation are consumed by the Linux private batch adapter and will be required by the other target adapters. |
-| `session.rs` | 9 | unfinished target negotiation composition | Verified atomic discovery and required-width validation remain private HELLO inputs; blocked macOS public-session variants preserve the reviewed prototype while production spawn/bootstrap fail closed pending exact pre-bootstrap termination. |
+| `session.rs` | 9 | unfinished target negotiation composition | Verified atomic discovery and required-width validation remain private HELLO inputs; Linux and Windows consume the public variants, while blocked macOS variants preserve the reviewed prototype and production spawn/bootstrap fail closed pending exact pre-bootstrap termination. |
 | `backend/macos.rs` | 2 | target-specific landed backend | The consuming local/remote writer owners are used by the macOS transfer path; the broad struct allowances currently cover target-only fields and should be narrowed only with native macOS warning checks. |
 
 ### Obsolete Linux code removed

@@ -8,7 +8,7 @@ use crate::active::{ActivationError, ActiveReader, ActiveWriter, LeaseReservatio
 use crate::batch::ExpectedBatch;
 #[cfg(test)]
 use crate::batch::PendingBatch;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use crate::batch::TransferBatch;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::batch::{ActiveRegionSet, BatchError, CommittedRegion, LocalRegionAuthority};
@@ -18,7 +18,7 @@ use crate::liveness::ResourceError;
 use crate::liveness::ResourceOwner;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::protocol::CONTROL_FRAME_LEN;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::protocol::CoordinatorCapacityStatus;
 use crate::protocol::{CapabilityFrame, ManifestEntry, PreparationFrame, TransferManifest};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -275,6 +275,8 @@ pub(crate) enum WindowsCapabilityBatchError {
     Memory(WindowsBatchError),
     Control(AcceptedControlError),
     Resource(ResourceError),
+    ActiveLimit,
+    PeerPreparationFailed,
 }
 
 #[cfg(target_os = "windows")]
@@ -896,6 +898,121 @@ impl AcceptedControlDispatcher<CoordinatorMacControlTransport> {
 
 #[cfg(target_os = "windows")]
 impl AcceptedControlDispatcher<CoordinatorWindowsControlTransport> {
+    pub(crate) fn wait_for_windows_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<u32, SessionTransportError> {
+        let result = self.transport.wait_for_child_exit(deadline);
+        self.poison_both();
+        result
+    }
+
+    pub(crate) fn begin_public_windows_transfer_capacity(
+        &mut self,
+        batch: &TransferBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<CapabilityFrame, WindowsCapabilityBatchError> {
+        let entries = batch
+            .manifest_entries()
+            .ok_or(WindowsCapabilityBatchError::Memory(
+                WindowsBatchError::InvalidBatch,
+            ))?;
+        self.begin_native_transaction(entries, deadline)
+            .map_err(WindowsCapabilityBatchError::Control)
+    }
+
+    pub(crate) fn reserve_windows_transfer_batch(
+        &mut self,
+        batch: &TransferBatch,
+    ) -> Result<Vec<LeaseReservation>, ResourceError> {
+        self.reserve_mapped_lengths(batch.reservation_lengths())
+    }
+
+    pub(crate) fn exchange_public_windows_transfer_capacity(
+        &mut self,
+        frame: &CapabilityFrame,
+        local_status: CoordinatorCapacityStatus,
+        deadline: AbsoluteDeadline,
+    ) -> Result<bool, WindowsCapabilityBatchError> {
+        let local_ready = local_status == CoordinatorCapacityStatus::Ready;
+        let offer = frame.coordinator_capacity_frame(local_status);
+        if let Err(error) = self.transport.send_record(offer.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        let response = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(response) => response,
+            Err(error) => {
+                self.poison_both();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let peer_ready = if frame.receiver_capacity_frame(true).matches(&response) {
+            true
+        } else if frame.receiver_capacity_frame(false).matches(&response) {
+            false
+        } else {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !local_ready && peer_ready {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        if !local_ready || !peer_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(WindowsCapabilityBatchError::Control)?;
+        }
+        Ok(peer_ready)
+    }
+
+    pub(crate) fn begin_public_windows_mixed_direction_batch_preflighted(
+        &mut self,
+        batch: WindowsMixedDirectionBatch,
+        reservations: Vec<LeaseReservation>,
+        frame: CapabilityFrame,
+        deadline: AbsoluteDeadline,
+    ) -> Result<WindowsCoordinatorMixedDirectionTransaction<'_>, WindowsCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::WindowsSectionsV1
+            || batch.deadline() != deadline
+            || reservations.len() != batch.reservation_lengths().len()
+            || !self.state.is_transaction_open()
+            || !self.frame_matches_entries(&frame, batch.manifest_entries())
+        {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Memory(
+                WindowsBatchError::WrongProvenance,
+            ));
+        }
+        Ok(WindowsCoordinatorMixedDirectionTransaction {
+            transaction: CoordinatorCapabilityTransaction {
+                dispatcher: self,
+                frame,
+                deadline,
+                attempted: false,
+                already_poisoned: false,
+            },
+            batch,
+            reservations,
+            attempted: false,
+            #[cfg(test)]
+            sealed_frame_fault: false,
+            #[cfg(test)]
+            commit_frame_fault: false,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn windows_remote_capability_count_for_test(&self) -> usize {
         self.transport.remote_capability_count_for_test()
@@ -975,6 +1092,98 @@ impl AcceptedControlDispatcher<CoordinatorWindowsControlTransport> {
 
 #[cfg(target_os = "windows")]
 impl AcceptedControlDispatcher<ReceiverWindowsControlTransport> {
+    pub(crate) fn begin_public_windows_expected_mixed_direction_batch(
+        &mut self,
+        expected: ExpectedBatch,
+        deadline: AbsoluteDeadline,
+    ) -> Result<WindowsReceiverMixedDirectionTransaction<'_>, WindowsCapabilityBatchError> {
+        if self.parameters.authority_profile()
+            != crate::protocol::NativeAuthorityProfile::WindowsSectionsV1
+        {
+            return Err(WindowsCapabilityBatchError::Memory(
+                WindowsBatchError::WrongProvenance,
+            ));
+        }
+        let expected =
+            WindowsExpectedMixedDirectionBatch::new(expected, self.parameters.limits(), deadline)
+                .map_err(WindowsCapabilityBatchError::Memory)?;
+        let transaction_id = self
+            .enter_native_transaction(deadline)
+            .map_err(WindowsCapabilityBatchError::Control)?;
+        let offer = match self.transport.receive_record(CONTROL_FRAME_LEN, deadline) {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.poison_both();
+                return Err(WindowsCapabilityBatchError::Control(
+                    AcceptedControlError::Transport(error),
+                ));
+            }
+        };
+        let Some((frame, manifest, coordinator_status)) =
+            CapabilityFrame::decode_coordinator_capacity(&offer)
+        else {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        };
+        if !windows_received_mixed_manifest_matches(
+            self.parameters,
+            transaction_id,
+            &expected,
+            &manifest,
+        ) {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Control(ControlError::NonCanonical),
+            ));
+        }
+        let coordinator_ready = coordinator_status == CoordinatorCapacityStatus::Ready;
+        let reservations = if coordinator_ready {
+            self.reserve_mapped_lengths(expected.reservation_lengths())
+                .ok()
+        } else {
+            None
+        };
+        let local_ready = coordinator_ready && reservations.is_some();
+        let response = frame.receiver_capacity_frame(local_ready);
+        if let Err(error) = self.transport.send_record(response.as_bytes(), deadline) {
+            self.poison_both();
+            return Err(WindowsCapabilityBatchError::Control(
+                AcceptedControlError::Transport(error),
+            ));
+        }
+        if !local_ready {
+            self.state
+                .end_transaction()
+                .map_err(AcceptedControlError::Control)
+                .map_err(WindowsCapabilityBatchError::Control)?;
+            return Err(match coordinator_status {
+                CoordinatorCapacityStatus::PreparationFailed => {
+                    WindowsCapabilityBatchError::PeerPreparationFailed
+                }
+                CoordinatorCapacityStatus::Ready | CoordinatorCapacityStatus::ActiveLimit => {
+                    WindowsCapabilityBatchError::ActiveLimit
+                }
+            });
+        }
+        Ok(WindowsReceiverMixedDirectionTransaction {
+            dispatcher: self,
+            expected: Some(expected),
+            imported: None,
+            frame: None,
+            reservations: reservations.expect("ready capacity retains exact reservations"),
+            deadline,
+            transaction_id,
+            attempted: false,
+            already_poisoned: false,
+            #[cfg(test)]
+            imported_frame_fault: false,
+            #[cfg(test)]
+            ready_frame_fault: false,
+        })
+    }
+
     pub(crate) fn begin_windows_expected_mixed_direction_batch(
         &mut self,
         expected: ExpectedBatch,
