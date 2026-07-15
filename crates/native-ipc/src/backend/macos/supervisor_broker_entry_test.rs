@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use static_assertions::assert_not_impl_any;
 
@@ -39,11 +39,7 @@ fn post_report_gate_eof_wins_before_reported_authority() {
 
     drop(writer);
     assert_eq!(
-        finish_trace_report_before_authority(
-            &trace,
-            reader.as_raw_fd(),
-            Instant::now() + Duration::from_secs(1),
-        ),
+        finish_trace_report_before_authority(&trace, reader.as_raw_fd()),
         Ok(Some(BrokerGateExit::ServiceGone))
     );
 }

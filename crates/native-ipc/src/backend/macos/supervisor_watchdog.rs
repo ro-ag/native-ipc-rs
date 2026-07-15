@@ -343,17 +343,22 @@ impl<Authority: ExactBrokerAuthority> PendingReadyDelivery<Authority> {
         send: Send,
     ) -> Result<Result<(), Send::Error>, WatchdogStateError> {
         let proof = self.proof.as_ref().expect("armed Ready proof");
+        let handle = proof.handle;
+        let connection = proof.connection;
         let entry = self
             .entry
             .try_borrow()
             .unwrap_or_else(|_| std::process::abort());
-        if entry.handle != proof.handle || entry.connection != proof.connection {
+        if entry.handle != handle || entry.connection != connection {
             std::process::abort();
         }
         match entry.phase {
             BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
             BrokerPhase::Reaping(_) => std::process::abort(),
-            BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::TerminationRequired(_) => {}
+            BrokerPhase::Starting
+            | BrokerPhase::Traced
+            | BrokerPhase::ReadyCommitted
+            | BrokerPhase::TerminationRequired(_) => {}
         }
         if entry.phase != BrokerPhase::Traced {
             return Err(WatchdogStateError::InvalidTransition);
@@ -364,7 +369,7 @@ impl<Authority: ExactBrokerAuthority> PendingReadyDelivery<Authority> {
         }
         let deadline = entry.deadline;
         drop(entry);
-        match send.send_once(proof.handle, proof.connection, deadline) {
+        match send.send_once(handle, connection, deadline) {
             Ok(()) => {
                 if let Some(resume) = self
                     .proof
@@ -377,6 +382,18 @@ impl<Authority: ExactBrokerAuthority> PendingReadyDelivery<Authority> {
                     self.cleanup_reason = TerminationReason::ProtocolViolation;
                     return Err(WatchdogStateError::BrokerResumeFailed);
                 }
+                let mut entry = self
+                    .entry
+                    .try_borrow_mut()
+                    .unwrap_or_else(|_| std::process::abort());
+                if entry.handle != handle
+                    || entry.connection != connection
+                    || entry.phase != BrokerPhase::Traced
+                {
+                    std::process::abort();
+                }
+                entry.phase = BrokerPhase::ReadyCommitted;
+                drop(entry);
                 self.proof.take();
                 Ok(Ok(()))
             }
@@ -467,6 +484,7 @@ impl TraceEstablished {
 enum BrokerPhase {
     Starting,
     Traced,
+    ReadyCommitted,
     TerminationRequired(TerminationReason),
     Reaping(TerminationReason),
     Reaped(TerminationReason),
@@ -571,7 +589,9 @@ impl<Launch, Authority: ExactBrokerAuthority> RegisteredLaunchPermit<'_, Launch,
             BrokerPhase::Starting => {}
             BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
             BrokerPhase::Reaping(_) => std::process::abort(),
-            BrokerPhase::Traced | BrokerPhase::TerminationRequired(_) => {
+            BrokerPhase::Traced
+            | BrokerPhase::ReadyCommitted
+            | BrokerPhase::TerminationRequired(_) => {
                 return Err(WatchdogStateError::InvalidTransition);
             }
         }
@@ -791,7 +811,7 @@ fn emergency_terminate_entry<Authority: ExactBrokerAuthority>(
         let effective_reason = match entry.phase {
             BrokerPhase::Reaped(_) => return,
             BrokerPhase::Reaping(_) => std::process::abort(),
-            BrokerPhase::Starting | BrokerPhase::Traced => reason,
+            BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::ReadyCommitted => reason,
             BrokerPhase::TerminationRequired(existing) => existing,
         };
         entry.phase = BrokerPhase::Reaping(effective_reason);
@@ -1018,12 +1038,17 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
             .live
             .get(&handle)
             .ok_or(WatchdogStateError::UnknownSession)?;
-        if Instant::now()
-            < entry
-                .try_borrow()
-                .unwrap_or_else(|_| std::process::abort())
-                .deadline
-        {
+        let (phase, deadline) = {
+            let entry = entry.try_borrow().unwrap_or_else(|_| std::process::abort());
+            (entry.phase, entry.deadline)
+        };
+        match phase {
+            BrokerPhase::ReadyCommitted => return Err(WatchdogStateError::InvalidTransition),
+            BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
+            BrokerPhase::Reaping(_) => std::process::abort(),
+            BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::TerminationRequired(_) => {}
+        }
+        if Instant::now() < deadline {
             return Err(WatchdogStateError::InvalidTransition);
         }
         self.terminate_internal(handle, TerminationReason::DeadlineExpired)
@@ -1070,7 +1095,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 .try_borrow_mut()
                 .unwrap_or_else(|_| std::process::abort());
             let effective_reason = match entry.phase {
-                BrokerPhase::Starting | BrokerPhase::Traced => reason,
+                BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::ReadyCommitted => reason,
                 BrokerPhase::TerminationRequired(existing) => existing,
                 BrokerPhase::Reaping(_) => std::process::abort(),
                 BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
@@ -1158,6 +1183,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                     BrokerPhase::Reaping(_) => std::process::abort(),
                     BrokerPhase::Starting
                     | BrokerPhase::Traced
+                    | BrokerPhase::ReadyCommitted
                     | BrokerPhase::TerminationRequired(_) => None,
                 }
             })
@@ -1180,7 +1206,10 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                     .try_borrow()
                     .unwrap_or_else(|_| std::process::abort())
                     .phase,
-                BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::TerminationRequired(_)
+                BrokerPhase::Starting
+                    | BrokerPhase::Traced
+                    | BrokerPhase::ReadyCommitted
+                    | BrokerPhase::TerminationRequired(_)
             )
         })
     }
@@ -1212,6 +1241,7 @@ impl<Authority: ExactBrokerAuthority> Drop for WatchdogTable<Authority> {
                 BrokerPhase::Reaping(_) => std::process::abort(),
                 BrokerPhase::Starting
                 | BrokerPhase::Traced
+                | BrokerPhase::ReadyCommitted
                 | BrokerPhase::TerminationRequired(_) => emergency_terminate_entry(
                     entry,
                     handle,

@@ -297,7 +297,6 @@ impl ExactParentBrokerLaunchPlan {
         self.plan
     }
 
-    #[cfg(test)]
     pub(in crate::backend::macos::supervisor) fn trace_report_binding(
         &self,
     ) -> BrokerTraceReportBinding {

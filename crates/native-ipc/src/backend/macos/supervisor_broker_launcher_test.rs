@@ -1,4 +1,6 @@
 use std::ffi::{CStr, c_char, c_int};
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -135,6 +137,7 @@ struct Fixture {
     child: Child,
     gate: Option<ActiveBrokerGate>,
     gate_writer: Option<OwnedFd>,
+    trace_peer: Option<UnixStream>,
 }
 
 impl Fixture {
@@ -189,6 +192,7 @@ impl Fixture {
                 reader: gate_reader,
             }),
             gate_writer: Some(gate_writer),
+            trace_peer: None,
         }
     }
 
@@ -208,7 +212,8 @@ impl Fixture {
             expected_executable,
         );
         let (trace, trace_peer) = UnixStream::pair().unwrap();
-        drop(trace_peer);
+        trace.set_nonblocking(true).unwrap();
+        self.trace_peer = Some(trace_peer);
         let active = ActiveBrokerProcess { gate, plan, trace };
         // SAFETY: Command just returned this positive direct-child PID, and
         // this fixture never performs another wait on its Child handle. The
@@ -222,6 +227,28 @@ impl Fixture {
 
     fn close_gate(&mut self) {
         drop(self.gate_writer.take());
+    }
+
+    fn held_exec(&mut self) -> (c_int, ExecTrapHeld) {
+        self.held_exec_until(self.deadline())
+    }
+
+    fn held_exec_until(&mut self, deadline: Instant) -> (c_int, ExecTrapHeld) {
+        let pid = c_int::try_from(self.child.id()).unwrap();
+        let initial = self.spawned_launcher(deadline).wait_initial_stop().unwrap();
+        let running = initial.prove_trace_and_continue_to_exec().unwrap();
+        (pid, running.wait_exec_trap().unwrap())
+    }
+
+    fn drain_report(&mut self) -> UnixStream {
+        let mut service = self.trace_peer.take().unwrap();
+        let mut report =
+            [0_u8; super::super::super::auth_adapter::broker_report::BROKER_TRACE_REPORT_BYTES];
+        service.read_exact(&mut report).unwrap();
+        assert_eq!(&report[..8], b"NIPCBTR1");
+        let mut extension = [0_u8; 1];
+        assert_eq!(service.read(&mut extension).unwrap(), 0);
+        service
     }
 }
 
@@ -320,6 +347,95 @@ fn different_exec_image_cannot_mint_bound_identity() {
         running.wait_exec_trap(),
         Err(LauncherWaitError::IdentityTransition)
     ));
+    fixture.close_gate();
+}
+
+#[test]
+fn held_exec_reports_waits_for_ready_and_resumes_exactly_once() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (pid, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+
+    let committed = reported.wait_for_ready_commit().unwrap().unwrap();
+    let resumed = committed.resume_target().unwrap();
+    assert_eq!(resumed.exact_pid_for_test(), pid);
+    drop(resumed);
+    fixture.close_gate();
+}
+
+#[test]
+fn service_death_before_report_exactly_cleans_held_target() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (_, held) = fixture.held_exec();
+    fixture.close_gate();
+    // The production service is permanently single-threaded while spawning,
+    // but libtest concurrently execs unrelated helpers that can transiently
+    // inherit this fixture's pipe writer before their CLOEXEC boundary.
+    held.wait_for_gate_eof_for_test();
+    match held.report_trace_stops() {
+        Ok(Err(BrokerGateExit::ServiceGone)) => {}
+        Ok(Err(exit)) => panic!("unexpected gate exit: {exit:?}"),
+        Ok(Ok(_)) => panic!("service death minted reported authority"),
+        Err(error) => panic!("service death returned protocol error: {error:?}"),
+    }
+}
+
+#[test]
+fn malformed_or_extended_resume_exactly_cleans_reported_target() {
+    for resume in [[9_u8].as_slice(), [1_u8, 2].as_slice()] {
+        let mut fixture = Fixture::spawn("valid-exec");
+        let (_, held) = fixture.held_exec();
+        let reported = held.report_trace_stops().unwrap().unwrap();
+        let mut service = fixture.drain_report();
+        service.write_all(resume).unwrap();
+        service.shutdown(Shutdown::Write).unwrap();
+        assert!(matches!(
+            reported.wait_for_ready_commit(),
+            Err(BrokerEntryError::Plan(SupervisorWireError::Malformed))
+        ));
+        fixture.close_gate();
+    }
+}
+
+#[test]
+fn service_death_after_commit_preempts_delayed_resume() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let committed = reported.wait_for_ready_commit().unwrap().unwrap();
+    fixture.close_gate();
+    assert!(matches!(
+        committed.resume_target(),
+        Err(LauncherWaitError::ServiceGone)
+    ));
+}
+
+#[test]
+fn ready_resume_commit_has_no_broker_side_deadline_veto() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let (_, held) = fixture.held_exec_until(deadline);
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    std::thread::sleep(Duration::from_millis(300));
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let committed = reported.wait_for_ready_commit().unwrap().unwrap();
+    let resumed = committed.resume_target().unwrap();
+    drop(resumed);
     fixture.close_gate();
 }
 

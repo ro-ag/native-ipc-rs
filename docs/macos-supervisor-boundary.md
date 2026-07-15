@@ -75,10 +75,17 @@ direct child together with the complete active plan/gate/report bundle, keeps
 the initial `SIGSTOP` unproven until `PT_CONTINUE` succeeds, and accepts the
 exec trap only after the audit PID version changes, real/effective IDs match,
 and `proc_pidpath` equals the installed plan path. Untraced, substituted-image,
-unexpected-stop, service-death, and deadline paths exact-clean. The fixed
-launcher spawner/entry and the production transition from this held token into
-FD 5 report/Ready/RESUME remain unimplemented, so report emission stays
-test-only.
+unexpected-stop, service-death, and deadline paths exact-clean. Only that held
+token can now emit the canonical FD 5 report; it retains the stopped target
+through exact RESUME+EOF, rechecks FD 3 immediately at the effect boundary,
+and then continues exactly once without a second broker-side deadline veto.
+The service receiver and armed Ready guard remain the sole deadline authority
+after report EOF. Only successful Ready plus reverse commit moves the watchdog
+to `ReadyCommitted`; stale deadline work cannot retroactively terminate that
+phase, while client loss, protocol failure, unexpected stop, and service table
+drop remain exact-clean effects. The resumed target still carries exact cleanup ownership.
+The fixed launcher spawner/entry and production service-death/target-exit loop
+remain unimplemented.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it

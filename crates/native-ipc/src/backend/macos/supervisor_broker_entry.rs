@@ -23,10 +23,9 @@ use super::auth_adapter::broker_plan::{
     ExactParentBrokerLaunchPlan, MAX_BROKER_PLAN_BYTES, ReceivedBrokerLaunchPlan, broker_plan_ack,
     parse_broker_plan_prefix,
 };
+use super::auth_adapter::broker_report::finish_broker_trace_report;
 #[cfg(test)]
-use super::auth_adapter::broker_report::{
-    BROKER_RESUME_BYTE, encode_broker_trace_report, finish_broker_trace_report,
-};
+use super::auth_adapter::broker_report::{BROKER_RESUME_BYTE, encode_broker_trace_report};
 use super::auth_adapter::broker_spawn::{
     BROKER_CONTROL_FD, BROKER_GATE_FD, BROKER_TRACE_FD, INSTALLED_BROKER_MODE,
     INSTALLED_BROKER_PATH, INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT,
@@ -722,11 +721,9 @@ impl ActiveBrokerProcess {
         )? {
             return Ok(Err(BrokerGateExit::ServiceGone));
         }
-        if let Some(exit) = finish_trace_report_before_authority(
-            &self.trace,
-            self.gate.reader.as_raw_fd(),
-            deadline,
-        )? {
+        if let Some(exit) =
+            finish_trace_report_before_authority(&self.trace, self.gate.reader.as_raw_fd())?
+        {
             return Ok(Err(exit));
         }
         Ok(Ok(ReportedActiveBroker {
@@ -747,15 +744,8 @@ impl ReportedActiveBroker {
     pub(super) fn wait_for_ready_commit(
         mut self,
     ) -> Result<Result<ResumedActiveBroker, BrokerGateExit>, BrokerEntryError> {
-        let deadline = self.plan.deadline().local();
         let mut resume = [0_u8; 1];
-        if read_resume_commit(
-            &mut self.trace,
-            self.gate.reader.as_raw_fd(),
-            &mut resume,
-            deadline,
-        )?
-        .is_some()
+        if read_resume_commit(&mut self.trace, self.gate.reader.as_raw_fd(), &mut resume)?.is_some()
         {
             return Ok(Err(BrokerGateExit::ServiceGone));
         }
@@ -777,12 +767,10 @@ impl ReportedActiveBroker {
     }
 }
 
-#[cfg(test)]
 fn read_resume_commit(
     trace: &mut UnixStream,
     gate_fd: c_int,
     resume: &mut [u8; 1],
-    deadline: Instant,
 ) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
     loop {
         if let Some(exit) = probe_dormant_gate(gate_fd)? {
@@ -794,9 +782,7 @@ fn read_resume_commit(
             Ok(_) => unreachable!("one-byte read returned impossible length"),
             Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                ensure_deadline_live(Some(deadline))?;
-                if let Some(exit) =
-                    poll_control_and_gate(gate_fd, trace.as_raw_fd(), POLLIN, Some(deadline))?
+                if let Some(exit) = poll_control_and_gate(gate_fd, trace.as_raw_fd(), POLLIN, None)?
                 {
                     return Ok(Some(exit));
                 }
@@ -808,7 +794,6 @@ fn read_resume_commit(
     }
 }
 
-#[cfg(test)]
 fn require_resume_commit_eof(
     trace: &mut UnixStream,
     gate_fd: c_int,
@@ -841,17 +826,14 @@ fn final_resume_gate_probe(gate_fd: c_int) -> Result<Option<BrokerGateExit>, Bro
     Ok(probe_dormant_gate(gate_fd)?.map(|_| BrokerGateExit::ServiceGone))
 }
 
-#[cfg(test)]
 fn finish_trace_report_before_authority(
     trace: &UnixStream,
     gate_fd: c_int,
-    deadline: Instant,
 ) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
     finish_broker_trace_report(trace).map_err(|error| BrokerEntryError::Plan(error.into()))?;
     if probe_dormant_gate(gate_fd)?.is_some() {
         return Ok(Some(BrokerGateExit::ServiceGone));
     }
-    ensure_deadline_live(Some(deadline))?;
     Ok(None)
 }
 

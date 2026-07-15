@@ -641,6 +641,52 @@ fn reverse_resume_commit_occurs_only_after_successful_ready_send() {
 }
 
 #[test]
+fn committed_ready_is_not_retroactively_terminated_by_deadline() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let deadline = near_future_deadline();
+    let handle = table
+        .register_test(session(), launch(owner, deadline), broker)
+        .unwrap()
+        .handle();
+    let (service_endpoint, mut broker_endpoint) = UnixStream::pair().unwrap();
+    service_endpoint.set_nonblocking(true).unwrap();
+    broker_endpoint.set_nonblocking(true).unwrap();
+    let resume = BrokerResumeSender::from_test_stream(service_endpoint);
+    // SAFETY: the paired stream models this exact registered broker's
+    // authenticated FD5 report and reverse commit authority.
+    let trace =
+        unsafe { TraceEstablished::from_broker_handshake_with_resume(handle, owner, resume) };
+    let delivery = table.mark_traced_for_delivery(trace).unwrap();
+    let send_endpoint = broker_endpoint.try_clone().unwrap();
+    assert_eq!(
+        delivery.deliver(OrderedReadySend {
+            outcome: TestSendOutcome::Success,
+            broker_endpoint: send_endpoint,
+        }),
+        Ok(Ok(()))
+    );
+    let mut resume_byte = [0_u8; 1];
+    assert_eq!(broker_endpoint.read(&mut resume_byte).unwrap(), 1);
+    assert_eq!(resume_byte, [1]);
+    assert_eq!(broker_endpoint.read(&mut resume_byte).unwrap(), 0);
+
+    wait_past(deadline);
+    assert_eq!(
+        table.terminate_for_deadline(handle),
+        Err(WatchdogStateError::InvalidTransition)
+    );
+    assert!(table.contains_live(handle));
+    assert_eq!(state.lock().unwrap().attempts, 0);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 0);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner).unwrap(),
+        Ok(())
+    );
+}
+
+#[test]
 fn reverse_resume_write_failure_exactly_cleans_before_returning() {
     let owner = connection();
     let mut table = WatchdogTable::new();

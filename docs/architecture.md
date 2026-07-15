@@ -406,10 +406,15 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    endpoint, and original deadline across a sole-waiter child typestate. It
    distinguishes an unproven initial stop from successful ptrace continuation
    and requires changed audit PID version, complete real/effective credential
-   equality, and exact installed `proc_pidpath` at the exec trap. The fixed
-   launcher spawner/entry and safe held-token-to-report transition remain to be
-   implemented; report tests still use an explicit synthetic stop-proof
-   fixture. A one-shot non-sendable
+   equality, and exact installed `proc_pidpath` at the exec trap. That token now
+   alone emits FD 5, retains the stopped target through Ready-bound RESUME+EOF,
+   rechecks service liveness at the continuation boundary, and resumes once
+   without a post-report broker clock veto; every rejection exact-cleans. The
+   watchdog enters `ReadyCommitted` only after Ready and reverse commit both
+   succeed, so stale deadline work cannot kill the committed session; all
+   non-deadline terminal causes remain valid. The
+   fixed launcher spawner/entry and resumed target-exit/service-death loop remain
+   to be implemented. A one-shot non-sendable
    child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
    semantics, and blocks SIGCHLD for inheriting service threads. The fixed

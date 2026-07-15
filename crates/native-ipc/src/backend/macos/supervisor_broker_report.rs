@@ -1,7 +1,6 @@
 //! Exact one-shot broker trace report carried on the fixed service channel.
 
 use std::io::{Read, Write};
-#[cfg(test)]
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -12,7 +11,7 @@ use crate::backend::macos::supervisor_watchdog::SessionHandle;
 const MAGIC: [u8; 8] = *b"NIPCBTR1";
 const VERSION: u16 = 1;
 const EXEC_TRAP_HELD: u16 = 2;
-pub(super) const BROKER_TRACE_REPORT_BYTES: usize = 224;
+pub(in crate::backend::macos::supervisor) const BROKER_TRACE_REPORT_BYTES: usize = 224;
 pub(in crate::backend::macos) const BROKER_RESUME_BYTE: [u8; 1] = [1];
 
 /// Exact canonical plan facts allowed in the broker's one-shot trace report.
@@ -309,7 +308,6 @@ pub(in crate::backend::macos) enum BrokerTraceReportError {
     Io(i32),
 }
 
-#[cfg(test)]
 pub(in crate::backend::macos::supervisor) fn encode_broker_trace_report(
     binding: BrokerTraceReportBinding,
 ) -> Result<[u8; BROKER_TRACE_REPORT_BYTES], BrokerTraceReportError> {
@@ -332,7 +330,6 @@ pub(in crate::backend::macos::supervisor) fn encode_broker_trace_report(
     Ok(bytes)
 }
 
-#[cfg(test)]
 pub(in crate::backend::macos::supervisor) fn finish_broker_trace_report(
     stream: &UnixStream,
 ) -> Result<(), BrokerTraceReportError> {

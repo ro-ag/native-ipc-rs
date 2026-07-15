@@ -5,9 +5,13 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Instant;
 
+use super::super::SupervisorWireError;
+use super::super::auth_adapter::broker_report::{BROKER_RESUME_BYTE, encode_broker_trace_report};
 use super::{
-    ActiveBrokerGate, ActiveBrokerProcess, EAGAIN, EINTR, F_GETFL, F_SETFL, O_NONBLOCK, fcntl,
-    last_errno,
+    ActiveBrokerGate, ActiveBrokerProcess, BrokerEntryError, BrokerGateExit, EAGAIN, EINTR,
+    F_GETFL, F_SETFL, O_NONBLOCK, ensure_deadline_live, fcntl,
+    finish_trace_report_before_authority, last_errno, read_resume_commit,
+    require_resume_commit_eof, set_nonblocking, write_control_while_dormant,
 };
 use crate::backend::macos::bootstrap::{TaskAuditIdentity, capture_task_audit_identity};
 
@@ -55,6 +59,7 @@ enum ExactPhase {
     AwaitingExecTrap,
     ObservedTracedStop,
     ExecTrapHeld,
+    RunningTarget,
     Reaped,
 }
 
@@ -90,6 +95,24 @@ pub(super) struct AwaitingExecTrap {
 pub(super) struct ExecTrapHeld {
     inner: Option<ExactLauncher>,
     _after_exec: TaskAuditIdentity,
+}
+
+/// Exact exec-trap authority after its canonical FD5 report reached service.
+#[must_use = "the reported target must receive Ready-bound resume or exact-clean"]
+pub(super) struct ReportedExecTrapHeld {
+    inner: Option<ExactLauncher>,
+}
+
+/// Exact exec-trap authority after the canonical Ready-bound RESUME commit.
+#[must_use = "the committed target must resume exactly once or exact-clean"]
+pub(super) struct ReadyCommittedExecTrap {
+    inner: Option<ExactLauncher>,
+}
+
+/// Exact traced target running only after successful Ready delivery.
+#[must_use = "the running target must retain broker cleanup authority"]
+pub(super) struct ResumedTarget {
+    inner: Option<ExactLauncher>,
 }
 
 impl SpawnedLauncher {
@@ -190,6 +213,95 @@ impl AwaitingExecTrap {
 }
 
 impl ExecTrapHeld {
+    pub(super) fn report_trace_stops(
+        mut self,
+    ) -> Result<Result<ReportedExecTrapHeld, BrokerGateExit>, BrokerEntryError> {
+        let mut inner = self.inner.take().unwrap_or_else(|| std::process::abort());
+        let deadline = inner.deadline();
+        ensure_deadline_live(Some(deadline))?;
+        let bytes = encode_broker_trace_report(inner.active.plan.trace_report_binding())
+            .map_err(|error| BrokerEntryError::Plan(error.into()))?;
+        let gate_fd = inner.active.gate.reader.as_raw_fd();
+        set_nonblocking(gate_fd, true)?;
+        if write_control_while_dormant(&mut inner.active.trace, gate_fd, &bytes, deadline)?
+            .is_some()
+        {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        if let Some(exit) = finish_trace_report_before_authority(&inner.active.trace, gate_fd)? {
+            return Ok(Err(exit));
+        }
+        Ok(Ok(ReportedExecTrapHeld { inner: Some(inner) }))
+    }
+
+    #[cfg(test)]
+    fn exact_pid_for_test(&self) -> c_int {
+        self.inner
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .pid
+    }
+
+    #[cfg(test)]
+    fn wait_for_gate_eof_for_test(&self) {
+        let inner = self.inner.as_ref().unwrap_or_else(|| std::process::abort());
+        loop {
+            match probe_gate(inner.gate()) {
+                Err(LauncherWaitError::ServiceGone) => return,
+                Ok(()) => poll_gate_slice(inner.gate()).unwrap(),
+                Err(error) => panic!("unexpected gate probe failure: {error:?}"),
+            }
+        }
+    }
+}
+
+impl ReportedExecTrapHeld {
+    pub(super) fn wait_for_ready_commit(
+        mut self,
+    ) -> Result<Result<ReadyCommittedExecTrap, BrokerGateExit>, BrokerEntryError> {
+        let mut inner = self.inner.take().unwrap_or_else(|| std::process::abort());
+        let gate_fd = inner.active.gate.reader.as_raw_fd();
+        let mut resume = [0_u8; 1];
+        if read_resume_commit(&mut inner.active.trace, gate_fd, &mut resume)?.is_some() {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        if resume != BROKER_RESUME_BYTE {
+            return Err(BrokerEntryError::Plan(SupervisorWireError::Malformed));
+        }
+        if require_resume_commit_eof(&mut inner.active.trace, gate_fd)?.is_some() {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        Ok(Ok(ReadyCommittedExecTrap { inner: Some(inner) }))
+    }
+}
+
+impl ReadyCommittedExecTrap {
+    pub(super) fn resume_target(mut self) -> Result<ResumedTarget, LauncherWaitError> {
+        let mut inner = self.inner.take().unwrap_or_else(|| std::process::abort());
+        // The commit token is freely delayable, so service liveness must be
+        // sampled at the effect boundary rather than only when it was minted.
+        probe_gate(inner.gate())?;
+        // Successful Ready delivery is the final deadline commit. This exact
+        // continuation therefore performs no second clock veto.
+        // SAFETY: the retained sole waiter holds the exact target at its
+        // verified exec trap; Darwin address 1 resumes at the current PC.
+        if unsafe {
+            ptrace(
+                PT_CONTINUE,
+                inner.pid,
+                std::ptr::without_provenance_mut::<c_void>(1),
+                0,
+            )
+        } != 0
+        {
+            return Err(LauncherWaitError::Native(last_errno()));
+        }
+        inner.phase = ExactPhase::RunningTarget;
+        Ok(ResumedTarget { inner: Some(inner) })
+    }
+}
+
+impl ResumedTarget {
     #[cfg(test)]
     fn exact_pid_for_test(&self) -> c_int {
         self.inner
@@ -333,7 +445,9 @@ impl Drop for ExactLauncher {
         match self.phase {
             ExactPhase::AwaitingInitialStop => exact_signal(self.pid, SIGKILL),
             ExactPhase::UnprovenInitialStop => exact_signal(self.pid, SIGKILL),
-            ExactPhase::AwaitingExecTrap => exact_signal(self.pid, SIGSTOP),
+            ExactPhase::AwaitingExecTrap | ExactPhase::RunningTarget => {
+                exact_signal(self.pid, SIGSTOP)
+            }
             ExactPhase::ObservedTracedStop | ExactPhase::ExecTrapHeld => {
                 exact_ptrace_kill(self.pid)
             }
