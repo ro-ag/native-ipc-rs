@@ -9,6 +9,7 @@ use super::super::{
     SupervisorDeadlineBinding, SupervisorWireError, TargetEnvironmentEntry, validate_component,
     validate_environment_key, validate_installed_executable, validate_policy_id,
 };
+use super::broker_report::BrokerTraceReportBinding;
 use super::{PendingSpawnReply, SessionAssignedSpawn};
 
 const MAGIC: [u8; 8] = *b"NIPCBP01";
@@ -58,6 +59,7 @@ pub(super) struct BrokerPlanStageError {
 pub(in crate::backend::macos::supervisor) struct ReceivedBrokerLaunchPlan {
     plan: BrokerLaunchPlan,
     deadline: SupervisorDeadlineBinding,
+    digest: [u8; 32],
 }
 
 /// Exact-parent FD4 plan whose complete-frame ACK was written before START.
@@ -65,12 +67,14 @@ pub(in crate::backend::macos::supervisor) struct ReceivedBrokerLaunchPlan {
 pub(in crate::backend::macos::supervisor) struct AcknowledgedBrokerLaunchPlan {
     plan: BrokerLaunchPlan,
     deadline: SupervisorDeadlineBinding,
+    digest: [u8; 32],
 }
 
 /// Plan whose acknowledged FD4 staging was followed by exact FD3 activation.
 pub(in crate::backend::macos::supervisor) struct ExactParentBrokerLaunchPlan {
     plan: BrokerLaunchPlan,
     deadline: SupervisorDeadlineBinding,
+    digest: [u8; 32],
 }
 
 pub(in crate::backend::macos::supervisor) struct BrokerPlanPrefix {
@@ -139,12 +143,7 @@ impl StagedBrokerSpawn {
         image: &super::broker_spawn::InstalledBrokerImage,
         wait_domain: &mut super::DedicatedChildWaitDomain,
     ) -> Result<
-        PendingSpawnReply<
-            super::super::super::supervisor_watchdog::AtomicallySpawnedBroker<
-                super::super::ValidatedSpawn,
-                super::broker_spawn::DirectChildBrokerAuthority,
-            >,
-        >,
+        super::broker_spawn::PendingFixedImageBroker,
         Box<PendingSpawnReply<super::broker_spawn::BrokerSpawnError>>,
     > {
         super::broker_spawn::spawn_staged_broker(self, image, wait_domain)
@@ -188,7 +187,11 @@ impl ReceivedBrokerLaunchPlan {
         if plan.deadline != deadline.wire() {
             return Err(SupervisorWireError::ReplayOrSubstitution);
         }
-        Ok(Self { plan, deadline })
+        Ok(Self {
+            plan,
+            deadline,
+            digest: broker_plan_digest(bytes),
+        })
     }
 
     pub(in crate::backend::macos::supervisor) const fn deadline(
@@ -211,6 +214,7 @@ impl ReceivedBrokerLaunchPlan {
         AcknowledgedBrokerLaunchPlan {
             plan: self.plan,
             deadline: self.deadline,
+            digest: self.digest,
         }
     }
 }
@@ -232,17 +236,27 @@ impl AcknowledgedBrokerLaunchPlan {
         ExactParentBrokerLaunchPlan {
             plan: self.plan,
             deadline: self.deadline,
+            digest: self.digest,
         }
     }
 }
 
 impl ExactParentBrokerLaunchPlan {
-    pub(super) const fn deadline(&self) -> SupervisorDeadlineBinding {
+    pub(in crate::backend::macos::supervisor) const fn deadline(
+        &self,
+    ) -> SupervisorDeadlineBinding {
         self.deadline
     }
 
     pub(super) fn into_plan(self) -> BrokerLaunchPlan {
         self.plan
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::macos::supervisor) fn trace_report_binding(
+        &self,
+    ) -> BrokerTraceReportBinding {
+        self.plan.trace_report_binding(self.digest)
     }
 }
 
@@ -272,14 +286,40 @@ pub(in crate::backend::macos::supervisor) fn broker_plan_ack(
 ) -> [u8; BROKER_ACK_BYTES] {
     let mut ack = [0_u8; BROKER_ACK_BYTES];
     ack[..8].copy_from_slice(&ACK_MAGIC);
-    let mut hasher = Sha256::new();
-    hasher.update(ACK_DOMAIN);
-    hasher.update(frame);
-    ack[8..].copy_from_slice(&hasher.finalize());
+    ack[8..].copy_from_slice(&broker_plan_digest(frame));
     ack
 }
 
+pub(in crate::backend::macos::supervisor) fn broker_plan_digest(frame: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ACK_DOMAIN);
+    hasher.update(frame);
+    hasher.finalize().into()
+}
+
+pub(super) fn trace_report_binding_from_frame(
+    frame: &[u8],
+) -> Result<BrokerTraceReportBinding, SupervisorWireError> {
+    let plan = BrokerLaunchPlan::decode_untrusted(frame)?;
+    Ok(plan.trace_report_binding(broker_plan_digest(frame)))
+}
+
 impl BrokerLaunchPlan {
+    fn trace_report_binding(&self, plan_digest: [u8; 32]) -> BrokerTraceReportBinding {
+        BrokerTraceReportBinding::new(
+            self.deadline,
+            self.connection_generation,
+            self.sequence,
+            self.effective_uid,
+            self.effective_gid,
+            self.session,
+            self.client_nonce,
+            self.service_nonce,
+            self.target_identity,
+            plan_digest,
+        )
+    }
+
     fn encode(&self) -> Result<Vec<u8>, SupervisorWireError> {
         self.validate()?;
         let mut bytes = vec![0_u8; HEADER_BYTES];

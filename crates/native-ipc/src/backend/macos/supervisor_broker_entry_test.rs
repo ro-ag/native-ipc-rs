@@ -1,11 +1,12 @@
 use std::ffi::{OsStr, OsString, c_int};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use static_assertions::assert_not_impl_any;
 
@@ -18,10 +19,34 @@ const EXACT_TEST: &str =
 unsafe extern "C" {
     fn close(fd: c_int) -> c_int;
     fn dup2(source: c_int, destination: c_int) -> c_int;
+    fn pipe(descriptors: *mut c_int) -> c_int;
 }
 
 assert_not_impl_any!(DormantBrokerGate: Clone, Copy);
 assert_not_impl_any!(ActiveBrokerGate: Clone, Copy);
+
+#[test]
+fn post_report_gate_eof_wins_before_reported_authority() {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors has storage for the two pipe descriptors.
+    assert_eq!(unsafe { pipe(descriptors.as_mut_ptr()) }, 0);
+    // SAFETY: successful pipe returned two distinct owned descriptors.
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: successful pipe returned two distinct owned descriptors.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    set_nonblocking(reader.as_raw_fd(), true).unwrap();
+    let (trace, _service) = UnixStream::pair().unwrap();
+
+    drop(writer);
+    assert_eq!(
+        finish_trace_report_before_authority(
+            &trace,
+            reader.as_raw_fd(),
+            Instant::now() + Duration::from_secs(1),
+        ),
+        Ok(Some(BrokerGateExit::ServiceGone))
+    );
+}
 
 fn spawn_helper(mode: &str) -> Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -60,6 +85,7 @@ fn fixed_arguments_accept_only_the_installed_vector() {
         OsStr::new(INSTALLED_BROKER_MODE),
         OsStr::new(INSTALLED_GATE_ARGUMENT),
         OsStr::new(INSTALLED_CONTROL_ARGUMENT),
+        OsStr::new(INSTALLED_TRACE_ARGUMENT),
     ];
     assert_eq!(validate_fixed_arguments(exact), Ok(()));
 
@@ -69,29 +95,34 @@ fn fixed_arguments_accept_only_the_installed_vector() {
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
+            OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from("--other-mode"),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
+            OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from("--gate-fd=4"),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
-        ],
-        vec![
-            OsString::from(INSTALLED_BROKER_PATH),
-            OsString::from(INSTALLED_BROKER_MODE),
-            OsString::from(INSTALLED_GATE_ARGUMENT),
+            OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
+        ],
+        vec![
+            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(INSTALLED_BROKER_MODE),
+            OsString::from(INSTALLED_GATE_ARGUMENT),
+            OsString::from(INSTALLED_CONTROL_ARGUMENT),
+            OsString::from(INSTALLED_TRACE_ARGUMENT),
             OsString::from("extra"),
         ],
     ];

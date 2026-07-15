@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
+use super::supervisor::auth_adapter::broker_report::AuthenticatedBrokerTraceReport;
 use super::supervisor::{ConnectionIdentity, ValidatedSpawn};
 
 const MAX_LIVE_SESSIONS: usize = 64;
@@ -74,10 +75,11 @@ struct RegisteredLaunch<Launch> {
 /// clean-exec spawner must create this value internally at the point where it
 /// obtains the exact unreaped child authority. This prevents callers from
 /// pairing one authenticated launch with another request's broker.
-pub(super) struct AtomicallySpawnedBroker<Launch, Authority: ExactBrokerAuthority> {
+pub(super) struct AtomicallySpawnedBroker<Launch, Authority: ExactBrokerAuthority, Report = ()> {
     session: FreshSessionId,
     launch: Launch,
     broker: ExactBroker<Authority>,
+    report: Report,
 }
 
 impl<Launch, Authority: ExactBrokerAuthority> AtomicallySpawnedBroker<Launch, Authority> {
@@ -91,11 +93,35 @@ impl<Launch, Authority: ExactBrokerAuthority> AtomicallySpawnedBroker<Launch, Au
             session,
             launch,
             broker,
+            report: (),
         }
     }
+}
 
-    fn into_parts(self) -> (FreshSessionId, Launch, ExactBroker<Authority>) {
-        (self.session, self.launch, self.broker)
+#[cfg(test)]
+impl<Launch, Authority: ExactBrokerAuthority, Report>
+    AtomicallySpawnedBroker<Launch, Authority, Report>
+{
+    pub(super) unsafe fn from_test_atomic_spawn_with_report(
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+        report: Report,
+    ) -> Self {
+        Self {
+            session,
+            launch,
+            broker,
+            report,
+        }
+    }
+}
+
+impl<Launch, Authority: ExactBrokerAuthority, Report>
+    AtomicallySpawnedBroker<Launch, Authority, Report>
+{
+    fn into_parts(self) -> (FreshSessionId, Launch, ExactBroker<Authority>, Report) {
+        (self.session, self.launch, self.broker, self.report)
     }
 }
 
@@ -103,16 +129,18 @@ impl
     AtomicallySpawnedBroker<
         ValidatedSpawn,
         super::supervisor::auth_adapter::broker_spawn::DirectChildBrokerAuthority,
+        super::supervisor::auth_adapter::broker_report::BrokerTraceReportReceiver,
     >
 {
     pub(super) fn from_fixed_image_spawn(
         spawned: super::supervisor::auth_adapter::broker_spawn::FixedImageBrokerSpawn,
     ) -> Self {
-        let (session, launch, broker) = spawned.into_parts();
+        let (session, launch, broker, report) = spawned.into_parts();
         Self {
             session,
             launch,
             broker,
+            report,
         }
     }
 }
@@ -132,18 +160,19 @@ impl<Launch> RegisteredLaunch<Launch> {
 }
 
 /// Registration result separating the copyable client handle from launch authority.
-struct RegisteredSession<Launch> {
+struct RegisteredSession<Launch, Report = ()> {
     handle: SessionHandle,
     launch: RegisteredLaunch<Launch>,
+    report: Report,
 }
 
-impl<Launch> RegisteredSession<Launch> {
+impl<Launch, Report> RegisteredSession<Launch, Report> {
     const fn handle(&self) -> SessionHandle {
         self.handle
     }
 
-    fn into_launch(self) -> RegisteredLaunch<Launch> {
-        self.launch
+    fn into_parts(self) -> (RegisteredLaunch<Launch>, Report) {
+        (self.launch, self.report)
     }
 }
 
@@ -374,10 +403,20 @@ impl TraceEstablished {
         self.connection
     }
 
+    pub(super) const fn from_authenticated_broker_report(
+        report: AuthenticatedBrokerTraceReport,
+    ) -> Self {
+        Self {
+            handle: report.handle(),
+            connection: report.connection(),
+        }
+    }
+
     /// # Safety
     ///
     /// The sole broker waiter must have established tracing and consumed both
     /// trusted-launcher stops for `handle` under `connection`.
+    #[cfg(test)]
     pub(super) const unsafe fn from_broker_handshake(
         handle: SessionHandle,
         connection: ConnectionIdentity,
@@ -435,11 +474,12 @@ pub(super) struct WatchdogTable<Authority: ExactBrokerAuthority> {
 /// progressing while preventing this exact launch from escaping cleanup. Every
 /// abandonment path emergency exact-cleans the bound broker.
 #[must_use = "a registered spawn must reach Ready or exact-clean its broker"]
-pub(super) struct PendingRegisteredSession<Launch, Authority: ExactBrokerAuthority> {
+pub(super) struct PendingRegisteredSession<Launch, Authority: ExactBrokerAuthority, Report = ()> {
     entry: Rc<RefCell<WatchdogEntry<Authority>>>,
     handle: SessionHandle,
     connection: ConnectionIdentity,
     launch: Option<RegisteredLaunch<Launch>>,
+    report: Option<Report>,
     trace: Option<TraceEstablished>,
     cleanup_reason: TerminationReason,
     armed: bool,
@@ -511,7 +551,9 @@ impl<Launch, Authority: ExactBrokerAuthority> RegisteredLaunchPermit<'_, Launch,
     }
 }
 
-impl<Launch, Authority: ExactBrokerAuthority> PendingRegisteredSession<Launch, Authority> {
+impl<Launch, Authority: ExactBrokerAuthority, Report>
+    PendingRegisteredSession<Launch, Authority, Report>
+{
     pub(super) const fn handle(&self) -> SessionHandle {
         self.handle
     }
@@ -553,8 +595,62 @@ impl<Launch, Authority: ExactBrokerAuthority> PendingRegisteredSession<Launch, A
         })
     }
 
+    pub(super) fn report_mut(&mut self) -> Result<&mut Report, WatchdogStateError> {
+        if !self.armed {
+            std::process::abort();
+        }
+        let entry = self
+            .entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != self.handle || entry.connection != self.connection {
+            std::process::abort();
+        }
+        if entry.phase != BrokerPhase::Starting {
+            return Err(WatchdogStateError::InvalidTransition);
+        }
+        if Instant::now() >= entry.deadline {
+            drop(entry);
+            self.cleanup_reason = TerminationReason::DeadlineExpired;
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
+        drop(entry);
+        self.report
+            .as_mut()
+            .ok_or(WatchdogStateError::InvalidTransition)
+    }
+
+    pub(super) fn consume_report(&mut self) -> Result<Report, WatchdogStateError> {
+        if !self.armed {
+            std::process::abort();
+        }
+        let entry = self
+            .entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != self.handle || entry.connection != self.connection {
+            std::process::abort();
+        }
+        if entry.phase != BrokerPhase::Starting {
+            return Err(WatchdogStateError::InvalidTransition);
+        }
+        if Instant::now() >= entry.deadline {
+            drop(entry);
+            self.cleanup_reason = TerminationReason::DeadlineExpired;
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
+        drop(entry);
+        self.report
+            .take()
+            .ok_or(WatchdogStateError::InvalidTransition)
+    }
+
     pub(super) fn mark_protocol_violation(&mut self) {
         self.cleanup_reason = TerminationReason::ProtocolViolation;
+    }
+
+    pub(super) fn mark_deadline_expired(&mut self) {
+        self.cleanup_reason = TerminationReason::DeadlineExpired;
     }
 
     pub(super) fn bind_trace(&mut self, trace: TraceEstablished) -> Result<(), TraceEstablished> {
@@ -580,7 +676,9 @@ impl<Launch, Authority: ExactBrokerAuthority> PendingRegisteredSession<Launch, A
     }
 }
 
-impl<Launch, Authority: ExactBrokerAuthority> Drop for PendingRegisteredSession<Launch, Authority> {
+impl<Launch, Authority: ExactBrokerAuthority, Report> Drop
+    for PendingRegisteredSession<Launch, Authority, Report>
+{
     fn drop(&mut self) {
         if self.armed {
             emergency_terminate_entry(
@@ -591,6 +689,7 @@ impl<Launch, Authority: ExactBrokerAuthority> Drop for PendingRegisteredSession<
             );
             self.armed = false;
         }
+        drop(self.report.take());
     }
 }
 
@@ -684,12 +783,12 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
     }
 
     /// Registers authority before a broker or untrusted target may run.
-    fn register<Launch: RegisteredLaunchEffect>(
+    fn register<Launch: RegisteredLaunchEffect, Report>(
         &mut self,
-        spawned: AtomicallySpawnedBroker<Launch, Authority>,
-    ) -> Result<RegisteredSession<Launch>, WatchdogStateError> {
+        spawned: AtomicallySpawnedBroker<Launch, Authority, Report>,
+    ) -> Result<RegisteredSession<Launch, Report>, WatchdogStateError> {
         self.sweep_reaped();
-        let (session, launch, broker) = spawned.into_parts();
+        let (session, launch, broker, report) = spawned.into_parts();
         if self.live.len() >= MAX_LIVE_SESSIONS
             || self.live.len().saturating_add(self.tombstones.len())
                 >= MAX_SESSIONS_PER_SERVICE_GENERATION
@@ -725,6 +824,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 TerminationReason::DeadlineExpired,
             );
             self.sweep_reaped();
+            drop(report);
             return Err(WatchdogStateError::DeadlineExpired);
         }
         let activation = self
@@ -751,6 +851,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 TerminationReason::LaunchAbandoned,
             );
             self.sweep_reaped();
+            drop(report);
             return Err(WatchdogStateError::BrokerActivationFailed);
         }
         Ok(RegisteredSession {
@@ -761,16 +862,17 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 deadline,
                 launch,
             },
+            report,
         })
     }
 
-    pub(super) fn register_armed<Launch: RegisteredLaunchEffect>(
+    pub(super) fn register_armed<Launch: RegisteredLaunchEffect, Report>(
         &mut self,
-        spawned: AtomicallySpawnedBroker<Launch, Authority>,
-    ) -> Result<PendingRegisteredSession<Launch, Authority>, WatchdogStateError> {
+        spawned: AtomicallySpawnedBroker<Launch, Authority, Report>,
+    ) -> Result<PendingRegisteredSession<Launch, Authority, Report>, WatchdogStateError> {
         let registered = self.register(spawned)?;
         let handle = registered.handle();
-        let launch = registered.into_launch();
+        let (launch, report) = registered.into_parts();
         let connection = launch.connection();
         let entry = Rc::clone(
             self.live
@@ -782,6 +884,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
             handle,
             connection,
             launch: Some(launch),
+            report: Some(report),
             trace: None,
             cleanup_reason: TerminationReason::LaunchAbandoned,
             armed: true,

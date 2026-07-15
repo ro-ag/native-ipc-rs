@@ -4,7 +4,9 @@
 //! broker spawner. Crossing the gate does not authorize a launcher, target,
 //! path, PID, signal, task port, or filesystem operation. A future broker
 //! control channel must bind a separately staged canonical launch plan to the
-//! exact service child and watchdog session before this gate is released.
+//! exact service child and watchdog session before this gate is released. A
+//! separate fixed report channel can return only the exact plan binding after
+//! a future native broker loop consumes both trusted-launcher stops.
 
 use std::ffi::{OsStr, c_int, c_void};
 use std::fs::File;
@@ -21,9 +23,12 @@ use super::auth_adapter::broker_plan::{
     ExactParentBrokerLaunchPlan, MAX_BROKER_PLAN_BYTES, ReceivedBrokerLaunchPlan, broker_plan_ack,
     parse_broker_plan_prefix,
 };
+#[cfg(test)]
+use super::auth_adapter::broker_report::{encode_broker_trace_report, finish_broker_trace_report};
 use super::auth_adapter::broker_spawn::{
-    BROKER_CONTROL_FD, BROKER_GATE_FD, INSTALLED_BROKER_MODE, INSTALLED_BROKER_PATH,
-    INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT, START_BYTE,
+    BROKER_CONTROL_FD, BROKER_GATE_FD, BROKER_TRACE_FD, INSTALLED_BROKER_MODE,
+    INSTALLED_BROKER_PATH, INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT,
+    INSTALLED_TRACE_ARGUMENT, START_BYTE,
 };
 
 const F_GETFD: c_int = 1;
@@ -81,6 +86,8 @@ pub(super) enum BrokerEntryError {
     InvalidGate,
     /// Descriptor 4 was absent or was not a bidirectional Unix stream socket.
     InvalidControl,
+    /// Descriptor 5 was absent or was not the fixed trace-report Unix stream.
+    InvalidTrace,
     /// A descriptor operation failed with this Darwin error number.
     Descriptor(c_int),
     /// A blocking gate read failed with this Darwin error number.
@@ -113,16 +120,26 @@ pub(super) struct DormantBrokerGate {
 pub(super) struct DormantBrokerProcess {
     gate: DormantBrokerGate,
     control: UnixStream,
+    trace: UnixStream,
 }
 
 /// ACKed plan retained inseparably with the still-dormant gate.
 pub(super) struct StagedDormantBroker {
     gate: DormantBrokerGate,
     plan: AcknowledgedBrokerLaunchPlan,
+    trace: UnixStream,
 }
 
 /// Exact plan authority minted only by the later sole FD3 START observation.
 pub(super) struct ActiveBrokerProcess {
+    pub(super) gate: ActiveBrokerGate,
+    pub(super) plan: ExactParentBrokerLaunchPlan,
+    trace: UnixStream,
+}
+
+/// Broker whose one exact exec-trap report has reached the service channel.
+#[cfg(test)]
+pub(super) struct ReportedActiveBroker {
     pub(super) gate: ActiveBrokerGate,
     pub(super) plan: ExactParentBrokerLaunchPlan,
 }
@@ -150,8 +167,15 @@ impl DormantBrokerGate {
         // 3 and 4 in this just-execed process.
         let gate = unsafe { Self::adopt_fixed_gate() }?;
         // SAFETY: the same fixed process ABI transfers sole ownership of FD4.
-        let control = unsafe { adopt_fixed_control() }?;
-        Ok(DormantBrokerProcess { gate, control })
+        let control =
+            unsafe { adopt_fixed_socket(BROKER_CONTROL_FD, BrokerEntryError::InvalidControl) }?;
+        // SAFETY: same fixed ABI transfers sole ownership of FD5.
+        let trace = unsafe { adopt_fixed_socket(BROKER_TRACE_FD, BrokerEntryError::InvalidTrace) }?;
+        Ok(DormantBrokerProcess {
+            gate,
+            control,
+            trace,
+        })
     }
 
     /// Waits for the sole exact activation byte or service-death EOF.
@@ -249,7 +273,20 @@ impl DormantBrokerProcess {
         control
             .set_nonblocking(true)
             .map_err(|error| BrokerEntryError::Descriptor(error.raw_os_error().unwrap_or(0)))?;
-        Ok(Self { gate, control })
+        // SAFETY: the same child installs a private Unix stream at FD5.
+        if unsafe { fcntl(BROKER_TRACE_FD, F_GETFD) } < 0 {
+            return Err(BrokerEntryError::InvalidTrace);
+        }
+        // SAFETY: the test spawn transfers sole ownership of live FD5.
+        let trace = UnixStream::from(unsafe { OwnedFd::from_raw_fd(BROKER_TRACE_FD) });
+        trace
+            .set_nonblocking(true)
+            .map_err(|error| BrokerEntryError::Descriptor(error.raw_os_error().unwrap_or(0)))?;
+        Ok(Self {
+            gate,
+            control,
+            trace,
+        })
     }
 
     /// Receives exactly one bounded frame while FD3 remains dormant, validates
@@ -327,6 +364,7 @@ impl DormantBrokerProcess {
         Ok(Ok(StagedDormantBroker {
             gate: self.gate,
             plan,
+            trace: self.trace,
         }))
     }
 }
@@ -343,7 +381,11 @@ impl StagedDormantBroker {
                 // SAFETY: wait_for_activation consumed the sole exact START
                 // byte after this plan's ACK and rejected any extra byte.
                 let plan = unsafe { self.plan.activate() };
-                Ok(Ok(ActiveBrokerProcess { gate, plan }))
+                Ok(Ok(ActiveBrokerProcess {
+                    gate,
+                    plan,
+                    trace: self.trace,
+                }))
             }
         }
     }
@@ -416,13 +458,16 @@ fn poll_gate_until(fd: c_int, deadline: Instant) -> Result<(), BrokerEntryError>
     }
 }
 
-unsafe fn adopt_fixed_control() -> Result<UnixStream, BrokerEntryError> {
+unsafe fn adopt_fixed_socket(
+    fd: c_int,
+    invalid: BrokerEntryError,
+) -> Result<UnixStream, BrokerEntryError> {
     // SAFETY: read-only liveness query before ownership construction.
-    if unsafe { fcntl(BROKER_CONTROL_FD, F_GETFD) } < 0 {
-        return Err(BrokerEntryError::InvalidControl);
+    if unsafe { fcntl(fd, F_GETFD) } < 0 {
+        return Err(invalid);
     }
     // SAFETY: F_GETFL is a read-only query on the still-unowned live FD4.
-    let flags = unsafe { fcntl(BROKER_CONTROL_FD, F_GETFL) };
+    let flags = unsafe { fcntl(fd, F_GETFL) };
     let mut socket_type: c_int = 0;
     let mut socket_type_len = u32::try_from(std::mem::size_of::<c_int>())
         .map_err(|_| BrokerEntryError::InvalidControl)?;
@@ -431,7 +476,7 @@ unsafe fn adopt_fixed_control() -> Result<UnixStream, BrokerEntryError> {
         || flags & O_ACCMODE != O_RDWR
         || unsafe {
             getsockopt(
-                BROKER_CONTROL_FD,
+                fd,
                 SOL_SOCKET,
                 SO_TYPE,
                 (&raw mut socket_type).cast(),
@@ -441,10 +486,10 @@ unsafe fn adopt_fixed_control() -> Result<UnixStream, BrokerEntryError> {
         || socket_type_len as usize != std::mem::size_of::<c_int>()
         || socket_type != SOCK_STREAM
     {
-        return Err(BrokerEntryError::InvalidControl);
+        return Err(invalid);
     }
     // SAFETY: the fixed entry contract transfers sole ownership of live FD4.
-    let owned = unsafe { OwnedFd::from_raw_fd(BROKER_CONTROL_FD) };
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let file = File::from(owned);
     let metadata = file
         .metadata()
@@ -639,6 +684,67 @@ fn poll_control_and_gate(
     }
 }
 
+impl ActiveBrokerProcess {
+    /// Emits the one canonical report only after both trusted-launcher stops.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be this plan's sole broker waiter and must have consumed
+    /// the launcher's initial `SIGSTOP` and pre-instruction exec `SIGTRAP` under
+    /// the unchanged deadline. No decoded bytes or numeric PID can satisfy that
+    /// native obligation.
+    #[cfg(test)]
+    pub(super) unsafe fn report_exact_trace_stops(
+        mut self,
+    ) -> Result<Result<ReportedActiveBroker, BrokerGateExit>, BrokerEntryError> {
+        let deadline = self.plan.deadline().local();
+        ensure_deadline_live(Some(deadline))?;
+        let bytes = encode_broker_trace_report(self.plan.trace_report_binding())
+            .map_err(|error| BrokerEntryError::Plan(error.into()))?;
+        set_nonblocking(self.gate.reader.as_raw_fd(), true)?;
+        if let Some(_exit) = write_control_while_dormant(
+            &mut self.trace,
+            self.gate.reader.as_raw_fd(),
+            &bytes,
+            deadline,
+        )? {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        if let Some(exit) = finish_trace_report_before_authority(
+            &self.trace,
+            self.gate.reader.as_raw_fd(),
+            deadline,
+        )? {
+            return Ok(Err(exit));
+        }
+        drop(self.trace);
+        set_nonblocking(self.gate.reader.as_raw_fd(), false)?;
+        Ok(Ok(ReportedActiveBroker {
+            gate: self.gate,
+            plan: self.plan,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::macos::supervisor) fn abandon_trace_for_test(self) -> ActiveBrokerGate {
+        self.gate
+    }
+}
+
+#[cfg(test)]
+fn finish_trace_report_before_authority(
+    trace: &UnixStream,
+    gate_fd: c_int,
+    deadline: Instant,
+) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
+    finish_broker_trace_report(trace).map_err(|error| BrokerEntryError::Plan(error.into()))?;
+    if probe_dormant_gate(gate_fd)?.is_some() {
+        return Ok(Some(BrokerGateExit::ServiceGone));
+    }
+    ensure_deadline_live(Some(deadline))?;
+    Ok(None)
+}
+
 impl ActiveBrokerGate {
     /// Blocks until service-death EOF. Any further byte is a protocol failure.
     pub(super) fn wait_for_service_death(self) -> Result<BrokerGateExit, BrokerEntryError> {
@@ -702,8 +808,10 @@ pub(in crate::backend::macos) unsafe fn run_fixed_gate_process() -> ! {
                 )) => 0,
                 Err(_) => 65,
                 Ok(Ok(active)) => {
-                    let _plan = active.plan;
-                    match active.gate.wait_for_service_death() {
+                    let ActiveBrokerProcess { gate, plan, trace } = active;
+                    let _plan = plan;
+                    drop(trace);
+                    match gate.wait_for_service_death() {
                         Ok(BrokerGateExit::ServiceGone) => 0,
                         Ok(BrokerGateExit::ServiceGoneBeforeActivation) => 66,
                         Err(_) => 65,
@@ -727,6 +835,7 @@ fn validate_fixed_arguments(
         INSTALLED_BROKER_MODE.as_bytes(),
         INSTALLED_GATE_ARGUMENT.as_bytes(),
         INSTALLED_CONTROL_ARGUMENT.as_bytes(),
+        INSTALLED_TRACE_ARGUMENT.as_bytes(),
     ];
     for expected in expected {
         let Some(argument) = arguments.next() else {

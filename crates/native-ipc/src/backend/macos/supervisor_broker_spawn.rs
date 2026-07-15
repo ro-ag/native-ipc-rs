@@ -16,8 +16,16 @@ use super::super::super::supervisor_watchdog::{
 use super::super::ValidatedSpawn;
 #[cfg(test)]
 use super::SessionAssignedSpawn;
+use super::broker_plan::trace_report_binding_from_frame;
 use super::broker_plan::{BROKER_ACK_BYTES, StagedBrokerSpawn, broker_plan_ack};
+use super::broker_report::BrokerTraceReportReceiver;
 use super::{DedicatedChildWaitDomain, PendingSpawnReply};
+
+pub(super) type FixedImageAtomicBroker =
+    AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority, BrokerTraceReportReceiver>;
+pub(super) type PendingFixedImageBroker = PendingSpawnReply<FixedImageAtomicBroker>;
+type FixedImageSpawnResult =
+    Result<PendingFixedImageBroker, Box<PendingSpawnReply<BrokerSpawnError>>>;
 
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
@@ -27,12 +35,14 @@ pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_PATH: &str =
 pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
 pub(in crate::backend::macos::supervisor) const INSTALLED_CONTROL_ARGUMENT: &str = "--control-fd=4";
+pub(in crate::backend::macos::supervisor) const INSTALLED_TRACE_ARGUMENT: &str = "--trace-fd=5";
 const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
 const CANONICAL_LANG: &str = "LANG=C";
 const CANONICAL_LOCALE: &str = "LC_ALL=C";
 
 pub(in crate::backend::macos::supervisor) const BROKER_GATE_FD: c_int = 3;
 pub(in crate::backend::macos::supervisor) const BROKER_CONTROL_FD: c_int = 4;
+pub(in crate::backend::macos::supervisor) const BROKER_TRACE_FD: c_int = 5;
 const STABLE_FD_MINIMUM: c_int = 10;
 pub(in crate::backend::macos::supervisor) const START_BYTE: [u8; 1] = [1];
 
@@ -131,6 +141,7 @@ pub(in crate::backend::macos::supervisor) struct InstalledBrokerImage {
     mode: CString,
     gate_argument: CString,
     control_argument: CString,
+    trace_argument: CString,
     environment_path: CString,
     environment_lang: CString,
     environment_locale: CString,
@@ -150,18 +161,20 @@ impl InstalledBrokerImage {
             mode: fixed_cstring(INSTALLED_BROKER_MODE)?,
             gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT)?,
             control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT)?,
+            trace_argument: fixed_cstring(INSTALLED_TRACE_ARGUMENT)?,
             environment_path: fixed_cstring(CANONICAL_PATH)?,
             environment_lang: fixed_cstring(CANONICAL_LANG)?,
             environment_locale: fixed_cstring(CANONICAL_LOCALE)?,
         })
     }
 
-    fn argv(&self) -> [*mut c_char; 5] {
+    fn argv(&self) -> [*mut c_char; 6] {
         [
             self.path.as_ptr().cast_mut(),
             self.mode.as_ptr().cast_mut(),
             self.gate_argument.as_ptr().cast_mut(),
             self.control_argument.as_ptr().cast_mut(),
+            self.trace_argument.as_ptr().cast_mut(),
             std::ptr::null_mut(),
         ]
     }
@@ -333,6 +346,7 @@ pub(in crate::backend::macos) struct FixedImageBrokerSpawn {
     session: FreshSessionId,
     launch: ValidatedSpawn,
     broker: ExactBroker<DirectChildBrokerAuthority>,
+    report: BrokerTraceReportReceiver,
 }
 
 impl FixedImageBrokerSpawn {
@@ -342,8 +356,9 @@ impl FixedImageBrokerSpawn {
         FreshSessionId,
         ValidatedSpawn,
         ExactBroker<DirectChildBrokerAuthority>,
+        BrokerTraceReportReceiver,
     ) {
-        (self.session, self.launch, self.broker)
+        (self.session, self.launch, self.broker, self.report)
     }
 }
 
@@ -354,10 +369,7 @@ pub(super) fn spawn_staged_broker(
     staged: StagedBrokerSpawn,
     image: &InstalledBrokerImage,
     wait_domain: &mut DedicatedChildWaitDomain,
-) -> Result<
-    PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority>>,
-    Box<PendingSpawnReply<BrokerSpawnError>>,
-> {
+) -> FixedImageSpawnResult {
     let (pending, frame) = staged.into_spawn_parts();
     let PendingSpawnReply {
         reply,
@@ -366,7 +378,18 @@ pub(super) fn spawn_staged_broker(
         output,
     } = pending;
     let deadline = output.spawn.deadline();
-    let (broker, control) = match spawn_fixed_image_with_control(image, wait_domain) {
+    let expected_report = match trace_report_binding_from_frame(&frame) {
+        Ok(binding) => binding,
+        Err(_) => {
+            return Err(Box::new(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output: BrokerSpawnError::ControlProtocol,
+            }));
+        }
+    };
+    let (broker, control, trace) = match spawn_fixed_image_with_control(image, wait_domain) {
         Ok(spawned) => spawned,
         Err(error) => {
             return Err(Box::new(PendingSpawnReply {
@@ -386,10 +409,24 @@ pub(super) fn spawn_staged_broker(
             output: error,
         }));
     }
+    let report =
+        match BrokerTraceReportReceiver::new(UnixStream::from(trace), expected_report, deadline) {
+            Ok(report) => report,
+            Err(_) => {
+                drop(broker);
+                return Err(Box::new(PendingSpawnReply {
+                    reply,
+                    freshness,
+                    bound_session,
+                    output: BrokerSpawnError::ControlProtocol,
+                }));
+            }
+        };
     let spawned = FixedImageBrokerSpawn {
         session: output.session,
         launch: output.spawn,
         broker,
+        report,
     };
     Ok(PendingSpawnReply {
         reply,
@@ -402,19 +439,23 @@ pub(super) fn spawn_staged_broker(
 fn spawn_fixed_image_with_control(
     image: &InstalledBrokerImage,
     wait_domain: &mut DedicatedChildWaitDomain,
-) -> Result<(ExactBroker<DirectChildBrokerAuthority>, OwnedFd), BrokerSpawnError> {
+) -> Result<(ExactBroker<DirectChildBrokerAuthority>, OwnedFd, OwnedFd), BrokerSpawnError> {
     wait_domain
         .verify_single_threaded_spawn()
         .map_err(|_| BrokerSpawnError::InvalidWaitDomain)?;
     let (parent_control, child_control) = create_control_pair()?;
+    let (parent_trace, child_trace) = create_control_pair()?;
     let broker = spawn_fixed_image_internal(
         image,
         wait_domain,
         Some(&child_control),
         Some(&parent_control),
+        Some(&child_trace),
+        Some(&parent_trace),
     )?;
     drop(child_control);
-    Ok((broker, parent_control))
+    drop(child_trace);
+    Ok((broker, parent_control, parent_trace))
 }
 
 #[cfg(test)]
@@ -422,7 +463,7 @@ fn spawn_fixed_image(
     image: &InstalledBrokerImage,
     wait_domain: &mut DedicatedChildWaitDomain,
 ) -> Result<ExactBroker<DirectChildBrokerAuthority>, BrokerSpawnError> {
-    spawn_fixed_image_internal(image, wait_domain, None, None)
+    spawn_fixed_image_internal(image, wait_domain, None, None, None, None)
 }
 
 #[cfg(test)]
@@ -452,16 +493,16 @@ impl PendingSpawnReply<SessionAssignedSpawn> {
                 }));
             }
         };
-        let spawned = FixedImageBrokerSpawn {
-            session: output.session,
-            launch: output.spawn,
-            broker,
+        // SAFETY: this test-only gate path models the exact child created for
+        // the same already session-assigned authenticated launch.
+        let spawned = unsafe {
+            AtomicallySpawnedBroker::from_test_atomic_spawn(output.session, output.spawn, broker)
         };
         Ok(PendingSpawnReply {
             reply,
             freshness,
             bound_session,
-            output: AtomicallySpawnedBroker::from_fixed_image_spawn(spawned),
+            output: spawned,
         })
     }
 }
@@ -471,6 +512,8 @@ fn spawn_fixed_image_internal(
     wait_domain: &mut DedicatedChildWaitDomain,
     child_control: Option<&OwnedFd>,
     parent_control: Option<&OwnedFd>,
+    child_trace: Option<&OwnedFd>,
+    parent_trace: Option<&OwnedFd>,
 ) -> Result<ExactBroker<DirectChildBrokerAuthority>, BrokerSpawnError> {
     wait_domain
         .verify_single_threaded_spawn()
@@ -484,6 +527,11 @@ fn spawn_fixed_image_internal(
         actions.add_dup2(child_control.as_raw_fd(), BROKER_CONTROL_FD)?;
         actions.add_close(child_control.as_raw_fd())?;
         actions.add_close(parent_control.as_raw_fd())?;
+    }
+    if let (Some(child_trace), Some(parent_trace)) = (child_trace, parent_trace) {
+        actions.add_dup2(child_trace.as_raw_fd(), BROKER_TRACE_FD)?;
+        actions.add_close(child_trace.as_raw_fd())?;
+        actions.add_close(parent_trace.as_raw_fd())?;
     }
 
     let mut attributes = SpawnAttributesGuard::new()?;

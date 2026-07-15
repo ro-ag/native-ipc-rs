@@ -44,18 +44,39 @@ extern "C" fn premain_wait_domain_hook() {
     }
     // SAFETY: getenv returned one NUL-terminated environment value.
     let mode = unsafe { CStr::from_ptr(mode) }.to_bytes();
-    if mode == b"control-broker" {
+    if mode == b"control-broker"
+        || mode == b"control-broker-report"
+        || mode == b"control-broker-no-report"
+    {
         // SAFETY: the production-shaped spawn file actions installed the two
         // fixed private descriptors before this pre-main initializer ran.
         let success = match unsafe { DormantBrokerProcess::adopt_test_channels() } {
             Ok(dormant) => match dormant.stage_plan() {
                 Ok(Ok(staged)) => match staged.wait_for_activation() {
                     Ok(Ok(active)) => {
-                        let _plan = active.plan;
-                        matches!(
-                            active.gate.wait_for_service_death(),
-                            Ok(BrokerGateExit::ServiceGone)
-                        )
+                        if mode == b"control-broker-report" {
+                            // SAFETY: this isolated fixture models the future
+                            // broker having consumed both exact trace stops.
+                            match unsafe { active.report_exact_trace_stops() } {
+                                Ok(Ok(reported)) => matches!(
+                                    reported.gate.wait_for_service_death(),
+                                    Ok(BrokerGateExit::ServiceGone)
+                                ),
+                                Ok(Err(BrokerGateExit::ServiceGone)) => true,
+                                _ => false,
+                            }
+                        } else if mode == b"control-broker-no-report" {
+                            matches!(
+                                active.abandon_trace_for_test().wait_for_service_death(),
+                                Ok(BrokerGateExit::ServiceGone)
+                            )
+                        } else {
+                            let _plan = active.plan;
+                            matches!(
+                                active.gate.wait_for_service_death(),
+                                Ok(BrokerGateExit::ServiceGone)
+                            )
+                        }
                     }
                     Ok(Err(
                         BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone,
@@ -151,23 +172,24 @@ fn test_image(script: &'static str) -> InstalledBrokerImage {
         mode: fixed_cstring("-c").unwrap(),
         gate_argument: fixed_cstring(script).unwrap(),
         control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
+        trace_argument: fixed_cstring(INSTALLED_TRACE_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),
     }
 }
 
-fn test_control_image(test_name: &'static str) -> InstalledBrokerImage {
+fn test_control_image_mode(test_name: &'static str, mode: &'static str) -> InstalledBrokerImage {
     let executable = std::env::current_exe().unwrap();
     InstalledBrokerImage {
         path: CString::new(executable.as_os_str().as_bytes()).unwrap(),
         mode: fixed_cstring("--exact").unwrap(),
         gate_argument: fixed_cstring(test_name).unwrap(),
         control_argument: fixed_cstring("--nocapture").unwrap(),
+        trace_argument: fixed_cstring(INSTALLED_TRACE_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
-        environment_locale: fixed_cstring("NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN=control-broker")
-            .unwrap(),
+        environment_locale: fixed_cstring(mode).unwrap(),
     }
 }
 
@@ -272,7 +294,13 @@ fn staged_plan_is_acked_before_watchdog_can_release_exact_broker() {
         .unwrap_or_else(|_| panic!("exact plan staging failed"));
     let mut domain = test_wait_domain();
     let pending = staged
-        .spawn_installed_broker(&test_control_image(TEST_NAME), &mut domain)
+        .spawn_installed_broker(
+            &test_control_image_mode(
+                TEST_NAME,
+                "NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN=control-broker",
+            ),
+            &mut domain,
+        )
         .unwrap_or_else(|error| {
             let (_, _, _, error) = error.into_parts();
             panic!("ACKed fixed-image spawn failed: {error:?}")
@@ -282,6 +310,94 @@ fn staged_plan_is_acked_before_watchdog_can_release_exact_broker() {
         .register_watchdog(&mut table)
         .unwrap_or_else(|_| panic!("watchdog release after ACK failed"));
     drop(registered);
+}
+
+#[test]
+fn exact_trace_channel_report_binds_registered_session_before_ready() {
+    const TEST_NAME: &str = "backend::macos::supervisor::auth_adapter::broker_spawn::tests::exact_trace_channel_report_binds_registered_session_before_ready";
+    let (pending, _owner, _handle) = assigned_pending(3904, 0x94);
+    let staged = pending
+        .stage_broker_plan()
+        .unwrap_or_else(|_| panic!("trace-report plan staging failed"));
+    let mut domain = test_wait_domain();
+    let pending = staged
+        .spawn_installed_broker(
+            &test_control_image_mode(
+                TEST_NAME,
+                "NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN=control-broker-report",
+            ),
+            &mut domain,
+        )
+        .unwrap_or_else(|_| panic!("trace-report broker spawn failed"));
+    let mut table = WatchdogTable::new();
+    let mut pending = pending
+        .register_watchdog(&mut table)
+        .unwrap_or_else(|_| panic!("trace-report watchdog registration failed"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match pending
+            .poll_broker_trace_report()
+            .unwrap_or_else(|_| panic!("trace-report poll failed"))
+        {
+            super::super::BrokerTraceBindingPoll::Pending(next) => {
+                assert!(Instant::now() < deadline, "trace report did not arrive");
+                pending = next;
+                thread::sleep(Duration::from_millis(1));
+            }
+            super::super::BrokerTraceBindingPoll::Bound(bound) => {
+                let ready = bound.establish_ready().unwrap();
+                drop(ready);
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_trace_report_eof_exactly_cleans_registered_broker() {
+    const TEST_NAME: &str = "backend::macos::supervisor::auth_adapter::broker_spawn::tests::missing_trace_report_eof_exactly_cleans_registered_broker";
+    let (pending, owner, handle) = assigned_pending(3905, 0x95);
+    let staged = pending
+        .stage_broker_plan()
+        .unwrap_or_else(|_| panic!("missing-report plan staging failed"));
+    let mut domain = test_wait_domain();
+    let pending = staged
+        .spawn_installed_broker(
+            &test_control_image_mode(
+                TEST_NAME,
+                "NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN=control-broker-no-report",
+            ),
+            &mut domain,
+        )
+        .unwrap_or_else(|_| panic!("missing-report broker spawn failed"));
+    let mut table = WatchdogTable::new();
+    let mut pending = pending
+        .register_watchdog(&mut table)
+        .unwrap_or_else(|_| panic!("missing-report watchdog registration failed"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match pending.poll_broker_trace_report() {
+            Ok(super::super::BrokerTraceBindingPoll::Pending(next)) => {
+                assert!(Instant::now() < deadline, "missing report did not close");
+                pending = next;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(super::super::BrokerTraceBindingPoll::Bound(_)) => {
+                panic!("missing report minted trace authority")
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.output,
+                    super::super::broker_report::BrokerTraceReportError::Malformed
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(crate::backend::macos::supervisor_watchdog::WatchdogStateError::UnknownSession)
+    );
 }
 
 fn pid(broker: &mut ExactBroker<DirectChildBrokerAuthority>) -> c_int {
@@ -329,7 +445,11 @@ fn installed_image_vectors_are_fixed_and_canonical() {
         image.control_argument.to_bytes(),
         INSTALLED_CONTROL_ARGUMENT.as_bytes()
     );
-    assert!(argv[4].is_null());
+    assert_eq!(
+        image.trace_argument.to_bytes(),
+        INSTALLED_TRACE_ARGUMENT.as_bytes()
+    );
+    assert!(argv[5].is_null());
     assert!(image.environment()[3].is_null());
 }
 
@@ -535,6 +655,7 @@ fn spawn_failure_mints_no_direct_child_authority() {
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
         control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
+        trace_argument: fixed_cstring(INSTALLED_TRACE_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),
@@ -554,6 +675,7 @@ fn spawn_failure_preserves_exact_reply_and_bound_session_error_path() {
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
         control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
+        trace_argument: fixed_cstring(INSTALLED_TRACE_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),

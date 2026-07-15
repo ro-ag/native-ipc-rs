@@ -389,8 +389,16 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    the later sole FD 3 START before any broker-consumable type exists. The
    source FD 4 stream transport uses gate-first polling, exact outer/inner
    lengths, one conservative deadline binding, sender write-half close, digest
-   ACK, and a deadline-bounded dormant FD 3/FD 4 transition. The packaged
-   broker effect loop remains to be implemented. A one-shot non-sendable
+   ACK, and a deadline-bounded dormant FD 3/FD 4 transition. A separate fixed
+   FD 5 stream is minted with the same exact broker spawn and remains sealed
+   through watchdog registration. It accepts only one fixed report plus EOF
+   before the original deadline, binds the complete plan digest, session,
+   connection generation, sequence, nonces, target, and credentials, and alone
+   can construct the production `TraceEstablished` proof. Missing, extended,
+   late, or substituted reports exact-clean the registered broker. The broker
+   report emitter is an unsafe typestate boundary whose native two-stop caller
+   and packaged effect loop remain to be implemented; tests use an explicit
+   synthetic stop-proof fixture and make no launcher claim. A one-shot non-sendable
    child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
    semantics, and blocks SIGCHLD for inheriting service threads. The fixed

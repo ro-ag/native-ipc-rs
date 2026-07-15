@@ -43,6 +43,21 @@ struct TestLaunch {
     deadline: Instant,
 }
 
+struct ReportDropProbe {
+    broker_state: Arc<Mutex<FakeState>>,
+    drops: Arc<Mutex<usize>>,
+}
+
+impl Drop for ReportDropProbe {
+    fn drop(&mut self) {
+        assert!(
+            self.broker_state.lock().unwrap().completed,
+            "report state dropped before exact broker reap"
+        );
+        *self.drops.lock().unwrap() += 1;
+    }
+}
+
 impl RegisteredLaunchEffect for TestLaunch {
     fn connection_identity(&self) -> ConnectionIdentity {
         self.connection
@@ -410,6 +425,46 @@ fn expired_launch_permit_exactly_cleans_before_returning_error() {
     assert!(table.contains_tombstone(handle));
     drop(pending);
     assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+}
+
+#[test]
+fn registered_report_expiry_preserves_deadline_reason_and_reaps_before_drop() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let drops = Arc::new(Mutex::new(0));
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let report = ReportDropProbe {
+        broker_state: Arc::clone(&state),
+        drops: Arc::clone(&drops),
+    };
+    // SAFETY: this test atomically pairs the modeled exact broker, launch,
+    // session, and report receipt in one construction.
+    let spawned = unsafe {
+        AtomicallySpawnedBroker::from_test_atomic_spawn_with_report(
+            session(),
+            launch(owner, deadline),
+            broker,
+            report,
+        )
+    };
+    let mut pending = table.register_armed(spawned).unwrap();
+    wait_past(deadline);
+
+    assert!(matches!(
+        pending.report_mut(),
+        Err(WatchdogStateError::DeadlineExpired)
+    ));
+    drop(pending);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reasons,
+        vec![Some(TerminationReason::DeadlineExpired)]
+    );
+    drop(state);
+    assert_eq!(*drops.lock().unwrap(), 1);
 }
 
 #[test]

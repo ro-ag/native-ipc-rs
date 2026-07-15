@@ -38,6 +38,9 @@ pub(in crate::backend::macos) mod broker_spawn;
 #[path = "supervisor_broker_plan.rs"]
 pub(super) mod broker_plan;
 
+#[path = "supervisor_broker_report.rs"]
+pub(in crate::backend::macos) mod broker_report;
+
 #[path = "supervisor_auth_worker_spawn.rs"]
 mod auth_worker_spawn;
 
@@ -1816,18 +1819,20 @@ unsafe impl NonblockingReadySend for PreparedReadyMachSend {
     }
 }
 
-impl<Authority: ExactBrokerAuthority>
-    PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, Authority>>
+type RegisteredSpawnReply<Authority, Report> =
+    PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority, Report>>;
+type RegisterWatchdogResult<Authority, Report> =
+    Result<RegisteredSpawnReply<Authority, Report>, Box<PendingSpawnReply<WatchdogStateError>>>;
+
+impl<Authority: ExactBrokerAuthority, Report>
+    PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, Authority, Report>>
 {
     /// Registers one atomic spawn result while retaining a session-specific
     /// armed obligation through trusted launch, trace binding, and Ready.
     pub(super) fn register_watchdog(
         self,
         table: &mut WatchdogTable<Authority>,
-    ) -> Result<
-        PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority>>,
-        Box<PendingSpawnReply<WatchdogStateError>>,
-    > {
+    ) -> RegisterWatchdogResult<Authority, Report> {
         let Self {
             reply,
             freshness,
@@ -1866,8 +1871,8 @@ impl<Authority: ExactBrokerAuthority>
     }
 }
 
-impl<Authority: ExactBrokerAuthority>
-    PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority>>
+impl<Authority: ExactBrokerAuthority, Report>
+    PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority, Report>>
 {
     pub(super) fn registered_launch_permit(
         &self,
@@ -1878,6 +1883,7 @@ impl<Authority: ExactBrokerAuthority>
     /// Accepts only the trace proof for the exact registered handle and
     /// authenticated connection retained with this request's reply. A mismatch
     /// exact-cleans before returning the error wrapper.
+    #[cfg(test)]
     pub(super) fn bind_trace(
         mut self,
         trace: TraceEstablished,
@@ -1939,6 +1945,104 @@ impl<Authority: ExactBrokerAuthority>
             output,
         })
     }
+}
+
+/// Result of one bounded nonblocking poll of the exact broker report receipt.
+pub(super) enum BrokerTraceBindingPoll {
+    Pending(PendingBrokerTraceReceipt),
+    Bound(PendingBrokerTraceReceipt),
+}
+
+type PendingBrokerTraceReceipt = RegisteredSpawnReply<
+    broker_spawn::DirectChildBrokerAuthority,
+    broker_report::BrokerTraceReportReceiver,
+>;
+
+impl PendingBrokerTraceReceipt {
+    /// Polls only the sealed report receipt created with this exact broker.
+    /// Malformed, late, substituted, or failed receipts exact-clean the bound
+    /// broker before the error wrapper is returned.
+    pub(super) fn poll_broker_trace_report(
+        mut self,
+    ) -> Result<BrokerTraceBindingPoll, Box<PendingSpawnReply<broker_report::BrokerTraceReportError>>>
+    {
+        let polled = match self.output.report_mut() {
+            Ok(report) => report.poll(),
+            Err(WatchdogStateError::DeadlineExpired) => {
+                Err(broker_report::BrokerTraceReportError::DeadlineExpired)
+            }
+            Err(_) => Err(broker_report::BrokerTraceReportError::InvalidTransition),
+        };
+        let received = match polled {
+            Ok(None) => return Ok(BrokerTraceBindingPoll::Pending(self)),
+            Ok(Some(received)) => received,
+            Err(error) => return Err(trace_report_failure(self, error)),
+        };
+        if self.bound_session != Some(self.output.handle())
+            || self.output.connection() != self.freshness.connection
+            || self.freshness.generation != self.freshness.connection.get()
+            || self.freshness.sequence != 1
+        {
+            return Err(trace_report_failure(
+                self,
+                broker_report::BrokerTraceReportError::Binding,
+            ));
+        }
+        let authenticated = match received
+            .authenticate_registered(self.output.handle(), self.output.connection())
+        {
+            Ok(authenticated) => authenticated,
+            Err(error) => return Err(trace_report_failure(self, error)),
+        };
+        let report = match self.output.consume_report() {
+            Ok(report) => report,
+            Err(WatchdogStateError::DeadlineExpired) => {
+                return Err(trace_report_failure(
+                    self,
+                    broker_report::BrokerTraceReportError::DeadlineExpired,
+                ));
+            }
+            Err(_) => {
+                return Err(trace_report_failure(
+                    self,
+                    broker_report::BrokerTraceReportError::InvalidTransition,
+                ));
+            }
+        };
+        drop(report);
+        let trace = TraceEstablished::from_authenticated_broker_report(authenticated);
+        if self.output.bind_trace(trace).is_err() {
+            return Err(trace_report_failure(
+                self,
+                broker_report::BrokerTraceReportError::InvalidTransition,
+            ));
+        }
+        Ok(BrokerTraceBindingPoll::Bound(self))
+    }
+}
+
+fn trace_report_failure(
+    pending: PendingBrokerTraceReceipt,
+    error: broker_report::BrokerTraceReportError,
+) -> Box<PendingSpawnReply<broker_report::BrokerTraceReportError>> {
+    let PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        mut output,
+    } = pending;
+    if error == broker_report::BrokerTraceReportError::DeadlineExpired {
+        output.mark_deadline_expired();
+    } else {
+        output.mark_protocol_violation();
+    }
+    drop(output);
+    Box::new(PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        output: error,
+    })
 }
 
 impl<Authority: ExactBrokerAuthority> PendingSpawnReply<PendingReadyDelivery<Authority>> {

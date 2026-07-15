@@ -52,15 +52,21 @@ never treats `ESRCH` as reap proof, aborts on `ECHILD` without numeric fallback,
 and mints terminal proof only from exact `waitpid` reap.
 
 The matching source entry boundary accepts only the fixed absolute `argv[0]`,
-broker mode, and `--gate-fd=3`. It adopts only a read-only FIFO reader at FD 3,
-sets `FD_CLOEXEC` before any future launcher exec, blocks until exactly byte
-`1`, and distinguishes service EOF before activation, immediately after the
-start byte, and during the active lifetime. A wrong, repeated, or later byte is
-terminal. The resulting active gate exposes no launch, path, PID, signal, task,
-or filesystem authority; START alone cannot select or launch a target. The
-eventual broker needs a separate bounded session-bound control channel that
-stages and acknowledges one canonical launch plan before watchdog registration
-can release this gate.
+broker mode, and exact `--gate-fd=3`, `--control-fd=4`, and `--trace-fd=5`
+vector. It adopts a read-only FIFO reader at FD 3 plus two bidirectional Unix
+streams, sets `FD_CLOEXEC`, gate-first stages and digest-ACKs one canonical
+deadline-bound plan on FD 4, then blocks until exactly START byte `1`. It
+distinguishes service EOF before activation, immediately after START, and
+during the active lifetime; a wrong, repeated, or later gate byte is terminal.
+FD 5 is a separate one-shot trace-report channel sealed into the same atomic
+broker spawn and watchdog registration. The service accepts only one fixed
+report plus EOF before the original deadline with exact plan digest,
+session/connection/sequence/nonces/credentials/target bindings. Missing,
+extended, late, or substituted output exact-cleans the registered broker. The
+resulting active gate and report receipt expose no request-selected launch,
+path, PID, signal, task, or filesystem authority. START and report bytes alone
+cannot launch a target; the unsafe report-emission boundary still requires the
+future broker-local launcher to consume both exact kernel stops.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it
@@ -74,8 +80,8 @@ a named FIFO using public descriptor metadata; FIFO shape and START are
 explicitly non-authoritative until an exact-child/session/control-plan binding
 is authenticated. Nor do they prove that the hard-coded production path is
 installed, root-owned, signed, packaged, or replacement-resistant. The
-broker control channel and packaged executable, clean-exec worker/launcher
-artifacts, installed service loop,
+packaged executable and native broker effect loop, clean-exec launcher artifact,
+installed service loop,
 permanent credential drop, real client-death authority, and launchd/XPC
 delegation policy remain unresolved. Public macOS therefore remains
 fail-closed.

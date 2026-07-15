@@ -17,6 +17,7 @@ mod macos {
     const MODE: &str = "--supervisor-broker";
     const GATE: &str = "--gate-fd=3";
     const CONTROL: &str = "--control-fd=4";
+    const TRACE: &str = "--trace-fd=5";
 
     #[repr(C)]
     struct TimeSpec {
@@ -33,6 +34,7 @@ mod macos {
     struct Spawned {
         child: Child,
         control: UnixStream,
+        _trace: UnixStream,
     }
 
     fn is_fixed_child_invocation() -> bool {
@@ -43,6 +45,7 @@ mod macos {
 
     fn spawn(mode: &str, gate: &str, control_argument: &str) -> Spawned {
         let (control, child_control) = UnixStream::pair().unwrap();
+        let (trace, child_trace) = UnixStream::pair().unwrap();
         // SAFETY: F_DUPFD_CLOEXEC=67 returns one fresh owned descriptor above
         // the fixed ABI range so dup2 always clears close-on-exec on FD4.
         let stable = unsafe { fcntl(child_control.as_raw_fd(), 67, 10) };
@@ -50,12 +53,19 @@ mod macos {
         // SAFETY: successful fcntl returned a fresh descriptor.
         let stable = unsafe { OwnedFd::from_raw_fd(stable) };
         let child_control_fd = stable.as_raw_fd();
+        // SAFETY: same collision-safe duplication for fixed trace FD5.
+        let stable_trace = unsafe { fcntl(child_trace.as_raw_fd(), 67, 10) };
+        assert!(stable_trace >= 10);
+        // SAFETY: successful fcntl returned a fresh descriptor.
+        let stable_trace = unsafe { OwnedFd::from_raw_fd(stable_trace) };
+        let child_trace_fd = stable_trace.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg0(INSTALLED_PATH)
             .arg(mode)
             .arg(gate)
             .arg(control_argument)
+            .arg(TRACE)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -63,7 +73,8 @@ mod macos {
         // before exec, installing its private stdin pipe reader at fixed FD 3.
         unsafe {
             command.pre_exec(move || {
-                if dup2(0, 3) == 3 && dup2(child_control_fd, 4) == 4 {
+                if dup2(0, 3) == 3 && dup2(child_control_fd, 4) == 4 && dup2(child_trace_fd, 5) == 5
+                {
                     Ok(())
                 } else {
                     Err(std::io::Error::last_os_error())
@@ -72,8 +83,14 @@ mod macos {
         }
         let child = command.spawn().unwrap();
         drop(stable);
+        drop(stable_trace);
         drop(child_control);
-        Spawned { child, control }
+        drop(child_trace);
+        Spawned {
+            child,
+            control,
+            _trace: trace,
+        }
     }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
