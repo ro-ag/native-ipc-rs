@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn process_image_identity_requires_exact_pid_credentials_and_path() {
+    let identity = TaskAuditIdentity {
+        audit: AuditToken {
+            values: [0, 0, 0, 0, 0, 42, 0, 7],
+        },
+        executable: b"/fixed-launcher".to_vec(),
+    };
+    assert!(identity.proves_exact_process_image(42, 0, 0, 0, 0, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(41, 0, 0, 0, 0, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(42, 501, 0, 0, 0, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(42, 0, 501, 0, 0, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(42, 0, 0, 20, 0, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(42, 0, 0, 0, 20, b"/fixed-launcher"));
+    assert!(!identity.proves_exact_process_image(42, 0, 0, 0, 0, b"/substitute"));
+}
+
+#[test]
 fn exec_identity_requires_real_and_effective_ids_and_exact_path() {
     let before = TaskAuditIdentity {
         audit: AuditToken {

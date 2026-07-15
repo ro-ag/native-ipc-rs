@@ -33,7 +33,9 @@ unsafe extern "C" {
     fn _exit(status: c_int) -> !;
     fn getenv(name: *const c_char) -> *mut c_char;
     fn getegid() -> u32;
+    fn getgid() -> u32;
     fn geteuid() -> u32;
+    fn getuid() -> u32;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn raise(signal: c_int) -> c_int;
     fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
@@ -219,6 +221,20 @@ impl Fixture {
     }
 
     fn spawned_launcher(&mut self, deadline: Instant) -> SpawnedLauncher {
+        let expected_executable = std::env::current_exe()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        self.spawned_launcher_with_identity(deadline, expected_executable, None)
+    }
+
+    fn spawned_launcher_with_identity(
+        &mut self,
+        deadline: Instant,
+        expected_launcher_executable: Vec<u8>,
+        expected_effective_uid: Option<u32>,
+    ) -> SpawnedLauncher {
         let pid = c_int::try_from(self.child.id()).unwrap();
         let gate = self.gate.take().unwrap();
         let expected_executable = std::env::current_exe()
@@ -237,10 +253,19 @@ impl Fixture {
         trace.set_nonblocking(true).unwrap();
         self.trace_peer = Some(trace_peer);
         let active = ActiveBrokerProcess { gate, plan, trace };
+        // SAFETY: credential getters have no preconditions.
+        let expected_launcher = FixedLauncherIdentity::for_test(
+            unsafe { getuid() },
+            expected_effective_uid.unwrap_or_else(|| unsafe { geteuid() }),
+            unsafe { getgid() },
+            unsafe { getegid() },
+            expected_launcher_executable,
+        );
         // SAFETY: Command just returned this positive direct-child PID, and
         // this fixture never performs another wait on its Child handle. The
-        // active process owns the immutable production-shaped plan binding.
-        unsafe { SpawnedLauncher::from_positive_spawn(pid, active) }.unwrap()
+        // active process owns the immutable production-shaped plan binding;
+        // the test identity names the exact fixed fixture image and IDs.
+        unsafe { SpawnedLauncher::from_positive_spawn(pid, active, expected_launcher) }.unwrap()
     }
 
     fn deadline(&self) -> Instant {
@@ -352,6 +377,39 @@ fn untraced_initial_sigstop_cannot_mint_ptrace_authority() {
     assert!(matches!(
         initial.prove_trace_and_continue_to_exec(),
         Err(LauncherWaitError::Native(_))
+    ));
+    fixture.close_gate();
+}
+
+#[test]
+fn wrong_initial_launcher_image_never_reaches_ptrace_continue() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let deadline = fixture.deadline();
+    assert!(matches!(
+        fixture
+            .spawned_launcher_with_identity(deadline, b"/usr/bin/false".to_vec(), None)
+            .wait_initial_stop(),
+        Err(LauncherWaitError::IdentityTransition)
+    ));
+    fixture.close_gate();
+}
+
+#[test]
+fn wrong_initial_launcher_credentials_never_reach_ptrace_continue() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let deadline = fixture.deadline();
+    let expected_executable = std::env::current_exe()
+        .unwrap()
+        .as_os_str()
+        .as_bytes()
+        .to_vec();
+    // SAFETY: credential getter has no preconditions.
+    let wrong_uid = unsafe { geteuid() }.wrapping_add(1);
+    assert!(matches!(
+        fixture
+            .spawned_launcher_with_identity(deadline, expected_executable, Some(wrong_uid))
+            .wait_initial_stop(),
+        Err(LauncherWaitError::IdentityTransition)
     ));
     fixture.close_gate();
 }

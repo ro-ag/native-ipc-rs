@@ -357,6 +357,28 @@ pub(super) struct TaskAuditIdentity {
 }
 
 impl TaskAuditIdentity {
+    /// Requires one exact PID, executable, and complete real/effective
+    /// credential tuple while the caller pins the stopped process.
+    pub(super) fn proves_exact_process_image(
+        &self,
+        pid: c_int,
+        expected_ruid: u32,
+        expected_euid: u32,
+        expected_rgid: u32,
+        expected_egid: u32,
+        expected_executable: &[u8],
+    ) -> bool {
+        let Ok(expected_pid) = u32::try_from(pid) else {
+            return false;
+        };
+        self.audit.values[5] == expected_pid
+            && self.audit.values[1] == expected_euid
+            && self.audit.values[2] == expected_egid
+            && self.audit.values[3] == expected_ruid
+            && self.audit.values[4] == expected_rgid
+            && self.executable == expected_executable
+    }
+
     /// Requires the same exact PID, the expected post-drop credentials, and a
     /// changed PID version. Darwin changes the audit PID version on `exec`.
     pub(super) fn proves_exec_transition_from(

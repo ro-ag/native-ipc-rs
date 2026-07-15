@@ -67,7 +67,37 @@ struct ExactLauncher {
     pid: c_int,
     phase: ExactPhase,
     active: ActiveBrokerProcess,
+    expected_launcher: FixedLauncherIdentity,
     _thread_confined: std::marker::PhantomData<Rc<()>>,
+}
+
+/// Installation-bound identity of the only launcher image the broker may
+/// trace. Its fields are private so request data cannot construct it.
+pub(super) struct FixedLauncherIdentity {
+    real_uid: u32,
+    effective_uid: u32,
+    real_gid: u32,
+    effective_gid: u32,
+    executable: Vec<u8>,
+}
+
+impl FixedLauncherIdentity {
+    #[cfg(test)]
+    fn for_test(
+        real_uid: u32,
+        effective_uid: u32,
+        real_gid: u32,
+        effective_gid: u32,
+        executable: Vec<u8>,
+    ) -> Self {
+        Self {
+            real_uid,
+            effective_uid,
+            real_gid,
+            effective_gid,
+            executable,
+        }
+    }
 }
 
 /// Exact unreaped direct child immediately after a positive fixed-image spawn.
@@ -131,6 +161,7 @@ impl SpawnedLauncher {
     pub(super) unsafe fn from_positive_spawn(
         pid: c_int,
         active: ActiveBrokerProcess,
+        expected_launcher: FixedLauncherIdentity,
     ) -> Result<Self, LauncherWaitError> {
         if pid <= 0 {
             return Err(LauncherWaitError::InvalidPid);
@@ -140,6 +171,7 @@ impl SpawnedLauncher {
                 pid,
                 phase: ExactPhase::AwaitingInitialStop,
                 active,
+                expected_launcher,
                 _thread_confined: std::marker::PhantomData,
             }),
         })
@@ -155,6 +187,16 @@ impl SpawnedLauncher {
             .map_err(|_| LauncherWaitError::IdentityTransition)?;
         probe_gate(inner.gate())?;
         ensure_deadline(inner.deadline())?;
+        if !before_exec.proves_exact_process_image(
+            inner.pid,
+            inner.expected_launcher.real_uid,
+            inner.expected_launcher.effective_uid,
+            inner.expected_launcher.real_gid,
+            inner.expected_launcher.effective_gid,
+            &inner.expected_launcher.executable,
+        ) {
+            return Err(LauncherWaitError::IdentityTransition);
+        }
         Ok(InitialStopObserved {
             inner: Some(inner),
             before_exec,
@@ -547,7 +589,7 @@ impl Drop for ExactLauncher {
         }
         match self.phase {
             ExactPhase::AwaitingInitialStop => exact_signal(self.pid, SIGKILL),
-            ExactPhase::UnprovenInitialStop => exact_signal(self.pid, SIGKILL),
+            ExactPhase::UnprovenInitialStop => exact_unproven_stop_kill(self.pid),
             ExactPhase::AwaitingExecTrap | ExactPhase::RunningTarget => {
                 exact_signal(self.pid, SIGSTOP)
             }
@@ -588,6 +630,20 @@ fn exact_ptrace_kill(pid: c_int) {
     if unsafe { ptrace(PT_KILL, pid, std::ptr::null_mut(), 0) } != 0 && last_errno() != ESRCH {
         std::process::abort();
     }
+}
+
+fn exact_unproven_stop_kill(pid: c_int) {
+    // A SIGSTOP observation alone does not prove PT_TRACE_ME. Prefer the
+    // tracee-only kill so a real tracee cannot remain held forever, then fall
+    // back to the exact direct-child signal when the stop was untraced.
+    // SAFETY: exact unreaped direct-child authority pins this numeric PID.
+    if unsafe { ptrace(PT_KILL, pid, std::ptr::null_mut(), 0) } == 0 {
+        return;
+    }
+    // Any ptrace error is ambiguous in this deliberately unproven phase;
+    // ESRCH is not reap proof. Exact direct-child ownership makes the signal
+    // fallback PID-safe, and an already-dead child simply returns ESRCH.
+    exact_signal(pid, SIGKILL);
 }
 
 #[cfg(test)]
