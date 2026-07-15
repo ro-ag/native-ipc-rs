@@ -20,6 +20,7 @@ use crate::session::{
 };
 type MachMsgReturn = c_int;
 type PosixSpawnAttr = *mut c_void;
+type PosixSpawnFileActions = *mut c_void;
 
 const MACH_PORT_NULL: MachPort = 0;
 const MACH_PORT_RIGHT_RECEIVE: c_int = 1;
@@ -109,7 +110,7 @@ unsafe extern "C" {
     fn posix_spawn(
         pid: *mut Pid,
         path: *const c_char,
-        file_actions: *const c_void,
+        file_actions: *const PosixSpawnFileActions,
         attributes: *const PosixSpawnAttr,
         argv: *const *mut c_char,
         envp: *const *mut c_char,

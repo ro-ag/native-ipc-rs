@@ -482,7 +482,7 @@ fn accept_client_hello(
     hello.accept(generation, nonce).unwrap()
 }
 
-fn accepted_spawn_reply(
+pub(super) fn accepted_spawn_reply(
     generation: u64,
 ) -> (
     PendingSpawnReply<AuthenticatedSpawnRequest>,
@@ -552,7 +552,7 @@ fn replace_spawn_reply<Output>(
     }
 }
 
-fn installed_catalog() -> InstalledPolicyCatalog {
+pub(super) fn installed_catalog() -> InstalledPolicyCatalog {
     let definition = TargetPolicyDefinition::new(
         b"com.example.receiver".to_vec(),
         CLIENT_CODE_IDENTITY,

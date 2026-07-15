@@ -99,6 +99,24 @@ impl<Launch, Authority: ExactBrokerAuthority> AtomicallySpawnedBroker<Launch, Au
     }
 }
 
+impl
+    AtomicallySpawnedBroker<
+        ValidatedSpawn,
+        super::supervisor::auth_adapter::broker_spawn::DirectChildBrokerAuthority,
+    >
+{
+    pub(super) fn from_fixed_image_spawn(
+        spawned: super::supervisor::auth_adapter::broker_spawn::FixedImageBrokerSpawn,
+    ) -> Self {
+        let (session, launch, broker) = spawned.into_parts();
+        Self {
+            session,
+            launch,
+            broker,
+        }
+    }
+}
+
 impl<Launch> RegisteredLaunch<Launch> {
     const fn handle(&self) -> SessionHandle {
         self.handle
@@ -165,6 +183,16 @@ impl<Authority: ExactBrokerAuthority> ExactBroker<Authority> {
 
     fn mark_reaped(&mut self, _proof: ReapedBroker) {
         self.armed = false;
+    }
+
+    #[cfg(test)]
+    pub(super) fn authority_mut_for_test(&mut self) -> &mut Authority {
+        &mut self.authority
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_reaped_for_test(&mut self, proof: ReapedBroker) {
+        self.mark_reaped(proof);
     }
 }
 

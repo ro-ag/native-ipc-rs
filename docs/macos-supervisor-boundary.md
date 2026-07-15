@@ -29,6 +29,38 @@ target code. Broker stop/`PT_KILL` and broker exit both act on the exact tracee.
 The backend-private implementation and adversarial corpus now exercise this
 chain.
 
+The source model now also contains the production-shaped broker creation
+boundary that was previously missing. An installation-only value prepares one
+fixed absolute broker path, fixed `argv` with matching `argv[0]`, and a
+canonical environment before exact-path `posix_spawn`. The child receives only
+one collision-normalized start/death pipe reader. Darwin
+`POSIX_SPAWN_CLOEXEC_DEFAULT`, `POSIX_SPAWN_SETSIGDEF`, and
+`POSIX_SPAWN_SETSIGMASK` close unrelated descriptors, restore explicit signal
+defaults, and install an empty child mask without changing the parent mask.
+Because Darwin has no atomic CLOEXEC pipe constructor, the dedicated service
+must remain permanently single-threaded: immediately before every pipe/spawn
+transition the linear wait-domain token rechecks the main thread and Darwin's
+sticky never-threaded state, along with canonical blocked `SIGCHLD`. This
+excludes a concurrent fork/exec from inheriting either briefly unmarked pipe
+end. Any future service child creation must consume the same exclusive domain;
+becoming threaded permanently rejects later broker spawns.
+The service retains the nonblocking, no-`SIGPIPE` writer, inserts the complete
+reply/session/validated-launch/exact-child owner into the watchdog table, and
+then writes one start byte. It keeps the writer after activation so service
+death produces EOF. Cleanup closes the gate, exact-waits before any signal,
+never treats `ESRCH` as reap proof, aborts on `ECHILD` without numeric fallback,
+and mints terminal proof only from exact `waitpid` reap.
+
+This remains source and native mechanism evidence. The test image is a fixed
+local shell used to characterize pipe, spawn, and direct-child semantics; it
+does not prove that the eventual signed broker's dyld/constructor path reaches
+only trusted gate code, nor that the hard-coded production path is installed,
+root-owned, signed, packaged, or replacement-resistant. The concrete broker
+entrypoint, clean-exec worker/launcher artifacts, installed service loop,
+permanent credential drop, real client-death authority, and launchd/XPC
+delegation policy remain unresolved. Public macOS therefore remains
+fail-closed.
+
 Standing decision (2026-07-13): the project keeps public macOS fail-closed
 rather than re-scoping the contract to a documented weaker containment class
 or depending on private libproc/proc_info interfaces. The exactness

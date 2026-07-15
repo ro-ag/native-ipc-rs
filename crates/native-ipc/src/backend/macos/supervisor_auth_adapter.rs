@@ -31,6 +31,9 @@ use super::{
     decode_header, encode_ready_spawn_result,
 };
 
+#[path = "supervisor_broker_spawn.rs"]
+pub(in crate::backend::macos) mod broker_spawn;
+
 const MAX_AUTH_WORKERS: usize = 4;
 const MAX_PENDING_PER_UID: usize = 2;
 const FRAME_DIGEST_DOMAIN: &[u8] = b"native-ipc-macos-supervisor-auth-frame-v1";
@@ -1060,9 +1063,11 @@ enum ChildWaitDomainError {
 /// public process-wide SIGCHLD prerequisites, while the absence of competing
 /// `wait*` callers remains a service-topology and source-ownership invariant.
 #[must_use = "the dedicated child wait domain must own every auth worker"]
-struct DedicatedChildWaitDomain {
+pub(in crate::backend::macos::supervisor) struct DedicatedChildWaitDomain {
     // The concrete runtime must remain on the dedicated service main thread.
     _not_send_or_sync: PhantomData<Rc<()>>,
+    #[cfg(test)]
+    bypass_spawn_recheck: bool,
 }
 
 impl DedicatedChildWaitDomain {
@@ -1073,7 +1078,9 @@ impl DedicatedChildWaitDomain {
     /// This must run during single-threaded service startup, before any child
     /// is spawned or any code capable of calling `wait*` is initialized. The
     /// installed service must reserve all direct children for this module and
-    /// must never later change SIGCHLD disposition or enable `SA_NOCLDWAIT`.
+    /// must serialize every later child creation through an exclusive borrow
+    /// of this domain, never race a raw fork/spawn against pipe CLOEXEC setup,
+    /// and never change SIGCHLD disposition or enable `SA_NOCLDWAIT`.
     unsafe fn establish_at_service_startup() -> Result<Self, ChildWaitDomainError> {
         // SAFETY: these public Darwin queries have no arguments or side effects.
         if unsafe { pthread_main_np() } == 0 {
@@ -1138,7 +1145,41 @@ impl DedicatedChildWaitDomain {
         }
         Ok(Self {
             _not_send_or_sync: PhantomData,
+            #[cfg(test)]
+            bypass_spawn_recheck: false,
         })
+    }
+
+    fn verify_single_threaded_spawn(&mut self) -> Result<(), ChildWaitDomainError> {
+        #[cfg(test)]
+        if self.bypass_spawn_recheck {
+            return Ok(());
+        }
+        // Darwin has no pipe2. Remaining permanently on the main thread with
+        // pthread_is_threaded_np still clear is the enforced exclusion that
+        // prevents any concurrent fork/exec from observing a new pipe before
+        // both ends receive FD_CLOEXEC.
+        // SAFETY: these public Darwin queries have no arguments or side effects.
+        if unsafe { pthread_main_np() } == 0 {
+            return Err(ChildWaitDomainError::NotMainThread);
+        }
+        // SAFETY: same public read-only process-state query.
+        if unsafe { pthread_is_threaded_np() } != 0 {
+            return Err(ChildWaitDomainError::ProcessAlreadyThreaded);
+        }
+        Self::validate_disposition(Self::query_disposition()?)?;
+        let mut current_mask = 0_u32;
+        // SAFETY: a null set performs a read-only query into current_mask.
+        let mask_error =
+            unsafe { pthread_sigmask(SIG_BLOCK, std::ptr::null(), &raw mut current_mask) };
+        if mask_error != 0 {
+            return Err(ChildWaitDomainError::SignalMask(mask_error));
+        }
+        // SAFETY: current_mask was initialized by successful pthread_sigmask.
+        if unsafe { sigismember(&raw const current_mask, SIGCHLD) } != 1 {
+            return Err(ChildWaitDomainError::SigchldNotBlocked);
+        }
+        Ok(())
     }
 
     fn query_disposition() -> Result<DarwinSigaction, ChildWaitDomainError> {
