@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::ffi::{CString, c_char, c_int};
 
 use super::supervisor::{ConnectionIdentity, LauncherSpawnParts, ValidatedSpawn, VerifiedPeer};
-use super::supervisor_watchdog::{RegisteredLaunch, SessionHandle};
+use super::supervisor_watchdog::{ExactBrokerAuthority, RegisteredLaunchPermit, SessionHandle};
 
 const RLIMIT_NPROC: c_int = 7;
 
@@ -44,45 +44,52 @@ pub(super) enum CredentialDropError {
     InvalidPreparedTarget,
     /// The original admitted absolute deadline elapsed before mutation.
     DeadlineExpired,
+    /// The watchdog registration was terminated before launch commitment.
+    RegistrationRevoked,
     /// The fixed launcher did not begin with real/effective root authority.
     LauncherNotRoot,
 }
 
 /// Proof that the broker consumed this session's initial `PT_TRACE_ME` stop.
-pub(super) struct LauncherTraceEstablished {
-    registration: RegisteredLaunch<ValidatedSpawn>,
+pub(super) struct LauncherTraceEstablished<'lease, Authority: ExactBrokerAuthority> {
+    registration: RegisteredLaunchPermit<'lease, ValidatedSpawn, Authority>,
 }
 
-impl LauncherTraceEstablished {
+impl<'lease, Authority: ExactBrokerAuthority> LauncherTraceEstablished<'lease, Authority> {
     /// # Safety
     ///
     /// The sole broker waiter for the registered launch must have
     /// consumed the trusted launcher's initial trace-proof stop. The launcher
     /// must still be that exact stopped/resumed tracee and must not have execed.
     pub(super) const unsafe fn from_broker_trace_stop(
-        registration: RegisteredLaunch<ValidatedSpawn>,
+        registration: RegisteredLaunchPermit<'lease, ValidatedSpawn, Authority>,
     ) -> Self {
         Self { registration }
     }
 
-    /// Consumes the sole policy-authorized effect registered for this session.
-    pub(super) fn into_launch(self) -> TraceBoundValidatedSpawn {
-        let (handle, connection, deadline, spawn) = self.registration.into_parts();
+    /// Prepares target bytes while retaining the permit lifetime as authority.
+    pub(super) fn into_launch(self) -> TraceBoundValidatedSpawn<'lease, Authority> {
+        let handle = self.registration.handle();
+        let connection = self.registration.connection();
+        let deadline = self.registration.deadline();
+        let spawn = self.registration.launch().launcher_parts_for_permit();
         TraceBoundValidatedSpawn {
             handle,
             connection,
             deadline,
-            spawn: spawn.into_launcher_parts(),
+            spawn,
+            registration: self.registration,
         }
     }
 }
 
 /// One exact registered session ready for drop-and-immediate-exec.
-pub(super) struct TraceBoundValidatedSpawn {
+pub(super) struct TraceBoundValidatedSpawn<'lease, Authority: ExactBrokerAuthority> {
     handle: SessionHandle,
     connection: ConnectionIdentity,
     deadline: std::time::Instant,
     spawn: LauncherSpawnParts,
+    registration: RegisteredLaunchPermit<'lease, ValidatedSpawn, Authority>,
 }
 
 /// Permanently drops credentials and immediately execs the exact installed image.
@@ -100,19 +107,36 @@ pub(super) struct TraceBoundValidatedSpawn {
 /// matching code identity. `PT_TRACE_ME` must remain active so Darwin ignores
 /// any set-user-ID/set-group-ID bits at exec and stops the target before its
 /// first instruction.
-pub(super) unsafe fn permanently_drop_and_exec(
-    launch: TraceBoundValidatedSpawn,
+pub(super) unsafe fn permanently_drop_and_exec<Authority: ExactBrokerAuthority>(
+    launch: TraceBoundValidatedSpawn<'_, Authority>,
 ) -> Result<Infallible, CredentialDropError> {
     let TraceBoundValidatedSpawn {
         handle,
         connection,
         deadline,
         spawn,
+        registration,
     } = launch;
     let prepared = PreparedExec::from_validated(spawn)?;
     let identity = AuthenticatedClientIdentity::from_verified_peer(prepared.peer)?;
     preflight_deadline(deadline)?;
     preflight_root()?;
+
+    // Revalidate the exact live registration only after all fallible
+    // preparation. The returned short borrow stays live across the no-callback
+    // irreversible transition, so copied request bytes cannot authorize a
+    // launch after the watchdog has reaped this session.
+    let _commit = registration.commit_guard().map_err(|error| match error {
+        super::supervisor_watchdog::WatchdogStateError::DeadlineExpired => {
+            CredentialDropError::DeadlineExpired
+        }
+        super::supervisor_watchdog::WatchdogStateError::CapacityExceeded
+        | super::supervisor_watchdog::WatchdogStateError::UnknownSession
+        | super::supervisor_watchdog::WatchdogStateError::WrongConnection
+        | super::supervisor_watchdog::WatchdogStateError::InvalidTransition => {
+            CredentialDropError::RegistrationRevoked
+        }
+    })?;
 
     // Keep the exact session binding live across the irreversible transition.
     let _exact_session = (

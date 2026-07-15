@@ -668,16 +668,17 @@ impl ValidatedSpawn {
         self.target_identity
     }
 
-    /// Consumes the installed-policy authority into the trusted launcher.
-    pub(super) fn into_launcher_parts(self) -> LauncherSpawnParts {
+    /// Copies prepared policy data only for a lifetime-branded registered
+    /// launch permit. The copied bytes carry no launch authority by themselves.
+    pub(super) fn launcher_parts_for_permit(&self) -> LauncherSpawnParts {
         LauncherSpawnParts {
             peer: self.peer,
             deadline: self.deadline,
-            policy_id: self.policy_id,
+            policy_id: self.policy_id.clone(),
             target_identity: self.target_identity,
-            installed_executable: self.installed_executable,
-            arguments: self.arguments,
-            environment: self.environment,
+            installed_executable: self.installed_executable.clone(),
+            arguments: self.arguments.clone(),
+            environment: self.environment.clone(),
         }
     }
 
@@ -947,8 +948,7 @@ pub(super) fn decode_spawn_result(
     }
 }
 
-#[cfg(test)]
-pub(super) fn encode_test_spawn_result(
+fn encode_spawn_result(
     result: Result<[u8; 32], SpawnFailure>,
     generation: u64,
     client_nonce: [u8; 32],
@@ -978,6 +978,25 @@ pub(super) fn encode_test_spawn_result(
         },
         &payload,
     )
+}
+
+fn encode_ready_spawn_result(
+    handle: [u8; 32],
+    generation: u64,
+    client_nonce: [u8; 32],
+    service_nonce: [u8; 32],
+) -> Result<Vec<u8>, SupervisorWireError> {
+    encode_spawn_result(Ok(handle), generation, client_nonce, service_nonce)
+}
+
+#[cfg(test)]
+pub(super) fn encode_test_spawn_result(
+    result: Result<[u8; 32], SpawnFailure>,
+    generation: u64,
+    client_nonce: [u8; 32],
+    service_nonce: [u8; 32],
+) -> Result<Vec<u8>, SupervisorWireError> {
+    encode_spawn_result(result, generation, client_nonce, service_nonce)
 }
 
 fn encode_record(header: Header, payload: &[u8]) -> Result<Vec<u8>, SupervisorWireError> {

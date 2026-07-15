@@ -1,6 +1,8 @@
 //! Opaque-session watchdog state independent of numeric process identifiers.
 
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::Instant;
 
 use super::supervisor::{ConnectionIdentity, ValidatedSpawn};
@@ -39,6 +41,10 @@ impl FreshSessionId {
             Ok(Self(value))
         }
     }
+
+    pub(super) const fn handle(&self) -> SessionHandle {
+        SessionHandle(self.0)
+    }
 }
 
 /// Opaque client-visible handle with no PID, task port, or signal authority.
@@ -52,43 +58,71 @@ impl SessionHandle {
 }
 
 /// Linear launch authority issued only after watchdog registration succeeds.
-pub(super) struct RegisteredLaunch<Launch> {
+struct RegisteredLaunch<Launch> {
     handle: SessionHandle,
     connection: ConnectionIdentity,
     deadline: Instant,
     launch: Launch,
 }
 
+/// One broker spawn result whose session, launch effect, and exact child
+/// authority were minted by the same atomic spawning operation.
+///
+/// There is deliberately no general production constructor: the future
+/// clean-exec spawner must create this value internally at the point where it
+/// obtains the exact unreaped child authority. This prevents callers from
+/// pairing one authenticated launch with another request's broker.
+pub(super) struct AtomicallySpawnedBroker<Launch, Authority: ExactBrokerAuthority> {
+    session: FreshSessionId,
+    launch: Launch,
+    broker: ExactBroker<Authority>,
+}
+
+impl<Launch, Authority: ExactBrokerAuthority> AtomicallySpawnedBroker<Launch, Authority> {
+    #[cfg(test)]
+    pub(super) unsafe fn from_test_atomic_spawn(
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+    ) -> Self {
+        Self {
+            session,
+            launch,
+            broker,
+        }
+    }
+
+    fn into_parts(self) -> (FreshSessionId, Launch, ExactBroker<Authority>) {
+        (self.session, self.launch, self.broker)
+    }
+}
+
 impl<Launch> RegisteredLaunch<Launch> {
-    pub(super) const fn handle(&self) -> SessionHandle {
+    const fn handle(&self) -> SessionHandle {
         self.handle
     }
 
-    pub(super) const fn connection(&self) -> ConnectionIdentity {
+    const fn connection(&self) -> ConnectionIdentity {
         self.connection
     }
 
-    pub(super) const fn deadline(&self) -> Instant {
+    const fn deadline(&self) -> Instant {
         self.deadline
-    }
-
-    pub(super) fn into_parts(self) -> (SessionHandle, ConnectionIdentity, Instant, Launch) {
-        (self.handle, self.connection, self.deadline, self.launch)
     }
 }
 
 /// Registration result separating the copyable client handle from launch authority.
-pub(super) struct RegisteredSession<Launch> {
+struct RegisteredSession<Launch> {
     handle: SessionHandle,
     launch: RegisteredLaunch<Launch>,
 }
 
 impl<Launch> RegisteredSession<Launch> {
-    pub(super) const fn handle(&self) -> SessionHandle {
+    const fn handle(&self) -> SessionHandle {
         self.handle
     }
 
-    pub(super) fn into_launch(self) -> RegisteredLaunch<Launch> {
+    fn into_launch(self) -> RegisteredLaunch<Launch> {
         self.launch
     }
 }
@@ -135,7 +169,7 @@ impl<Authority: ExactBrokerAuthority> ExactBroker<Authority> {
 impl<Authority: ExactBrokerAuthority> Drop for ExactBroker<Authority> {
     fn drop(&mut self) {
         if self.armed {
-            let proof = self.authority.emergency_terminate_and_reap();
+            let proof = self.authority.emergency_terminate_and_reap(None);
             self.mark_reaped(proof);
         }
     }
@@ -158,7 +192,7 @@ pub(super) unsafe trait ExactBrokerAuthority {
         reason: TerminationReason,
     ) -> Result<ReapedBroker, Self::Failure>;
 
-    fn emergency_terminate_and_reap(&mut self) -> ReapedBroker;
+    fn emergency_terminate_and_reap(&mut self, reason: Option<TerminationReason>) -> ReapedBroker;
 }
 
 /// Proof that the exact broker child reached the reaped terminal state.
@@ -187,6 +221,102 @@ pub(super) struct ReadySessionProof {
     connection: ConnectionIdentity,
 }
 
+/// Armed delivery boundary retaining one session-specific exact entry.
+///
+/// The guard remains armed until one send effect succeeds. Any error, panic,
+/// expiry, or ordinary drop exact-cleans only the proof-bound broker before
+/// control can escape.
+#[must_use = "Ready delivery must succeed or exact-clean the bound broker"]
+pub(super) struct PendingReadyDelivery<Authority: ExactBrokerAuthority> {
+    entry: Rc<RefCell<WatchdogEntry<Authority>>>,
+    proof: Option<ReadySessionProof>,
+    cleanup_reason: TerminationReason,
+}
+
+/// One prepared bounded nonblocking Ready send effect.
+///
+/// # Safety
+///
+/// Implementations must complete all allocation, encoding, and validation
+/// before this value is supplied. `send_once` must perform at most one
+/// nonblocking kernel send over the exact retained reply authority, must not
+/// invoke caller code or wait for queue capacity, and must recheck the supplied
+/// original deadline immediately before that send. The userspace clock check
+/// and kernel entry are not an atomic kernel deadline operation.
+pub(super) unsafe trait NonblockingReadySend {
+    type Error;
+
+    fn cleanup_reason(error: &Self::Error) -> TerminationReason;
+
+    fn send_once(
+        self,
+        handle: SessionHandle,
+        connection: ConnectionIdentity,
+        deadline: Instant,
+    ) -> Result<(), Self::Error>;
+}
+
+impl<Authority: ExactBrokerAuthority> PendingReadyDelivery<Authority> {
+    pub(super) fn deliver<Send: NonblockingReadySend>(
+        self,
+        send: Send,
+    ) -> Result<Result<(), Send::Error>, WatchdogStateError> {
+        self.deliver_at(Instant::now(), send)
+    }
+
+    fn deliver_at<Send: NonblockingReadySend>(
+        mut self,
+        now: Instant,
+        send: Send,
+    ) -> Result<Result<(), Send::Error>, WatchdogStateError> {
+        let proof = self.proof.as_ref().expect("armed Ready proof");
+        let entry = self
+            .entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != proof.handle || entry.connection != proof.connection {
+            std::process::abort();
+        }
+        match entry.phase {
+            BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
+            BrokerPhase::Reaping(_) => std::process::abort(),
+            BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::TerminationRequired(_) => {}
+        }
+        if entry.phase != BrokerPhase::Traced {
+            return Err(WatchdogStateError::InvalidTransition);
+        }
+        if now >= entry.deadline {
+            self.cleanup_reason = TerminationReason::DeadlineExpired;
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
+        let deadline = entry.deadline;
+        drop(entry);
+        match send.send_once(proof.handle, proof.connection, deadline) {
+            Ok(()) => {
+                self.proof.take();
+                Ok(Ok(()))
+            }
+            Err(error) => {
+                self.cleanup_reason = Send::cleanup_reason(&error);
+                Ok(Err(error))
+            }
+        }
+    }
+}
+
+impl<Authority: ExactBrokerAuthority> Drop for PendingReadyDelivery<Authority> {
+    fn drop(&mut self) {
+        if let Some(proof) = self.proof.take() {
+            emergency_terminate_entry(
+                &self.entry,
+                proof.handle,
+                proof.connection,
+                self.cleanup_reason,
+            );
+        }
+    }
+}
+
 impl ReadySessionProof {
     pub(super) const fn handle(&self) -> SessionHandle {
         self.handle
@@ -198,6 +328,14 @@ impl ReadySessionProof {
 }
 
 impl TraceEstablished {
+    pub(super) const fn handle(&self) -> SessionHandle {
+        self.handle
+    }
+
+    pub(super) const fn connection(&self) -> ConnectionIdentity {
+        self.connection
+    }
+
     /// # Safety
     ///
     /// The sole broker waiter must have established tracing and consumed both
@@ -215,11 +353,15 @@ enum BrokerPhase {
     Starting,
     Traced,
     TerminationRequired(TerminationReason),
+    Reaping(TerminationReason),
+    Reaped(TerminationReason),
 }
 
 /// Internal reason for exact broker teardown; never decoded from a signal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TerminationReason {
+    /// Trusted launch or trace setup was abandoned before Ready commitment.
+    LaunchAbandoned,
     /// The authenticated client connection was invalidated.
     ClientDisconnected,
     /// The immutable service-local deadline expired.
@@ -235,16 +377,264 @@ pub(super) enum TerminationReason {
 }
 
 struct WatchdogEntry<Authority: ExactBrokerAuthority> {
+    handle: SessionHandle,
     connection: ConnectionIdentity,
     deadline: Instant,
-    broker: ExactBroker<Authority>,
+    broker: Option<ExactBroker<Authority>>,
     phase: BrokerPhase,
 }
 
 /// Service-generation table retaining exact broker owners through cleanup.
 pub(super) struct WatchdogTable<Authority: ExactBrokerAuthority> {
-    live: HashMap<SessionHandle, WatchdogEntry<Authority>>,
+    live: HashMap<SessionHandle, Rc<RefCell<WatchdogEntry<Authority>>>>,
     tombstones: HashSet<SessionHandle>,
+}
+
+/// Armed ownership of one registered session while its trusted launch and
+/// trace handshake are incomplete.
+///
+/// The session-specific obligation permits unrelated lifecycle entries to keep
+/// progressing while preventing this exact launch from escaping cleanup. Every
+/// abandonment path emergency exact-cleans the bound broker.
+#[must_use = "a registered spawn must reach Ready or exact-clean its broker"]
+pub(super) struct PendingRegisteredSession<Launch, Authority: ExactBrokerAuthority> {
+    entry: Rc<RefCell<WatchdogEntry<Authority>>>,
+    handle: SessionHandle,
+    connection: ConnectionIdentity,
+    launch: Option<RegisteredLaunch<Launch>>,
+    trace: Option<TraceEstablished>,
+    cleanup_reason: TerminationReason,
+    armed: bool,
+}
+
+/// Borrowed launch effect view branded by the live registered-session lease.
+/// No method returns the owned effect, so it cannot survive lease cleanup.
+pub(super) struct RegisteredLaunchPermit<'lease, Launch, Authority: ExactBrokerAuthority> {
+    entry: Rc<RefCell<WatchdogEntry<Authority>>>,
+    launch: &'lease RegisteredLaunch<Launch>,
+}
+
+/// Short-lived final launch commitment held only across the no-callback
+/// irreversible launcher mutation and exec operation.
+#[must_use = "the launch commitment must remain live through irreversible exec"]
+pub(super) struct RegisteredLaunchCommitGuard<'permit, Authority: ExactBrokerAuthority> {
+    _entry: Ref<'permit, WatchdogEntry<Authority>>,
+}
+
+impl<Launch, Authority: ExactBrokerAuthority> RegisteredLaunchPermit<'_, Launch, Authority> {
+    pub(super) const fn handle(&self) -> SessionHandle {
+        self.launch.handle()
+    }
+
+    pub(super) const fn connection(&self) -> ConnectionIdentity {
+        self.launch.connection()
+    }
+
+    pub(super) const fn deadline(&self) -> Instant {
+        self.launch.deadline()
+    }
+
+    pub(super) const fn launch(&self) -> &Launch {
+        &self.launch.launch
+    }
+
+    /// Revalidates the exact live registration immediately before the
+    /// no-callback irreversible launcher operation and pins only this entry for
+    /// that operation's duration.
+    pub(super) fn commit_guard(
+        &self,
+    ) -> Result<RegisteredLaunchCommitGuard<'_, Authority>, WatchdogStateError> {
+        let entry = self
+            .entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != self.launch.handle || entry.connection != self.launch.connection {
+            std::process::abort();
+        }
+        match entry.phase {
+            BrokerPhase::Starting => {}
+            BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
+            BrokerPhase::Reaping(_) => std::process::abort(),
+            BrokerPhase::Traced | BrokerPhase::TerminationRequired(_) => {
+                return Err(WatchdogStateError::InvalidTransition);
+            }
+        }
+        if Instant::now() >= entry.deadline {
+            drop(entry);
+            emergency_terminate_entry(
+                &self.entry,
+                self.launch.handle,
+                self.launch.connection,
+                TerminationReason::DeadlineExpired,
+            );
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
+        Ok(RegisteredLaunchCommitGuard { _entry: entry })
+    }
+}
+
+impl<Launch, Authority: ExactBrokerAuthority> PendingRegisteredSession<Launch, Authority> {
+    pub(super) const fn handle(&self) -> SessionHandle {
+        self.handle
+    }
+
+    pub(super) const fn connection(&self) -> ConnectionIdentity {
+        self.connection
+    }
+
+    pub(super) fn launch_permit(
+        &self,
+    ) -> Result<RegisteredLaunchPermit<'_, Launch, Authority>, WatchdogStateError> {
+        let entry = self
+            .entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != self.handle || entry.connection != self.connection {
+            std::process::abort();
+        }
+        if entry.phase != BrokerPhase::Starting {
+            return Err(WatchdogStateError::InvalidTransition);
+        }
+        if Instant::now() >= entry.deadline {
+            drop(entry);
+            emergency_terminate_entry(
+                &self.entry,
+                self.handle,
+                self.connection,
+                TerminationReason::DeadlineExpired,
+            );
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
+        let launch = self
+            .launch
+            .as_ref()
+            .ok_or(WatchdogStateError::InvalidTransition)?;
+        Ok(RegisteredLaunchPermit {
+            entry: Rc::clone(&self.entry),
+            launch,
+        })
+    }
+
+    pub(super) fn mark_protocol_violation(&mut self) {
+        self.cleanup_reason = TerminationReason::ProtocolViolation;
+    }
+
+    pub(super) fn bind_trace(&mut self, trace: TraceEstablished) -> Result<(), TraceEstablished> {
+        if self.trace.is_some()
+            || trace.handle != self.handle
+            || trace.connection != self.connection
+        {
+            return Err(trace);
+        }
+        self.trace = Some(trace);
+        Ok(())
+    }
+
+    pub(super) fn mark_traced_for_delivery(
+        mut self,
+    ) -> Result<PendingReadyDelivery<Authority>, WatchdogStateError> {
+        let Some(trace) = self.trace.take() else {
+            self.mark_protocol_violation();
+            return Err(WatchdogStateError::InvalidTransition);
+        };
+        self.armed = false;
+        transition_registered_for_delivery(Rc::clone(&self.entry), trace)
+    }
+}
+
+impl<Launch, Authority: ExactBrokerAuthority> Drop for PendingRegisteredSession<Launch, Authority> {
+    fn drop(&mut self) {
+        if self.armed {
+            emergency_terminate_entry(
+                &self.entry,
+                self.handle,
+                self.connection,
+                self.cleanup_reason,
+            );
+            self.armed = false;
+        }
+    }
+}
+
+fn transition_registered_for_delivery<Authority: ExactBrokerAuthority>(
+    entry: Rc<RefCell<WatchdogEntry<Authority>>>,
+    proof: TraceEstablished,
+) -> Result<PendingReadyDelivery<Authority>, WatchdogStateError> {
+    let transition_error = {
+        let mut entry_ref = entry
+            .try_borrow_mut()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry_ref.handle != proof.handle || entry_ref.connection != proof.connection {
+            std::process::abort();
+        }
+        if entry_ref.phase != BrokerPhase::Starting {
+            Some(WatchdogStateError::InvalidTransition)
+        } else if Instant::now() >= entry_ref.deadline {
+            Some(WatchdogStateError::DeadlineExpired)
+        } else {
+            entry_ref.phase = BrokerPhase::Traced;
+            None
+        }
+    };
+    if let Some(error) = transition_error {
+        emergency_terminate_entry(
+            &entry,
+            proof.handle,
+            proof.connection,
+            if error == WatchdogStateError::DeadlineExpired {
+                TerminationReason::DeadlineExpired
+            } else {
+                TerminationReason::ProtocolViolation
+            },
+        );
+        return Err(error);
+    }
+    Ok(PendingReadyDelivery {
+        entry,
+        proof: Some(ReadySessionProof {
+            handle: proof.handle,
+            connection: proof.connection,
+        }),
+        cleanup_reason: TerminationReason::SpawnResultUndeliverable,
+    })
+}
+
+fn emergency_terminate_entry<Authority: ExactBrokerAuthority>(
+    entry: &Rc<RefCell<WatchdogEntry<Authority>>>,
+    handle: SessionHandle,
+    connection: ConnectionIdentity,
+    reason: TerminationReason,
+) {
+    let (mut broker, effective_reason) = {
+        let mut entry = entry
+            .try_borrow_mut()
+            .unwrap_or_else(|_| std::process::abort());
+        if entry.handle != handle || entry.connection != connection {
+            std::process::abort();
+        }
+        let effective_reason = match entry.phase {
+            BrokerPhase::Reaped(_) => return,
+            BrokerPhase::Reaping(_) => std::process::abort(),
+            BrokerPhase::Starting | BrokerPhase::Traced => reason,
+            BrokerPhase::TerminationRequired(existing) => existing,
+        };
+        entry.phase = BrokerPhase::Reaping(effective_reason);
+        (
+            entry.broker.take().unwrap_or_else(|| std::process::abort()),
+            effective_reason,
+        )
+    };
+    let proof = broker
+        .authority
+        .emergency_terminate_and_reap(Some(effective_reason));
+    broker.mark_reaped(proof);
+    let mut entry = entry
+        .try_borrow_mut()
+        .unwrap_or_else(|_| std::process::abort());
+    if entry.phase != BrokerPhase::Reaping(effective_reason) || entry.broker.is_some() {
+        std::process::abort();
+    }
+    entry.phase = BrokerPhase::Reaped(effective_reason);
 }
 
 impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
@@ -256,12 +646,12 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
     }
 
     /// Registers authority before a broker or untrusted target may run.
-    pub(super) fn register<Launch: RegisteredLaunchEffect>(
+    fn register<Launch: RegisteredLaunchEffect>(
         &mut self,
-        session: FreshSessionId,
-        launch: Launch,
-        broker: ExactBroker<Authority>,
+        spawned: AtomicallySpawnedBroker<Launch, Authority>,
     ) -> Result<RegisteredSession<Launch>, WatchdogStateError> {
+        self.sweep_reaped();
+        let (session, launch, broker) = spawned.into_parts();
         if self.live.len() >= MAX_LIVE_SESSIONS
             || self.live.len().saturating_add(self.tombstones.len())
                 >= MAX_SESSIONS_PER_SERVICE_GENERATION
@@ -276,12 +666,13 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         }
         self.live.insert(
             handle,
-            WatchdogEntry {
+            Rc::new(RefCell::new(WatchdogEntry {
+                handle,
                 connection,
                 deadline,
-                broker,
+                broker: Some(broker),
                 phase: BrokerPhase::Starting,
-            },
+            })),
         );
         Ok(RegisteredSession {
             handle,
@@ -294,13 +685,40 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         })
     }
 
+    pub(super) fn register_armed<Launch: RegisteredLaunchEffect>(
+        &mut self,
+        spawned: AtomicallySpawnedBroker<Launch, Authority>,
+    ) -> Result<PendingRegisteredSession<Launch, Authority>, WatchdogStateError> {
+        let registered = self.register(spawned)?;
+        let handle = registered.handle();
+        let launch = registered.into_launch();
+        let connection = launch.connection();
+        let entry = Rc::clone(
+            self.live
+                .get(&handle)
+                .expect("registration inserted the exact session entry"),
+        );
+        Ok(PendingRegisteredSession {
+            entry,
+            handle,
+            connection,
+            launch: Some(launch),
+            trace: None,
+            cleanup_reason: TerminationReason::LaunchAbandoned,
+            armed: true,
+        })
+    }
+
     /// Records that the broker established the exact trace relationship.
-    pub(super) fn mark_traced(
+    fn mark_traced(
         &mut self,
         proof: TraceEstablished,
     ) -> Result<ReadySessionProof, WatchdogStateError> {
+        let entry = self.client_entry(proof.handle, proof.connection)?;
         let expired = {
-            let entry = self.client_entry_mut(proof.handle, proof.connection)?;
+            let mut entry = entry
+                .try_borrow_mut()
+                .unwrap_or_else(|_| std::process::abort());
             if entry.phase != BrokerPhase::Starting {
                 return Err(WatchdogStateError::InvalidTransition);
             }
@@ -323,6 +741,17 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         })
     }
 
+    /// Atomically transitions the exact trace proof into an armed delivery
+    /// guard. A deadline failure returns only after any retryable retained
+    /// terminal authority has been emergency exact-reaped.
+    pub(super) fn mark_traced_for_delivery(
+        &mut self,
+        proof: TraceEstablished,
+    ) -> Result<PendingReadyDelivery<Authority>, WatchdogStateError> {
+        let entry = self.client_entry(proof.handle, proof.connection)?;
+        transition_registered_for_delivery(entry, proof)
+    }
+
     /// Consumes an undelivered readiness proof into exact cleanup. A failed
     /// cleanup attempt leaves the same broker authority and first terminal
     /// reason retained in the table for service-loop retry.
@@ -330,8 +759,13 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         &mut self,
         proof: ReadySessionProof,
     ) -> Result<Result<(), Authority::Failure>, WatchdogStateError> {
-        let entry = self.client_entry_mut(proof.handle, proof.connection)?;
-        if entry.phase != BrokerPhase::Traced {
+        let entry = self.client_entry(proof.handle, proof.connection)?;
+        if entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort())
+            .phase
+            != BrokerPhase::Traced
+        {
             return Err(WatchdogStateError::InvalidTransition);
         }
         self.terminate_internal(proof.handle, TerminationReason::SpawnResultUndeliverable)
@@ -357,11 +791,17 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         &mut self,
         handle: SessionHandle,
     ) -> Result<Result<(), Authority::Failure>, WatchdogStateError> {
+        self.sweep_reaped();
         let entry = self
             .live
             .get(&handle)
             .ok_or(WatchdogStateError::UnknownSession)?;
-        if Instant::now() < entry.deadline {
+        if Instant::now()
+            < entry
+                .try_borrow()
+                .unwrap_or_else(|_| std::process::abort())
+                .deadline
+        {
             return Err(WatchdogStateError::InvalidTransition);
         }
         self.terminate_internal(handle, TerminationReason::DeadlineExpired)
@@ -388,7 +828,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         connection: ConnectionIdentity,
         reason: TerminationReason,
     ) -> Result<Result<(), Authority::Failure>, WatchdogStateError> {
-        self.client_entry_mut(handle, connection)?;
+        self.client_entry(handle, connection)?;
         self.terminate_internal(handle, reason)
     }
 
@@ -397,56 +837,167 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         handle: SessionHandle,
         reason: TerminationReason,
     ) -> Result<Result<(), Authority::Failure>, WatchdogStateError> {
-        let result = {
-            let entry = self
-                .live
-                .get_mut(&handle)
-                .ok_or(WatchdogStateError::UnknownSession)?;
+        self.sweep_reaped();
+        let entry = Rc::clone(
+            self.live
+                .get(&handle)
+                .ok_or(WatchdogStateError::UnknownSession)?,
+        );
+        let (mut broker, effective_reason) = {
+            let mut entry = entry
+                .try_borrow_mut()
+                .unwrap_or_else(|_| std::process::abort());
             let effective_reason = match entry.phase {
-                BrokerPhase::Starting | BrokerPhase::Traced => {
-                    entry.phase = BrokerPhase::TerminationRequired(reason);
-                    reason
-                }
+                BrokerPhase::Starting | BrokerPhase::Traced => reason,
                 BrokerPhase::TerminationRequired(existing) => existing,
+                BrokerPhase::Reaping(_) => std::process::abort(),
+                BrokerPhase::Reaped(_) => return Err(WatchdogStateError::UnknownSession),
             };
-            entry.broker.authority.terminate_and_reap(effective_reason)
+            entry.phase = BrokerPhase::Reaping(effective_reason);
+            let broker = entry.broker.take().unwrap_or_else(|| std::process::abort());
+            (broker, effective_reason)
         };
-        if let Ok(proof) = result {
-            let mut removed = self
-                .live
-                .remove(&handle)
-                .expect("live entry existed for successful exact cleanup");
-            removed.broker.mark_reaped(proof);
-            self.tombstones.insert(handle);
-            Ok(Ok(()))
-        } else {
-            Ok(result.map(|_| ()))
+        let result = broker.authority.terminate_and_reap(effective_reason);
+        let result = match result {
+            Ok(proof) => {
+                broker.mark_reaped(proof);
+                let mut entry = entry
+                    .try_borrow_mut()
+                    .unwrap_or_else(|_| std::process::abort());
+                if entry.phase != BrokerPhase::Reaping(effective_reason) || entry.broker.is_some() {
+                    std::process::abort();
+                }
+                entry.phase = BrokerPhase::Reaped(effective_reason);
+                Ok(())
+            }
+            Err(error) => {
+                let mut entry = entry
+                    .try_borrow_mut()
+                    .unwrap_or_else(|_| std::process::abort());
+                if entry.phase != BrokerPhase::Reaping(effective_reason) || entry.broker.is_some() {
+                    std::process::abort();
+                }
+                entry.phase = BrokerPhase::TerminationRequired(effective_reason);
+                entry.broker = Some(broker);
+                Err(error)
+            }
+        };
+        if result.is_ok() {
+            self.sweep_reaped();
         }
+        Ok(result)
     }
 
-    fn client_entry_mut(
+    fn emergency_terminate_registered(
         &mut self,
         handle: SessionHandle,
         connection: ConnectionIdentity,
-    ) -> Result<&mut WatchdogEntry<Authority>, WatchdogStateError> {
-        let entry = self
-            .live
-            .get_mut(&handle)
-            .ok_or(WatchdogStateError::UnknownSession)?;
-        if entry.connection != connection {
+        reason: TerminationReason,
+    ) {
+        let Ok(entry) = self.client_entry(handle, connection) else {
+            std::process::abort();
+        };
+        emergency_terminate_entry(&entry, handle, connection, reason);
+        self.sweep_reaped();
+    }
+
+    fn client_entry(
+        &mut self,
+        handle: SessionHandle,
+        connection: ConnectionIdentity,
+    ) -> Result<Rc<RefCell<WatchdogEntry<Authority>>>, WatchdogStateError> {
+        self.sweep_reaped();
+        let entry = Rc::clone(
+            self.live
+                .get(&handle)
+                .ok_or(WatchdogStateError::UnknownSession)?,
+        );
+        let entry_connection = entry
+            .try_borrow()
+            .unwrap_or_else(|_| std::process::abort())
+            .connection;
+        if entry_connection != connection {
             return Err(WatchdogStateError::WrongConnection);
         }
         Ok(entry)
     }
 
+    fn sweep_reaped(&mut self) {
+        let reaped: Vec<_> = self
+            .live
+            .iter()
+            .filter_map(|(handle, entry)| {
+                let phase = entry
+                    .try_borrow()
+                    .unwrap_or_else(|_| std::process::abort())
+                    .phase;
+                match phase {
+                    BrokerPhase::Reaped(_) => Some(*handle),
+                    BrokerPhase::Reaping(_) => std::process::abort(),
+                    BrokerPhase::Starting
+                    | BrokerPhase::Traced
+                    | BrokerPhase::TerminationRequired(_) => None,
+                }
+            })
+            .collect();
+        for handle in reaped {
+            if !self.tombstones.insert(handle) {
+                std::process::abort();
+            }
+            self.live
+                .remove(&handle)
+                .unwrap_or_else(|| std::process::abort());
+        }
+    }
+
     #[cfg(test)]
     fn contains_live(&self, handle: SessionHandle) -> bool {
-        self.live.contains_key(&handle)
+        self.live.get(&handle).is_some_and(|entry| {
+            matches!(
+                entry
+                    .try_borrow()
+                    .unwrap_or_else(|_| std::process::abort())
+                    .phase,
+                BrokerPhase::Starting | BrokerPhase::Traced | BrokerPhase::TerminationRequired(_)
+            )
+        })
     }
 
     #[cfg(test)]
     fn contains_tombstone(&self, handle: SessionHandle) -> bool {
         self.tombstones.contains(&handle)
+            || self.live.get(&handle).is_some_and(|entry| {
+                matches!(
+                    entry
+                        .try_borrow()
+                        .unwrap_or_else(|_| std::process::abort())
+                        .phase,
+                    BrokerPhase::Reaped(_)
+                )
+            })
+    }
+}
+
+impl<Authority: ExactBrokerAuthority> Drop for WatchdogTable<Authority> {
+    fn drop(&mut self) {
+        for entry in self.live.values() {
+            let (handle, connection, phase) = {
+                let entry = entry.try_borrow().unwrap_or_else(|_| std::process::abort());
+                (entry.handle, entry.connection, entry.phase)
+            };
+            match phase {
+                BrokerPhase::Reaped(_) => {}
+                BrokerPhase::Reaping(_) => std::process::abort(),
+                BrokerPhase::Starting
+                | BrokerPhase::Traced
+                | BrokerPhase::TerminationRequired(_) => emergency_terminate_entry(
+                    entry,
+                    handle,
+                    connection,
+                    TerminationReason::ProtocolViolation,
+                ),
+            }
+        }
     }
 }
 

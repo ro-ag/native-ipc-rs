@@ -15,8 +15,12 @@ assert_not_impl_any!(FreshSessionId: Clone, Copy);
 assert_not_impl_any!(ExactBroker<FakeBroker>: Clone, Copy);
 assert_not_impl_any!(TraceEstablished: Clone, Copy);
 assert_not_impl_any!(ReadySessionProof: Clone, Copy);
+assert_not_impl_any!(PendingReadyDelivery<FakeBroker>: Clone, Copy);
 assert_not_impl_any!(ReapedBroker: Clone, Copy);
 assert_not_impl_any!(RegisteredLaunch<TestLaunch>: Clone, Copy);
+assert_not_impl_any!(RegisteredLaunchPermit<'static, TestLaunch, FakeBroker>: Clone, Copy);
+assert_not_impl_any!(RegisteredLaunchCommitGuard<'static, FakeBroker>: Clone, Copy);
+assert_not_impl_any!(PendingRegisteredSession<TestLaunch, FakeBroker>: Clone, Copy);
 
 #[derive(Debug, Default, Eq, PartialEq)]
 struct FakeState {
@@ -24,6 +28,7 @@ struct FakeState {
     emergency_attempts: usize,
     completed: bool,
     reasons: Vec<TerminationReason>,
+    emergency_reasons: Vec<Option<TerminationReason>>,
 }
 
 struct FakeBroker {
@@ -67,12 +72,77 @@ unsafe impl ExactBrokerAuthority for FakeBroker {
         Ok(unsafe { ReapedBroker::from_exact_reap() })
     }
 
-    fn emergency_terminate_and_reap(&mut self) -> ReapedBroker {
+    fn emergency_terminate_and_reap(&mut self, reason: Option<TerminationReason>) -> ReapedBroker {
         let mut state = self.state.lock().unwrap();
         state.emergency_attempts += 1;
+        state.emergency_reasons.push(reason);
         state.completed = true;
         // SAFETY: the fake emergency path models successful exact broker reap.
         unsafe { ReapedBroker::from_exact_reap() }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TestSendOutcome {
+    Success,
+    Error,
+    Panic,
+}
+
+#[derive(Default)]
+struct TestSendObservation {
+    calls: usize,
+    handle: Option<SessionHandle>,
+    connection: Option<ConnectionIdentity>,
+    deadline: Option<Instant>,
+}
+
+struct TestReadySend {
+    outcome: TestSendOutcome,
+    observation: Arc<Mutex<TestSendObservation>>,
+}
+
+fn test_ready_send(outcome: TestSendOutcome) -> (TestReadySend, Arc<Mutex<TestSendObservation>>) {
+    let observation = Arc::new(Mutex::new(TestSendObservation::default()));
+    (
+        TestReadySend {
+            outcome,
+            observation: Arc::clone(&observation),
+        },
+        observation,
+    )
+}
+
+// SAFETY: this fixed test sender performs no allocation or callback in
+// send_once. It records one immediate invocation and returns its preselected
+// outcome without waiting or retrying.
+unsafe impl NonblockingReadySend for TestReadySend {
+    type Error = &'static str;
+
+    fn cleanup_reason(_error: &Self::Error) -> TerminationReason {
+        TerminationReason::SpawnResultUndeliverable
+    }
+
+    fn send_once(
+        self,
+        handle: SessionHandle,
+        connection: ConnectionIdentity,
+        deadline: Instant,
+    ) -> Result<(), Self::Error> {
+        let mut observation = self
+            .observation
+            .try_lock()
+            .expect("single-threaded test observation must never block");
+        observation.calls += 1;
+        observation.handle = Some(handle);
+        observation.connection = Some(connection);
+        observation.deadline = Some(deadline);
+        drop(observation);
+        match self.outcome {
+            TestSendOutcome::Success => Ok(()),
+            TestSendOutcome::Error => Err("send"),
+            TestSendOutcome::Panic => panic!("injected fixed send panic"),
+        }
     }
 }
 
@@ -110,6 +180,50 @@ fn broker(failures_remaining: usize) -> (ExactBroker<FakeBroker>, Arc<Mutex<Fake
     (broker, state)
 }
 
+trait WatchdogTableTestExt<Authority: ExactBrokerAuthority> {
+    fn register_test<Launch: RegisteredLaunchEffect>(
+        &mut self,
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+    ) -> Result<RegisteredSession<Launch>, WatchdogStateError>;
+
+    fn register_armed_test<Launch: RegisteredLaunchEffect>(
+        &mut self,
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+    ) -> Result<PendingRegisteredSession<Launch, Authority>, WatchdogStateError>;
+}
+
+impl<Authority: ExactBrokerAuthority> WatchdogTableTestExt<Authority> for WatchdogTable<Authority> {
+    fn register_test<Launch: RegisteredLaunchEffect>(
+        &mut self,
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+    ) -> Result<RegisteredSession<Launch>, WatchdogStateError> {
+        // SAFETY: every test call models one atomic spawn result and supplies
+        // its paired launch and exact broker in the same expression.
+        let spawned =
+            unsafe { AtomicallySpawnedBroker::from_test_atomic_spawn(session, launch, broker) };
+        self.register(spawned)
+    }
+
+    fn register_armed_test<Launch: RegisteredLaunchEffect>(
+        &mut self,
+        session: FreshSessionId,
+        launch: Launch,
+        broker: ExactBroker<Authority>,
+    ) -> Result<PendingRegisteredSession<Launch, Authority>, WatchdogStateError> {
+        // SAFETY: the test call models one atomic spawn result and supplies its
+        // paired launch and exact broker in the same expression.
+        let spawned =
+            unsafe { AtomicallySpawnedBroker::from_test_atomic_spawn(session, launch, broker) };
+        self.register_armed(spawned)
+    }
+}
+
 fn future_deadline() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
@@ -132,7 +246,7 @@ fn unexpected_stop_is_terminal_and_success_tombstones_the_session() {
     let mut table = WatchdogTable::new();
     let (broker, state) = broker(0);
     let handle = table
-        .register(session(), launch(owner, future_deadline()), broker)
+        .register_test(session(), launch(owner, future_deadline()), broker)
         .unwrap()
         .handle();
     let _ready = table.mark_traced(trace_proof(handle, owner)).unwrap();
@@ -151,13 +265,162 @@ fn unexpected_stop_is_terminal_and_success_tombstones_the_session() {
 }
 
 #[test]
+fn pending_launch_obligation_does_not_block_unrelated_session_cleanup() {
+    let first_owner = connection();
+    let second_owner = connection();
+    let mut table = WatchdogTable::new();
+    let (first_broker, first_state) = broker(0);
+    let first = table
+        .register_armed_test(
+            session(),
+            launch(first_owner, future_deadline()),
+            first_broker,
+        )
+        .unwrap();
+    let first_handle = first.handle();
+    let (second_broker, second_state) = broker(0);
+    let second_handle = table
+        .register_test(
+            session(),
+            launch(second_owner, future_deadline()),
+            second_broker,
+        )
+        .unwrap()
+        .handle();
+
+    assert_eq!(
+        table.terminate_for_unexpected_stop(second_handle),
+        Ok(Ok(()))
+    );
+    assert_eq!(second_state.lock().unwrap().attempts, 1);
+    assert_eq!(first_state.lock().unwrap().attempts, 0);
+    assert_eq!(first_state.lock().unwrap().emergency_attempts, 0);
+    assert!(table.contains_live(first_handle));
+
+    drop(first);
+    assert_eq!(first_state.lock().unwrap().emergency_attempts, 1);
+    assert_eq!(
+        table.terminate_for_client_request(first_handle, first_owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
+}
+
+#[test]
+fn table_cleanup_and_drop_cannot_double_clean_retained_session_obligation() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let pending = table
+        .register_armed_test(session(), launch(owner, future_deadline()), broker)
+        .unwrap();
+    let handle = pending.handle();
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Ok(Ok(()))
+    );
+    assert_eq!(state.lock().unwrap().attempts, 1);
+    drop(pending);
+    assert_eq!(state.lock().unwrap().attempts, 1);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 0);
+}
+
+#[test]
+fn table_drop_exactly_cleans_even_with_retained_session_obligation() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let pending = table
+        .register_armed_test(session(), launch(owner, future_deadline()), broker)
+        .unwrap();
+    drop(table);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+    drop(pending);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+}
+
+#[test]
+fn active_launch_permit_does_not_block_table_cleanup() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let pending = table
+        .register_armed_test(session(), launch(owner, future_deadline()), broker)
+        .unwrap();
+    let permit = pending.launch_permit().unwrap();
+
+    drop(table);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+    assert_eq!(
+        permit.commit_guard().err(),
+        Some(WatchdogStateError::UnknownSession)
+    );
+    drop(permit);
+    drop(pending);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+}
+
+#[test]
+fn expired_launch_permit_exactly_cleans_before_returning_error() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let pending = table
+        .register_armed_test(
+            session(),
+            launch(owner, Instant::now() - Duration::from_secs(1)),
+            broker,
+        )
+        .unwrap();
+    let handle = pending.handle();
+
+    assert!(matches!(
+        pending.launch_permit(),
+        Err(WatchdogStateError::DeadlineExpired)
+    ));
+    let locked = state.lock().unwrap();
+    assert_eq!(locked.emergency_attempts, 1);
+    assert_eq!(
+        locked.emergency_reasons,
+        vec![Some(TerminationReason::DeadlineExpired)]
+    );
+    drop(locked);
+    assert!(table.contains_tombstone(handle));
+    drop(pending);
+    assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+}
+
+#[test]
+fn armed_obligation_emergency_cleanup_preserves_first_terminal_reason() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(1);
+    let pending = table
+        .register_armed_test(session(), launch(owner, future_deadline()), broker)
+        .unwrap();
+    let handle = pending.handle();
+
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Ok(Err("retry"))
+    );
+    drop(pending);
+    let state = state.lock().unwrap();
+    assert_eq!(state.reasons, vec![TerminationReason::ClientRequested]);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reasons,
+        vec![Some(TerminationReason::ClientRequested)]
+    );
+}
+
+#[test]
 fn undelivered_ready_proof_exactly_cleans_or_retains_first_reason() {
     for failures in [0, 1] {
         let owner = connection();
         let mut table = WatchdogTable::new();
         let (broker, state) = broker(failures);
         let handle = table
-            .register(session(), launch(owner, future_deadline()), broker)
+            .register_test(session(), launch(owner, future_deadline()), broker)
             .unwrap()
             .handle();
         let ready = table.mark_traced(trace_proof(handle, owner)).unwrap();
@@ -186,13 +449,143 @@ fn undelivered_ready_proof_exactly_cleans_or_retains_first_reason() {
 }
 
 #[test]
+fn ready_delivery_success_disarms_and_keeps_the_exact_session_live() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let handle = table
+        .register_test(session(), launch(owner, future_deadline()), broker)
+        .unwrap()
+        .handle();
+    let delivery = table
+        .mark_traced_for_delivery(trace_proof(handle, owner))
+        .unwrap();
+    let (send, observation) = test_ready_send(TestSendOutcome::Success);
+    assert_eq!(delivery.deliver(send), Ok(Ok(())));
+    let observation = observation.lock().unwrap();
+    assert_eq!(observation.calls, 1);
+    assert_eq!(observation.handle, Some(handle));
+    assert_eq!(observation.connection, Some(owner));
+    assert!(
+        observation
+            .deadline
+            .is_some_and(|value| value > Instant::now())
+    );
+    drop(observation);
+    assert!(table.contains_live(handle));
+    assert!(!table.contains_tombstone(handle));
+    assert_eq!(state.lock().unwrap().attempts, 0);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner).unwrap(),
+        Ok(())
+    );
+}
+
+#[test]
+fn ready_delivery_drop_and_send_error_clean_only_the_bound_session() {
+    for drop_without_send in [false, true] {
+        let owner = connection();
+        let mut table = WatchdogTable::new();
+        let (bound_broker, bound_state) = broker(0);
+        let (other_broker, other_state) = broker(0);
+        let bound = table
+            .register_test(session(), launch(owner, future_deadline()), bound_broker)
+            .unwrap()
+            .handle();
+        let other = table
+            .register_test(session(), launch(owner, future_deadline()), other_broker)
+            .unwrap()
+            .handle();
+        let delivery = table
+            .mark_traced_for_delivery(trace_proof(bound, owner))
+            .unwrap();
+        if drop_without_send {
+            drop(delivery);
+        } else {
+            let (send, observation) = test_ready_send(TestSendOutcome::Error);
+            assert_eq!(delivery.deliver(send), Ok(Err("send")));
+            assert_eq!(observation.lock().unwrap().calls, 1);
+        }
+        assert!(!table.contains_live(bound));
+        assert!(table.contains_tombstone(bound));
+        assert!(table.contains_live(other));
+        assert_eq!(bound_state.lock().unwrap().attempts, 0);
+        assert_eq!(bound_state.lock().unwrap().emergency_attempts, 1);
+        assert_eq!(other_state.lock().unwrap().attempts, 0);
+        assert_eq!(
+            table.terminate_for_client_request(other, owner).unwrap(),
+            Ok(())
+        );
+    }
+}
+
+#[test]
+fn ready_delivery_panic_and_drop_use_exact_emergency_cleanup() {
+    for panic_in_send in [false, true] {
+        let owner = connection();
+        let mut table = WatchdogTable::new();
+        let (broker, state) = broker(1);
+        let handle = table
+            .register_test(session(), launch(owner, future_deadline()), broker)
+            .unwrap()
+            .handle();
+        let delivery = table
+            .mark_traced_for_delivery(trace_proof(handle, owner))
+            .unwrap();
+        if panic_in_send {
+            let (send, observation) = test_ready_send(TestSendOutcome::Panic);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = delivery.deliver(send);
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(observation.lock().unwrap().calls, 1);
+        } else {
+            drop(delivery);
+        }
+        assert!(!table.contains_live(handle));
+        assert!(table.contains_tombstone(handle));
+        let state = state.lock().unwrap();
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.emergency_attempts, 1);
+        assert!(state.completed);
+    }
+}
+
+#[test]
+fn ready_delivery_rechecks_deadline_before_invoking_send() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let deadline = future_deadline();
+    let handle = table
+        .register_test(session(), launch(owner, deadline), broker)
+        .unwrap()
+        .handle();
+    let delivery = table
+        .mark_traced_for_delivery(trace_proof(handle, owner))
+        .unwrap();
+    let (send, observation) = test_ready_send(TestSendOutcome::Success);
+    assert_eq!(
+        delivery.deliver_at(deadline, send),
+        Err(WatchdogStateError::DeadlineExpired)
+    );
+    assert_eq!(observation.lock().unwrap().calls, 0);
+    assert!(!table.contains_live(handle));
+    assert!(table.contains_tombstone(handle));
+    assert_eq!(
+        state.lock().unwrap().emergency_reasons,
+        vec![Some(TerminationReason::DeadlineExpired)]
+    );
+}
+
+#[test]
 fn expired_trace_transition_mints_no_ready_and_exactly_cleans_or_retains() {
     for failures in [0, 1] {
         let owner = connection();
         let mut table = WatchdogTable::new();
         let (broker, state) = broker(failures);
         let handle = table
-            .register(
+            .register_test(
                 session(),
                 launch(owner, Instant::now() - Duration::from_secs(1)),
                 broker,
@@ -230,7 +623,7 @@ fn failed_cleanup_retains_exact_authority_and_all_terminal_causes_retry() {
     let (broker, state) = broker(1);
     let deadline = Instant::now() - Duration::from_secs(1);
     let handle = table
-        .register(session(), launch(owner, deadline), broker)
+        .register_test(session(), launch(owner, deadline), broker)
         .unwrap()
         .handle();
     assert_eq!(table.terminate_for_deadline(handle).unwrap(), Err("retry"));
@@ -258,7 +651,7 @@ fn deadline_cleanup_cannot_begin_before_registered_deadline() {
     let (broker, state) = broker(0);
     let deadline = future_deadline();
     let handle = table
-        .register(session(), launch(owner, deadline), broker)
+        .register_test(session(), launch(owner, deadline), broker)
         .unwrap()
         .handle();
     assert_eq!(
@@ -279,7 +672,7 @@ fn wrong_connection_never_receives_or_invokes_authority() {
     let mut table = WatchdogTable::new();
     let (broker, state) = broker(0);
     let handle = table
-        .register(session(), launch(owner, future_deadline()), broker)
+        .register_test(session(), launch(owner, future_deadline()), broker)
         .unwrap()
         .handle();
     assert_eq!(
@@ -300,7 +693,7 @@ fn trace_transition_requires_typed_proof_and_is_single_use() {
     let mut table = WatchdogTable::new();
     let (broker, _state) = broker(0);
     let handle = table
-        .register(session(), launch(owner, future_deadline()), broker)
+        .register_test(session(), launch(owner, future_deadline()), broker)
         .unwrap()
         .handle();
     assert!(matches!(
@@ -329,11 +722,11 @@ fn trace_proof_cannot_be_substituted_between_sessions() {
     let (first, _first_state) = broker(0);
     let (second, _second_state) = broker(0);
     let first_handle = table
-        .register(session(), launch(owner, future_deadline()), first)
+        .register_test(session(), launch(owner, future_deadline()), first)
         .unwrap()
         .handle();
     let second_handle = table
-        .register(session(), launch(owner, future_deadline()), second)
+        .register_test(session(), launch(owner, future_deadline()), second)
         .unwrap()
         .handle();
 
@@ -358,12 +751,12 @@ fn registration_failure_emergency_cleans_the_unstored_authority() {
     for _ in 0..MAX_LIVE_SESSIONS {
         let (broker, _state) = broker(0);
         table
-            .register(session(), launch(owner, future_deadline()), broker)
+            .register_test(session(), launch(owner, future_deadline()), broker)
             .unwrap();
     }
     let (rejected, rejected_state) = broker(0);
     assert!(matches!(
-        table.register(session(), launch(owner, future_deadline()), rejected),
+        table.register_test(session(), launch(owner, future_deadline()), rejected),
         Err(WatchdogStateError::CapacityExceeded)
     ));
     let rejected_state = rejected_state.lock().unwrap();
@@ -378,10 +771,10 @@ fn dropping_live_table_emergency_cleans_every_exact_broker() {
     let (first, first_state) = broker(0);
     let (second, second_state) = broker(0);
     table
-        .register(session(), launch(owner, future_deadline()), first)
+        .register_test(session(), launch(owner, future_deadline()), first)
         .unwrap();
     table
-        .register(session(), launch(owner, future_deadline()), second)
+        .register_test(session(), launch(owner, future_deadline()), second)
         .unwrap();
     drop(table);
     for state in [first_state, second_state] {

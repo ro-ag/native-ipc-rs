@@ -269,15 +269,27 @@ destruction, oversized-head progress without `MACH_RCV_LARGE`, and linear
 send-once reply ownership. It routes hello/spawn state only after validation and
    exact worker reap. A receive-only spawn-result decoder also authenticates
    exact service freshness before revealing only an opaque handle or coarse
-   failure; there is no production success encoder. This remains source/native
-   mechanism evidence, not an installed privileged service or clean-exec
+   failure. The source model now assigns the fresh opaque session before broker
+   creation, accepts only one atomic launch-plus-exact-broker result, and keeps
+   an armed session-specific watchdog obligation through launch transfer, trace
+   binding, Ready encoding, and the exact send-once reply. Drop, substitution,
+   deadline, encoding, and recoverable-send paths emergency exact-reap the
+   bound broker before returning; an indeterminate Mach send exact-cleans and
+   then fail-stops. A successful zero-timeout send alone disarms the Ready
+   guard. The obligation does not borrow the whole table, so an unrelated
+   session can still be terminated while one launch is pending; table shutdown
+   also exact-cleans entries retained by outstanding obligations. A revocable
+   launch permit exposes no owned launch authority and holds no long-lived
+   table borrow, so same-session cleanup can reap it. Immediately before the
+   no-callback credential-drop/exec transition, a short guard revalidates and
+   pins the exact live registration; copied preparation bytes cannot commit
+   after cleanup.
+   Native tests exercise real Mach Ready delivery and invalid-destination
+   cleanup. The deadline is rechecked immediately before the send, but that
+   userspace check and kernel entry are not one atomic kernel deadline action.
+   This remains source/native mechanism evidence, not an installed
+   privileged service, atomic production broker spawner, or clean-exec
    Security-worker executable/entrypoint.
-   The watchdog separately mints one noncopyable readiness proof only after the
-   unexpired registered session transitions from Starting to exact Traced. An
-   expired transition enters exact deadline cleanup and mints no proof. Consuming an
-   undeliverable proof records a distinct terminal cause and exactly cleans or
-   retains the broker authority. No production encoder can yet combine that
-   proof with the authenticated request's exact send-once reply right.
 3. The service/watchdog is independently privileged so target code running as
    the client cannot signal-stop it. Privilege is retained only by the minimal
    broker/watchdog; the launcher permanently drops real/effective/saved IDs to

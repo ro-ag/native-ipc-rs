@@ -263,7 +263,16 @@ authentication-adapter model also retains each exact Mach frame through a
 fixed one-job worker, binds its private reply endpoint with a linear receipt,
 and mints no peer authority before typed exact worker reap. Its cleanup API
 makes only bounded nonblocking progress and never reconstructs a worker from a
-PID. These models are not packaged service artifacts and have no positive
+PID. The spawn-reply model also assigns the opaque session before broker
+creation and retains one session-specific armed watchdog obligation through a
+real zero-timeout Mach Ready send, without blocking unrelated session cleanup.
+Its launch permit carries a revocable session-specific registration without
+holding a long-lived table borrow: same-session cleanup remains operable, and
+the launcher revalidates a short final guard immediately before its no-callback
+credential-drop/exec transition. Copied launch bytes cannot commit after the
+watchdog has reaped the session. The obligation exact-cleans every tested
+abandonment, substitution, freshness, deadline, and recoverable-send path. These models are
+not packaged service artifacts and have no positive
 root/signing evidence. Public macOS therefore still needs an independently
 privileged, authenticated launchd/Mach service/watchdog and remains fail-closed; the proof and residual
 constraints are documented in

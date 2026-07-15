@@ -141,8 +141,20 @@ Versioning once a stable API is released.
   unexpired `Starting` to exact-traced transition. An expired transition mints
   no proof and enters exact deadline cleanup. If a future Ready reply is not
   deliverable, consuming that proof records a distinct terminal reason and
-  exactly reaps or retains the same broker authority for retry. The proof is
-  not yet connected to a production reply encoder.
+  exactly reaps or retains the same broker authority for retry.
+- Fuse the accepted spawn reply with a session assigned before broker creation,
+  one atomic launch-plus-exact-broker result, and a session-specific armed
+  watchdog obligation. Its revocable launch permit holds no long-lived table
+  borrow, so same-session and unrelated cleanup remain operable while it is
+  pending. A short final guard revalidates the live registration immediately
+  across the no-callback credential-drop/exec transition; copied launch bytes
+  cannot commit after reap. The
+  obligation survives trace validation, then moves
+  into a zero-timeout prepared Mach Ready send. Substitution, abandonment,
+  freshness/deadline failure, and recoverable send failure exact-clean the
+  bound broker before returning; indeterminate send status exact-cleans before
+  fail-stop. This is backend-private source/native evidence and does not supply
+  the installed privileged service or enable public macOS sessions.
 - Characterize the public raw-Mach deployment path with ignored C/CMake probes:
   launchd `bootstrap_check_in`/`bootstrap_look_up` delivers exact bidirectional
   audit trailers, and Security accepts exactly 32 native audit-token bytes for

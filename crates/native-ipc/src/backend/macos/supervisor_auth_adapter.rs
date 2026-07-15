@@ -16,11 +16,19 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use super::super::supervisor_watchdog::ExactBroker;
+use super::super::supervisor_watchdog::{
+    AtomicallySpawnedBroker, ExactBrokerAuthority, FreshSessionId, NonblockingReadySend,
+    PendingReadyDelivery, PendingRegisteredSession, RegisteredLaunchPermit, SessionHandle,
+    TerminationReason, TraceEstablished, WatchdogStateError, WatchdogTable,
+};
 use super::super::{MachPort, current_task, deallocate_port};
 use super::{
-    ConnectionGeneration, ConnectionIdentity, FreshServiceNonce, MAX_SUPERVISOR_RECORD_BYTES,
-    RecordKind, SupervisorConnection, SupervisorDeadline, SupervisorWireError, VerifiedMessage,
-    VerifiedPeer, decode_header,
+    AuthenticatedSpawnRequest, ConnectionGeneration, ConnectionIdentity, FreshServiceNonce,
+    InstalledPolicyCatalog, MAX_SUPERVISOR_RECORD_BYTES, RecordKind, SupervisorConnection,
+    SupervisorDeadline, SupervisorWireError, ValidatedSpawn, VerifiedMessage, VerifiedPeer,
+    decode_header, encode_ready_spawn_result,
 };
 
 const MAX_AUTH_WORKERS: usize = 4;
@@ -63,6 +71,7 @@ const MACH_MSGH_BITS_COMPLEX: u32 = 0x8000_0000;
 const MACH_MSG_TYPE_PORT_SEND: u32 = 17;
 const MACH_MSG_TYPE_PORT_SEND_ONCE: u32 = 18;
 const MACH_SEND_MSG: u32 = 0x0000_0001;
+const MACH_SEND_TIMEOUT: u32 = 0x0000_0010;
 const MACH_SEND_INTERRUPT: u32 = 0x0000_0040;
 const MACH_SEND_INVALID_DEST: MachMsgReturn = 0x1000_0003;
 const MACH_SEND_TIMED_OUT: MachMsgReturn = 0x1000_0004;
@@ -539,6 +548,70 @@ pub(super) struct RawMachRecord {
 /// Linear send-once reply right delivered in one canonical request header.
 pub(super) struct MachSendOnceRight(MachPort);
 
+enum ClassifiedMachSendError {
+    Recoverable(MachReplyError),
+    Indeterminate(MachMsgReturn),
+}
+
+/// Fully allocated and encoded one-shot Mach send. Dropping before the syscall
+/// destroys the exact retained message/right; an indeterminate syscall result
+/// disarms Drop because the kernel may already have consumed part of it.
+struct PreparedMachSend {
+    storage: Vec<u64>,
+    message_size: u32,
+    armed: bool,
+}
+
+impl PreparedMachSend {
+    fn send_classified(mut self) -> Result<(), ClassifiedMachSendError> {
+        let bytes = words_as_bytes_mut(&mut self.storage);
+        // SAFETY: preparation created one complete aligned inline message. A
+        // zero timeout makes the single send syscall nonblocking.
+        let status = unsafe {
+            mach_msg(
+                bytes.as_mut_ptr().cast(),
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT | MACH_SEND_INTERRUPT,
+                self.message_size,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        match status {
+            0 => {
+                self.armed = false;
+                Ok(())
+            }
+            MACH_SEND_INVALID_DEST | MACH_SEND_TIMED_OUT | MACH_SEND_INTERRUPTED => {
+                // The kernel pseudo-receives recoverable failed sends back into
+                // this buffer and may rewrite the right's numeric name.
+                destroy_mach_message(bytes);
+                self.armed = false;
+                Err(ClassifiedMachSendError::Recoverable(
+                    MachReplyError::MachSend(status),
+                ))
+            }
+            _ => {
+                // The buffer may be partially consumed. Exact right cleanup is
+                // no longer possible; the caller must exact-clean its session
+                // authority and fail-stop without touching this message again.
+                self.armed = false;
+                Err(ClassifiedMachSendError::Indeterminate(status))
+            }
+        }
+    }
+}
+
+impl Drop for PreparedMachSend {
+    fn drop(&mut self) {
+        if self.armed {
+            destroy_mach_message(words_as_bytes_mut(&mut self.storage));
+            self.armed = false;
+        }
+    }
+}
+
 impl MachSendOnceRight {
     /// # Safety
     ///
@@ -570,7 +643,7 @@ impl MachSendOnceRight {
         self.0
     }
 
-    fn send(mut self, payload: &[u8]) -> Result<(), MachReplyError> {
+    fn prepare(mut self, payload: &[u8]) -> Result<PreparedMachSend, MachReplyError> {
         let unrounded_size = size_of::<MachMsgHeader>()
             .checked_add(payload.len())
             .ok_or(MachReplyError::InvalidReply)?;
@@ -600,31 +673,19 @@ impl MachSendOnceRight {
         // Ownership moved from `self` into this message before the syscall.
         unsafe { bytes.as_mut_ptr().cast::<MachMsgHeader>().write(header) };
         bytes[size_of::<MachMsgHeader>()..message_size].copy_from_slice(payload);
-        // SAFETY: the message and exact live send-once right satisfy mach_msg.
-        let status = unsafe {
-            mach_msg(
-                bytes.as_mut_ptr().cast(),
-                MACH_SEND_MSG | MACH_SEND_INTERRUPT,
-                message_size_wire,
-                0,
-                MACH_PORT_NULL,
-                0,
-                MACH_PORT_NULL,
-            )
-        };
-        match status {
-            0 => Ok(()),
-            MACH_SEND_INVALID_DEST | MACH_SEND_TIMED_OUT | MACH_SEND_INTERRUPTED => {
-                // The kernel pseudo-receives recoverable failed sends back into
-                // this buffer and may rewrite the right's numeric name. Destroy
-                // the post-call message, never the pre-call name.
-                destroy_mach_message(bytes);
-                Err(MachReplyError::MachSend(status))
-            }
-            _ => {
-                // Other send errors may have partially destroyed the message.
-                // No exact cleanup operation remains, so the permanent service
-                // must fail-stop before it can touch a potentially reused name.
+        Ok(PreparedMachSend {
+            storage,
+            message_size: message_size_wire,
+            armed: true,
+        })
+    }
+
+    fn send(self, payload: &[u8]) -> Result<(), MachReplyError> {
+        match self.prepare(payload)?.send_classified() {
+            Ok(()) => Ok(()),
+            Err(ClassifiedMachSendError::Recoverable(error)) => Err(error),
+            Err(ClassifiedMachSendError::Indeterminate(_)) => {
+                // Generic replies own no proof-bound broker to clean first.
                 std::process::abort()
             }
         }
@@ -1404,6 +1465,7 @@ impl<Output> AuthenticatedMachRequest<Output> {
         PendingSpawnReply {
             reply: self.reply,
             freshness,
+            bound_session: None,
             output: self.output,
         }
     }
@@ -1422,10 +1484,12 @@ impl<Output> AuthenticatedMachRequest<Output> {
 pub(super) struct PendingSpawnReply<Output> {
     reply: MachSendOnceRight,
     freshness: SpawnReplyFreshness,
+    bound_session: Option<SessionHandle>,
     output: Output,
 }
 
 impl<Output> PendingSpawnReply<Output> {
+    #[cfg(test)]
     pub(super) fn map_output<Next>(
         self,
         operation: impl FnOnce(Output) -> Next,
@@ -1433,10 +1497,12 @@ impl<Output> PendingSpawnReply<Output> {
         PendingSpawnReply {
             reply: self.reply,
             freshness: self.freshness,
+            bound_session: self.bound_session,
             output: operation(self.output),
         }
     }
 
+    #[cfg(test)]
     pub(super) fn try_map_output<Next, Failure>(
         self,
         operation: impl FnOnce(Output) -> Result<Next, Failure>,
@@ -1444,25 +1510,354 @@ impl<Output> PendingSpawnReply<Output> {
         let Self {
             reply,
             freshness,
+            bound_session,
             output,
         } = self;
         match operation(output) {
             Ok(output) => Ok(PendingSpawnReply {
                 reply,
                 freshness,
+                bound_session,
                 output,
             }),
             Err(output) => Err(PendingSpawnReply {
                 reply,
                 freshness,
+                bound_session,
                 output,
             }),
         }
     }
 
     #[cfg(test)]
-    pub(super) fn into_parts(self) -> (MachSendOnceRight, SpawnReplyFreshness, Output) {
-        (self.reply, self.freshness, self.output)
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        MachSendOnceRight,
+        SpawnReplyFreshness,
+        Option<SessionHandle>,
+        Output,
+    ) {
+        (self.reply, self.freshness, self.bound_session, self.output)
+    }
+}
+
+impl PendingSpawnReply<AuthenticatedSpawnRequest> {
+    /// Consumes the exact authenticated request through the immutable catalog
+    /// without permitting a closure to substitute another effect authority.
+    pub(super) fn validate(
+        self,
+        catalog: &InstalledPolicyCatalog,
+    ) -> Result<PendingSpawnReply<ValidatedSpawn>, Box<PendingSpawnReply<SupervisorWireError>>>
+    {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        match output.validate(catalog) {
+            Ok(output) => Ok(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output,
+            }),
+            Err(output) => Err(Box::new(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output,
+            })),
+        }
+    }
+}
+
+/// Validated request after its fresh opaque session is inseparably assigned to
+/// the exact reply path, before any broker child can be created.
+pub(super) struct SessionAssignedSpawn {
+    session: FreshSessionId,
+    spawn: ValidatedSpawn,
+}
+
+impl PendingSpawnReply<ValidatedSpawn> {
+    pub(super) fn assign_session(
+        self,
+        session: FreshSessionId,
+    ) -> PendingSpawnReply<SessionAssignedSpawn> {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        debug_assert!(bound_session.is_none());
+        let handle = session.handle();
+        PendingSpawnReply {
+            reply,
+            freshness,
+            bound_session: Some(handle),
+            output: SessionAssignedSpawn {
+                session,
+                spawn: output,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl PendingSpawnReply<SessionAssignedSpawn> {
+    unsafe fn attach_test_atomic_broker<Authority: ExactBrokerAuthority>(
+        self,
+        broker: ExactBroker<Authority>,
+    ) -> PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, Authority>> {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        // SAFETY: the test caller models the broker as the exact child created
+        // for this already assigned launch operation.
+        let output = unsafe {
+            AtomicallySpawnedBroker::from_test_atomic_spawn(output.session, output.spawn, broker)
+        };
+        PendingSpawnReply {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        }
+    }
+}
+
+/// Trace proof did not match the armed registered-session obligation.
+pub(super) struct TraceBindingMismatch;
+
+enum ReadyNativeSendError {
+    Binding,
+    DeadlineExpired,
+    Recoverable(MachReplyError),
+    Indeterminate(MachMsgReturn),
+}
+
+/// Terminal result of attempting the exact authenticated Ready reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReadyReplyError {
+    Protocol(SupervisorWireError),
+    Watchdog(WatchdogStateError),
+    Mach(MachReplyError),
+}
+
+struct PreparedReadyMachSend {
+    message: PreparedMachSend,
+    expected_handle: SessionHandle,
+    expected_connection: ConnectionIdentity,
+}
+
+// SAFETY: all allocation and encoding occur before this value is constructed.
+// send_once performs only scalar binding/deadline checks and one zero-timeout
+// Mach send over the exact retained send-once reply authority.
+unsafe impl NonblockingReadySend for PreparedReadyMachSend {
+    type Error = ReadyNativeSendError;
+
+    fn cleanup_reason(error: &Self::Error) -> TerminationReason {
+        match error {
+            ReadyNativeSendError::DeadlineExpired => TerminationReason::DeadlineExpired,
+            ReadyNativeSendError::Binding
+            | ReadyNativeSendError::Recoverable(_)
+            | ReadyNativeSendError::Indeterminate(_) => TerminationReason::SpawnResultUndeliverable,
+        }
+    }
+
+    fn send_once(
+        self,
+        handle: SessionHandle,
+        connection: ConnectionIdentity,
+        deadline: Instant,
+    ) -> Result<(), Self::Error> {
+        if handle != self.expected_handle || connection != self.expected_connection {
+            return Err(ReadyNativeSendError::Binding);
+        }
+        if Instant::now() >= deadline {
+            return Err(ReadyNativeSendError::DeadlineExpired);
+        }
+        self.message.send_classified().map_err(|error| match error {
+            ClassifiedMachSendError::Recoverable(error) => ReadyNativeSendError::Recoverable(error),
+            ClassifiedMachSendError::Indeterminate(error) => {
+                ReadyNativeSendError::Indeterminate(error)
+            }
+        })
+    }
+}
+
+impl<Authority: ExactBrokerAuthority>
+    PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, Authority>>
+{
+    /// Registers one atomic spawn result while retaining a session-specific
+    /// armed obligation through trusted launch, trace binding, and Ready.
+    pub(super) fn register_watchdog(
+        self,
+        table: &mut WatchdogTable<Authority>,
+    ) -> Result<
+        PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority>>,
+        Box<PendingSpawnReply<WatchdogStateError>>,
+    > {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        debug_assert!(bound_session.is_some());
+        match table.register_armed(output) {
+            Ok(mut registered) => {
+                let handle = registered.handle();
+                if bound_session != Some(handle) || registered.connection() != freshness.connection
+                {
+                    registered.mark_protocol_violation();
+                    drop(registered);
+                    return Err(Box::new(PendingSpawnReply {
+                        reply,
+                        freshness,
+                        bound_session,
+                        output: WatchdogStateError::WrongConnection,
+                    }));
+                }
+                Ok(PendingSpawnReply {
+                    reply,
+                    freshness,
+                    bound_session: Some(handle),
+                    output: registered,
+                })
+            }
+            Err(output) => Err(Box::new(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output,
+            })),
+        }
+    }
+}
+
+impl<Authority: ExactBrokerAuthority>
+    PendingSpawnReply<PendingRegisteredSession<ValidatedSpawn, Authority>>
+{
+    pub(super) fn registered_launch_permit(
+        &self,
+    ) -> Result<RegisteredLaunchPermit<'_, ValidatedSpawn, Authority>, WatchdogStateError> {
+        self.output.launch_permit()
+    }
+
+    /// Accepts only the trace proof for the exact registered handle and
+    /// authenticated connection retained with this request's reply. A mismatch
+    /// exact-cleans before returning the error wrapper.
+    pub(super) fn bind_trace(
+        mut self,
+        trace: TraceEstablished,
+    ) -> Result<Self, Box<PendingSpawnReply<TraceBindingMismatch>>> {
+        if self.bound_session == Some(self.output.handle())
+            && self.output.connection() == self.freshness.connection
+            && trace.handle() == self.output.handle()
+            && trace.connection() == self.output.connection()
+            && self.output.bind_trace(trace).is_ok()
+        {
+            Ok(self)
+        } else {
+            self.output.mark_protocol_violation();
+            let Self {
+                reply,
+                freshness,
+                bound_session,
+                output,
+            } = self;
+            drop(output);
+            Err(Box::new(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output: TraceBindingMismatch,
+            }))
+        }
+    }
+
+    /// Transitions directly into the armed table-borrowing Ready guard; no
+    /// loose Ready proof can escape between trace transition and reply cleanup.
+    pub(super) fn establish_ready(
+        self,
+    ) -> Result<PendingSpawnReply<PendingReadyDelivery<Authority>>, WatchdogStateError> {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        if bound_session != Some(output.handle())
+            || freshness.connection != output.connection()
+            || freshness.generation != freshness.connection.get()
+            || freshness.sequence != 1
+            || freshness.client_nonce == [0; 32]
+            || freshness.service_nonce == [0; 32]
+            || freshness.client_nonce == freshness.service_nonce
+        {
+            let mut output = output;
+            output.mark_protocol_violation();
+            drop(output);
+            return Err(WatchdogStateError::WrongConnection);
+        }
+        let output = output.mark_traced_for_delivery()?;
+        Ok(PendingSpawnReply {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        })
+    }
+}
+
+impl<Authority: ExactBrokerAuthority> PendingSpawnReply<PendingReadyDelivery<Authority>> {
+    /// Encodes and commits Ready only through the armed watchdog guard. Every
+    /// error drops that guard and emergency exact-cleans before it is returned;
+    /// an indeterminate Mach send exact-cleans and then fail-stops.
+    pub(super) fn send_ready(self) -> Result<(), ReadyReplyError> {
+        let Self {
+            reply,
+            freshness,
+            bound_session,
+            output,
+        } = self;
+        let handle = bound_session.ok_or(ReadyReplyError::Watchdog(
+            WatchdogStateError::UnknownSession,
+        ))?;
+        let payload = encode_ready_spawn_result(
+            handle.bytes(),
+            freshness.generation,
+            freshness.client_nonce,
+            freshness.service_nonce,
+        )
+        .map_err(ReadyReplyError::Protocol)?;
+        let message = reply.prepare(&payload).map_err(ReadyReplyError::Mach)?;
+        let send = PreparedReadyMachSend {
+            message,
+            expected_handle: handle,
+            expected_connection: freshness.connection,
+        };
+        match output.deliver(send) {
+            Ok(Ok(())) => Ok(()),
+            Err(error) => Err(ReadyReplyError::Watchdog(error)),
+            Ok(Err(ReadyNativeSendError::Binding)) => Err(ReadyReplyError::Watchdog(
+                WatchdogStateError::WrongConnection,
+            )),
+            Ok(Err(ReadyNativeSendError::DeadlineExpired)) => Err(ReadyReplyError::Watchdog(
+                WatchdogStateError::DeadlineExpired,
+            )),
+            Ok(Err(ReadyNativeSendError::Recoverable(error))) => Err(ReadyReplyError::Mach(error)),
+            Ok(Err(ReadyNativeSendError::Indeterminate(error))) => {
+                let _ = error;
+                std::process::abort()
+            }
+        }
     }
 }
 

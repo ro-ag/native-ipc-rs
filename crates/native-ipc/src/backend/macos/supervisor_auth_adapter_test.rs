@@ -10,9 +10,10 @@ use static_assertions::assert_not_impl_any;
 
 use super::*;
 use crate::backend::macos::supervisor::{
-    ConnectionGeneration, FreshServiceNonce, SpawnRequest, TargetEnvironmentEntry,
-    encode_client_hello, encode_spawn_request,
+    ConnectionGeneration, FreshServiceNonce, InstalledPolicyCatalog, SpawnRequest,
+    TargetEnvironmentEntry, TargetPolicyDefinition, encode_client_hello, encode_spawn_request,
 };
+use crate::backend::macos::supervisor_watchdog::{ReapedBroker, TerminationReason};
 
 const MACH_PORT_RIGHT_RECEIVE: c_int = 1;
 const MACH_MSG_TYPE_COPY_SEND: u32 = 19;
@@ -35,6 +36,13 @@ unsafe extern "C" {
         name: MachPort,
         poly: MachPort,
         disposition: c_int,
+    ) -> c_int;
+    fn mach_port_extract_right(
+        task: MachPort,
+        name: MachPort,
+        disposition: u32,
+        extracted: *mut MachPort,
+        extracted_type: *mut u32,
     ) -> c_int;
     fn mach_port_mod_refs(task: MachPort, name: MachPort, right: c_int, delta: c_int) -> c_int;
     fn mach_port_type(task: MachPort, name: MachPort, port_type: *mut u32) -> c_int;
@@ -78,6 +86,41 @@ const AUDIT_IDENTITY: [u8; 32] = [0x11; 32];
 const CLIENT_CODE_IDENTITY: [u8; 32] = [0x22; 32];
 const CLIENT_NONCE: [u8; 32] = [0x33; 32];
 const SERVICE_NONCE: [u8; 32] = [0x44; 32];
+const TARGET_CODE_IDENTITY: [u8; 32] = [0x77; 32];
+
+#[derive(Default)]
+struct ReadyBrokerState {
+    normal_attempts: usize,
+    emergency_attempts: usize,
+    emergency_reason: Option<TerminationReason>,
+}
+
+struct ReadyBroker {
+    state: Arc<Mutex<ReadyBrokerState>>,
+}
+
+// SAFETY: this fake retains one modeled exact broker and mints reap proof only
+// after its corresponding modeled cleanup action completes.
+unsafe impl ExactBrokerAuthority for ReadyBroker {
+    type Failure = ();
+
+    fn terminate_and_reap(
+        &mut self,
+        _reason: TerminationReason,
+    ) -> Result<ReapedBroker, Self::Failure> {
+        self.state.lock().unwrap().normal_attempts += 1;
+        // SAFETY: the fake models exact normal reap completion.
+        Ok(unsafe { ReapedBroker::from_exact_reap() })
+    }
+
+    fn emergency_terminate_and_reap(&mut self, reason: Option<TerminationReason>) -> ReapedBroker {
+        let mut state = self.state.lock().unwrap();
+        state.emergency_attempts += 1;
+        state.emergency_reason = reason;
+        // SAFETY: the fake models exact emergency reap completion.
+        unsafe { ReapedBroker::from_exact_reap() }
+    }
+}
 
 assert_not_impl_any!(FreshAuthWorkerGeneration: Clone, Copy);
 assert_not_impl_any!(FreshAuthJobId: Clone, Copy);
@@ -131,6 +174,30 @@ impl TestReceiveRight {
             0
         );
         self.send_reference = true;
+    }
+
+    fn make_send_once(&self) -> MachSendOnceRight {
+        let mut extracted = MACH_PORT_NULL;
+        let mut extracted_type = 0_u32;
+        // SAFETY: this object owns the live receive right and both output
+        // pointers are valid for the kernel to mint one send-once reference.
+        assert_eq!(
+            unsafe {
+                mach_port_extract_right(
+                    current_task(),
+                    self.name,
+                    MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                    &raw mut extracted,
+                    &raw mut extracted_type,
+                )
+            },
+            0
+        );
+        assert_ne!(extracted, MACH_PORT_NULL);
+        assert_eq!(extracted_type, MACH_MSG_TYPE_PORT_SEND_ONCE);
+        // SAFETY: the preceding successful insertion created exactly one live
+        // send-once right under this name; the returned owner is linear.
+        unsafe { MachSendOnceRight::from_test_name(extracted) }
     }
 
     fn destroy_receive(&mut self) {
@@ -409,6 +476,91 @@ fn accept_client_hello(
         panic!("authenticated record was not a client hello")
     };
     hello.accept(generation, nonce).unwrap()
+}
+
+fn accepted_spawn_reply(
+    generation: u64,
+) -> (
+    PendingSpawnReply<AuthenticatedSpawnRequest>,
+    ConnectionIdentity,
+) {
+    let (mut pool, _states) = pool(&[generation + 10, generation + 11]);
+    let (hello_job, hello_receipt) = pool
+        .dispatch(
+            raw(
+                AUDIT_IDENTITY,
+                501,
+                encode_client_hello(CLIENT_NONCE).unwrap(),
+            ),
+            job_id(0xa1),
+            deadline_after(Duration::from_secs(5)),
+        )
+        .unwrap()
+        .into_parts();
+    let authenticated = pool
+        .complete(received_result(hello_receipt, validated_result(hello_job)))
+        .unwrap();
+    let (mut connection, _hello_reply) = accept_client_hello(authenticated, generation);
+    let owner = connection.connection_identity();
+    let request = SpawnRequest::new(
+        deadline_after(Duration::from_secs(5)),
+        b"com.example.receiver".to_vec(),
+        vec![b"--mode=test".to_vec()],
+        vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let bytes = encode_spawn_request(
+        &request,
+        owner.get(),
+        CLIENT_NONCE,
+        service_nonce(generation),
+    )
+    .unwrap();
+    let (spawn_job, spawn_receipt) = pool
+        .dispatch(
+            raw(AUDIT_IDENTITY, 501, bytes),
+            job_id(0xa2),
+            deadline_after(Duration::from_secs(5)),
+        )
+        .unwrap()
+        .into_parts();
+    let authenticated = pool
+        .complete(received_result(spawn_receipt, validated_result(spawn_job)))
+        .unwrap();
+    let AuthenticatedMachRoute::Spawn(spawn) = authenticated.route().unwrap() else {
+        panic!("authenticated record was not a spawn")
+    };
+    let pending = spawn.accept(&mut connection).unwrap();
+    (pending, owner)
+}
+
+fn replace_spawn_reply<Output>(
+    pending: PendingSpawnReply<Output>,
+    reply: MachSendOnceRight,
+) -> PendingSpawnReply<Output> {
+    let (old_reply, freshness, bound_session, output) = pending.into_parts();
+    drop(old_reply);
+    PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        output,
+    }
+}
+
+fn installed_catalog() -> InstalledPolicyCatalog {
+    let definition = TargetPolicyDefinition::new(
+        b"com.example.receiver".to_vec(),
+        CLIENT_CODE_IDENTITY,
+        TARGET_CODE_IDENTITY,
+        b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
+        b"receiver".to_vec(),
+        4,
+        vec![b"LANG".to_vec()],
+    )
+    .unwrap();
+    // SAFETY: this test models one immutable root-owned installed catalog.
+    unsafe { InstalledPolicyCatalog::from_verified_installation(vec![definition]).unwrap() }
 }
 
 fn job_id(value: u8) -> FreshAuthJobId {
@@ -1283,24 +1435,397 @@ fn pending_spawn_reply_preserves_exact_freshness_through_both_map_branches() {
     let pending = PendingSpawnReply {
         reply: MachSendOnceRight::synthetic(),
         freshness,
+        bound_session: None,
         output: 5_u8,
     };
-    let (_reply, mapped_freshness, output) = pending.map_output(u16::from).into_parts();
+    let (_reply, mapped_freshness, bound_session, output) =
+        pending.map_output(u16::from).into_parts();
     assert_eq!(mapped_freshness, freshness);
+    assert_eq!(bound_session, None);
     assert_eq!(output, 5_u16);
 
     let pending = PendingSpawnReply {
         reply: MachSendOnceRight::synthetic(),
         freshness,
+        bound_session: None,
         output: 6_u8,
     };
     let retained_error = pending
         .try_map_output(|value| Err::<u16, _>(u16::from(value)))
         .err()
         .unwrap();
-    let (_reply, error_freshness, error) = retained_error.into_parts();
+    let (_reply, error_freshness, bound_session, error) = retained_error.into_parts();
     assert_eq!(error_freshness, freshness);
+    assert_eq!(bound_session, None);
     assert_eq!(error, 6_u16);
+}
+
+#[test]
+fn exact_spawn_reply_registers_binds_trace_and_arms_cleanup_without_substitution() {
+    let (pending, owner) = accepted_spawn_reply(1301);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let mut table = WatchdogTable::new();
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x91; 32];
+    session_id[..8].copy_from_slice(&1301_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let pending = pending.assign_session(session);
+    // SAFETY: this test models the broker as the exact child created by the
+    // same spawn operation that consumed this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let pending = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    let handle = {
+        let launch = pending
+            .registered_launch_permit()
+            .expect("registered launch is linear and initially present");
+        assert_eq!(launch.connection(), owner);
+        launch.handle()
+    };
+    // SAFETY: this models the broker consuming both stops for the exact
+    // registered launch returned alongside the retained reply binding.
+    let trace = unsafe { TraceEstablished::from_broker_handshake(handle, owner) };
+    let pending = match pending.bind_trace(trace) {
+        Ok(pending) => pending,
+        Err(_) => panic!("exact trace proof did not match registered reply"),
+    };
+    let ready = pending.establish_ready().unwrap();
+    drop(ready);
+    let state = state.lock().unwrap();
+    assert_eq!(state.normal_attempts, 0);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::SpawnResultUndeliverable)
+    );
+    drop(state);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
+}
+
+#[test]
+fn registered_reply_drop_exactly_cleans_before_ready() {
+    assert_not_impl_any!(SessionAssignedSpawn: Clone, Copy);
+    assert_not_impl_any!(
+        AtomicallySpawnedBroker<ValidatedSpawn, ReadyBroker>: Clone,
+        Copy
+    );
+    assert_not_impl_any!(
+        PendingRegisteredSession<ValidatedSpawn, ReadyBroker>: Clone,
+        Copy
+    );
+
+    let (pending, owner) = accepted_spawn_reply(1302);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x92; 32];
+    session_id[..8].copy_from_slice(&1302_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let handle = session.handle();
+    let pending = pending.assign_session(session);
+    // SAFETY: the test broker is paired with this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let mut table = WatchdogTable::new();
+    let registered = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    drop(registered);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.normal_attempts, 0);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::LaunchAbandoned)
+    );
+    drop(state);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
+}
+
+#[test]
+fn substituted_atomic_session_is_rejected_and_exactly_cleaned() {
+    let (pending, _owner) = accepted_spawn_reply(1303);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let mut assigned_id = [0x93; 32];
+    assigned_id[..8].copy_from_slice(&1303_u64.to_le_bytes());
+    let mut substituted_id = [0x94; 32];
+    substituted_id[..8].copy_from_slice(&2303_u64.to_le_bytes());
+    // SAFETY: both modeled session IDs are nonzero and distinct.
+    let assigned = unsafe { FreshSessionId::from_fresh_random(assigned_id).unwrap() };
+    // SAFETY: both modeled session IDs are nonzero and distinct.
+    let substituted = unsafe { FreshSessionId::from_fresh_random(substituted_id).unwrap() };
+    let pending = pending.assign_session(assigned);
+    let (reply, freshness, bound_session, output) = pending.into_parts();
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    // SAFETY: this deliberately models a broken atomic spawner so registration
+    // must reject the substituted session before any launch authority escapes.
+    let output = unsafe {
+        AtomicallySpawnedBroker::from_test_atomic_spawn(substituted, output.spawn, broker)
+    };
+    let pending = PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        output,
+    };
+    let mut table = WatchdogTable::new();
+    let error = pending.register_watchdog(&mut table).err().unwrap();
+    assert_eq!(error.output, WatchdogStateError::WrongConnection);
+    drop(error);
+    let state = state.lock().unwrap();
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::ProtocolViolation)
+    );
+}
+
+#[test]
+fn trace_binding_mismatch_exactly_cleans_registered_broker() {
+    let (pending, owner) = accepted_spawn_reply(1304);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x95; 32];
+    session_id[..8].copy_from_slice(&1304_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let pending = pending.assign_session(session);
+    // SAFETY: the test broker is paired with this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let mut table = WatchdogTable::new();
+    let registered = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    let handle = registered.registered_launch_permit().unwrap().handle();
+    let wrong_owner = connection(9304).connection_identity();
+    // SAFETY: this deliberately models a trace proof from another connection.
+    let wrong_trace = unsafe { TraceEstablished::from_broker_handshake(handle, wrong_owner) };
+    let error = registered.bind_trace(wrong_trace).err().unwrap();
+    drop(error);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::ProtocolViolation)
+    );
+    drop(state);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
+}
+
+#[test]
+fn ready_freshness_failure_exactly_cleans_registered_broker() {
+    let (pending, owner) = accepted_spawn_reply(1305);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x96; 32];
+    session_id[..8].copy_from_slice(&1305_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let pending = pending.assign_session(session);
+    // SAFETY: the test broker is paired with this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let mut table = WatchdogTable::new();
+    let registered = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    let handle = registered.registered_launch_permit().unwrap().handle();
+    // SAFETY: this models the exact broker completing both launch stops.
+    let trace = unsafe { TraceEstablished::from_broker_handshake(handle, owner) };
+    let mut registered = registered.bind_trace(trace).ok().unwrap();
+    registered.freshness.sequence = 2;
+    assert_eq!(
+        registered.establish_ready().err(),
+        Some(WatchdogStateError::WrongConnection)
+    );
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::ProtocolViolation)
+    );
+    drop(state);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
+}
+
+#[test]
+fn native_ready_send_delivers_exact_authenticated_result_and_stays_live() {
+    let (pending, owner) = accepted_spawn_reply(1306);
+    let reply_port = TestReceiveRight::allocate();
+    let pending = replace_spawn_reply(pending, reply_port.make_send_once());
+    let freshness = pending.freshness;
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x97; 32];
+    session_id[..8].copy_from_slice(&1306_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let pending = pending.assign_session(session);
+    // SAFETY: the test broker is paired with this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let mut table = WatchdogTable::new();
+    let registered = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    let handle = registered.registered_launch_permit().unwrap().handle();
+    // SAFETY: this models the exact broker completing both launch stops.
+    let trace = unsafe { TraceEstablished::from_broker_handshake(handle, owner) };
+    let registered = registered.bind_trace(trace).ok().unwrap();
+    let ready = registered.establish_ready().unwrap();
+    assert_eq!(ready.send_ready(), Ok(()));
+
+    let (header, payload) = receive_inline_message(reply_port.name);
+    assert_eq!(header.id, SUPERVISOR_MESSAGE_ID);
+    let decoded = super::super::decode_spawn_result(
+        &payload,
+        freshness.generation,
+        freshness.client_nonce,
+        freshness.service_nonce,
+    )
+    .unwrap();
+    let super::super::DecodedSpawnResult::Ready(decoded_handle) = decoded else {
+        panic!("native Ready send returned a rejection")
+    };
+    assert_eq!(decoded_handle.bytes(), handle.bytes());
+    assert_eq!(state.lock().unwrap().emergency_attempts, 0);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Ok(Ok(()))
+    );
+    assert_eq!(state.lock().unwrap().normal_attempts, 1);
+}
+
+#[test]
+fn recoverable_native_ready_send_exactly_cleans_before_returning_error() {
+    let (pending, owner) = accepted_spawn_reply(1307);
+    let mut invalid_port = TestReceiveRight::allocate();
+    let invalid_name = invalid_port.name;
+    invalid_port.destroy_receive();
+    // SAFETY: this deliberately models a send-once destination name that is
+    // already invalid so the prepared Ready send takes its recoverable path.
+    let invalid_reply = unsafe { MachSendOnceRight::from_test_name(invalid_name) };
+    let pending = replace_spawn_reply(pending, invalid_reply);
+    let pending = match pending.validate(&installed_catalog()) {
+        Ok(pending) => pending,
+        Err(_) => panic!("installed policy rejected exact authenticated spawn"),
+    };
+    let state = Arc::new(Mutex::new(ReadyBrokerState::default()));
+    // SAFETY: the fake models one exact unreaped broker child.
+    let broker = unsafe {
+        ExactBroker::from_unreaped_direct_child(ReadyBroker {
+            state: Arc::clone(&state),
+        })
+    };
+    let mut session_id = [0x98; 32];
+    session_id[..8].copy_from_slice(&1307_u64.to_le_bytes());
+    // SAFETY: this nonzero test session value is unique in the local table.
+    let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
+    let pending = pending.assign_session(session);
+    // SAFETY: the test broker is paired with this assigned launch.
+    let pending = unsafe { pending.attach_test_atomic_broker(broker) };
+    let mut table = WatchdogTable::new();
+    let registered = match pending.register_watchdog(&mut table) {
+        Ok(registered) => registered,
+        Err(_) => panic!("exact watchdog registration failed"),
+    };
+    let handle = registered.registered_launch_permit().unwrap().handle();
+    // SAFETY: this models the exact broker completing both launch stops.
+    let trace = unsafe { TraceEstablished::from_broker_handshake(handle, owner) };
+    let registered = registered.bind_trace(trace).ok().unwrap();
+    let ready = registered.establish_ready().unwrap();
+    assert_eq!(
+        ready.send_ready(),
+        Err(ReadyReplyError::Mach(MachReplyError::MachSend(
+            MACH_SEND_INVALID_DEST
+        )))
+    );
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.normal_attempts, 0);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reason,
+        Some(TerminationReason::SpawnResultUndeliverable)
+    );
+    drop(state);
+    assert_eq!(
+        table.terminate_for_client_request(handle, owner),
+        Err(WatchdogStateError::UnknownSession)
+    );
 }
 
 #[test]
@@ -1709,7 +2234,8 @@ fn complete_audit_token_transition_still_cannot_cross_adapter() {
         panic!("authenticated record was not a spawn")
     };
     let pending = spawn.accept(&mut connection).unwrap();
-    let (_reply, freshness, _request) = pending.into_parts();
+    let (_reply, freshness, bound_session, _request) = pending.into_parts();
+    assert_eq!(bound_session, None);
     assert_eq!(freshness.connection, connection.connection_identity());
     assert_eq!(freshness.generation, 1103);
     assert_eq!(freshness.sequence, 1);

@@ -4,9 +4,29 @@ use super::*;
 use crate::backend::macos::supervisor::{
     ConnectionGeneration, FreshServiceNonce, SupervisorConnection, TargetEnvironmentEntry,
 };
+use crate::backend::macos::supervisor_watchdog::{
+    ExactBrokerAuthority, ReapedBroker, TerminationReason,
+};
 
-assert_not_impl_any!(LauncherTraceEstablished: Clone, Copy);
-assert_not_impl_any!(TraceBoundValidatedSpawn: Clone, Copy);
+struct StaticAuthority;
+
+// SAFETY: this type exists only for compile-time trait assertions and is never constructed.
+unsafe impl ExactBrokerAuthority for StaticAuthority {
+    type Failure = std::convert::Infallible;
+
+    fn terminate_and_reap(
+        &mut self,
+        _reason: TerminationReason,
+    ) -> Result<ReapedBroker, Self::Failure> {
+        unreachable!()
+    }
+
+    fn emergency_terminate_and_reap(&mut self, _reason: Option<TerminationReason>) -> ReapedBroker {
+        unreachable!()
+    }
+}
+
+assert_not_impl_any!(TraceBoundValidatedSpawn<'static, StaticAuthority>: Clone, Copy);
 assert_not_impl_any!(AuthenticatedClientIdentity: Clone, Copy);
 
 fn verified_peer() -> VerifiedPeer {
