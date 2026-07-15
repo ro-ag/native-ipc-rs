@@ -17,6 +17,10 @@ use super::{PendingSpawnReply, SessionAssignedSpawn};
 const MAGIC: [u8; 8] = *b"NIPCBP01";
 const VERSION: u16 = 1;
 const HEADER_BYTES: usize = 256;
+const LAUNCHER_MAGIC: [u8; 8] = *b"NIPCLP01";
+const LAUNCHER_VERSION: u16 = 1;
+const LAUNCHER_HEADER_BYTES: usize = 40;
+const LAUNCHER_PLAN_PREFIX_BYTES: usize = 24;
 pub(in crate::backend::macos::supervisor) const MAX_BROKER_PLAN_BYTES: usize = 80 * 1024;
 pub(in crate::backend::macos::supervisor) const BROKER_PLAN_PREFIX_BYTES: usize = 24;
 pub(in crate::backend::macos::supervisor) const BROKER_ACK_BYTES: usize = 40;
@@ -77,6 +81,37 @@ pub(in crate::backend::macos::supervisor) struct ExactParentBrokerLaunchPlan {
     plan: BrokerLaunchPlan,
     deadline: SupervisorDeadlineBinding,
     digest: [u8; 32],
+}
+
+/// Authority-free target data decoded by the fixed trusted launcher.
+///
+/// This type carries no trace, session, Ready, report, or termination proof.
+/// Only the broker's retained [`ExactParentBrokerLaunchPlan`] remains
+/// authoritative across launcher identity proof and the later exec trap.
+pub(in crate::backend::macos::supervisor) struct ReceivedLauncherExecPlan {
+    plan: LauncherExecPlan,
+    deadline: SupervisorDeadlineBinding,
+}
+
+/// Minimal cross-exec launcher data, deliberately disjoint from broker
+/// authentication, session, report, and termination state.
+struct LauncherExecPlan {
+    deadline: SupervisorDeadline,
+    effective_uid: u32,
+    effective_gid: u32,
+    installed_executable: Vec<u8>,
+    arguments: Vec<Vec<u8>>,
+    environment: Vec<TargetEnvironmentEntry>,
+}
+
+/// Owned target inputs prepared from one canonical launcher frame.
+pub(in crate::backend::macos::supervisor) struct LauncherExecParts {
+    pub(in crate::backend::macos::supervisor) deadline: SupervisorDeadlineBinding,
+    pub(in crate::backend::macos::supervisor) effective_uid: u32,
+    pub(in crate::backend::macos::supervisor) effective_gid: u32,
+    pub(in crate::backend::macos::supervisor) installed_executable: Vec<u8>,
+    pub(in crate::backend::macos::supervisor) arguments: Vec<Vec<u8>>,
+    pub(in crate::backend::macos::supervisor) environment: Vec<TargetEnvironmentEntry>,
 }
 
 pub(in crate::backend::macos::supervisor) struct BrokerPlanPrefix {
@@ -302,6 +337,61 @@ impl ExactParentBrokerLaunchPlan {
     ) -> BrokerTraceReportBinding {
         self.plan.trace_report_binding(self.digest)
     }
+
+    /// Re-encodes the already validated exact-parent plan for the fixed
+    /// launcher's authority-free post-trace transport.
+    pub(in crate::backend::macos::supervisor) fn launcher_frame(
+        &self,
+    ) -> Result<Vec<u8>, SupervisorWireError> {
+        LauncherExecPlan::from_broker(&self.plan).encode()
+    }
+}
+
+impl ReceivedLauncherExecPlan {
+    /// Decodes one exact canonical frame against the deadline retained from
+    /// its previously parsed fixed prefix, without minting launch authority.
+    pub(in crate::backend::macos::supervisor) fn decode_with_deadline(
+        bytes: &[u8],
+        deadline: SupervisorDeadlineBinding,
+    ) -> Result<Self, SupervisorWireError> {
+        let plan = LauncherExecPlan::decode_untrusted(bytes)?;
+        if plan.deadline != deadline.wire() {
+            return Err(SupervisorWireError::ReplayOrSubstitution);
+        }
+        Ok(Self { plan, deadline })
+    }
+
+    pub(in crate::backend::macos::supervisor) fn into_parts(self) -> LauncherExecParts {
+        LauncherExecParts {
+            deadline: self.deadline,
+            effective_uid: self.plan.effective_uid,
+            effective_gid: self.plan.effective_gid,
+            installed_executable: self.plan.installed_executable,
+            arguments: self.plan.arguments,
+            environment: self.plan.environment,
+        }
+    }
+}
+
+pub(in crate::backend::macos::supervisor) fn parse_launcher_plan_prefix(
+    prefix: &[u8; LAUNCHER_PLAN_PREFIX_BYTES],
+    outer_len: usize,
+) -> Result<BrokerPlanPrefix, SupervisorWireError> {
+    if !(LAUNCHER_HEADER_BYTES..=MAX_BROKER_PLAN_BYTES).contains(&outer_len)
+        || prefix[..8] != LAUNCHER_MAGIC
+        || get_u16(prefix, 8) != Some(LAUNCHER_VERSION)
+        || prefix[10..12] != [0; 2]
+        || get_u32(prefix, 12) != u32::try_from(outer_len).ok()
+    {
+        return Err(SupervisorWireError::Malformed);
+    }
+    let deadline = SupervisorDeadlineBinding::from_wire(SupervisorDeadline::from_wire(
+        get_u64(prefix, 16).ok_or(SupervisorWireError::Malformed)?,
+    ))?;
+    Ok(BrokerPlanPrefix {
+        frame_len: outer_len,
+        deadline,
+    })
 }
 
 pub(in crate::backend::macos::supervisor) fn parse_broker_plan_prefix(
@@ -491,6 +581,124 @@ impl BrokerLaunchPlan {
             return Err(SupervisorWireError::Malformed);
         }
         validate_policy_id(&self.policy_id)?;
+        validate_installed_executable(&self.installed_executable)?;
+        for argument in &self.arguments {
+            validate_component(argument)?;
+        }
+        let mut keys = HashSet::with_capacity(self.environment.len());
+        for entry in &self.environment {
+            validate_environment_key(entry.key())?;
+            validate_component(entry.value())?;
+            if !keys.insert(entry.key()) {
+                return Err(SupervisorWireError::InvalidTargetInput);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LauncherExecPlan {
+    fn from_broker(plan: &BrokerLaunchPlan) -> Self {
+        Self {
+            deadline: plan.deadline,
+            effective_uid: plan.effective_uid,
+            effective_gid: plan.effective_gid,
+            installed_executable: plan.installed_executable.clone(),
+            arguments: plan.arguments.clone(),
+            environment: plan.environment.clone(),
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, SupervisorWireError> {
+        self.validate()?;
+        let mut bytes = vec![0_u8; LAUNCHER_HEADER_BYTES];
+        bytes[..8].copy_from_slice(&LAUNCHER_MAGIC);
+        put_u16(&mut bytes, 8, LAUNCHER_VERSION);
+        put_u64(&mut bytes, 16, self.deadline.wire_value());
+        put_u32(&mut bytes, 24, self.effective_uid);
+        put_u32(&mut bytes, 28, self.effective_gid);
+        put_u32(&mut bytes, 32, u32_len(&self.installed_executable)?);
+        put_u16(&mut bytes, 36, u16_len(&self.arguments)?);
+        put_u16(&mut bytes, 38, u16_len(&self.environment)?);
+        bytes.extend_from_slice(&self.installed_executable);
+        for argument in &self.arguments {
+            append_component(&mut bytes, argument)?;
+        }
+        for entry in &self.environment {
+            append_component(&mut bytes, entry.key())?;
+            append_component(&mut bytes, entry.value())?;
+        }
+        if bytes.len() > MAX_BROKER_PLAN_BYTES {
+            return Err(SupervisorWireError::LimitExceeded);
+        }
+        let length = u32_len(&bytes)?;
+        put_u32(&mut bytes, 12, length);
+        Ok(bytes)
+    }
+
+    fn decode_untrusted(bytes: &[u8]) -> Result<Self, SupervisorWireError> {
+        if bytes.len() < LAUNCHER_HEADER_BYTES
+            || bytes.len() > MAX_BROKER_PLAN_BYTES
+            || bytes[..8] != LAUNCHER_MAGIC
+            || get_u16(bytes, 8) != Some(LAUNCHER_VERSION)
+            || bytes[10..12] != [0; 2]
+            || get_u32(bytes, 12) != u32::try_from(bytes.len()).ok()
+        {
+            return Err(SupervisorWireError::Malformed);
+        }
+        let executable_len = usize_at(bytes, 32)?;
+        let argument_count = usize::from(get_u16(bytes, 36).ok_or(SupervisorWireError::Malformed)?);
+        let environment_count =
+            usize::from(get_u16(bytes, 38).ok_or(SupervisorWireError::Malformed)?);
+        if executable_len > MAX_COMPONENT_BYTES
+            || argument_count == 0
+            || argument_count > MAX_ARGUMENTS
+            || environment_count > MAX_ENVIRONMENT
+        {
+            return Err(SupervisorWireError::LimitExceeded);
+        }
+        let mut cursor = LAUNCHER_HEADER_BYTES;
+        let installed_executable = take_exact(bytes, &mut cursor, executable_len)?.to_vec();
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(take_component(bytes, &mut cursor)?);
+        }
+        let mut environment = Vec::with_capacity(environment_count);
+        for _ in 0..environment_count {
+            environment.push(TargetEnvironmentEntry::new(
+                take_component(bytes, &mut cursor)?,
+                take_component(bytes, &mut cursor)?,
+            )?);
+        }
+        if cursor != bytes.len() {
+            return Err(SupervisorWireError::Malformed);
+        }
+        let plan = Self {
+            deadline: SupervisorDeadline::from_wire(
+                get_u64(bytes, 16).ok_or(SupervisorWireError::Malformed)?,
+            ),
+            effective_uid: get_u32(bytes, 24).ok_or(SupervisorWireError::Malformed)?,
+            effective_gid: get_u32(bytes, 28).ok_or(SupervisorWireError::Malformed)?,
+            installed_executable,
+            arguments,
+            environment,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    fn validate(&self) -> Result<(), SupervisorWireError> {
+        if self.deadline.wire_value() == 0
+            || self.effective_uid == 0
+            || self.effective_uid == u32::MAX
+            || self.effective_gid == 0
+            || self.effective_gid == u32::MAX
+            || self.arguments.is_empty()
+            || self.arguments.len() > MAX_ARGUMENTS
+            || self.environment.len() > MAX_ENVIRONMENT
+        {
+            return Err(SupervisorWireError::Malformed);
+        }
         validate_installed_executable(&self.installed_executable)?;
         for argument in &self.arguments {
             validate_component(argument)?;

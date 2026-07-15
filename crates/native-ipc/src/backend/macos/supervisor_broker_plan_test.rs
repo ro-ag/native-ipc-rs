@@ -16,7 +16,7 @@ fn plan() -> BrokerLaunchPlan {
         target_identity: [4; 32],
         client_nonce: [5; 32],
         service_nonce: [6; 32],
-        policy_id: b"com.example.receiver".to_vec(),
+        policy_id: b"org.example.private-policy".to_vec(),
         installed_executable: b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
         arguments: vec![b"receiver".to_vec(), b"--mode=test".to_vec()],
         environment: vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
@@ -36,6 +36,76 @@ fn exact_plan_round_trips_canonically() {
     let bound = unsafe { acknowledged.activate() };
     assert_eq!(bound.deadline().wire(), plan.deadline);
     assert_eq!(bound.into_plan(), plan);
+}
+
+#[test]
+fn exact_parent_alone_mints_canonical_authority_free_launcher_data() {
+    let original = plan();
+    let encoded = original.encode().unwrap();
+    let received = ReceivedBrokerLaunchPlan::decode(&encoded).unwrap();
+    // SAFETY: this codec-only test models exact FD4 ACK and FD3 START.
+    let exact = unsafe { received.acknowledge_exact_parent().activate() };
+    let deadline = exact.deadline();
+    let launcher_frame = exact.launcher_frame().unwrap();
+    assert_ne!(launcher_frame, encoded);
+    for secret in [
+        &[1; 32][..],
+        &[2; 32][..],
+        &[3; 32][..],
+        &[4; 32][..],
+        &[5; 32][..],
+        &[6; 32][..],
+        b"org.example.private-policy",
+    ] {
+        assert!(
+            !launcher_frame
+                .windows(secret.len())
+                .any(|value| value == secret)
+        );
+    }
+    let prefix: &[u8; LAUNCHER_PLAN_PREFIX_BYTES] = launcher_frame[..LAUNCHER_PLAN_PREFIX_BYTES]
+        .try_into()
+        .unwrap();
+    let parsed = parse_launcher_plan_prefix(prefix, launcher_frame.len()).unwrap();
+    assert_eq!(parsed.deadline.wire(), deadline.wire());
+    let parts = ReceivedLauncherExecPlan::decode_with_deadline(&launcher_frame, parsed.deadline)
+        .unwrap()
+        .into_parts();
+    assert_eq!(parts.deadline.wire(), original.deadline);
+    assert_eq!(parts.effective_uid, original.effective_uid);
+    assert_eq!(parts.effective_gid, original.effective_gid);
+    assert_eq!(parts.installed_executable, original.installed_executable);
+    assert_eq!(parts.arguments, original.arguments);
+    assert_eq!(parts.environment, original.environment);
+}
+
+#[test]
+fn launcher_data_rejects_every_truncation_extension_and_deadline_substitution() {
+    let broker = plan();
+    let encoded = LauncherExecPlan::from_broker(&broker).encode().unwrap();
+    let prefix: &[u8; LAUNCHER_PLAN_PREFIX_BYTES] =
+        encoded[..LAUNCHER_PLAN_PREFIX_BYTES].try_into().unwrap();
+    let parsed = parse_launcher_plan_prefix(prefix, encoded.len()).unwrap();
+    for length in 0..encoded.len() {
+        assert!(
+            ReceivedLauncherExecPlan::decode_with_deadline(&encoded[..length], parsed.deadline)
+                .is_err()
+        );
+    }
+    let mut extended = encoded.clone();
+    extended.push(0);
+    assert!(ReceivedLauncherExecPlan::decode_with_deadline(&extended, parsed.deadline).is_err());
+
+    let mut substituted = encoded;
+    put_u64(
+        &mut substituted,
+        16,
+        broker.deadline.wire_value().checked_add(1).unwrap(),
+    );
+    assert_eq!(
+        ReceivedLauncherExecPlan::decode_with_deadline(&substituted, parsed.deadline).err(),
+        Some(SupervisorWireError::ReplayOrSubstitution)
+    );
 }
 
 #[test]
