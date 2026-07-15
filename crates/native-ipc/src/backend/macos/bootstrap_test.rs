@@ -1,4 +1,30 @@
 use super::*;
+
+#[test]
+fn exec_identity_requires_real_and_effective_ids_and_exact_path() {
+    let before = TaskAuditIdentity {
+        audit: AuditToken {
+            values: [0, 0, 0, 0, 0, 42, 0, 7],
+        },
+        executable: b"/before".to_vec(),
+    };
+    let partial_drop = TaskAuditIdentity {
+        audit: AuditToken {
+            values: [0, 501, 20, 0, 0, 42, 0, 8],
+        },
+        executable: b"/expected".to_vec(),
+    };
+    assert!(!partial_drop.proves_exec_transition_from(&before, 42, 501, 20, b"/expected"));
+
+    let complete_drop = TaskAuditIdentity {
+        audit: AuditToken {
+            values: [0, 501, 20, 501, 20, 42, 0, 8],
+        },
+        executable: b"/expected".to_vec(),
+    };
+    assert!(complete_drop.proves_exec_transition_from(&before, 42, 501, 20, b"/expected"));
+    assert!(!complete_drop.proves_exec_transition_from(&before, 42, 501, 20, b"/substitute"));
+}
 use native_ipc_core::layout::{
     AcknowledgementRouteSpec, Endpoint, LayoutLimits, RegionSetLayout, RegionSpec, RoleId,
     ValidationExpectations,

@@ -33,6 +33,9 @@ use super::auth_adapter::broker_spawn::{
     INSTALLED_TRACE_ARGUMENT, START_BYTE,
 };
 
+#[path = "supervisor_broker_launcher.rs"]
+mod broker_launcher;
+
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;

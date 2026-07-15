@@ -1,6 +1,6 @@
 //! Private Mach bootstrap channel with audit-token process authentication.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::mem::{size_of, size_of_val, zeroed};
 #[cfg(test)]
@@ -69,6 +69,7 @@ const TASK_AUDIT_TOKEN_COUNT: u32 = 8;
 const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
 const POSIX_SPAWN_SETSID: i16 = 0x0400;
 const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
+const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
 unsafe extern "C" {
     fn mach_port_allocate(task: MachPort, right: c_int, name: *mut MachPort) -> c_int;
@@ -117,6 +118,11 @@ unsafe extern "C" {
     ) -> c_int;
     fn kill(pid: Pid, signal: c_int) -> c_int;
     fn waitpid(pid: Pid, status: *mut c_int, options: c_int) -> Pid;
+}
+
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffer_size: u32) -> c_int;
 }
 
 #[link(name = "bsm")]
@@ -343,6 +349,64 @@ impl Drop for ReceiveRight {
 /// token before the child runs. Native testing shows that an ordinary `exec`
 /// invalidates this right, so it is not a cross-exec lifecycle capability.
 struct TaskNameRight(MachPort);
+
+/// Kernel audit identity sampled while an exact direct child is ptrace-stopped.
+pub(super) struct TaskAuditIdentity {
+    audit: AuditToken,
+    executable: Vec<u8>,
+}
+
+impl TaskAuditIdentity {
+    /// Requires the same exact PID, the expected post-drop credentials, and a
+    /// changed PID version. Darwin changes the audit PID version on `exec`.
+    pub(super) fn proves_exec_transition_from(
+        &self,
+        before: &Self,
+        pid: c_int,
+        expected_euid: u32,
+        expected_egid: u32,
+        expected_executable: &[u8],
+    ) -> bool {
+        let Ok(expected_pid) = u32::try_from(pid) else {
+            return false;
+        };
+        before.audit.values[5] == expected_pid
+            && self.audit.values[5] == expected_pid
+            && before.audit.values[7] != self.audit.values[7]
+            && self.audit.values[1] == expected_euid
+            && self.audit.values[2] == expected_egid
+            && self.audit.values[3] == expected_euid
+            && self.audit.values[4] == expected_egid
+            && self.executable == expected_executable
+    }
+}
+
+/// Captures only an execution-scoped task-name identity, never task control.
+/// The caller must independently pin `pid` against reuse while this runs.
+pub(super) fn capture_task_audit_identity(pid: c_int) -> Result<TaskAuditIdentity, BootstrapError> {
+    let (_right, audit) = TaskNameRight::capture(pid)?;
+    let mut path = [0_u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: exact stopped-child authority pins pid while proc_pidpath writes
+    // at most the supplied live buffer. libproc returns a NUL-terminated path.
+    let result = unsafe {
+        proc_pidpath(
+            pid,
+            path.as_mut_ptr().cast(),
+            u32::try_from(path.len()).unwrap_or(u32::MAX),
+        )
+    };
+    if result <= 0 {
+        return Err(BootstrapError::InvalidMessage);
+    }
+    let executable = CStr::from_bytes_until_nul(&path)
+        .map_err(|_| BootstrapError::InvalidMessage)?
+        .to_bytes()
+        .to_vec();
+    if executable.is_empty() {
+        return Err(BootstrapError::InvalidMessage);
+    }
+    Ok(TaskAuditIdentity { audit, executable })
+}
 
 impl TaskNameRight {
     fn capture_suspended(pid: Pid) -> Result<(Self, AuditToken), BootstrapError> {

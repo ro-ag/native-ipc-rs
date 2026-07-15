@@ -70,8 +70,15 @@ EOF without a second clock veto. The broker admits resumed authority only after
 that exact frame and a final FD 3 service-death probe. The
 resulting active gate and report receipt expose no request-selected launch,
 path, PID, signal, task, or filesystem authority. START and report bytes alone
-cannot launch a target; the unsafe report-emission boundary still requires the
-future broker-local launcher to consume both exact kernel stops.
+cannot launch a target. The source broker-local waiter now consumes an exact
+direct child together with the complete active plan/gate/report bundle, keeps
+the initial `SIGSTOP` unproven until `PT_CONTINUE` succeeds, and accepts the
+exec trap only after the audit PID version changes, real/effective IDs match,
+and `proc_pidpath` equals the installed plan path. Untraced, substituted-image,
+unexpected-stop, service-death, and deadline paths exact-clean. The fixed
+launcher spawner/entry and the production transition from this held token into
+FD 5 report/Ready/RESUME remain unimplemented, so report emission stays
+test-only.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it

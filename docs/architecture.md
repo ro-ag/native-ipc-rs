@@ -402,9 +402,14 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    byte and closes the endpoint, after which no second deadline veto can create
    a Ready-but-never-resumed session. The broker requires exact byte plus EOF
    and one final FD 3 death probe before resumed authority. The broker
-   report emitter is an unsafe typestate boundary whose native two-stop caller
-   and packaged effect loop remain to be implemented; tests use an explicit
-   synthetic stop-proof fixture and make no launcher claim. A one-shot non-sendable
+   source broker-local waiter now retains the exact active plan, gate, report
+   endpoint, and original deadline across a sole-waiter child typestate. It
+   distinguishes an unproven initial stop from successful ptrace continuation
+   and requires changed audit PID version, complete real/effective credential
+   equality, and exact installed `proc_pidpath` at the exec trap. The fixed
+   launcher spawner/entry and safe held-token-to-report transition remain to be
+   implemented; report tests still use an explicit synthetic stop-proof
+   fixture. A one-shot non-sendable
    child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
    semantics, and blocks SIGCHLD for inheriting service threads. The fixed

@@ -1,6 +1,8 @@
 //! Canonical cross-exec broker launch-plan frame.
 
 use std::collections::HashSet;
+#[cfg(test)]
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -246,6 +248,49 @@ impl ExactParentBrokerLaunchPlan {
         &self,
     ) -> SupervisorDeadlineBinding {
         self.deadline
+    }
+
+    pub(in crate::backend::macos::supervisor) const fn effective_uid(&self) -> u32 {
+        self.plan.effective_uid
+    }
+
+    pub(in crate::backend::macos::supervisor) const fn effective_gid(&self) -> u32 {
+        self.plan.effective_gid
+    }
+
+    pub(in crate::backend::macos::supervisor) fn installed_executable(&self) -> &[u8] {
+        &self.plan.installed_executable
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::macos::supervisor) fn for_launcher_test(
+        deadline: Instant,
+        effective_uid: u32,
+        effective_gid: u32,
+        installed_executable: Vec<u8>,
+    ) -> Self {
+        let deadline = SupervisorDeadlineBinding::from_test_instant(deadline).unwrap();
+        Self {
+            plan: BrokerLaunchPlan {
+                deadline: deadline.wire(),
+                connection_generation: 1,
+                sequence: 1,
+                effective_uid,
+                effective_gid,
+                session: [1; 32],
+                audit_identity: [2; 32],
+                code_identity: [3; 32],
+                target_identity: [4; 32],
+                client_nonce: [5; 32],
+                service_nonce: [6; 32],
+                policy_id: b"test.launcher".to_vec(),
+                installed_executable,
+                arguments: vec![b"launcher-fixture".to_vec()],
+                environment: Vec::new(),
+            },
+            deadline,
+            digest: [7; 32],
+        }
     }
 
     pub(super) fn into_plan(self) -> BrokerLaunchPlan {
