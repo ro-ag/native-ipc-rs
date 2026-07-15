@@ -346,8 +346,9 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    record for the worker digest and later decoding. The deadline is rechecked immediately before the send, but that
    userspace check and kernel entry are not one atomic kernel deadline action.
    This remains source/native mechanism evidence, not an installed privileged
-   service, packaged broker/control loop, or clean-exec Security-worker
-   executable/entrypoint.
+   service, packaged broker/control loop, or separately packaged, signed, and
+   root-installed clean-exec Security-worker artifact. The fixed source entry
+   and spawner exist but are not installation evidence.
 3. The service/watchdog is independently privileged so target code running as
    the client cannot signal-stop it. Privilege is retained only by the minimal
    broker/watchdog; the launcher permanently drops real/effective/saved IDs to
@@ -378,10 +379,16 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    initialization, nondefault SIGCHLD, and `SA_NOCLDWAIT`, then installs
    canonical default disposition and blocks SIGCHLD for subsequently inherited
    thread masks. The token is one-shot and non-sendable, but it cannot prove
-   absence of future broad waiters. It currently exposes no production
-   PID-taking constructor; the installed clean-exec spawner must own the whole
-   `posix_spawn` success-to-armed-authority sequence before this evidence can be
-   treated as a deployable sole-waiter domain.
+   absence of future broad waiters. The fixed source spawner creates the private
+   one-job pipes and owns the whole `posix_spawn`
+   success-to-armed-direct-child-authority sequence. The paired clean-exec entry
+   validates the fixed process ABI and dynamically loads Security.framework
+   only inside the worker; native composition reaches exact status-zero reap
+   without statically linking Security/CoreFoundation into the surrounding
+   binary. This is not yet deployable sole-waiter evidence: the worker is not a
+   separately signed, root-installed, replacement-resistant artifact, the
+   service does not verify its immutable policy constants, and a complete
+   process-wide no-competing-waiter policy is not wired or proven.
 7. The signed trusted launcher authenticates its broker, establishes
    `PT_TRACE_ME` with an explicit stopped handshake, drops to the nonroot client
    identity, installs hard `RLIMIT_NPROC=1`, and execs only after the lifecycle

@@ -1,9 +1,10 @@
 //! Fused exact-message authentication state for the privileged supervisor.
 //!
 //! This is a source-level raw receive and ownership boundary, not an installed
-//! Mach service. The deployable adapter must add clean-exec Security.framework
-//! workers and exact worker authority inside this child module so the parent
-//! module's unsafe peer/message factories stay private.
+//! Mach service. Fixed clean-exec Security.framework workers and exact worker
+//! authority stay inside this child module so the parent module's unsafe
+//! peer/message factories remain private. Packaging, installation verification,
+//! and service-loop wiring remain outside this source boundary.
 
 use std::collections::HashSet;
 use std::ffi::c_int;
@@ -36,6 +37,12 @@ pub(in crate::backend::macos) mod broker_spawn;
 
 #[path = "supervisor_broker_plan.rs"]
 pub(super) mod broker_plan;
+
+#[path = "supervisor_auth_worker_spawn.rs"]
+mod auth_worker_spawn;
+
+#[path = "supervisor_auth_worker_entry.rs"]
+pub(in crate::backend::macos) mod auth_worker_entry;
 
 const MAX_AUTH_WORKERS: usize = 4;
 const MAX_PENDING_PER_UID: usize = 2;

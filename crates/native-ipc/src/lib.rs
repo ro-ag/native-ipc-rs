@@ -59,6 +59,29 @@ pub unsafe fn __private_macos_broker_gate_main() -> ! {
     unsafe { backend::macos::run_fixed_broker_gate_process() }
 }
 
+/// Runs the fixed macOS clean-exec authentication-worker boundary.
+///
+/// This hidden artifact entry validates one exact inherited request, performs
+/// the installed fixed Security requirement check against its audit token,
+/// emits one canonical result, and exits. It exists only for a separately
+/// compiled minimal signed worker executable.
+///
+/// # Safety
+///
+/// This must run in the just-execed dedicated worker before threads or
+/// Security.framework initialization. `requirement` and `code_identity` must
+/// be compile-time installed-policy constants in that artifact, and the exact
+/// spawner must exclusively transfer descriptors 3 and 4 plus the fixed vector.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub unsafe fn __private_macos_auth_worker_main(
+    requirement: &std::ffi::CStr,
+    code_identity: [u8; 32],
+) -> ! {
+    // SAFETY: the caller supplies the complete fixed process-entry contract.
+    unsafe { backend::macos::run_fixed_auth_worker_process(requirement, code_identity) }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum BackendStatus {

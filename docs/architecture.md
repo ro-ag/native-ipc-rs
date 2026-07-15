@@ -393,12 +393,19 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    broker effect loop remains to be implemented. A one-shot non-sendable
    child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
-   semantics, and blocks SIGCHLD for inheriting service threads. It deliberately
-   cannot mint production child authority: no installed Security.framework
-   worker image or atomic `posix_spawn`/file-action-to-armed-owner wrapper
-implements the remaining unsafe native contracts yet. Those models
-are not wired to Mach transport, packaged, installed, or positively
-tested as root. The negative result for unprivileged same-UID
+   semantics, and blocks SIGCHLD for inheriting service threads. The fixed
+   source spawner now creates private one-job pipes, installs only FD 3/FD 4,
+   and converts a positive `posix_spawn` result directly into exact direct-child
+   authority before any fallible work. Its separate clean-exec entry validates
+   the fixed vector and descriptors, dynamically loads Security.framework only
+   inside that worker, authenticates the exact audit token, writes one atomic
+   result, and retains the result writer until process exit. Native tests compose
+   that spawner, real entry, Security validation, pool routing, and exact reap
+   while proving the enclosing test/service image has no static Security or
+   CoreFoundation dependency. The worker is still not separately packaged,
+   signed, root-installed, or verified as replacement-resistant; the spawner is
+   not wired to Mach transport or a complete process-wide waiter policy, and no
+   positive installed-root evidence exists. The negative result for unprivileged same-UID
 constructions, the primary-source evidence, and the standing fail-closed
 decision are recorded in
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md). In the

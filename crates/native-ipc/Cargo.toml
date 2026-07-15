@@ -68,3 +68,8 @@ harness = false
 name = "macos-broker-gate-entry"
 path = "tests/macos_broker_gate_entry.rs"
 harness = false
+
+[[test]]
+name = "macos-auth-worker-entry"
+path = "tests/macos_auth_worker_entry.rs"
+harness = false

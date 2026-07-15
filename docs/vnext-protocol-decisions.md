@@ -236,10 +236,11 @@ Ready or substitute for the armed watchdog cleanup guard required at send time.
 The auth-worker source also has a one-shot, main-thread-only child wait-domain
 initializer that rejects an already-threaded process, custom/ignored SIGCHLD,
 and `SA_NOCLDWAIT`, installs canonical default zombie semantics, and blocks
-SIGCHLD before service threads inherit their masks. The production child
-constructor remains absent until one concrete clean-exec spawner can own the
-entire successful `posix_spawn` to armed exact-worker transition without a
-fallible PID-only gap.
+SIGCHLD before service threads inherit their masks. The fixed source spawner
+owns the entire successful `posix_spawn` to armed exact-worker transition
+without a fallible PID-only gap, and its clean-exec entry retains result FD4
+through success or rejection until `_exit`. The separately packaged, signed,
+root-installed worker and complete service-wide waiter policy remain absent.
 The watchdog model exposes only connection-bound opaque handles and retains
 linear exact broker authority through a typed reap proof. The launcher-only
 transition binds the exact traced session and validated installed target to
