@@ -1,5 +1,19 @@
 # macOS exact-lifecycle supervisor boundary
 
+> **Scope correction (2026-07-15).** Parts of this document below predate the
+> current design and describe a *privileged, root-owned, credential-dropping*
+> supervisor. That design was removed. The supervisor is now **same-user and
+> unprivileged** — no root, no `setuid`, no root-owned install — and its purpose
+> is **lifecycle correctness** (verified-your-code child, contained, exactly
+> reaped, no zombie), not privilege separation. Untrusted code is confined to an
+> in-process library inside a signed child runner rather than run as a separate
+> process. The "hostile same-UID helper can stop its broker" and "privileged
+> service required" framing below applies only to the abandoned goal of
+> containing an *arbitrary adversarial process*; that is explicitly out of scope.
+> For the authoritative scope and threat model, see
+> [`docs/integration-model.md`](integration-model.md). Public macOS remains
+> `BackendUnavailable` by decision.
+
 Status: backend-private traced-launcher core implemented; privileged deployment
 boundary unresolved. A cooperative `ptrace` launcher plus hard
 `RLIMIT_NPROC=1` now closes the first-target-instruction, post-exec identity,

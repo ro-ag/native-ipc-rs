@@ -88,6 +88,38 @@ Native backends are private modules of `native-ipc`. The superseded 0.4
 `native-ipc-platform` package remains available from the `v0.4.0` tag and its
 published crate, but is not a vNext workspace package or public API.
 
+## Integration model and scope
+
+`native-ipc` is used to build **both ends** of a connection — a host and a child
+runner, both your own code — that share memory through this library. It is not a
+tool for running an unknown program safely.
+
+The intended shape is a main **host** process, a disposable **child runner**
+(a small program you write and sign) that loads one untrusted artifact — a VST3
+plugin, a model runner, a third-party C library — as an in-process shared object,
+and `native-ipc` shared memory as the only, validated channel between them. The
+untrusted artifact never touches the host directly; it only operates on the
+region the host grants.
+
+The contract is that the library launches only code you control. Untrusted logic
+runs solely as an in-process library inside a signed runner, never as a
+standalone process the library was handed. Within that contract the child
+runner's lifecycle guarantee is: it is verified to be your code before it runs,
+it is contained (no new processes, no signalling out, an optional capability
+profile bounds files and network), and it is terminated deterministically and
+reaped with no leaked process or zombie — all **without root**. The library does
+not attempt to sandbox an arbitrary untrusted *process*, which is not achievable
+under public macOS APIs without a task port; it confines untrusted code to an
+in-process library instead. See
+[`docs/integration-model.md`](docs/integration-model.md) for the full scope,
+the honest residuals, and the per-platform mechanism.
+
+The **public API is identical on every supported platform**; only the underlying
+kernel mechanism differs (see [supported targets](#supported-targets)). The
+macOS lifecycle supervisor is a design that is not yet enabled — the public
+macOS backend is currently unavailable by decision — while the shared-memory
+core ships on all platforms.
+
 ## How memory is accessed
 
 Ordinary byte slices exist only while a new mapping is private and quiescent.

@@ -1,5 +1,12 @@
 # Repository Threat Model
 
+> **Scope.** This document covers the shared-memory and wire-protocol trust
+> boundaries. For the integration model (host / child runner / shared memory),
+> the "launch only your own signed code" contract, and the unprivileged
+> cooperative-tier lifecycle scope, see
+> [`docs/integration-model.md`](integration-model.md), which is the canonical
+> scope statement.
+
 ## Overview
 
 This repository is a Rust library foundation for local, cross-process message
