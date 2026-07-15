@@ -19,7 +19,6 @@ use native_ipc_core::mapping::{
 pub mod bootstrap;
 pub(super) mod supervisor;
 pub(super) mod supervisor_client;
-pub(super) mod supervisor_launcher;
 pub(super) mod supervisor_watchdog;
 
 /// Runs the fixed no-callback broker gate executable boundary.

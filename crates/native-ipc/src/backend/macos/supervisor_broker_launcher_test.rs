@@ -48,7 +48,7 @@ assert_not_impl_any!(AwaitingExecTrap: Clone, Copy, Send, Sync);
 assert_not_impl_any!(ExecTrapHeld: Clone, Copy, Send, Sync);
 
 #[test]
-fn installed_launcher_vectors_and_root_identity_are_fixed() {
+fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
     // SAFETY: this source-level vector test does not claim the fixed image is
     // installed or verified; it inspects only the installation-bound values.
     let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
@@ -75,12 +75,34 @@ fn installed_launcher_vectors_and_root_identity_are_fixed() {
         environment,
         [&b"PATH=/usr/bin:/bin"[..], &b"LANG=C"[..], &b"LC_ALL=C"[..],]
     );
+    // The launcher must present this unprivileged supervisor's own identity.
+    // No request value contributes, and root is never expected or required.
     let identity = image.fixed_identity();
-    assert_eq!(identity.real_uid, 0);
-    assert_eq!(identity.effective_uid, 0);
-    assert_eq!(identity.real_gid, 0);
-    assert_eq!(identity.effective_gid, 0);
+    // SAFETY: credential getters have no preconditions.
+    unsafe {
+        assert_eq!(identity.real_uid, getuid());
+        assert_eq!(identity.effective_uid, geteuid());
+        assert_eq!(identity.real_gid, getgid());
+        assert_eq!(identity.effective_gid, getegid());
+    }
     assert_eq!(identity.executable, INSTALLED_LAUNCHER_PATH.as_bytes());
+}
+
+#[test]
+fn launcher_identity_never_expects_or_requires_root() {
+    // A supervisor that expected root here would reject its own launcher, and
+    // a design that required it would need an install this project refuses.
+    // SAFETY: credential getters have no preconditions.
+    let running_as_root = unsafe { geteuid() == 0 };
+    assert!(
+        !running_as_root,
+        "the unprivileged supervisor's tests must not run as root",
+    );
+    // SAFETY: source-level vector construction only; see above.
+    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let identity = image.fixed_identity();
+    assert_ne!(identity.real_uid, 0);
+    assert_ne!(identity.effective_uid, 0);
 }
 
 /// Complete broker-side state for the fixed launcher spawn boundary, with no

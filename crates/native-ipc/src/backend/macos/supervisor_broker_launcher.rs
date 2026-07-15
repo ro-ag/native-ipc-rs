@@ -1,5 +1,17 @@
 //! Exact broker-local authority for the trusted launcher's two ptrace stops.
 //!
+//! This supervisor is unprivileged and same-user throughout. Nothing here
+//! needs or wants elevated rights: owning an exact direct child, tracing it,
+//! holding it at an exec trap, and reaping it are all ordinary operations on
+//! one's own children. The launcher exists solely because the target is
+//! foreign code that cannot `PT_TRACE_ME` itself — it is our image, which
+//! traces itself and then execs the target, giving the broker an exec trap
+//! before the target's first instruction. It never changes credentials.
+//!
+//! What this boundary provides is lifecycle correctness — no leaked process,
+//! no zombie, exact termination of an uncooperative target — not privilege
+//! separation. A hostile process running as the same user is out of scope.
+//!
 //! # Fixed launcher channel contract
 //!
 //! `--broker-death-fd=3` and `--plan-fd=4` are compiled into the installed
@@ -89,6 +101,10 @@ struct PollFd {
 }
 
 unsafe extern "C" {
+    fn getegid() -> u32;
+    fn geteuid() -> u32;
+    fn getgid() -> u32;
+    fn getuid() -> u32;
     fn kill(pid: c_int, signal: c_int) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn poll(descriptors: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
@@ -236,13 +252,23 @@ impl InstalledLauncherImage {
         ]
     }
 
+    /// Credentials the launcher must already carry at its initial stop.
+    ///
+    /// This supervisor is unprivileged and same-user, so the launcher is an
+    /// ordinary direct child that must present exactly this process's own
+    /// identity. It never gains or drops privilege: an image whose credentials
+    /// differ here changed identity across exec (a set-user-ID or set-group-ID
+    /// binary) and is therefore not the image the deployer installed.
     fn fixed_identity(&self) -> FixedLauncherIdentity {
-        FixedLauncherIdentity {
-            real_uid: 0,
-            effective_uid: 0,
-            real_gid: 0,
-            effective_gid: 0,
-            executable: self.path.as_bytes().to_vec(),
+        // SAFETY: credential getters have no preconditions.
+        unsafe {
+            FixedLauncherIdentity {
+                real_uid: getuid(),
+                effective_uid: geteuid(),
+                real_gid: getgid(),
+                effective_gid: getegid(),
+                executable: self.path.as_bytes().to_vec(),
+            }
         }
     }
 }
