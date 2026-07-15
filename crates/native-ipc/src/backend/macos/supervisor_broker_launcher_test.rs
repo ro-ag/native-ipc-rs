@@ -46,6 +46,42 @@ assert_not_impl_any!(InitialStopObserved: Clone, Copy, Send, Sync);
 assert_not_impl_any!(AwaitingExecTrap: Clone, Copy, Send, Sync);
 assert_not_impl_any!(ExecTrapHeld: Clone, Copy, Send, Sync);
 
+#[test]
+fn installed_launcher_vectors_and_root_identity_are_fixed() {
+    // SAFETY: this source-level vector test does not claim the fixed image is
+    // installed or verified; it inspects only the installation-bound values.
+    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let argv = image.argv();
+    let environment = image.environment();
+    let argv = argv[..argv.len() - 1]
+        .iter()
+        .map(|value| unsafe { CStr::from_ptr(value.cast_const()) }.to_bytes())
+        .collect::<Vec<_>>();
+    let environment = environment[..environment.len() - 1]
+        .iter()
+        .map(|value| unsafe { CStr::from_ptr(value.cast_const()) }.to_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            INSTALLED_LAUNCHER_PATH.as_bytes(),
+            INSTALLED_LAUNCHER_MODE.as_bytes(),
+            INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes(),
+            INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes(),
+        ]
+    );
+    assert_eq!(
+        environment,
+        [&b"PATH=/usr/bin:/bin"[..], &b"LANG=C"[..], &b"LC_ALL=C"[..],]
+    );
+    let identity = image.fixed_identity();
+    assert_eq!(identity.real_uid, 0);
+    assert_eq!(identity.effective_uid, 0);
+    assert_eq!(identity.real_gid, 0);
+    assert_eq!(identity.effective_gid, 0);
+    assert_eq!(identity.executable, INSTALLED_LAUNCHER_PATH.as_bytes());
+}
+
 #[used]
 #[unsafe(link_section = "__DATA,__mod_init_func")]
 static EXACT_LAUNCHER_HOOK: extern "C" fn() = exact_launcher_hook;

@@ -1,6 +1,6 @@
 //! Exact broker-local authority for the trusted launcher's two ptrace stops.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Instant;
@@ -26,6 +26,15 @@ const ESRCH: c_int = 3;
 const ECHILD: c_int = 10;
 const POLLIN: i16 = 0x0001;
 
+pub(super) const INSTALLED_LAUNCHER_PATH: &str =
+    "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.launcher";
+pub(super) const INSTALLED_LAUNCHER_MODE: &str = "--supervisor-launcher";
+pub(super) const INSTALLED_LAUNCHER_DEATH_ARGUMENT: &str = "--broker-death-fd=3";
+pub(super) const INSTALLED_LAUNCHER_PLAN_ARGUMENT: &str = "--plan-fd=4";
+const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
+const CANONICAL_LANG: &str = "LANG=C";
+const CANONICAL_LOCALE: &str = "LC_ALL=C";
+
 #[repr(C)]
 struct PollFd {
     fd: c_int,
@@ -50,6 +59,72 @@ pub(super) enum LauncherWaitError {
     UnexpectedStatus,
     IdentityTransition,
     Native(c_int),
+}
+
+/// Installation-only fixed launcher image and canonical clean-exec vectors.
+///
+/// No request data selects its path, arguments, environment, credentials, PID,
+/// signal, or descriptors. Construction alone does not claim installed-image
+/// verification; that obligation remains with the privileged runtime.
+pub(super) struct InstalledLauncherImage {
+    path: CString,
+    mode: CString,
+    death_argument: CString,
+    plan_argument: CString,
+    environment_path: CString,
+    environment_lang: CString,
+    environment_locale: CString,
+}
+
+impl InstalledLauncherImage {
+    /// # Safety
+    ///
+    /// The installed supervisor must first verify the fixed path is the
+    /// immutable root-owned signed launcher image for this service.
+    pub(super) unsafe fn from_verified_installation() -> Result<Self, LauncherWaitError> {
+        Ok(Self {
+            path: fixed_launcher_cstring(INSTALLED_LAUNCHER_PATH)?,
+            mode: fixed_launcher_cstring(INSTALLED_LAUNCHER_MODE)?,
+            death_argument: fixed_launcher_cstring(INSTALLED_LAUNCHER_DEATH_ARGUMENT)?,
+            plan_argument: fixed_launcher_cstring(INSTALLED_LAUNCHER_PLAN_ARGUMENT)?,
+            environment_path: fixed_launcher_cstring(CANONICAL_PATH)?,
+            environment_lang: fixed_launcher_cstring(CANONICAL_LANG)?,
+            environment_locale: fixed_launcher_cstring(CANONICAL_LOCALE)?,
+        })
+    }
+
+    fn argv(&self) -> [*mut c_char; 5] {
+        [
+            self.path.as_ptr().cast_mut(),
+            self.mode.as_ptr().cast_mut(),
+            self.death_argument.as_ptr().cast_mut(),
+            self.plan_argument.as_ptr().cast_mut(),
+            std::ptr::null_mut(),
+        ]
+    }
+
+    fn environment(&self) -> [*mut c_char; 4] {
+        [
+            self.environment_path.as_ptr().cast_mut(),
+            self.environment_lang.as_ptr().cast_mut(),
+            self.environment_locale.as_ptr().cast_mut(),
+            std::ptr::null_mut(),
+        ]
+    }
+
+    fn fixed_identity(&self) -> FixedLauncherIdentity {
+        FixedLauncherIdentity {
+            real_uid: 0,
+            effective_uid: 0,
+            real_gid: 0,
+            effective_gid: 0,
+            executable: self.path.as_bytes().to_vec(),
+        }
+    }
+}
+
+fn fixed_launcher_cstring(value: &'static str) -> Result<CString, LauncherWaitError> {
+    CString::new(value).map_err(|_| LauncherWaitError::IdentityTransition)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
