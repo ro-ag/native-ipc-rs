@@ -83,9 +83,13 @@ The service receiver and armed Ready guard remain the sole deadline authority
 after report EOF. Only successful Ready plus reverse commit moves the watchdog
 to `ReadyCommitted`; stale deadline work cannot retroactively terminate that
 phase, while client loss, protocol failure, unexpected stop, and service table
-drop remain exact-clean effects. The resumed target still carries exact cleanup ownership.
-The fixed launcher spawner/entry and production service-death/target-exit loop
-remain unimplemented.
+drop remain exact-clean effects. The resumed target then enters a gate-first
+sole-waiter loop with no post-Ready clock veto. Exact natural exit or signal
+death is reaped before a PID-free outcome is returned; any later traced stop
+is terminal and exact-cleaned. Service EOF or a bad gate byte wins through a
+final post-wait probe: a still-live or stopped target exact-cleans, while an
+already reaped target only changes the terminal classification. The fixed
+launcher spawner/entry remains unimplemented.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it
@@ -99,7 +103,7 @@ a named FIFO using public descriptor metadata; FIFO shape and START are
 explicitly non-authoritative until an exact-child/session/control-plan binding
 is authenticated. Nor do they prove that the hard-coded production path is
 installed, root-owned, signed, packaged, or replacement-resistant. The
-packaged executable and native broker effect loop, clean-exec launcher artifact,
+packaged executable and clean-exec launcher artifact,
 installed service loop,
 permanent credential drop, real client-death authority, and launchd/XPC
 delegation policy remain unresolved. Public macOS therefore remains

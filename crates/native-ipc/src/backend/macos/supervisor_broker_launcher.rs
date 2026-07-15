@@ -115,6 +115,13 @@ pub(super) struct ResumedTarget {
     inner: Option<ExactLauncher>,
 }
 
+/// Exact natural exit observed by the sole broker waiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExactTargetExit {
+    Exited(u8),
+    Signaled(c_int),
+}
+
 impl SpawnedLauncher {
     /// # Safety
     ///
@@ -299,15 +306,100 @@ impl ReadyCommittedExecTrap {
         inner.phase = ExactPhase::RunningTarget;
         Ok(ResumedTarget { inner: Some(inner) })
     }
+
+    #[cfg(test)]
+    fn wait_for_gate_eof_for_test(&self) {
+        let inner = self.inner.as_ref().unwrap_or_else(|| std::process::abort());
+        loop {
+            match probe_gate(inner.gate()) {
+                Err(LauncherWaitError::ServiceGone) => return,
+                Ok(()) => poll_gate_slice(inner.gate()).unwrap(),
+                Err(error) => panic!("unexpected gate probe failure: {error:?}"),
+            }
+        }
+    }
 }
 
 impl ResumedTarget {
+    pub(super) fn wait_for_exit(self) -> Result<ExactTargetExit, LauncherWaitError> {
+        self.wait_for_exit_with_post_wait(|_| {})
+    }
+
+    fn wait_for_exit_with_post_wait<Barrier>(
+        mut self,
+        barrier: Barrier,
+    ) -> Result<ExactTargetExit, LauncherWaitError>
+    where
+        Barrier: FnOnce(&ActiveBrokerGate),
+    {
+        let mut inner = self.inner.take().unwrap_or_else(|| std::process::abort());
+        let mut barrier = Some(barrier);
+        loop {
+            // Service loss wins over a simultaneously observable target exit.
+            // Dropping the retained exact authority then performs exact cleanup.
+            probe_gate(inner.gate())?;
+            let mut status = 0;
+            // SAFETY: the broker remains the sole waiter for this exact,
+            // unreaped direct child after the Ready-bound continuation.
+            let result = unsafe { waitpid(inner.pid, &raw mut status, WNOHANG | WUNTRACED) };
+            if result == inner.pid {
+                if traced_stop_signal(status).is_some() {
+                    inner.phase = ExactPhase::ObservedTracedStop;
+                    barrier.take().unwrap_or_else(|| std::process::abort())(inner.gate());
+                    probe_gate(inner.gate())?;
+                    return Err(LauncherWaitError::UnexpectedStatus);
+                }
+                inner.phase = ExactPhase::Reaped;
+                barrier.take().unwrap_or_else(|| std::process::abort())(inner.gate());
+                probe_gate(inner.gate())?;
+                return exact_target_exit(status).ok_or(LauncherWaitError::UnexpectedStatus);
+            }
+            if result < 0 {
+                let error = last_errno();
+                if error == EINTR {
+                    continue;
+                }
+                if error == ECHILD {
+                    std::process::abort();
+                }
+                return Err(LauncherWaitError::Native(error));
+            }
+            if result > 0 {
+                std::process::abort();
+            }
+            poll_gate_slice(inner.gate())?;
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_exit_with_post_wait_for_test<Barrier>(
+        self,
+        barrier: Barrier,
+    ) -> Result<ExactTargetExit, LauncherWaitError>
+    where
+        Barrier: FnOnce(&ActiveBrokerGate),
+    {
+        self.wait_for_exit_with_post_wait(barrier)
+    }
+
     #[cfg(test)]
     fn exact_pid_for_test(&self) -> c_int {
         self.inner
             .as_ref()
             .unwrap_or_else(|| std::process::abort())
             .pid
+    }
+
+    #[cfg(test)]
+    fn wait_for_gate_eof_for_test(&self) {
+        let inner = self.inner.as_ref().unwrap_or_else(|| std::process::abort());
+        loop {
+            match probe_gate(inner.gate()) {
+                Err(LauncherWaitError::ServiceGone) => return,
+                Ok(()) => poll_gate_slice(inner.gate()).unwrap(),
+                Err(error) => panic!("unexpected gate probe failure: {error:?}"),
+            }
+        }
     }
 }
 
@@ -435,6 +527,17 @@ fn ensure_deadline(deadline: Instant) -> Result<(), LauncherWaitError> {
 
 fn traced_stop_signal(status: c_int) -> Option<c_int> {
     (status & 0xff == 0x7f).then_some((status >> 8) & 0xff)
+}
+
+fn exact_target_exit(status: c_int) -> Option<ExactTargetExit> {
+    let terminal = status & 0x7f;
+    if terminal == 0 {
+        Some(ExactTargetExit::Exited(((status >> 8) & 0xff) as u8))
+    } else if terminal != 0x7f {
+        Some(ExactTargetExit::Signaled(terminal))
+    } else {
+        None
+    }
 }
 
 impl Drop for ExactLauncher {

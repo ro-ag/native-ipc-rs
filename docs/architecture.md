@@ -412,9 +412,12 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    without a post-report broker clock veto; every rejection exact-cleans. The
    watchdog enters `ReadyCommitted` only after Ready and reverse commit both
    succeed, so stale deadline work cannot kill the committed session; all
-   non-deadline terminal causes remain valid. The
-   fixed launcher spawner/entry and resumed target-exit/service-death loop remain
-   to be implemented. A one-shot non-sendable
+   non-deadline terminal causes remain valid. Resumed authority enters a
+   gate-first exact-wait loop without a post-Ready clock veto. Natural exit or
+   signal death consumes the exact reap before returning a PID-free outcome;
+   any later traced stop, service EOF, or invalid gate byte exact-cleans, with
+   a post-wait gate probe preserving service-death priority. The fixed launcher
+   spawner/entry remains to be implemented. A one-shot non-sendable
    child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
    semantics, and blocks SIGCHLD for inheriting service threads. The fixed

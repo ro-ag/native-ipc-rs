@@ -15,6 +15,12 @@ use super::*;
 const FIXTURE_ENV: &[u8] = b"NATIVE_IPC_TEST_EXACT_BROKER_LAUNCHER\0";
 const VALID_EXEC: &[u8] = b"valid-exec";
 const POST_EXEC: &[u8] = b"post-exec";
+const TARGET_STOP: &[u8] = b"target-stop";
+const POST_EXEC_STOP: &[u8] = b"post-exec-stop";
+const TARGET_DELAY: &[u8] = b"target-delay";
+const POST_EXEC_DELAY: &[u8] = b"post-exec-delay";
+const TARGET_SIGKILL: &[u8] = b"target-sigkill";
+const POST_EXEC_SIGKILL: &[u8] = b"post-exec-sigkill";
 const FAKE_TRAP: &[u8] = b"fake-trap";
 const UNEXPECTED_STOP: &[u8] = b"unexpected-stop";
 const UNTRACED_STOP: &[u8] = b"untraced-stop";
@@ -51,7 +57,11 @@ extern "C" fn exact_launcher_hook() {
     }
     // SAFETY: getenv returned one NUL-terminated environment value.
     let mode = unsafe { CStr::from_ptr(mode) }.to_bytes();
-    if mode == POST_EXEC {
+    if mode == POST_EXEC
+        || mode == POST_EXEC_STOP
+        || mode == POST_EXEC_DELAY
+        || mode == POST_EXEC_SIGKILL
+    {
         return;
     }
     if mode != VALID_EXEC
@@ -59,6 +69,9 @@ extern "C" fn exact_launcher_hook() {
         && mode != UNEXPECTED_STOP
         && mode != UNTRACED_STOP
         && mode != SUBSTITUTE_EXEC
+        && mode != TARGET_STOP
+        && mode != TARGET_DELAY
+        && mode != TARGET_SIGKILL
     {
         // SAFETY: an isolated malformed fixture must not enter libtest.
         unsafe { _exit(91) }
@@ -109,7 +122,16 @@ extern "C" fn exact_launcher_hook() {
 
     // SAFETY: both arguments are static NUL-terminated strings. Marking the
     // next image prevents this initializer from tracing a second time.
-    if unsafe { setenv(FIXTURE_ENV.as_ptr().cast(), c"post-exec".as_ptr(), 1) } != 0 {
+    let post_exec = if mode == TARGET_STOP {
+        c"post-exec-stop"
+    } else if mode == TARGET_DELAY {
+        c"post-exec-delay"
+    } else if mode == TARGET_SIGKILL {
+        c"post-exec-sigkill"
+    } else {
+        c"post-exec"
+    };
+    if unsafe { setenv(FIXTURE_ENV.as_ptr().cast(), post_exec.as_ptr(), 1) } != 0 {
         // SAFETY: the fixture cannot establish its one-exec invariant.
         unsafe { _exit(95) }
     }
@@ -415,6 +437,7 @@ fn service_death_after_commit_preempts_delayed_resume() {
     service.shutdown(Shutdown::Write).unwrap();
     let committed = reported.wait_for_ready_commit().unwrap().unwrap();
     fixture.close_gate();
+    committed.wait_for_gate_eof_for_test();
     assert!(matches!(
         committed.resume_target(),
         Err(LauncherWaitError::ServiceGone)
@@ -440,7 +463,220 @@ fn ready_resume_commit_has_no_broker_side_deadline_veto() {
 }
 
 #[test]
+fn resumed_target_natural_exit_is_exactly_reaped() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    assert_eq!(resumed.wait_for_exit(), Ok(ExactTargetExit::Exited(101)));
+    fixture.close_gate();
+}
+
+#[test]
+fn post_ready_sigkill_is_a_terminal_traced_stop_and_exactly_cleaned() {
+    let mut fixture = Fixture::spawn("target-sigkill");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    assert_eq!(
+        resumed.wait_for_exit(),
+        Err(LauncherWaitError::UnexpectedStatus)
+    );
+    fixture.close_gate();
+}
+
+#[test]
+fn terminal_status_decoder_distinguishes_exit_and_signal() {
+    assert_eq!(
+        exact_target_exit(23 << 8),
+        Some(ExactTargetExit::Exited(23))
+    );
+    assert_eq!(
+        exact_target_exit(SIGKILL),
+        Some(ExactTargetExit::Signaled(SIGKILL))
+    );
+    assert_eq!(exact_target_exit((SIGSTOP << 8) | 0x7f), None);
+}
+
+#[test]
+fn service_death_after_terminal_wait_wins_classification() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    let gate_writer = fixture.gate_writer.take().unwrap();
+    assert_eq!(
+        resumed.wait_for_exit_with_post_wait_for_test(move |gate| {
+            drop(gate_writer);
+            wait_for_gate_eof(gate);
+        }),
+        Err(LauncherWaitError::ServiceGone)
+    );
+}
+
+#[test]
+fn service_death_after_stop_wait_wins_and_exactly_cleans() {
+    let mut fixture = Fixture::spawn("target-stop");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    let gate_writer = fixture.gate_writer.take().unwrap();
+    assert_eq!(
+        resumed.wait_for_exit_with_post_wait_for_test(move |gate| {
+            drop(gate_writer);
+            wait_for_gate_eof(gate);
+        }),
+        Err(LauncherWaitError::ServiceGone)
+    );
+}
+
+#[test]
+fn service_death_while_target_runs_preempts_exit_and_exactly_cleans() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    fixture.close_gate();
+    // The production broker is single-threaded, while unrelated libtest
+    // helpers can transiently retain a CLOEXEC writer until their exec edge.
+    resumed.wait_for_gate_eof_for_test();
+    assert_eq!(resumed.wait_for_exit(), Err(LauncherWaitError::ServiceGone));
+}
+
+#[test]
+fn service_death_after_waiting_begins_still_wins_and_exactly_cleans() {
+    let mut fixture = Fixture::spawn("target-delay");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    let gate_writer = fixture.gate_writer.take().unwrap();
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        drop(gate_writer);
+    });
+    assert_eq!(resumed.wait_for_exit(), Err(LauncherWaitError::ServiceGone));
+    closer.join().unwrap();
+}
+
+#[test]
+fn post_ready_target_stop_is_terminal_and_exactly_cleaned() {
+    let mut fixture = Fixture::spawn("target-stop");
+    let (_, held) = fixture.held_exec();
+    let reported = held.report_trace_stops().unwrap().unwrap();
+    let mut service = fixture.drain_report();
+    service
+        .write_all(&super::super::super::auth_adapter::broker_report::BROKER_RESUME_BYTE)
+        .unwrap();
+    service.shutdown(Shutdown::Write).unwrap();
+    let resumed = reported
+        .wait_for_ready_commit()
+        .unwrap()
+        .unwrap()
+        .resume_target()
+        .unwrap();
+    assert_eq!(
+        resumed.wait_for_exit(),
+        Err(LauncherWaitError::UnexpectedStatus)
+    );
+    fixture.close_gate();
+}
+
+#[test]
 #[ignore = "exec target for the exact broker-launcher native fixture"]
 fn fixture_target() {
+    // SAFETY: getenv reads the one fixed fixture variable in the isolated
+    // post-exec target process.
+    let mode = unsafe { getenv(FIXTURE_ENV.as_ptr().cast()) };
+    if !mode.is_null()
+        // SAFETY: the nonnull environment pointer is NUL-terminated.
+        && unsafe { CStr::from_ptr(mode) }.to_bytes() == POST_EXEC_STOP
+    {
+        // SAFETY: this deliberately creates a traced post-Ready stop so the
+        // broker's running-target waiter must exact-clean it.
+        assert_eq!(unsafe { raise(SIGSTOP) }, 0);
+    }
+    if !mode.is_null()
+        // SAFETY: the nonnull environment pointer is NUL-terminated.
+        && unsafe { CStr::from_ptr(mode) }.to_bytes() == POST_EXEC_DELAY
+    {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if !mode.is_null()
+        // SAFETY: the nonnull environment pointer is NUL-terminated.
+        && unsafe { CStr::from_ptr(mode) }.to_bytes() == POST_EXEC_SIGKILL
+    {
+        // SAFETY: the isolated fixture intentionally terminates itself.
+        assert_eq!(unsafe { raise(SIGKILL) }, 0);
+    }
     panic!("the exact launcher waiter should kill this image at its exec trap");
+}
+
+fn wait_for_gate_eof(gate: &ActiveBrokerGate) {
+    loop {
+        match probe_gate(gate) {
+            Err(LauncherWaitError::ServiceGone) => return,
+            Ok(()) => poll_gate_slice(gate).unwrap(),
+            Err(error) => panic!("unexpected gate probe failure: {error:?}"),
+        }
+    }
 }
