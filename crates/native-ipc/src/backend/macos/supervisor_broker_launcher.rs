@@ -747,16 +747,20 @@ impl SpawnAttributesGuard {
         }
     }
 
-    /// Replaces the inherited `launchd` bootstrap port with a dead name, so
-    /// neither the launcher nor the target it execs can look up, register, or
-    /// check in with any system service.
+    /// Sets the child's `TASK_BOOTSTRAP_PORT` special port to a dead name.
+    ///
+    /// The intent is to deny the launcher and its target any `launchd` service
+    /// lookup. It is not sufficient on its own: adversarial measurement on the
+    /// current OS shows a child spawned this way still obtains a live bootstrap
+    /// port and reaches `launchd`, so this only removes the *inherited* port and
+    /// does not close the delegation path. Cutting off `launchd` is an open
+    /// problem tracked for the adversarial tier, not something this call proves.
     ///
     /// A dead name is used rather than a live port the broker owns but never
     /// services: a never-drained receive right would let the child's first
     /// bootstrap message queue and then block it forever in `mach_msg`, which
     /// `ResumedTarget::wait_for_exit` could not preempt because Ready delivery
-    /// is the final deadline commit. A dead name fails every send immediately
-    /// with `MACH_SEND_INVALID_DEST` instead, and owns no resource to retain.
+    /// is the final deadline commit. A dead name owns no resource to retain.
     fn configure_dead_end_bootstrap(&mut self) -> Result<(), LauncherSpawnFailure> {
         // SAFETY: initialized attributes and a name the kernel stores verbatim.
         let result = unsafe {
