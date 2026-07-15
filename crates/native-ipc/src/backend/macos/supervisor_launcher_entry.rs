@@ -492,3 +492,7 @@ fn last_errno() -> c_int {
 #[cfg(test)]
 #[path = "supervisor_launcher_entry_test.rs"]
 mod tests;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "supervisor_launcher_lifecycle_test.rs"]
+mod lifecycle_tests;

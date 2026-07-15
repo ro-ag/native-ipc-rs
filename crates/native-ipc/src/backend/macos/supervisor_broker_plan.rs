@@ -304,6 +304,25 @@ impl ExactParentBrokerLaunchPlan {
         effective_gid: u32,
         installed_executable: Vec<u8>,
     ) -> Self {
+        Self::for_launcher_test_with_arguments(
+            deadline,
+            effective_uid,
+            effective_gid,
+            installed_executable,
+            vec![b"launcher-fixture".to_vec()],
+        )
+    }
+
+    /// Like [`Self::for_launcher_test`] but with caller-chosen argv, so a
+    /// lifecycle fixture can name a real system target such as `/bin/sleep`.
+    #[cfg(test)]
+    pub(in crate::backend::macos::supervisor) fn for_launcher_test_with_arguments(
+        deadline: Instant,
+        effective_uid: u32,
+        effective_gid: u32,
+        installed_executable: Vec<u8>,
+        arguments: Vec<Vec<u8>>,
+    ) -> Self {
         let deadline = SupervisorDeadlineBinding::from_test_instant(deadline).unwrap();
         Self {
             plan: BrokerLaunchPlan {
@@ -320,7 +339,7 @@ impl ExactParentBrokerLaunchPlan {
                 service_nonce: [6; 32],
                 policy_id: b"test.launcher".to_vec(),
                 installed_executable,
-                arguments: vec![b"launcher-fixture".to_vec()],
+                arguments,
                 environment: Vec::new(),
             },
             deadline,
