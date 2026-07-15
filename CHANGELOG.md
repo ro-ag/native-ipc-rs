@@ -150,7 +150,10 @@ Versioning once a stable API is released.
   the retained send-once reply.
 - Fuse the accepted spawn reply with a session assigned before broker creation,
   one atomic launch-plus-exact-broker result, and a session-specific armed
-  watchdog obligation. Its revocable launch permit holds no long-lived table
+  watchdog obligation. Require that broker to remain dormant until the table
+  contains its exact owner; only then may one nonblocking, non-callback
+  activation release its fixed start gate. Activation failure exact-reaps and
+  tombstones before returning. Its revocable launch permit holds no long-lived table
   borrow, so same-session and unrelated cleanup remain operable while it is
   pending. A short final guard revalidates the live registration immediately
   across the no-callback credential-drop/exec transition; copied launch bytes

@@ -278,7 +278,10 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    then fail-stops. A successful zero-timeout send alone disarms the Ready
    guard. The obligation does not borrow the whole table, so an unrelated
    session can still be terminated while one launch is pending; table shutdown
-   also exact-cleans entries retained by outstanding obligations. A revocable
+   also exact-cleans entries retained by outstanding obligations. Broker
+   authority must arrive dormant: the exact entry is inserted first, then one
+   nonblocking/no-callback activation releases the future fixed start gate;
+   activation failure exact-reaps and tombstones before returning. A revocable
    launch permit exposes no owned launch authority and holds no long-lived
    table borrow, so same-session cleanup can reap it. Immediately before the
    no-callback credential-drop/exec transition, a short guard revalidates and

@@ -23,6 +23,8 @@ pub(super) enum WatchdogStateError {
     InvalidTransition,
     /// The registered launch authority expired before readiness commitment.
     DeadlineExpired,
+    /// The exact broker could not be released after registration completed.
+    BrokerActivationFailed,
 }
 
 /// Fresh service-generated session identifier, consumed on registration.
@@ -186,6 +188,14 @@ impl<Authority: ExactBrokerAuthority> Drop for ExactBroker<Authority> {
 /// live authority.
 pub(super) unsafe trait ExactBrokerAuthority {
     type Failure;
+
+    /// Releases a broker that was created dormant only after its exact owner
+    /// is present in the watchdog table.
+    ///
+    /// This must perform at most one nonblocking kernel operation, must not
+    /// invoke caller code, and on error must retain the same exact unreaped
+    /// authority for emergency cleanup.
+    fn activate_after_registration(&mut self) -> Result<(), Self::Failure>;
 
     fn terminate_and_reap(
         &mut self,
@@ -674,6 +684,32 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 phase: BrokerPhase::Starting,
             })),
         );
+        let activation = self
+            .live
+            .get(&handle)
+            .expect("registration inserted the exact session entry")
+            .try_borrow_mut()
+            .unwrap_or_else(|_| std::process::abort())
+            .broker
+            .as_mut()
+            .unwrap_or_else(|| std::process::abort())
+            .authority
+            .activate_after_registration();
+        if activation.is_err() {
+            let entry = Rc::clone(
+                self.live
+                    .get(&handle)
+                    .expect("failed activation retains the exact session entry"),
+            );
+            emergency_terminate_entry(
+                &entry,
+                handle,
+                connection,
+                TerminationReason::LaunchAbandoned,
+            );
+            self.sweep_reaped();
+            return Err(WatchdogStateError::BrokerActivationFailed);
+        }
         Ok(RegisteredSession {
             handle,
             launch: RegisteredLaunch {

@@ -24,6 +24,7 @@ assert_not_impl_any!(PendingRegisteredSession<TestLaunch, FakeBroker>: Clone, Co
 
 #[derive(Debug, Default, Eq, PartialEq)]
 struct FakeState {
+    activation_attempts: usize,
     attempts: usize,
     emergency_attempts: usize,
     completed: bool,
@@ -34,6 +35,7 @@ struct FakeState {
 struct FakeBroker {
     state: Arc<Mutex<FakeState>>,
     failures_remaining: usize,
+    activation_fails: bool,
 }
 
 struct TestLaunch {
@@ -55,6 +57,15 @@ impl RegisteredLaunchEffect for TestLaunch {
 // failure leaves the same modeled authority; emergency cleanup always succeeds.
 unsafe impl ExactBrokerAuthority for FakeBroker {
     type Failure = &'static str;
+
+    fn activate_after_registration(&mut self) -> Result<(), Self::Failure> {
+        self.state.lock().unwrap().activation_attempts += 1;
+        if self.activation_fails {
+            Err("activation")
+        } else {
+            Ok(())
+        }
+    }
 
     fn terminate_and_reap(
         &mut self,
@@ -174,6 +185,7 @@ fn broker(failures_remaining: usize) -> (ExactBroker<FakeBroker>, Arc<Mutex<Fake
     let authority = FakeBroker {
         state: Arc::clone(&state),
         failures_remaining,
+        activation_fails: false,
     };
     // SAFETY: tests model one exact unreaped broker child owner.
     let broker = unsafe { ExactBroker::from_unreaped_direct_child(authority) };
@@ -762,6 +774,35 @@ fn registration_failure_emergency_cleans_the_unstored_authority() {
     let rejected_state = rejected_state.lock().unwrap();
     assert!(rejected_state.completed);
     assert_eq!(rejected_state.emergency_attempts, 1);
+}
+
+#[test]
+fn broker_activation_occurs_after_registration_and_failure_exactly_cleans() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let authority = FakeBroker {
+        state: Arc::clone(&state),
+        failures_remaining: 0,
+        activation_fails: true,
+    };
+    // SAFETY: the fake models one exact dormant unreaped broker child.
+    let broker = unsafe { ExactBroker::from_unreaped_direct_child(authority) };
+    let fresh = session();
+    let handle = fresh.handle();
+    assert!(matches!(
+        table.register_test(fresh, launch(owner, future_deadline()), broker),
+        Err(WatchdogStateError::BrokerActivationFailed)
+    ));
+    let state = state.lock().unwrap();
+    assert_eq!(state.activation_attempts, 1);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reasons,
+        vec![Some(TerminationReason::LaunchAbandoned)]
+    );
+    drop(state);
+    assert!(table.contains_tombstone(handle));
 }
 
 #[test]

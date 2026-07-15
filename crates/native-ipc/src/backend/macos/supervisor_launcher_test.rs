@@ -14,6 +14,10 @@ struct StaticAuthority;
 unsafe impl ExactBrokerAuthority for StaticAuthority {
     type Failure = std::convert::Infallible;
 
+    fn activate_after_registration(&mut self) -> Result<(), Self::Failure> {
+        unreachable!()
+    }
+
     fn terminate_and_reap(
         &mut self,
         _reason: TerminationReason,

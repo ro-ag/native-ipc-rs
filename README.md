@@ -266,6 +266,9 @@ makes only bounded nonblocking progress and never reconstructs a worker from a
 PID. The spawn-reply model also assigns the opaque session before broker
 creation and retains one session-specific armed watchdog obligation through a
 real zero-timeout Mach Ready send, without blocking unrelated session cleanup.
+Every broker authority is dormant on arrival: watchdog insertion completes
+before one nonblocking, non-callback activation operation, and activation
+failure exact-reaps and tombstones before returning.
 Its launch permit carries a revocable session-specific registration without
 holding a long-lived table borrow: same-session cleanup remains operable, and
 the launcher revalidates a short final guard immediately before its no-callback

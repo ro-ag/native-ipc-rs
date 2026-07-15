@@ -133,7 +133,8 @@ pub(super) unsafe fn permanently_drop_and_exec<Authority: ExactBrokerAuthority>(
         super::supervisor_watchdog::WatchdogStateError::CapacityExceeded
         | super::supervisor_watchdog::WatchdogStateError::UnknownSession
         | super::supervisor_watchdog::WatchdogStateError::WrongConnection
-        | super::supervisor_watchdog::WatchdogStateError::InvalidTransition => {
+        | super::supervisor_watchdog::WatchdogStateError::InvalidTransition
+        | super::supervisor_watchdog::WatchdogStateError::BrokerActivationFailed => {
             CredentialDropError::RegistrationRevoked
         }
     })?;

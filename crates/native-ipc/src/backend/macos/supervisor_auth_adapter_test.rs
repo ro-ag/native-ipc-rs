@@ -104,6 +104,10 @@ struct ReadyBroker {
 unsafe impl ExactBrokerAuthority for ReadyBroker {
     type Failure = ();
 
+    fn activate_after_registration(&mut self) -> Result<(), Self::Failure> {
+        Ok(())
+    }
+
     fn terminate_and_reap(
         &mut self,
         _reason: TerminationReason,
