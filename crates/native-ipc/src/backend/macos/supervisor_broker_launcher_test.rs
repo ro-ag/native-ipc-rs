@@ -28,6 +28,7 @@ const SUBSTITUTE_EXEC: &[u8] = b"substitute-exec";
 const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::broker_launcher::tests::fixture_target";
 const PT_TRACE_ME: c_int = 0;
+const ENOENT: c_int = 2;
 
 unsafe extern "C" {
     fn _exit(status: c_int) -> !;
@@ -80,6 +81,153 @@ fn installed_launcher_vectors_and_root_identity_are_fixed() {
     assert_eq!(identity.real_gid, 0);
     assert_eq!(identity.effective_gid, 0);
     assert_eq!(identity.executable, INSTALLED_LAUNCHER_PATH.as_bytes());
+}
+
+/// Complete broker-side state for the fixed launcher spawn boundary, with no
+/// child of its own. The spawn under test is the only process creator here.
+struct SpawnBoundary {
+    active: Option<ActiveBrokerProcess>,
+    gate_writer: Option<OwnedFd>,
+    _trace_peer: UnixStream,
+}
+
+impl SpawnBoundary {
+    fn new(deadline: Instant) -> Self {
+        let mut descriptors = [-1; 2];
+        // SAFETY: descriptors has storage for both pipe descriptors.
+        assert_eq!(unsafe { pipe(descriptors.as_mut_ptr()) }, 0);
+        // SAFETY: the successful pipe returned two distinct owned descriptors.
+        let gate_reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: the successful pipe returned two distinct owned descriptors.
+        let gate_writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let expected_executable = std::env::current_exe()
+            .unwrap()
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        // SAFETY: credential getters have no preconditions.
+        let plan = super::super::super::auth_adapter::broker_plan::ExactParentBrokerLaunchPlan::for_launcher_test(
+            deadline,
+            unsafe { geteuid() },
+            unsafe { getegid() },
+            expected_executable,
+        );
+        let (trace, trace_peer) = UnixStream::pair().unwrap();
+        trace.set_nonblocking(true).unwrap();
+        Self {
+            active: Some(ActiveBrokerProcess {
+                gate: ActiveBrokerGate {
+                    reader: gate_reader,
+                },
+                plan,
+                trace,
+            }),
+            gate_writer: Some(gate_writer),
+            _trace_peer: trace_peer,
+        }
+    }
+
+    fn take_active(&mut self) -> ActiveBrokerProcess {
+        self.active.take().unwrap()
+    }
+
+    fn close_gate(&mut self) {
+        drop(self.gate_writer.take());
+    }
+
+    fn poison_gate(&mut self) {
+        let writer = self.gate_writer.as_ref().unwrap().try_clone().unwrap();
+        std::fs::File::from(writer).write_all(&[1]).unwrap();
+    }
+}
+
+/// One anonymous pipe whose ends are owned by the caller.
+fn test_pipe() -> (OwnedFd, OwnedFd) {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors has storage for both pipe descriptors.
+    assert_eq!(unsafe { pipe(descriptors.as_mut_ptr()) }, 0);
+    // SAFETY: the successful pipe returned two distinct owned descriptors.
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: the successful pipe returned two distinct owned descriptors.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    (reader, writer)
+}
+
+/// Source-level vectors only. No test claims the fixed image is installed,
+/// root-owned, signed, or verified.
+fn uninstalled_fixed_image() -> InstalledLauncherImage {
+    // SAFETY: this inspects installation-bound values and deliberately drives
+    // the spawn against an absent path; it asserts no installation evidence.
+    unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap()
+}
+
+#[test]
+fn uninstalled_fixed_launcher_image_fails_only_at_the_exact_spawn() {
+    assert!(
+        !std::path::Path::new(INSTALLED_LAUNCHER_PATH).exists(),
+        "this boundary test is only meaningful while the fixed image is absent",
+    );
+    let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
+    let (active, failure) =
+        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
+            .err()
+            .expect("an absent fixed launcher image cannot spawn")
+            .into_parts();
+    // Every pipe, descriptor relocation, file action, spawn attribute, dead-end
+    // bootstrap name, expected identity, and the canonical frame were prepared
+    // successfully; only the absent fixed path failed. Darwin forks before it
+    // execs, so a transient child does exist, but posix_spawn never writes the
+    // pid, SIGKILLs it, and reparents it to initproc for reaping. This broker
+    // therefore has no child to own, and every wait here remains pid-specific.
+    assert_eq!(failure, LauncherSpawnFailure::Spawn(ENOENT));
+    // The failure returned the complete exact broker authority rather than
+    // dropping it, so the broker can still report and clean up exactly.
+    drop(active);
+    boundary.close_gate();
+}
+
+#[test]
+fn service_death_preempts_the_fixed_launcher_spawn() {
+    let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
+    boundary.close_gate();
+    let (_active, failure) =
+        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
+            .err()
+            .expect("service death must preempt the spawn")
+            .into_parts();
+    // Service loss outranks creating a privileged child. This must never reach
+    // posix_spawn, so it cannot report the absent image instead.
+    assert_eq!(failure, LauncherSpawnFailure::ServiceGone);
+}
+
+#[test]
+fn expired_deadline_preempts_the_fixed_launcher_spawn() {
+    let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(2));
+    let (_active, failure) =
+        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
+            .err()
+            .expect("an expired deadline must preempt the spawn")
+            .into_parts();
+    // The original absolute deadline is checked while no child exists, so an
+    // expired request can never create one.
+    assert_eq!(failure, LauncherSpawnFailure::DeadlineExpired);
+    boundary.close_gate();
+}
+
+#[test]
+fn a_gate_byte_preempts_the_fixed_launcher_spawn() {
+    let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
+    boundary.poison_gate();
+    let (_active, failure) =
+        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
+            .err()
+            .expect("a noncanonical gate byte must preempt the spawn")
+            .into_parts();
+    // Only EOF is canonical on the gate. A byte is a protocol failure and must
+    // not be mistaken for a live service that may spawn a launcher.
+    assert_eq!(failure, LauncherSpawnFailure::InvalidGate);
+    boundary.close_gate();
 }
 
 #[used]
@@ -198,6 +346,7 @@ struct Fixture {
     gate: Option<ActiveBrokerGate>,
     gate_writer: Option<OwnedFd>,
     trace_peer: Option<UnixStream>,
+    launcher_readers: Option<(OwnedFd, OwnedFd)>,
 }
 
 impl Fixture {
@@ -253,6 +402,7 @@ impl Fixture {
             }),
             gate_writer: Some(gate_writer),
             trace_peer: None,
+            launcher_readers: None,
         }
     }
 
@@ -297,11 +447,19 @@ impl Fixture {
             unsafe { getegid() },
             expected_launcher_executable,
         );
+        // Real retained ends, so the fixture arms the production channel shape
+        // and exercises the release-before-signal cleanup ordering. The reader
+        // ends stay live here, standing in for the child that would hold them.
+        let (death_reader, death_writer) = test_pipe();
+        let (plan_reader, plan_writer) = test_pipe();
+        self.launcher_readers = Some((death_reader, plan_reader));
+        let channels = RetainedLauncherChannels::for_test(plan_writer, death_writer);
         // SAFETY: Command just returned this positive direct-child PID, and
         // this fixture never performs another wait on its Child handle. The
         // active process owns the immutable production-shaped plan binding;
         // the test identity names the exact fixed fixture image and IDs.
-        unsafe { SpawnedLauncher::from_positive_spawn(pid, active, expected_launcher) }.unwrap()
+        unsafe { SpawnedLauncher::from_positive_spawn(pid, active, expected_launcher, channels) }
+            .unwrap()
     }
 
     fn deadline(&self) -> Instant {

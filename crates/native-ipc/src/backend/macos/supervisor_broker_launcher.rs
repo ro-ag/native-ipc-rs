@@ -1,7 +1,28 @@
 //! Exact broker-local authority for the trusted launcher's two ptrace stops.
+//!
+//! # Fixed launcher channel contract
+//!
+//! `--broker-death-fd=3` and `--plan-fd=4` are compiled into the installed
+//! argument vector, so the launcher entry must honour this ordering exactly:
+//!
+//! 1. The launcher performs `PT_TRACE_ME` and `raise(SIGSTOP)` **before**
+//!    reading FD4. The broker proves the stopped launcher's exact PID, path,
+//!    and complete root identity while it is stopped, and only then delivers
+//!    the plan. A launcher that blocked on FD4 first could never be identified,
+//!    and `wait_initial_stop` never writes FD4, so it would spin to the
+//!    deadline.
+//! 2. The broker therefore delivers the frame after identity proof, and the
+//!    launcher's FD4 read is the first thing it does once continued.
+//!
+//! This also keeps delivery clear of Darwin's 64 KiB pipe buffer as a
+//! correctness dependency: the broker writes FD4 only while the launcher is
+//! running and draining it, multiplexed against service death and the exact
+//! child state, so a frame larger than the buffer cannot deadlock either side.
+//!
+//! FD3 carries no data. Its only signal is EOF, which means the broker died.
 
 use std::ffi::{CString, c_char, c_int, c_void};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -34,6 +55,31 @@ pub(super) const INSTALLED_LAUNCHER_PLAN_ARGUMENT: &str = "--plan-fd=4";
 const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
 const CANONICAL_LANG: &str = "LANG=C";
 const CANONICAL_LOCALE: &str = "LC_ALL=C";
+const NULL_DEVICE: &str = "/dev/null";
+
+/// Fixed launcher descriptors. Both numbers are also compiled into the
+/// installed image's argument vector, so no request value can move a channel.
+const LAUNCHER_DEATH_FD: c_int = 3;
+const LAUNCHER_PLAN_FD: c_int = 4;
+const LAUNCHER_STDIO_FDS: [c_int; 3] = [0, 1, 2];
+/// Keeps every broker-retained end clear of the fixed child descriptors, so no
+/// `dup2` destination can collide with a still-live parent descriptor.
+const STABLE_FD_MINIMUM: c_int = 10;
+
+const F_DUPFD_CLOEXEC: c_int = 67;
+const F_SETNOSIGPIPE: c_int = 73;
+const O_RDWR: c_int = 2;
+
+const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
+const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
+const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
+const TASK_BOOTSTRAP_PORT: c_int = 4;
+/// `MACH_PORT_DEAD`. XNU gates the spawn port action's copyin on
+/// `MACH_PORT_VALID`, so this name is stored verbatim rather than copied in.
+const MACH_PORT_DEAD: u32 = !0;
+
+type PosixSpawnAttr = *mut c_void;
+type PosixSpawnFileActions = *mut c_void;
 
 #[repr(C)]
 struct PollFd {
@@ -44,10 +90,86 @@ struct PollFd {
 
 unsafe extern "C" {
     fn kill(pid: c_int, signal: c_int) -> c_int;
+    fn pipe(descriptors: *mut c_int) -> c_int;
     fn poll(descriptors: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
+    fn posix_spawn(
+        pid: *mut c_int,
+        path: *const c_char,
+        file_actions: *const PosixSpawnFileActions,
+        attributes: *const PosixSpawnAttr,
+        argv: *const *mut c_char,
+        environment: *const *mut c_char,
+    ) -> c_int;
+    fn posix_spawn_file_actions_addclose(actions: *mut PosixSpawnFileActions, fd: c_int) -> c_int;
+    fn posix_spawn_file_actions_adddup2(
+        actions: *mut PosixSpawnFileActions,
+        source: c_int,
+        destination: c_int,
+    ) -> c_int;
+    fn posix_spawn_file_actions_addopen(
+        actions: *mut PosixSpawnFileActions,
+        fd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: u16,
+    ) -> c_int;
+    fn posix_spawn_file_actions_destroy(actions: *mut PosixSpawnFileActions) -> c_int;
+    fn posix_spawn_file_actions_init(actions: *mut PosixSpawnFileActions) -> c_int;
+    fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
+    fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
+    fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
+    fn posix_spawnattr_setsigdefault(attributes: *mut PosixSpawnAttr, signals: *const u32)
+    -> c_int;
+    fn posix_spawnattr_setsigmask(attributes: *mut PosixSpawnAttr, signals: *const u32) -> c_int;
+    fn posix_spawnattr_setspecialport_np(
+        attributes: *mut PosixSpawnAttr,
+        port: u32,
+        which: c_int,
+    ) -> c_int;
     fn ptrace(request: c_int, pid: c_int, address: *mut c_void, data: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut u8, count: usize) -> isize;
+    fn sigdelset(set: *mut u32, signal: c_int) -> c_int;
+    fn sigemptyset(set: *mut u32) -> c_int;
+    fn sigfillset(set: *mut u32) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+}
+
+/// Preparation or exact-spawn failure before launcher authority is minted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LauncherSpawnFailure {
+    /// A fixed installation vector was not a valid C string.
+    InvalidFixedImage,
+    /// The exact-parent plan could not be re-encoded for the launcher.
+    Plan(SupervisorWireError),
+    /// The original absolute deadline elapsed before the spawn.
+    DeadlineExpired,
+    /// The service writer disappeared before the spawn.
+    ServiceGone,
+    /// The service gate carried a byte where only EOF is canonical.
+    InvalidGate,
+    /// A fixed channel pipe failed with this Darwin error number.
+    Pipe(c_int),
+    /// A descriptor operation failed with this Darwin error number.
+    Descriptor(c_int),
+    /// A spawn file action failed with this error number.
+    FileActions(c_int),
+    /// A spawn attribute failed with this error number.
+    Attributes(c_int),
+    /// `posix_spawn` itself failed with this error number.
+    Spawn(c_int),
+}
+
+/// Failed launcher spawn that retains the complete exact broker authority.
+#[must_use = "a failed launcher spawn retains exact broker authority"]
+pub(super) struct LauncherSpawnError {
+    active: ActiveBrokerProcess,
+    failure: LauncherSpawnFailure,
+}
+
+impl LauncherSpawnError {
+    pub(super) fn into_parts(self) -> (ActiveBrokerProcess, LauncherSpawnFailure) {
+        (self.active, self.failure)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +196,7 @@ pub(super) struct InstalledLauncherImage {
     environment_path: CString,
     environment_lang: CString,
     environment_locale: CString,
+    null_device: CString,
 }
 
 impl InstalledLauncherImage {
@@ -81,7 +204,7 @@ impl InstalledLauncherImage {
     ///
     /// The installed supervisor must first verify the fixed path is the
     /// immutable root-owned signed launcher image for this service.
-    pub(super) unsafe fn from_verified_installation() -> Result<Self, LauncherWaitError> {
+    pub(super) unsafe fn from_verified_installation() -> Result<Self, LauncherSpawnFailure> {
         Ok(Self {
             path: fixed_launcher_cstring(INSTALLED_LAUNCHER_PATH)?,
             mode: fixed_launcher_cstring(INSTALLED_LAUNCHER_MODE)?,
@@ -90,6 +213,7 @@ impl InstalledLauncherImage {
             environment_path: fixed_launcher_cstring(CANONICAL_PATH)?,
             environment_lang: fixed_launcher_cstring(CANONICAL_LANG)?,
             environment_locale: fixed_launcher_cstring(CANONICAL_LOCALE)?,
+            null_device: fixed_launcher_cstring(NULL_DEVICE)?,
         })
     }
 
@@ -123,8 +247,8 @@ impl InstalledLauncherImage {
     }
 }
 
-fn fixed_launcher_cstring(value: &'static str) -> Result<CString, LauncherWaitError> {
-    CString::new(value).map_err(|_| LauncherWaitError::IdentityTransition)
+fn fixed_launcher_cstring(value: &'static str) -> Result<CString, LauncherSpawnFailure> {
+    CString::new(value).map_err(|_| LauncherSpawnFailure::InvalidFixedImage)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +267,44 @@ struct ExactLauncher {
     phase: ExactPhase,
     active: ActiveBrokerProcess,
     expected_launcher: FixedLauncherIdentity,
+    channels: Option<RetainedLauncherChannels>,
     _thread_confined: std::marker::PhantomData<Rc<()>>,
+}
+
+/// Broker-retained ends of the fixed launcher channels.
+///
+/// Closing `death_writer` is the launcher's only broker-death signal, so exact
+/// cleanup drops it before any signal: a launcher blocked on its own FD3 probe
+/// then wakes and self-terminates even if the kill races. Dropping the private
+/// bootstrap port destroys the launcher's inherited namespace rather than
+/// reconnecting it to `launchd`.
+/// Field order is release order: dropping this value closes the plan writer
+/// first, then the death writer.
+pub(super) struct RetainedLauncherChannels {
+    /// `None` once the one canonical frame is delivered and FD4 is closed.
+    plan: Option<LauncherPlanDelivery>,
+    /// The launcher's only broker-death signal; live for its whole life.
+    death_writer: OwnedFd,
+}
+
+/// The one canonical launcher frame and the exact writer that delivers it.
+struct LauncherPlanDelivery {
+    writer: OwnedFd,
+    frame: Vec<u8>,
+}
+
+impl RetainedLauncherChannels {
+    /// Fixture shape carrying real ends for a child the test spawned itself.
+    #[cfg(test)]
+    pub(super) fn for_test(plan_writer: OwnedFd, death_writer: OwnedFd) -> Self {
+        Self {
+            plan: Some(LauncherPlanDelivery {
+                writer: plan_writer,
+                frame: Vec::new(),
+            }),
+            death_writer,
+        }
+    }
 }
 
 /// Installation-bound identity of the only launcher image the broker may
@@ -179,6 +340,411 @@ impl FixedLauncherIdentity {
 #[must_use = "the exact launcher must reach exec trap or be exact-cleaned"]
 pub(super) struct SpawnedLauncher {
     inner: Option<ExactLauncher>,
+}
+
+/// The sole production transition that creates a trusted launcher child.
+///
+/// Every allocation, C string, pipe, descriptor relocation, file action, spawn
+/// attribute, private bootstrap port, expected identity, and the canonical
+/// launcher frame is prepared before `posix_spawn`, so no preparation failure
+/// can ever strand a live child. A positive PID is then wrapped in exact
+/// unreaped direct-child ownership with no intervening fallible call,
+/// allocation, or callback.
+pub(super) fn spawn_fixed_launcher(
+    active: ActiveBrokerProcess,
+    image: &InstalledLauncherImage,
+) -> Result<SpawnedLauncher, Box<LauncherSpawnError>> {
+    PreparedLauncherSpawn::prepare(active, image)?.spawn_and_arm()
+}
+
+/// Complete pre-spawn state for exactly one launcher child.
+///
+/// It owns the exact broker authority and borrows the one image it was
+/// prepared against, so the identity the broker will verify and the vectors it
+/// will actually spawn cannot come from two different images or plans.
+struct PreparedLauncherSpawn<'image> {
+    image: &'image InstalledLauncherImage,
+    active: ActiveBrokerProcess,
+    resources: LauncherSpawnResources,
+}
+
+/// Every fallible resource one launcher child needs, all already acquired.
+struct LauncherSpawnResources {
+    actions: FileActionsGuard,
+    attributes: SpawnAttributesGuard,
+    death_reader: OwnedFd,
+    plan_reader: OwnedFd,
+    channels: RetainedLauncherChannels,
+    expected_launcher: FixedLauncherIdentity,
+}
+
+impl<'image> PreparedLauncherSpawn<'image> {
+    fn prepare(
+        active: ActiveBrokerProcess,
+        image: &'image InstalledLauncherImage,
+    ) -> Result<Self, Box<LauncherSpawnError>> {
+        match LauncherSpawnResources::acquire(&active, image) {
+            Ok(resources) => Ok(Self {
+                image,
+                active,
+                resources,
+            }),
+            Err(failure) => Err(Box::new(LauncherSpawnError { active, failure })),
+        }
+    }
+}
+
+impl LauncherSpawnResources {
+    fn acquire(
+        active: &ActiveBrokerProcess,
+        image: &InstalledLauncherImage,
+    ) -> Result<Self, LauncherSpawnFailure> {
+        let frame = active
+            .plan
+            .launcher_frame()
+            .map_err(LauncherSpawnFailure::Plan)?;
+        let expected_launcher = image.fixed_identity();
+        let (death_reader, death_writer) = create_launcher_pipe()?;
+        let (plan_reader, plan_writer) = create_launcher_pipe()?;
+        // The broker never writes the death pipe and must outlive a launcher
+        // that dies mid-frame, so neither retained writer may raise SIGPIPE.
+        set_no_sigpipe(death_writer.as_raw_fd())?;
+        set_no_sigpipe(plan_writer.as_raw_fd())?;
+        // Plan delivery is multiplexed against service death and exact child
+        // state, so it must never block on a launcher that stopped reading.
+        set_writer_nonblocking(plan_writer.as_raw_fd())?;
+
+        let mut actions = FileActionsGuard::new()?;
+        // Canonical stdio: the launcher inherits no terminal. Together with
+        // CLOEXEC_DEFAULT below, the launcher receives exactly fds 0-4 and no
+        // channel back to the broker or service. This covers the launcher
+        // only: dup2 clears FD_CLOEXEC on its destination and CLOEXEC_DEFAULT
+        // is scoped to this spawn, so fds 3 and 4 survive the launcher's own
+        // exec. The launcher entry must close both before execing the target.
+        for fd in LAUNCHER_STDIO_FDS {
+            actions.add_open_null(fd, &image.null_device)?;
+        }
+        actions.add_dup2(death_reader.as_raw_fd(), LAUNCHER_DEATH_FD)?;
+        actions.add_dup2(plan_reader.as_raw_fd(), LAUNCHER_PLAN_FD)?;
+        // The relocated ends are already close-on-exec, but file actions run
+        // before exec, so every parent-retained end is closed explicitly.
+        for fd in [
+            death_reader.as_raw_fd(),
+            death_writer.as_raw_fd(),
+            plan_reader.as_raw_fd(),
+            plan_writer.as_raw_fd(),
+        ] {
+            actions.add_close(fd)?;
+        }
+
+        let mut attributes = SpawnAttributesGuard::new()?;
+        attributes.configure_canonical_signals()?;
+        attributes.configure_dead_end_bootstrap()?;
+
+        Ok(Self {
+            actions,
+            attributes,
+            death_reader,
+            plan_reader,
+            channels: RetainedLauncherChannels {
+                plan: Some(LauncherPlanDelivery {
+                    writer: plan_writer,
+                    frame,
+                }),
+                death_writer,
+            },
+            expected_launcher,
+        })
+    }
+}
+
+impl PreparedLauncherSpawn<'_> {
+    fn spawn_and_arm(self) -> Result<SpawnedLauncher, Box<LauncherSpawnError>> {
+        let Self {
+            image,
+            active,
+            resources:
+                LauncherSpawnResources {
+                    actions,
+                    attributes,
+                    death_reader,
+                    plan_reader,
+                    channels,
+                    expected_launcher,
+                },
+        } = self;
+        // Last veto while no child exists. Service death and the original
+        // absolute deadline both outrank creating a new privileged process.
+        if let Err(failure) = ensure_spawn_admissible(&active) {
+            return Err(Box::new(LauncherSpawnError { active, failure }));
+        }
+
+        let argv = image.argv();
+        let environment = image.environment();
+        let mut pid = 0;
+        // SAFETY: every C string, pointer array, file action, spawn attribute,
+        // bootstrap right, and pipe end was completely prepared above and
+        // remains live for the duration of this call.
+        let result = unsafe {
+            posix_spawn(
+                &raw mut pid,
+                image.path.as_ptr(),
+                &raw const actions.0,
+                &raw const attributes.0,
+                argv.as_ptr(),
+                environment.as_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(Box::new(LauncherSpawnError {
+                active,
+                failure: LauncherSpawnFailure::Spawn(result),
+            }));
+        }
+        if pid <= 0 {
+            std::process::abort();
+        }
+
+        // No allocation, fallible operation, or callback may occur between the
+        // successful positive spawn and this single ownership transition.
+        // SAFETY: posix_spawn just returned this positive direct-child PID to
+        // the broker's sole wait domain, `active` is the exact plan that
+        // authorized it, and `channels` are the ends created for this child.
+        let launcher = unsafe { SpawnedLauncher::arm(pid, active, expected_launcher, channels) };
+
+        // The child's ends and the prepared C objects may be destroyed only
+        // after the exact launcher authority is armed.
+        drop(death_reader);
+        drop(plan_reader);
+        drop(actions);
+        drop(attributes);
+        Ok(launcher)
+    }
+}
+
+fn ensure_spawn_admissible(active: &ActiveBrokerProcess) -> Result<(), LauncherSpawnFailure> {
+    set_gate_nonblocking(&active.gate).map_err(spawn_gate_failure)?;
+    let verdict =
+        probe_gate(&active.gate).and_then(|()| ensure_deadline(active.plan.deadline().local()));
+    // The blocking contract belongs to ActiveBrokerProcess, which is minted
+    // with a blocking gate. A failed spawn hands that authority back, and its
+    // wait_for_service_death retries only EINTR, so leaving O_NONBLOCK set
+    // would turn a later clean service-death wait into an EAGAIN error exit.
+    let restored = set_gate_blocking(&active.gate);
+    verdict.map_err(spawn_gate_failure)?;
+    restored
+}
+
+fn set_gate_blocking(gate: &ActiveBrokerGate) -> Result<(), LauncherSpawnFailure> {
+    set_nonblocking(gate.reader.as_raw_fd(), false).map_err(|error| match error {
+        BrokerEntryError::Descriptor(error) => LauncherSpawnFailure::Descriptor(error),
+        // set_nonblocking reports no other failure for a live descriptor.
+        _ => std::process::abort(),
+    })
+}
+
+fn spawn_gate_failure(error: LauncherWaitError) -> LauncherSpawnFailure {
+    match error {
+        LauncherWaitError::ServiceGone => LauncherSpawnFailure::ServiceGone,
+        LauncherWaitError::InvalidGate => LauncherSpawnFailure::InvalidGate,
+        LauncherWaitError::DeadlineExpired => LauncherSpawnFailure::DeadlineExpired,
+        LauncherWaitError::Native(error) => LauncherSpawnFailure::Descriptor(error),
+        // The gate and clock checks above cannot produce a child-state verdict.
+        LauncherWaitError::InvalidPid
+        | LauncherWaitError::UnexpectedStatus
+        | LauncherWaitError::IdentityTransition => std::process::abort(),
+    }
+}
+
+fn create_launcher_pipe() -> Result<(OwnedFd, OwnedFd), LauncherSpawnFailure> {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors points to two writable integers.
+    if unsafe { pipe(descriptors.as_mut_ptr()) } != 0 {
+        return Err(LauncherSpawnFailure::Pipe(last_errno()));
+    }
+    // SAFETY: the successful pipe returned two distinct owned descriptors.
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: the successful pipe returned two distinct owned descriptors.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    // Darwin has no pipe2, so relocate both ends clear of the fixed child
+    // descriptors and make them close-on-exec in one operation. The original
+    // ends close when this scope ends.
+    let reader = duplicate_cloexec(reader.as_raw_fd())?;
+    let writer = duplicate_cloexec(writer.as_raw_fd())?;
+    Ok((reader, writer))
+}
+
+fn duplicate_cloexec(fd: c_int) -> Result<OwnedFd, LauncherSpawnFailure> {
+    // SAFETY: fd is live and F_DUPFD_CLOEXEC returns a new owned descriptor at
+    // or above the requested minimum.
+    let duplicate = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, STABLE_FD_MINIMUM) };
+    if duplicate < 0 {
+        return Err(LauncherSpawnFailure::Descriptor(last_errno()));
+    }
+    // SAFETY: the successful fcntl returned one fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+fn set_no_sigpipe(fd: c_int) -> Result<(), LauncherSpawnFailure> {
+    // SAFETY: fd is live and Darwin's F_SETNOSIGPIPE takes a scalar flag.
+    if unsafe { fcntl(fd, F_SETNOSIGPIPE, 1) } == 0 {
+        Ok(())
+    } else {
+        Err(LauncherSpawnFailure::Descriptor(last_errno()))
+    }
+}
+
+fn set_writer_nonblocking(fd: c_int) -> Result<(), LauncherSpawnFailure> {
+    // SAFETY: fd is live and F_GETFL is a read-only descriptor query.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err(LauncherSpawnFailure::Descriptor(last_errno()));
+    }
+    // SAFETY: fd is live and the value preserves unrelated status flags.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == 0 {
+        Ok(())
+    } else {
+        Err(LauncherSpawnFailure::Descriptor(last_errno()))
+    }
+}
+
+struct FileActionsGuard(PosixSpawnFileActions);
+
+impl FileActionsGuard {
+    fn new() -> Result<Self, LauncherSpawnFailure> {
+        let mut actions = std::ptr::null_mut();
+        // SAFETY: actions points to writable opaque storage.
+        let result = unsafe { posix_spawn_file_actions_init(&raw mut actions) };
+        if result == 0 {
+            Ok(Self(actions))
+        } else {
+            Err(LauncherSpawnFailure::FileActions(result))
+        }
+    }
+
+    fn add_open_null(&mut self, fd: c_int, path: &CString) -> Result<(), LauncherSpawnFailure> {
+        // SAFETY: actions is initialized, fd is nonnegative, and path is the
+        // installed image's live fixed device C string.
+        spawn_file_action_result(unsafe {
+            posix_spawn_file_actions_addopen(&raw mut self.0, fd, path.as_ptr(), O_RDWR, 0)
+        })
+    }
+
+    fn add_dup2(&mut self, source: c_int, destination: c_int) -> Result<(), LauncherSpawnFailure> {
+        // SAFETY: actions is initialized and both descriptors are nonnegative.
+        spawn_file_action_result(unsafe {
+            posix_spawn_file_actions_adddup2(&raw mut self.0, source, destination)
+        })
+    }
+
+    fn add_close(&mut self, fd: c_int) -> Result<(), LauncherSpawnFailure> {
+        // SAFETY: actions is initialized and fd is nonnegative.
+        spawn_file_action_result(unsafe { posix_spawn_file_actions_addclose(&raw mut self.0, fd) })
+    }
+}
+
+impl Drop for FileActionsGuard {
+    fn drop(&mut self) {
+        // These guards are destroyed only after a successful spawn has already
+        // armed the exact launcher, and abort() would skip ExactLauncher::drop
+        // and orphan a live root child. Destroy can only fail on storage this
+        // type never constructs, so the no-stranded-child law outranks a
+        // fail-stop here and the result is deliberately ignored.
+        // SAFETY: initialized actions are destroyed exactly once.
+        let _ = unsafe { posix_spawn_file_actions_destroy(&raw mut self.0) };
+    }
+}
+
+fn spawn_file_action_result(result: c_int) -> Result<(), LauncherSpawnFailure> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(LauncherSpawnFailure::FileActions(result))
+    }
+}
+
+struct SpawnAttributesGuard(PosixSpawnAttr);
+
+impl SpawnAttributesGuard {
+    fn new() -> Result<Self, LauncherSpawnFailure> {
+        let mut attributes = std::ptr::null_mut();
+        // SAFETY: attributes points to writable opaque storage.
+        let result = unsafe { posix_spawnattr_init(&raw mut attributes) };
+        if result == 0 {
+            Ok(Self(attributes))
+        } else {
+            Err(LauncherSpawnFailure::Attributes(result))
+        }
+    }
+
+    fn configure_canonical_signals(&mut self) -> Result<(), LauncherSpawnFailure> {
+        let mut defaults = 0_u32;
+        let mut mask = 0_u32;
+        // SAFETY: both values are Darwin sigset_t storage. SIGKILL and SIGSTOP
+        // cannot be caught or reset, so they are removed from the default set.
+        if unsafe { sigfillset(&raw mut defaults) } != 0
+            || unsafe { sigdelset(&raw mut defaults, SIGKILL) } != 0
+            || unsafe { sigdelset(&raw mut defaults, SIGSTOP) } != 0
+            || unsafe { sigemptyset(&raw mut mask) } != 0
+        {
+            return Err(LauncherSpawnFailure::Attributes(last_errno()));
+        }
+        // SAFETY: initialized attributes and signal sets remain live.
+        let result = unsafe { posix_spawnattr_setsigdefault(&raw mut self.0, &raw const defaults) };
+        if result != 0 {
+            return Err(LauncherSpawnFailure::Attributes(result));
+        }
+        // SAFETY: initialized attributes and empty signal mask remain live.
+        let result = unsafe { posix_spawnattr_setsigmask(&raw mut self.0, &raw const mask) };
+        if result != 0 {
+            return Err(LauncherSpawnFailure::Attributes(result));
+        }
+        // SAFETY: flags are public Darwin posix_spawn flags. No suspended-spawn
+        // or containment-claiming session flag is used; the launcher stops
+        // itself under PT_TRACE_ME instead.
+        let result = unsafe {
+            posix_spawnattr_setflags(
+                &raw mut self.0,
+                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(LauncherSpawnFailure::Attributes(result))
+        }
+    }
+
+    /// Replaces the inherited `launchd` bootstrap port with a dead name, so
+    /// neither the launcher nor the target it execs can look up, register, or
+    /// check in with any system service.
+    ///
+    /// A dead name is used rather than a live port the broker owns but never
+    /// services: a never-drained receive right would let the child's first
+    /// bootstrap message queue and then block it forever in `mach_msg`, which
+    /// `ResumedTarget::wait_for_exit` could not preempt because Ready delivery
+    /// is the final deadline commit. A dead name fails every send immediately
+    /// with `MACH_SEND_INVALID_DEST` instead, and owns no resource to retain.
+    fn configure_dead_end_bootstrap(&mut self) -> Result<(), LauncherSpawnFailure> {
+        // SAFETY: initialized attributes and a name the kernel stores verbatim.
+        let result = unsafe {
+            posix_spawnattr_setspecialport_np(&raw mut self.0, MACH_PORT_DEAD, TASK_BOOTSTRAP_PORT)
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(LauncherSpawnFailure::Attributes(result))
+        }
+    }
+}
+
+impl Drop for SpawnAttributesGuard {
+    fn drop(&mut self) {
+        // Ignored for the same reason as FileActionsGuard::drop: this runs
+        // after the exact launcher is armed, and abort() would strand it.
+        // SAFETY: initialized attributes are destroyed exactly once.
+        let _ = unsafe { posix_spawnattr_destroy(&raw mut self.0) };
+    }
 }
 
 /// Exact launcher held at the expected initial stop, before ptrace is proven.
@@ -228,28 +794,53 @@ pub(super) enum ExactTargetExit {
 }
 
 impl SpawnedLauncher {
+    /// The sole transition that mints exact unreaped direct-child authority.
+    ///
     /// # Safety
     ///
     /// `pid` must be the strictly positive result of this active broker's
-    /// just-finished fixed-image launcher spawn. No other waiter may observe
-    /// the child, and `active` must be the exact plan that authorized it.
-    pub(super) unsafe fn from_positive_spawn(
+    /// just-finished launcher spawn, no other waiter may observe the child,
+    /// `active` must be the exact plan that authorized it, and `channels` must
+    /// be the broker ends created for that same child.
+    unsafe fn arm(
         pid: c_int,
         active: ActiveBrokerProcess,
         expected_launcher: FixedLauncherIdentity,
-    ) -> Result<Self, LauncherWaitError> {
+        channels: RetainedLauncherChannels,
+    ) -> Self {
         if pid <= 0 {
-            return Err(LauncherWaitError::InvalidPid);
+            std::process::abort();
         }
-        Ok(Self {
+        Self {
             inner: Some(ExactLauncher {
                 pid,
                 phase: ExactPhase::AwaitingInitialStop,
                 active,
                 expected_launcher,
+                channels: Some(channels),
                 _thread_confined: std::marker::PhantomData,
             }),
-        })
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Same contract as [`SpawnedLauncher::arm`]. Production launchers are
+    /// armed only inside [`spawn_fixed_launcher`]; this exists so fixtures can
+    /// arm a child they spawned themselves, with real retained channels.
+    #[cfg(test)]
+    pub(super) unsafe fn from_positive_spawn(
+        pid: c_int,
+        active: ActiveBrokerProcess,
+        expected_launcher: FixedLauncherIdentity,
+        channels: RetainedLauncherChannels,
+    ) -> Result<Self, LauncherWaitError> {
+        if pid <= 0 {
+            return Err(LauncherWaitError::InvalidPid);
+        }
+        // SAFETY: the caller carries the same contract forward, and the pid
+        // sign was just checked so `arm` cannot abort on it.
+        Ok(unsafe { Self::arm(pid, active, expected_launcher, channels) })
     }
 
     pub(super) fn wait_initial_stop(mut self) -> Result<InitialStopObserved, LauncherWaitError> {
@@ -659,6 +1250,11 @@ fn exact_target_exit(status: c_int) -> Option<ExactTargetExit> {
 
 impl Drop for ExactLauncher {
     fn drop(&mut self) {
+        // Release every retained end before signalling. A launcher parked on
+        // its own FD3 broker-death probe then wakes and self-terminates even if
+        // the signal races, and its bootstrap namespace dies rather than
+        // outliving the broker that vouched for it.
+        drop(self.channels.take());
         if self.phase == ExactPhase::Reaped {
             return;
         }
