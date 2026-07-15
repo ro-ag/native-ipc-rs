@@ -285,7 +285,11 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    pins the exact live registration; copied preparation bytes cannot commit
    after cleanup.
    Native tests exercise real Mach Ready delivery and invalid-destination
-   cleanup. The deadline is rechecked immediately before the send, but that
+   cleanup. Raw ingress uses separate service receive and authentication caps;
+   Spawn authentication is bounded by the earlier of the fixed cap and the
+   original absolute wire deadline. Darwin's required inline-message alignment
+   is stripped only when every padding byte is zero, leaving the exact logical
+   record for the worker digest and later decoding. The deadline is rechecked immediately before the send, but that
    userspace check and kernel entry are not one atomic kernel deadline action.
    This remains source/native mechanism evidence, not an installed
    privileged service, atomic production broker spawner, or clean-exec

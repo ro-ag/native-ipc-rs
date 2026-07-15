@@ -574,6 +574,124 @@ fn deadline_after(duration: Duration) -> SupervisorDeadline {
     SupervisorDeadline::from_instant(Instant::now() + duration).unwrap()
 }
 
+#[test]
+fn authentication_deadline_is_the_earlier_wire_deadline_or_service_cap() {
+    let connection = connection(0x4141);
+    let wire_deadline = deadline_after(Duration::from_secs(2));
+    let later_cap = deadline_after(Duration::from_secs(5));
+    let request = SpawnRequest::new(
+        wire_deadline,
+        b"com.example.receiver".to_vec(),
+        vec![b"--mode=test".to_vec()],
+        vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let spawn = raw(
+        AUDIT_IDENTITY,
+        501,
+        encode_spawn_request(
+            &request,
+            connection.connection_identity().get(),
+            CLIENT_NONCE,
+            service_nonce(0x4141),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        spawn.authentication_deadline(later_cap).unwrap(),
+        wire_deadline
+    );
+
+    let earlier_cap = deadline_after(Duration::from_millis(250));
+    assert_eq!(
+        spawn.authentication_deadline(earlier_cap).unwrap(),
+        earlier_cap
+    );
+
+    let hello = raw(
+        AUDIT_IDENTITY,
+        501,
+        encode_client_hello(CLIENT_NONCE).unwrap(),
+    );
+    assert_eq!(
+        hello.authentication_deadline(earlier_cap).unwrap(),
+        earlier_cap
+    );
+}
+
+#[test]
+fn expired_or_short_spawn_deadline_rejects_before_authentication_dispatch() {
+    let connection = connection(0x4242);
+    let request = SpawnRequest::new(
+        deadline_after(Duration::from_secs(2)),
+        b"com.example.receiver".to_vec(),
+        vec![b"--mode=test".to_vec()],
+        vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let mut bytes = encode_spawn_request(
+        &request,
+        connection.connection_identity().get(),
+        CLIENT_NONCE,
+        service_nonce(0x4242),
+    )
+    .unwrap();
+    bytes[super::super::HEADER_LEN..super::super::HEADER_LEN + size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_le_bytes());
+    assert_eq!(
+        raw(AUDIT_IDENTITY, 501, bytes)
+            .authentication_deadline(deadline_after(Duration::from_secs(5))),
+        Err(SupervisorWireError::LimitExceeded)
+    );
+
+    let mut short = encode_spawn_request(
+        &request,
+        connection.connection_identity().get(),
+        CLIENT_NONCE,
+        service_nonce(0x4242),
+    )
+    .unwrap();
+    short.truncate(super::super::HEADER_LEN + size_of::<u64>());
+    short[12..16].copy_from_slice(&(size_of::<u64>() as u32).to_le_bytes());
+    assert_eq!(
+        raw(AUDIT_IDENTITY, 501, short)
+            .authentication_deadline(deadline_after(Duration::from_secs(5))),
+        Err(SupervisorWireError::Malformed)
+    );
+}
+
+#[test]
+fn darwin_alignment_normalization_accepts_only_exact_zero_padding() {
+    let connection = connection(0x4343);
+    let request = SpawnRequest::new(
+        deadline_after(Duration::from_secs(2)),
+        b"com.example.receiver".to_vec(),
+        vec![b"--mode=test".to_vec()],
+        vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let logical = encode_spawn_request(
+        &request,
+        connection.connection_identity().get(),
+        CLIENT_NONCE,
+        service_nonce(0x4343),
+    )
+    .unwrap();
+    assert_ne!(logical.len() % size_of::<u32>(), 0);
+    let mut padded = logical.clone();
+    padded.resize(round_mach_message(logical.len()).unwrap(), 0);
+    assert_eq!(
+        exact_logical_supervisor_record(&padded),
+        Some(logical.as_slice())
+    );
+
+    *padded.last_mut().unwrap() = 1;
+    assert_eq!(exact_logical_supervisor_record(&padded), None);
+    *padded.last_mut().unwrap() = 0;
+    padded[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(exact_logical_supervisor_record(&padded), None);
+}
+
 fn validated_result(job: AuthWorkerJob) -> AuthWorkerResult {
     // SAFETY: tests model successful Security validation on the assigned
     // worker's private endpoint.
@@ -623,7 +741,7 @@ fn send_inline_request(
         mach_msg(
             bytes.as_mut_ptr().cast(),
             MACH_SEND_MSG,
-            u32::try_from(message_size).unwrap(),
+            u32::try_from(round_mach_message(message_size).unwrap()).unwrap(),
             0,
             MACH_PORT_NULL,
             0,
@@ -734,9 +852,10 @@ fn raw_mach_receive_fuses_exact_kernel_audit_and_linear_reply_right() {
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
     let (job, receipt) = receiver
-        .receive_and_dispatch(
+        .receive_and_dispatch_capped(
             job_id(80),
             deadline_after(Duration::from_secs(5)),
+            deadline_after(Duration::from_secs(4)),
             &mut pool,
         )
         .unwrap()
@@ -762,6 +881,91 @@ fn raw_mach_receive_fuses_exact_kernel_audit_and_linear_reply_right() {
 }
 
 #[test]
+fn native_spawn_receive_dispatches_only_under_minimum_deadline_and_drops_rejections() {
+    for (wire_duration, cap_duration, expected_wire) in [
+        (Duration::from_millis(500), Duration::from_secs(2), true),
+        (Duration::from_secs(2), Duration::from_millis(500), false),
+    ] {
+        let mut service = TestReceiveRight::allocate();
+        service.make_send();
+        let reply = TestReceiveRight::allocate();
+        let wire_deadline = deadline_after(wire_duration);
+        let auth_cap = deadline_after(cap_duration);
+        let request = SpawnRequest::new(
+            wire_deadline,
+            b"com.example.receiver".to_vec(),
+            vec![b"--mode=test".to_vec()],
+            vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
+        )
+        .unwrap();
+        let bytes =
+            encode_spawn_request(&request, 0x5151, CLIENT_NONCE, service_nonce(0x5151)).unwrap();
+        assert_eq!(send_supervisor_request(service.name, reply.name, &bytes), 0);
+
+        let (mut pool, states) = pool(&[0x5151]);
+        // SAFETY: this test is the sole receiver and retains the live right.
+        let mut receiver =
+            unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
+        let dispatched = receiver
+            .receive_and_dispatch_capped(
+                job_id(if expected_wire { 0x51 } else { 0x52 }),
+                deadline_after(Duration::from_secs(2)),
+                auth_cap,
+                &mut pool,
+            )
+            .unwrap();
+        let worker = dispatched.worker();
+        let (job, receipt) = dispatched.into_parts();
+        assert_eq!(
+            job.deadline(),
+            if expected_wire {
+                wire_deadline.wire_value()
+            } else {
+                auth_cap.wire_value()
+            }
+        );
+        drop(receipt);
+        pool.cancel(worker).unwrap();
+        assert_eq!(states[0].lock().unwrap().terminations, 1);
+        receive_send_once_destroyed(reply.name);
+    }
+
+    let mut service = TestReceiveRight::allocate();
+    service.make_send();
+    let reply = TestReceiveRight::allocate();
+    let request = SpawnRequest::new(
+        deadline_after(Duration::from_secs(2)),
+        b"com.example.receiver".to_vec(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut bytes =
+        encode_spawn_request(&request, 0x5252, CLIENT_NONCE, service_nonce(0x5252)).unwrap();
+    bytes[super::super::HEADER_LEN..super::super::HEADER_LEN + size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_le_bytes());
+    assert_eq!(send_supervisor_request(service.name, reply.name, &bytes), 0);
+    let (mut pool, states) = pool(&[0x5252]);
+    // SAFETY: this test is the sole receiver and retains the live right.
+    let mut receiver =
+        unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
+    assert!(matches!(
+        receiver.receive_and_dispatch_capped(
+            job_id(0x53),
+            deadline_after(Duration::from_secs(2)),
+            deadline_after(Duration::from_secs(2)),
+            &mut pool,
+        ),
+        Err(AuthAdapterError::Protocol(
+            SupervisorWireError::LimitExceeded
+        ))
+    ));
+    assert!(pool.slots[0].as_ref().unwrap().pending.is_none());
+    assert_eq!(states[0].lock().unwrap().terminations, 0);
+    receive_send_once_destroyed(reply.name);
+}
+
+#[test]
 fn raw_mach_receive_destroys_malformed_reply_and_preserves_queue_progress() {
     let mut service = TestReceiveRight::allocate();
     service.make_send();
@@ -784,8 +988,9 @@ fn raw_mach_receive_destroys_malformed_reply_and_preserves_queue_progress() {
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
     assert!(matches!(
-        receiver.receive_and_dispatch(
+        receiver.receive_and_dispatch_capped(
             job_id(85),
+            deadline_after(Duration::from_secs(5)),
             deadline_after(Duration::from_secs(5)),
             &mut pool,
         ),
@@ -800,8 +1005,9 @@ fn raw_mach_receive_destroys_malformed_reply_and_preserves_queue_progress() {
         0
     );
     let (job, receipt) = receiver
-        .receive_and_dispatch(
+        .receive_and_dispatch_capped(
             job_id(86),
+            deadline_after(Duration::from_secs(5)),
             deadline_after(Duration::from_secs(5)),
             &mut pool,
         )
@@ -837,8 +1043,9 @@ fn raw_mach_receive_immediately_destroys_complex_transferred_rights() {
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
     assert!(matches!(
-        receiver.receive_and_dispatch(
+        receiver.receive_and_dispatch_capped(
             job_id(87),
+            deadline_after(Duration::from_secs(5)),
             deadline_after(Duration::from_secs(5)),
             &mut pool,
         ),
@@ -870,8 +1077,9 @@ fn oversized_mach_record_is_destroyed_without_blocking_following_request() {
     // SAFETY: the test is the sole receiver and retains the live receive right.
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
-    match receiver.receive_and_dispatch(
+    match receiver.receive_and_dispatch_capped(
         job_id(88),
+        deadline_after(Duration::from_secs(5)),
         deadline_after(Duration::from_secs(5)),
         &mut pool,
     ) {
@@ -888,8 +1096,9 @@ fn oversized_mach_record_is_destroyed_without_blocking_following_request() {
         0
     );
     let (job, receipt) = receiver
-        .receive_and_dispatch(
+        .receive_and_dispatch_capped(
             job_id(89),
+            deadline_after(Duration::from_secs(5)),
             deadline_after(Duration::from_secs(5)),
             &mut pool,
         )
@@ -913,9 +1122,10 @@ fn raw_mach_receive_obeys_original_empty_queue_deadline() {
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
     let started = Instant::now();
     assert!(matches!(
-        receiver.receive_and_dispatch(
+        receiver.receive_and_dispatch_capped(
             job_id(90),
             deadline_after(Duration::from_millis(50)),
+            deadline_after(Duration::from_secs(5)),
             &mut pool,
         ),
         Err(AuthAdapterError::DeadlineExpired)
@@ -936,8 +1146,9 @@ fn authenticated_reply_send_handles_dead_and_invalid_destinations() {
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
     let (job, receipt) = receiver
-        .receive_and_dispatch(
+        .receive_and_dispatch_capped(
             job_id(91),
+            deadline_after(Duration::from_secs(5)),
             deadline_after(Duration::from_secs(5)),
             &mut pool,
         )

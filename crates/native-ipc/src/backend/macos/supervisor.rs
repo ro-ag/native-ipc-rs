@@ -119,6 +119,11 @@ impl SupervisorDeadline {
         Self(value)
     }
 
+    /// Returns the earlier authority boundary without sampling either clock.
+    pub(super) const fn earlier(self, other: Self) -> Self {
+        if self.0 <= other.0 { self } else { other }
+    }
+
     fn to_local_instant(self) -> Result<Instant, SupervisorWireError> {
         // Capture `Instant` first so time spent sampling the shared clock can
         // only shorten, never extend, the local authority window.

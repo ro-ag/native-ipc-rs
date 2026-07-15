@@ -271,7 +271,11 @@ holding a long-lived table borrow: same-session cleanup remains operable, and
 the launcher revalidates a short final guard immediately before its no-callback
 credential-drop/exec transition. Copied launch bytes cannot commit after the
 watchdog has reaped the session. The obligation exact-cleans every tested
-abandonment, substitution, freshness, deadline, and recoverable-send path. These models are
+abandonment, substitution, freshness, deadline, and recoverable-send path. The
+raw Mach ingress now also separates its service poll bound from authentication:
+Spawn authentication uses the earlier of the fixed service cap and the exact
+wire deadline, and only verified zero Darwin alignment bytes are removed before
+the logical record is authenticated. These models are
 not packaged service artifacts and have no positive
 root/signing evidence. Public macOS therefore still needs an independently
 privileged, authenticated launchd/Mach service/watchdog and remains fail-closed; the proof and residual

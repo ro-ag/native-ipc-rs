@@ -142,6 +142,12 @@ Versioning once a stable API is released.
   no proof and enters exact deadline cleanup. If a future Ready reply is not
   deliverable, consuming that proof records a distinct terminal reason and
   exactly reaps or retains the same broker authority for retry.
+- Separate raw-Mach receive polling from the authentication authority window.
+  Client Hello uses a fixed service authentication cap; Spawn uses the earlier
+  of that cap and its exact original wire deadline. Normalize only Darwin's
+  verified zero message-alignment bytes before digesting the logical record;
+  inconsistent/nonzero padding rejects before worker assignment and destroys
+  the retained send-once reply.
 - Fuse the accepted spawn reply with a session assigned before broker creation,
   one atomic launch-plus-exact-broker result, and a session-specific armed
   watchdog obligation. Its revocable launch permit holds no long-lived table

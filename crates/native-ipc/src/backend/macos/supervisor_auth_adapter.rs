@@ -776,23 +776,34 @@ impl RawMachReceiver {
         })
     }
 
-    /// Receives one exact inline request and immediately binds it to one idle
-    /// authentication worker. No raw record or reply right escapes separately.
-    pub(super) fn receive_and_dispatch<Authority: ExactAuthWorkerAuthority>(
+    /// Receives under one service-owned poll bound, then authenticates under
+    /// the earlier of a service-owned authentication cap and the original
+    /// spawn deadline carried by the exact received bytes.
+    ///
+    /// A client hello has no effect deadline, so it uses only `auth_cap`.
+    /// Parsing unauthenticated bytes here can only shorten or reject work; it
+    /// cannot create a peer, connection, policy effect, or watchdog entry.
+    pub(super) fn receive_and_dispatch_capped<Authority: ExactAuthWorkerAuthority>(
         &mut self,
         job_id: FreshAuthJobId,
-        deadline: SupervisorDeadline,
+        receive_deadline: SupervisorDeadline,
+        auth_cap: SupervisorDeadline,
         pool: &mut AuthWorkerPool<Authority>,
     ) -> Result<DispatchedAuthJob, AuthAdapterError<Authority::Failure>> {
-        let raw = self.receive(deadline).map_err(|error| match error {
-            AuthAdapterError::InvalidReceiveRight => AuthAdapterError::InvalidReceiveRight,
-            AuthAdapterError::MalformedMachMessage => AuthAdapterError::MalformedMachMessage,
-            AuthAdapterError::RecordTooLarge => AuthAdapterError::RecordTooLarge,
-            AuthAdapterError::MachReceive(code) => AuthAdapterError::MachReceive(code),
-            AuthAdapterError::DeadlineExpired => AuthAdapterError::DeadlineExpired,
-            AuthAdapterError::Protocol(error) => AuthAdapterError::Protocol(error),
-            _ => unreachable!("raw receive cannot return worker-state errors"),
-        })?;
+        let raw = self
+            .receive(receive_deadline)
+            .map_err(|error| match error {
+                AuthAdapterError::InvalidReceiveRight => AuthAdapterError::InvalidReceiveRight,
+                AuthAdapterError::MalformedMachMessage => AuthAdapterError::MalformedMachMessage,
+                AuthAdapterError::RecordTooLarge => AuthAdapterError::RecordTooLarge,
+                AuthAdapterError::MachReceive(code) => AuthAdapterError::MachReceive(code),
+                AuthAdapterError::DeadlineExpired => AuthAdapterError::DeadlineExpired,
+                AuthAdapterError::Protocol(error) => AuthAdapterError::Protocol(error),
+                _ => unreachable!("raw receive cannot return worker-state errors"),
+            })?;
+        let deadline = raw
+            .authentication_deadline(auth_cap)
+            .map_err(AuthAdapterError::Protocol)?;
         pool.dispatch(raw, job_id, deadline)
     }
 
@@ -872,7 +883,14 @@ impl RawMachReceiver {
         let effective_uid = unsafe { audit_token_to_euid(trailer.audit) };
         // SAFETY: same checked complete token and public BSM ABI as above.
         let effective_gid = unsafe { audit_token_to_egid(trailer.audit) };
-        let payload = bytes[payload_offset..message_size].to_vec();
+        let received_payload = &bytes[payload_offset..message_size];
+        let payload = match exact_logical_supervisor_record(received_payload) {
+            Some(payload) => payload.to_vec(),
+            None => {
+                destroy_mach_message(bytes);
+                return Err(AuthAdapterError::MalformedMachMessage);
+            }
+        };
         // SAFETY: the checked nonzero received remote port is the canonical
         // send-once reply right. We do not destroy this accepted message.
         let reply = unsafe { MachSendOnceRight::from_received(header.remote_port) }
@@ -888,6 +906,33 @@ impl RawMachReceiver {
                 reply,
             )
         })
+    }
+}
+
+impl RawMachRecord {
+    /// Selects an authentication deadline from the exact retained request.
+    ///
+    /// Only a canonical Spawn envelope contributes caller authority. Its
+    /// prefix must contain the fixed absolute deadline before any worker is
+    /// assigned. Every other canonical request is bounded by the service cap
+    /// and is classified after exact-message authentication.
+    fn authentication_deadline(
+        &self,
+        auth_cap: SupervisorDeadline,
+    ) -> Result<SupervisorDeadline, SupervisorWireError> {
+        auth_cap.to_local_instant()?;
+        let header = decode_header(&self.bytes)?;
+        let deadline = if header.kind == RecordKind::Spawn {
+            if header.payload_len < super::SPAWN_PREFIX_LEN {
+                return Err(SupervisorWireError::Malformed);
+            }
+            let wire = super::u64_at(&self.bytes[super::HEADER_LEN..], 0)?;
+            SupervisorDeadline::from_wire(wire).earlier(auth_cap)
+        } else {
+            auth_cap
+        };
+        deadline.to_local_instant()?;
+        Ok(deadline)
     }
 }
 
@@ -2474,6 +2519,27 @@ fn supervisor_receive_bytes() -> Option<usize> {
         .checked_add(MAX_SUPERVISOR_RECORD_BYTES)
         .and_then(round_mach_message)
         .and_then(|size| size.checked_add(size_of::<AuditTrailer>()))
+}
+
+/// Removes only Darwin's mandatory zero alignment bytes from one inline
+/// supervisor record. The embedded protocol length remains the authenticated
+/// logical length; inconsistent or nonzero padding is never normalized.
+fn exact_logical_supervisor_record(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < super::HEADER_LEN {
+        return None;
+    }
+    let payload_len = usize::try_from(super::u32_at(bytes, 12).ok()?).ok()?;
+    let logical_len = super::HEADER_LEN.checked_add(payload_len)?;
+    if logical_len > MAX_SUPERVISOR_RECORD_BYTES
+        || round_mach_message(logical_len)? != bytes.len()
+        || bytes
+            .get(logical_len..)?
+            .iter()
+            .any(|padding| *padding != 0)
+    {
+        return None;
+    }
+    bytes.get(..logical_len)
 }
 
 fn mach_receive_timeout(deadline: SupervisorDeadline) -> Result<u32, SupervisorWireError> {
