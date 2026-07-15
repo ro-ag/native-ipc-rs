@@ -59,11 +59,14 @@ const ESRCH: c_int = 3;
 const ECHILD: c_int = 10;
 const POLLIN: i16 = 0x0001;
 
-pub(super) const INSTALLED_LAUNCHER_PATH: &str =
+pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_PATH: &str =
     "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.launcher";
-pub(super) const INSTALLED_LAUNCHER_MODE: &str = "--supervisor-launcher";
-pub(super) const INSTALLED_LAUNCHER_DEATH_ARGUMENT: &str = "--broker-death-fd=3";
-pub(super) const INSTALLED_LAUNCHER_PLAN_ARGUMENT: &str = "--plan-fd=4";
+pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_MODE: &str =
+    "--supervisor-launcher";
+pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_DEATH_ARGUMENT: &str =
+    "--broker-death-fd=3";
+pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_PLAN_ARGUMENT: &str =
+    "--plan-fd=4";
 const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
 const CANONICAL_LANG: &str = "LANG=C";
 const CANONICAL_LOCALE: &str = "LC_ALL=C";
@@ -71,8 +74,8 @@ const NULL_DEVICE: &str = "/dev/null";
 
 /// Fixed launcher descriptors. Both numbers are also compiled into the
 /// installed image's argument vector, so no request value can move a channel.
-const LAUNCHER_DEATH_FD: c_int = 3;
-const LAUNCHER_PLAN_FD: c_int = 4;
+pub(in crate::backend::macos::supervisor) const LAUNCHER_DEATH_FD: c_int = 3;
+pub(in crate::backend::macos::supervisor) const LAUNCHER_PLAN_FD: c_int = 4;
 const LAUNCHER_STDIO_FDS: [c_int; 3] = [0, 1, 2];
 /// Keeps every broker-retained end clear of the fixed child descriptors, so no
 /// `dup2` destination can collide with a still-live parent descriptor.

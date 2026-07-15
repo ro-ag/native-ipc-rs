@@ -59,6 +59,26 @@ pub unsafe fn __private_macos_broker_gate_main() -> ! {
     unsafe { backend::macos::run_fixed_broker_gate_process() }
 }
 
+/// Runs the fixed macOS trusted-launcher boundary without callbacks.
+///
+/// The launcher exists because the target is foreign code that cannot trace
+/// itself. This image designates the broker as its tracer, stops for identity
+/// proof, contains itself, then becomes the target. It needs no privilege and
+/// refuses to run as root.
+///
+/// # Safety
+///
+/// This must run in the just-execed launcher before threads, children, or
+/// effect-bearing endpoints exist. The fixed spawner must exclusively transfer
+/// descriptor 3 (broker death) and descriptor 4 (plan) plus the installed
+/// process vector; no Rust value may already own either descriptor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub unsafe fn __private_macos_launcher_main() -> ! {
+    // SAFETY: the caller supplies the complete fixed process-entry contract.
+    unsafe { backend::macos::run_fixed_launcher_process() }
+}
+
 /// Runs the fixed macOS clean-exec authentication-worker boundary.
 ///
 /// This hidden artifact entry validates one exact inherited request, performs

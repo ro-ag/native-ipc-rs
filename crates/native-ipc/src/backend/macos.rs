@@ -32,6 +32,18 @@ pub(crate) unsafe fn run_fixed_broker_gate_process() -> ! {
     unsafe { supervisor::broker_entry::run_fixed_gate_process() }
 }
 
+/// Runs the fixed trusted-launcher boundary.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed launcher process-entry contract
+/// documented by the launcher runner. This is exposed only for the separate
+/// executable crate the deployer builds and signs.
+pub(crate) unsafe fn run_fixed_launcher_process() -> ! {
+    // SAFETY: the caller transfers the exact documented entry contract.
+    unsafe { supervisor::launcher_entry::run_fixed_launcher_process() }
+}
+
 /// Runs the fixed clean-exec authentication-worker boundary.
 ///
 /// # Safety

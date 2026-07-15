@@ -1305,6 +1305,9 @@ pub(super) mod auth_adapter;
 #[path = "supervisor_broker_entry.rs"]
 pub(super) mod broker_entry;
 
+#[path = "supervisor_launcher_entry.rs"]
+pub(super) mod launcher_entry;
+
 #[cfg(test)]
 #[path = "supervisor_test.rs"]
 mod tests;

@@ -33,7 +33,7 @@ use super::auth_adapter::broker_spawn::{
 };
 
 #[path = "supervisor_broker_launcher.rs"]
-mod broker_launcher;
+pub(super) mod broker_launcher;
 
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
