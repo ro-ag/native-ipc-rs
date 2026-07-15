@@ -58,6 +58,8 @@ const WUNTRACED: c_int = 2;
 const ESRCH: c_int = 3;
 const ECHILD: c_int = 10;
 const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const EPIPE: c_int = 32;
 
 pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_PATH: &str =
     "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.launcher";
@@ -151,6 +153,7 @@ unsafe extern "C" {
     fn sigemptyset(set: *mut u32) -> c_int;
     fn sigfillset(set: *mut u32) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
 }
 
 /// Preparation or exact-spawn failure before launcher authority is minted.
@@ -325,11 +328,11 @@ struct LauncherPlanDelivery {
 impl RetainedLauncherChannels {
     /// Fixture shape carrying real ends for a child the test spawned itself.
     #[cfg(test)]
-    pub(super) fn for_test(plan_writer: OwnedFd, death_writer: OwnedFd) -> Self {
+    pub(super) fn for_test(plan_writer: OwnedFd, death_writer: OwnedFd, frame: Vec<u8>) -> Self {
         Self {
             plan: Some(LauncherPlanDelivery {
                 writer: plan_writer,
-                frame: Vec::new(),
+                frame,
             }),
             death_writer,
         }
@@ -930,6 +933,59 @@ impl InitialStopObserved {
 }
 
 impl AwaitingExecTrap {
+    /// Delivers the one canonical launcher frame on fixed FD4.
+    ///
+    /// This runs only after the initial stop proved the exact launcher, and
+    /// only while it is continued and draining FD4. Delivery is therefore
+    /// nonblocking and multiplexed against the three authorities that outrank
+    /// it: service death, the original absolute deadline, and the exact child's
+    /// own state. A launcher that died mid-frame surfaces as `EPIPE` rather
+    /// than as a broker that blocks forever, because both retained writers were
+    /// created with `F_SETNOSIGPIPE`.
+    ///
+    /// Because the broker writes only while the launcher is running, a frame
+    /// larger than Darwin's pipe buffer cannot deadlock either side.
+    pub(super) fn deliver_plan(&mut self) -> Result<(), LauncherWaitError> {
+        let inner = self.inner.as_mut().unwrap_or_else(|| std::process::abort());
+        // The plan is delivered exactly once; production always arms with one.
+        let Some(LauncherPlanDelivery { writer, frame }) =
+            inner.channels.as_mut().and_then(|held| held.plan.take())
+        else {
+            std::process::abort();
+        };
+        let deadline = inner.deadline();
+        let mut written = 0_usize;
+        while written < frame.len() {
+            // Service loss and the original deadline both outrank handing a
+            // launcher the plan it would act on.
+            probe_gate(&inner.active.gate)?;
+            ensure_deadline(deadline)?;
+            let remaining = &frame[written..];
+            // SAFETY: the slice is live for its own length and the retained
+            // nonblocking writer is this launcher's exact plan channel.
+            let result = unsafe { write(writer.as_raw_fd(), remaining.as_ptr(), remaining.len()) };
+            if result > 0 {
+                written += usize::try_from(result).unwrap_or_else(|_| std::process::abort());
+                continue;
+            }
+            if result == 0 {
+                return Err(LauncherWaitError::UnexpectedStatus);
+            }
+            match last_errno() {
+                EINTR => {}
+                EAGAIN => poll_plan_slice(&inner.active.gate, writer.as_raw_fd())?,
+                // The launcher closed its plan reader or died mid-frame.
+                EPIPE => return Err(LauncherWaitError::UnexpectedStatus),
+                error => return Err(LauncherWaitError::Native(error)),
+            }
+        }
+        // Closing the writer is the frame's terminator: the launcher requires
+        // EOF, so a truncated or extended frame cannot be mistaken for this one.
+        drop(writer);
+        probe_gate(&inner.active.gate)?;
+        ensure_deadline(deadline)
+    }
+
     pub(super) fn wait_exec_trap(mut self) -> Result<ExecTrapHeld, LauncherWaitError> {
         let mut inner = self.inner.take().unwrap_or_else(|| std::process::abort());
         wait_for_exact_stop(&mut inner, SIGTRAP)?;
@@ -1242,6 +1298,34 @@ fn probe_gate(gate: &ActiveBrokerGate) -> Result<(), LauncherWaitError> {
         }
         return Err(LauncherWaitError::Native(error));
     }
+}
+
+/// Waits for the plan writer to accept more bytes, or for the service to die.
+///
+/// The gate is polled alongside the writer so a service that disappears while
+/// a launcher stops reading cannot leave delivery parked on a full pipe.
+fn poll_plan_slice(gate: &ActiveBrokerGate, writer: c_int) -> Result<(), LauncherWaitError> {
+    let mut descriptors = [
+        PollFd {
+            fd: gate.reader.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: writer,
+            events: POLLOUT,
+            revents: 0,
+        },
+    ];
+    // SAFETY: descriptors contains two initialized writable pollfd values.
+    let result = unsafe { poll(descriptors.as_mut_ptr(), 2, 1) };
+    if result < 0 {
+        let error = last_errno();
+        if error != EINTR {
+            return Err(LauncherWaitError::Native(error));
+        }
+    }
+    Ok(())
 }
 
 fn poll_gate_slice(gate: &ActiveBrokerGate) -> Result<(), LauncherWaitError> {

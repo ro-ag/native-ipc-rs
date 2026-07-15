@@ -371,6 +371,7 @@ struct Fixture {
     gate_writer: Option<OwnedFd>,
     trace_peer: Option<UnixStream>,
     launcher_readers: Option<(OwnedFd, OwnedFd)>,
+    plan_frame: Vec<u8>,
 }
 
 impl Fixture {
@@ -427,7 +428,16 @@ impl Fixture {
             gate_writer: Some(gate_writer),
             trace_peer: None,
             launcher_readers: None,
+            plan_frame: Vec::new(),
         }
+    }
+
+    /// Takes the plan-pipe reader end, which the fixture holds in place of the
+    /// child, so a test can read back exactly what the broker delivered.
+    fn take_plan_reader(&mut self) -> OwnedFd {
+        let (death_reader, plan_reader) = self.launcher_readers.take().unwrap();
+        self.launcher_readers = Some((death_reader, test_pipe().0));
+        plan_reader
     }
 
     fn spawned_launcher(&mut self, deadline: Instant) -> SpawnedLauncher {
@@ -473,11 +483,13 @@ impl Fixture {
         );
         // Real retained ends, so the fixture arms the production channel shape
         // and exercises the release-before-signal cleanup ordering. The reader
-        // ends stay live here, standing in for the child that would hold them.
+        // ends stay live here, standing in for the child that would hold them,
+        // so plan delivery can be read back and verified byte for byte.
         let (death_reader, death_writer) = test_pipe();
         let (plan_reader, plan_writer) = test_pipe();
         self.launcher_readers = Some((death_reader, plan_reader));
-        let channels = RetainedLauncherChannels::for_test(plan_writer, death_writer);
+        let channels =
+            RetainedLauncherChannels::for_test(plan_writer, death_writer, self.plan_frame.clone());
         // SAFETY: Command just returned this positive direct-child PID, and
         // this fixture never performs another wait on its Child handle. The
         // active process owns the immutable production-shaped plan binding;
@@ -736,6 +748,57 @@ fn ready_resume_commit_has_no_broker_side_deadline_veto() {
     let resumed = committed.resume_target().unwrap();
     drop(resumed);
     fixture.close_gate();
+}
+
+#[test]
+fn deliver_plan_writes_the_exact_frame_on_fd4_then_closes_for_eof() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    // Larger than Darwin's pipe buffer, so a background reader must drain it
+    // and the broker's nonblocking write actually exercises its poll path. The
+    // pattern is distinctive so a byte-exact round trip is meaningful.
+    let frame: Vec<u8> = (0..131_072_u32).map(|index| (index % 251) as u8).collect();
+    fixture.plan_frame = frame.clone();
+
+    let deadline = fixture.deadline();
+    let launcher = fixture.spawned_launcher(deadline);
+    let reader = fixture.take_plan_reader();
+    // Drain the plan pipe from a second thread, as the launcher child would.
+    let expected_len = frame.len();
+    let drain = std::thread::spawn(move || {
+        let mut received = Vec::new();
+        let mut file = std::fs::File::from(reader);
+        file.read_to_end(&mut received).unwrap();
+        received
+    });
+
+    let initial = launcher.wait_initial_stop().unwrap();
+    let mut awaiting = initial.prove_trace_and_continue_to_exec().unwrap();
+    awaiting.deliver_plan().unwrap();
+
+    let received = drain.join().unwrap();
+    assert_eq!(received.len(), expected_len, "delivered length must match");
+    assert_eq!(received, frame, "delivered bytes must match exactly");
+    // read_to_end returned, so the writer was closed: the launcher's required
+    // EOF terminator was produced.
+    drop(awaiting);
+    fixture.close_gate();
+}
+
+#[test]
+fn deliver_plan_is_preempted_by_service_death() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    fixture.plan_frame = vec![0x5a; 64];
+    let deadline = fixture.deadline();
+    let launcher = fixture.spawned_launcher(deadline);
+    let _reader = fixture.take_plan_reader();
+    let initial = launcher.wait_initial_stop().unwrap();
+    let mut awaiting = initial.prove_trace_and_continue_to_exec().unwrap();
+    // Service loss outranks handing a launcher the plan it would act on.
+    fixture.close_gate();
+    assert!(matches!(
+        awaiting.deliver_plan(),
+        Err(LauncherWaitError::ServiceGone),
+    ));
 }
 
 #[test]
