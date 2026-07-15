@@ -712,6 +712,21 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
                 phase: BrokerPhase::Starting,
             })),
         );
+        if Instant::now() >= deadline {
+            let entry = Rc::clone(
+                self.live
+                    .get(&handle)
+                    .expect("expired registration retains the exact session entry"),
+            );
+            emergency_terminate_entry(
+                &entry,
+                handle,
+                connection,
+                TerminationReason::DeadlineExpired,
+            );
+            self.sweep_reaped();
+            return Err(WatchdogStateError::DeadlineExpired);
+        }
         let activation = self
             .live
             .get(&handle)

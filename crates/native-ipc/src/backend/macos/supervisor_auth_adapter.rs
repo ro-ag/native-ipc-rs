@@ -34,6 +34,9 @@ use super::{
 #[path = "supervisor_broker_spawn.rs"]
 pub(in crate::backend::macos) mod broker_spawn;
 
+#[path = "supervisor_broker_plan.rs"]
+pub(super) mod broker_plan;
+
 const MAX_AUTH_WORKERS: usize = 4;
 const MAX_PENDING_PER_UID: usize = 2;
 const FRAME_DIGEST_DOMAIN: &[u8] = b"native-ipc-macos-supervisor-auth-frame-v1";

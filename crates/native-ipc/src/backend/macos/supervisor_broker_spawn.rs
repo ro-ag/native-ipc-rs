@@ -1,16 +1,23 @@
 //! Fixed-image broker spawn and exact direct-child lifecycle authority.
 
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::io::{Read, Write};
 use std::marker::PhantomData;
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::time::Instant;
 
 use super::super::super::supervisor_watchdog::{
     AtomicallySpawnedBroker, ExactBroker, ExactBrokerAuthority, FreshSessionId, ReapedBroker,
     TerminationReason,
 };
 use super::super::ValidatedSpawn;
-use super::{DedicatedChildWaitDomain, PendingSpawnReply, SessionAssignedSpawn};
+#[cfg(test)]
+use super::SessionAssignedSpawn;
+use super::broker_plan::{BROKER_ACK_BYTES, StagedBrokerSpawn, broker_plan_ack};
+use super::{DedicatedChildWaitDomain, PendingSpawnReply};
 
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
@@ -19,11 +26,13 @@ pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_PATH: &str =
     "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
+pub(in crate::backend::macos::supervisor) const INSTALLED_CONTROL_ARGUMENT: &str = "--control-fd=4";
 const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
 const CANONICAL_LANG: &str = "LANG=C";
 const CANONICAL_LOCALE: &str = "LC_ALL=C";
 
 pub(in crate::backend::macos::supervisor) const BROKER_GATE_FD: c_int = 3;
+pub(in crate::backend::macos::supervisor) const BROKER_CONTROL_FD: c_int = 4;
 const STABLE_FD_MINIMUM: c_int = 10;
 pub(in crate::backend::macos::supervisor) const START_BYTE: [u8; 1] = [1];
 
@@ -45,11 +54,25 @@ const ESRCH: c_int = 3;
 const SIGKILL: c_int = 9;
 const SIGSTOP: c_int = 17;
 const WNOHANG: c_int = 1;
+const EAGAIN: c_int = 35;
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
+
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
 
 unsafe extern "C" {
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
+    fn poll(descriptors: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
     fn posix_spawn(
         pid: *mut c_int,
         path: *const c_char,
@@ -91,6 +114,9 @@ pub(in crate::backend::macos) enum BrokerSpawnError {
     Wait(c_int),
     Signal(c_int),
     Activation(c_int),
+    Control(c_int),
+    ControlProtocol,
+    DeadlineExpired,
     InvalidTransition,
     InvalidWaitDomain,
 }
@@ -104,6 +130,7 @@ pub(in crate::backend::macos::supervisor) struct InstalledBrokerImage {
     path: CString,
     mode: CString,
     gate_argument: CString,
+    control_argument: CString,
     environment_path: CString,
     environment_lang: CString,
     environment_locale: CString,
@@ -122,17 +149,19 @@ impl InstalledBrokerImage {
             path: fixed_cstring(INSTALLED_BROKER_PATH)?,
             mode: fixed_cstring(INSTALLED_BROKER_MODE)?,
             gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT)?,
+            control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT)?,
             environment_path: fixed_cstring(CANONICAL_PATH)?,
             environment_lang: fixed_cstring(CANONICAL_LANG)?,
             environment_locale: fixed_cstring(CANONICAL_LOCALE)?,
         })
     }
 
-    fn argv(&self) -> [*mut c_char; 4] {
+    fn argv(&self) -> [*mut c_char; 5] {
         [
             self.path.as_ptr().cast_mut(),
             self.mode.as_ptr().cast_mut(),
             self.gate_argument.as_ptr().cast_mut(),
+            self.control_argument.as_ptr().cast_mut(),
             std::ptr::null_mut(),
         ]
     }
@@ -318,16 +347,90 @@ impl FixedImageBrokerSpawn {
     }
 }
 
+/// The sole production broker-creation transition. It accepts only a frame
+/// already minted with the complete authenticated/session-assigned typestate,
+/// and returns success only after the exact child ACKs those complete bytes.
+pub(super) fn spawn_staged_broker(
+    staged: StagedBrokerSpawn,
+    image: &InstalledBrokerImage,
+    wait_domain: &mut DedicatedChildWaitDomain,
+) -> Result<
+    PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority>>,
+    Box<PendingSpawnReply<BrokerSpawnError>>,
+> {
+    let (pending, frame) = staged.into_spawn_parts();
+    let PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        output,
+    } = pending;
+    let deadline = output.spawn.deadline();
+    let (broker, control) = match spawn_fixed_image_with_control(image, wait_domain) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            return Err(Box::new(PendingSpawnReply {
+                reply,
+                freshness,
+                bound_session,
+                output: error,
+            }));
+        }
+    };
+    if let Err(error) = send_plan_and_require_ack(control, &frame, deadline) {
+        drop(broker);
+        return Err(Box::new(PendingSpawnReply {
+            reply,
+            freshness,
+            bound_session,
+            output: error,
+        }));
+    }
+    let spawned = FixedImageBrokerSpawn {
+        session: output.session,
+        launch: output.spawn,
+        broker,
+    };
+    Ok(PendingSpawnReply {
+        reply,
+        freshness,
+        bound_session,
+        output: AtomicallySpawnedBroker::from_fixed_image_spawn(spawned),
+    })
+}
+
+fn spawn_fixed_image_with_control(
+    image: &InstalledBrokerImage,
+    wait_domain: &mut DedicatedChildWaitDomain,
+) -> Result<(ExactBroker<DirectChildBrokerAuthority>, OwnedFd), BrokerSpawnError> {
+    wait_domain
+        .verify_single_threaded_spawn()
+        .map_err(|_| BrokerSpawnError::InvalidWaitDomain)?;
+    let (parent_control, child_control) = create_control_pair()?;
+    let broker = spawn_fixed_image_internal(
+        image,
+        wait_domain,
+        Some(&child_control),
+        Some(&parent_control),
+    )?;
+    drop(child_control);
+    Ok((broker, parent_control))
+}
+
+#[cfg(test)]
+fn spawn_fixed_image(
+    image: &InstalledBrokerImage,
+    wait_domain: &mut DedicatedChildWaitDomain,
+) -> Result<ExactBroker<DirectChildBrokerAuthority>, BrokerSpawnError> {
+    spawn_fixed_image_internal(image, wait_domain, None, None)
+}
+
+#[cfg(test)]
 impl PendingSpawnReply<SessionAssignedSpawn> {
-    /// Atomically consumes the complete reply/session/validated-launch value
-    /// into one fixed-image child and its exact authority. A spawn error keeps
-    /// the original reply freshness and bound opaque session on the error path.
-    /// The exclusive wait-domain borrow also serializes Darwin's non-atomic
-    /// pipe creation/CLOEXEC preparation against every service-owned spawn.
-    pub(in crate::backend::macos::supervisor) fn spawn_installed_broker(
+    fn spawn_gate_only_test(
         self,
         image: &InstalledBrokerImage,
-        _wait_domain: &mut DedicatedChildWaitDomain,
+        wait_domain: &mut DedicatedChildWaitDomain,
     ) -> Result<
         PendingSpawnReply<AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority>>,
         Box<PendingSpawnReply<BrokerSpawnError>>,
@@ -338,14 +441,14 @@ impl PendingSpawnReply<SessionAssignedSpawn> {
             bound_session,
             output,
         } = self;
-        let broker = match spawn_fixed_image(image, _wait_domain) {
+        let broker = match spawn_fixed_image(image, wait_domain) {
             Ok(broker) => broker,
-            Err(output) => {
+            Err(error) => {
                 return Err(Box::new(PendingSpawnReply {
                     reply,
                     freshness,
                     bound_session,
-                    output,
+                    output: error,
                 }));
             }
         };
@@ -363,9 +466,11 @@ impl PendingSpawnReply<SessionAssignedSpawn> {
     }
 }
 
-fn spawn_fixed_image(
+fn spawn_fixed_image_internal(
     image: &InstalledBrokerImage,
     wait_domain: &mut DedicatedChildWaitDomain,
+    child_control: Option<&OwnedFd>,
+    parent_control: Option<&OwnedFd>,
 ) -> Result<ExactBroker<DirectChildBrokerAuthority>, BrokerSpawnError> {
     wait_domain
         .verify_single_threaded_spawn()
@@ -375,6 +480,11 @@ fn spawn_fixed_image(
     actions.add_dup2(gate_reader.as_raw_fd(), BROKER_GATE_FD)?;
     actions.add_close(gate_reader.as_raw_fd())?;
     actions.add_close(gate_writer.as_raw_fd())?;
+    if let (Some(child_control), Some(parent_control)) = (child_control, parent_control) {
+        actions.add_dup2(child_control.as_raw_fd(), BROKER_CONTROL_FD)?;
+        actions.add_close(child_control.as_raw_fd())?;
+        actions.add_close(parent_control.as_raw_fd())?;
+    }
 
     let mut attributes = SpawnAttributesGuard::new()?;
     attributes.configure_canonical_signals()?;
@@ -417,6 +527,148 @@ fn spawn_fixed_image(
     // after the exact child authority is armed.
     drop(gate_reader);
     Ok(broker)
+}
+
+fn create_control_pair() -> Result<(OwnedFd, OwnedFd), BrokerSpawnError> {
+    let (parent, child) = UnixStream::pair()
+        .map_err(|error| BrokerSpawnError::Control(error.raw_os_error().unwrap_or(ECHILD)))?;
+    let parent = duplicate_cloexec(parent.as_raw_fd())?;
+    let child = duplicate_cloexec(child.as_raw_fd())?;
+    set_nonblocking(parent.as_raw_fd())?;
+    set_nonblocking(child.as_raw_fd())?;
+    for fd in [parent.as_raw_fd(), child.as_raw_fd()] {
+        // Darwin's F_SETNOSIGPIPE prevents a dead peer from terminating either
+        // the permanent service or the just-execed broker during the ACK.
+        if unsafe { fcntl(fd, F_SETNOSIGPIPE, 1) } != 0 {
+            return Err(BrokerSpawnError::Descriptor(last_error(ECHILD)));
+        }
+    }
+    Ok((parent, child))
+}
+
+fn send_plan_and_require_ack(
+    control: OwnedFd,
+    frame: &[u8],
+    deadline: Instant,
+) -> Result<(), BrokerSpawnError> {
+    let mut stream = UnixStream::from(control);
+    let outer_len = u32::try_from(frame.len()).map_err(|_| BrokerSpawnError::ControlProtocol)?;
+    write_all_deadline(&mut stream, &outer_len.to_le_bytes(), deadline)?;
+    write_all_deadline(&mut stream, frame, deadline)?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| BrokerSpawnError::Control(error.raw_os_error().unwrap_or(ECHILD)))?;
+    let mut ack = [0_u8; BROKER_ACK_BYTES];
+    read_exact_deadline(&mut stream, &mut ack, deadline)?;
+    if Instant::now() >= deadline {
+        return Err(BrokerSpawnError::DeadlineExpired);
+    }
+    if ack != broker_plan_ack(frame) {
+        return Err(BrokerSpawnError::ControlProtocol);
+    }
+    let mut extra = [0_u8; 1];
+    match stream.read(&mut extra) {
+        Ok(0) => {}
+        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => return Err(BrokerSpawnError::ControlProtocol),
+        Err(error) => {
+            return Err(BrokerSpawnError::Control(
+                error.raw_os_error().unwrap_or(ECHILD),
+            ));
+        }
+    }
+    if Instant::now() >= deadline {
+        Err(BrokerSpawnError::DeadlineExpired)
+    } else {
+        Ok(())
+    }
+}
+
+fn write_all_deadline(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), BrokerSpawnError> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(BrokerSpawnError::DeadlineExpired);
+        }
+        match stream.write(bytes) {
+            Ok(0) => return Err(BrokerSpawnError::ControlProtocol),
+            Ok(count) => bytes = &bytes[count..],
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_one(stream.as_raw_fd(), POLLOUT, deadline)?;
+            }
+            Err(error) => {
+                return Err(BrokerSpawnError::Control(
+                    error.raw_os_error().unwrap_or(ECHILD),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_deadline(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), BrokerSpawnError> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(BrokerSpawnError::DeadlineExpired);
+        }
+        match stream.read(bytes) {
+            Ok(0) => return Err(BrokerSpawnError::ControlProtocol),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_one(stream.as_raw_fd(), POLLIN, deadline)?;
+            }
+            Err(error) => {
+                return Err(BrokerSpawnError::Control(
+                    error.raw_os_error().unwrap_or(ECHILD),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn poll_one(fd: c_int, events: i16, deadline: Instant) -> Result<(), BrokerSpawnError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BrokerSpawnError::DeadlineExpired)?;
+        let timeout = c_int::try_from(remaining.as_millis()).unwrap_or(c_int::MAX);
+        let mut descriptor = PollFd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: descriptor is one initialized writable pollfd.
+        let result = unsafe { poll(&raw mut descriptor, 1, timeout) };
+        if result > 0 {
+            if descriptor.revents & events != 0 {
+                return Ok(());
+            }
+            if descriptor.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                return Err(BrokerSpawnError::ControlProtocol);
+            }
+            continue;
+        }
+        if result == 0 {
+            if Instant::now() >= deadline {
+                return Err(BrokerSpawnError::DeadlineExpired);
+            }
+            continue;
+        }
+        let error = last_error(ECHILD);
+        if error != EINTR {
+            return Err(BrokerSpawnError::Control(error));
+        }
+    }
 }
 
 fn create_gate_pipe() -> Result<(OwnedFd, OwnedFd), BrokerSpawnError> {

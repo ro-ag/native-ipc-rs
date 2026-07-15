@@ -40,17 +40,18 @@ mod protocol;
 /// Runs the fixed macOS broker gate executable boundary without callbacks.
 ///
 /// This hidden artifact entry performs no launch effect: it validates the
-/// fixed process vector and FIFO reader, waits for one start byte, then retains
-/// the reader until service-death EOF. It exists only so a separately compiled
-/// minimal broker executable can enter reviewed crate-private gate code.
+/// fixed process vector, FIFO reader, and control stream; receives and
+/// acknowledges one canonical launch plan, waits for one start byte, then
+/// retains the reader until service-death EOF. It exists only so a separately
+/// compiled minimal broker executable can enter reviewed crate-private code.
 ///
 /// # Safety
 ///
 /// This must run in the just-execed dedicated broker before threads, children,
 /// policy, or effect-bearing endpoints. The exact fixed spawner must
-/// exclusively transfer descriptor 3 and the installed process vector; no
-/// Rust value may already own that descriptor. Read-only fixture dispatch over
-/// `argv[0]` is permitted before entry.
+/// exclusively transfer descriptors 3 and 4 and the installed process vector;
+/// no Rust value may already own either descriptor. Read-only fixture dispatch
+/// over `argv[0]` is permitted before entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[doc(hidden)]
 pub unsafe fn __private_macos_broker_gate_main() -> ! {

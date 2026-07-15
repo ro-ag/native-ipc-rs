@@ -379,12 +379,24 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    retry. The authenticated spawn request now retains its exact decoded
    generation, sequence, and both nonces with the linear Mach reply through
    success and error transformations, but the Ready proof and reply right are
-   not fused yet. A one-shot non-sendable child-wait-domain initializer checks
+   not fused yet. Before broker creation, only that complete reply plus its
+   assigned opaque session can mint the canonical bounded broker plan. The
+   authority-free frame preserves the original `CLOCK_UPTIME_RAW` deadline,
+   full exact-message peer identities, freshness, installed-policy target,
+   argv, and environment. Broker receipt parses into a distinct untrusted type,
+   conservatively rejects an expired or extended deadline, and still requires
+   proof of the exact inherited parent channel plus complete-frame EOF/ACK and
+   the later sole FD 3 START before any broker-consumable type exists. The
+   source FD 4 stream transport uses gate-first polling, exact outer/inner
+   lengths, one conservative deadline binding, sender write-half close, digest
+   ACK, and a deadline-bounded dormant FD 3/FD 4 transition. The packaged
+   broker effect loop remains to be implemented. A one-shot non-sendable
+   child-wait-domain initializer checks
    main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
    semantics, and blocks SIGCHLD for inheriting service threads. It deliberately
    cannot mint production child authority: no installed Security.framework
    worker image or atomic `posix_spawn`/file-action-to-armed-owner wrapper
-   implements the remaining unsafe native contracts yet. Those models
+implements the remaining unsafe native contracts yet. Those models
 are not wired to Mach transport, packaged, installed, or positively
 tested as root. The negative result for unprivileged same-UID
 constructions, the primary-source evidence, and the standing fail-closed

@@ -59,6 +59,7 @@ fn fixed_arguments_accept_only_the_installed_vector() {
         OsStr::new(INSTALLED_BROKER_PATH),
         OsStr::new(INSTALLED_BROKER_MODE),
         OsStr::new(INSTALLED_GATE_ARGUMENT),
+        OsStr::new(INSTALLED_CONTROL_ARGUMENT),
     ];
     assert_eq!(validate_fixed_arguments(exact), Ok(()));
 
@@ -67,25 +68,30 @@ fn fixed_arguments_accept_only_the_installed_vector() {
             OsString::from("relative-broker"),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
+            OsString::from(INSTALLED_CONTROL_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from("--other-mode"),
             OsString::from(INSTALLED_GATE_ARGUMENT),
+            OsString::from(INSTALLED_CONTROL_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from("--gate-fd=4"),
-        ],
-        vec![
-            OsString::from(INSTALLED_BROKER_PATH),
-            OsString::from(INSTALLED_BROKER_MODE),
+            OsString::from(INSTALLED_CONTROL_ARGUMENT),
         ],
         vec![
             OsString::from(INSTALLED_BROKER_PATH),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
+        ],
+        vec![
+            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(INSTALLED_BROKER_MODE),
+            OsString::from(INSTALLED_GATE_ARGUMENT),
+            OsString::from(INSTALLED_CONTROL_ARGUMENT),
             OsString::from("extra"),
         ],
     ];

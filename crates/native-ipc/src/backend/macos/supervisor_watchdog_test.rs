@@ -240,6 +240,19 @@ fn future_deadline() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
 
+fn near_future_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(1)
+}
+
+fn wait_past(deadline: Instant) {
+    std::thread::sleep(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_add(Duration::from_millis(1)),
+    );
+    assert!(Instant::now() >= deadline);
+}
+
 fn launch(connection: ConnectionIdentity, deadline: Instant) -> TestLaunch {
     TestLaunch {
         connection,
@@ -376,14 +389,12 @@ fn expired_launch_permit_exactly_cleans_before_returning_error() {
     let owner = connection();
     let mut table = WatchdogTable::new();
     let (broker, state) = broker(0);
+    let deadline = near_future_deadline();
     let pending = table
-        .register_armed_test(
-            session(),
-            launch(owner, Instant::now() - Duration::from_secs(1)),
-            broker,
-        )
+        .register_armed_test(session(), launch(owner, deadline), broker)
         .unwrap();
     let handle = pending.handle();
+    wait_past(deadline);
 
     assert!(matches!(
         pending.launch_permit(),
@@ -596,14 +607,12 @@ fn expired_trace_transition_mints_no_ready_and_exactly_cleans_or_retains() {
         let owner = connection();
         let mut table = WatchdogTable::new();
         let (broker, state) = broker(failures);
+        let deadline = near_future_deadline();
         let handle = table
-            .register_test(
-                session(),
-                launch(owner, Instant::now() - Duration::from_secs(1)),
-                broker,
-            )
+            .register_test(session(), launch(owner, deadline), broker)
             .unwrap()
             .handle();
+        wait_past(deadline);
         assert!(matches!(
             table.mark_traced(trace_proof(handle, owner)),
             Err(WatchdogStateError::DeadlineExpired)
@@ -633,11 +642,12 @@ fn failed_cleanup_retains_exact_authority_and_all_terminal_causes_retry() {
     let owner = connection();
     let mut table = WatchdogTable::new();
     let (broker, state) = broker(1);
-    let deadline = Instant::now() - Duration::from_secs(1);
+    let deadline = near_future_deadline();
     let handle = table
         .register_test(session(), launch(owner, deadline), broker)
         .unwrap()
         .handle();
+    wait_past(deadline);
     assert_eq!(table.terminate_for_deadline(handle).unwrap(), Err("retry"));
     assert!(table.contains_live(handle));
     assert_eq!(
@@ -803,6 +813,24 @@ fn broker_activation_occurs_after_registration_and_failure_exactly_cleans() {
     );
     drop(state);
     assert!(table.contains_tombstone(handle));
+}
+
+#[test]
+fn expired_registration_exactly_cleans_without_releasing_broker_gate() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    assert!(matches!(
+        table.register_test(session(), launch(owner, Instant::now()), broker),
+        Err(WatchdogStateError::DeadlineExpired)
+    ));
+    let state = state.lock().unwrap();
+    assert_eq!(state.activation_attempts, 0);
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reasons,
+        vec![Some(TerminationReason::DeadlineExpired)]
+    );
 }
 
 #[test]

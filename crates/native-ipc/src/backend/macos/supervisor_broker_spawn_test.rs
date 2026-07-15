@@ -1,6 +1,7 @@
 use std::ffi::{CStr, c_char};
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -8,9 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::backend::macos::supervisor::auth_adapter::broker_plan::ReceivedBrokerLaunchPlan;
 use crate::backend::macos::supervisor::auth_adapter::tests::{
     accepted_spawn_reply, installed_catalog,
 };
+use crate::backend::macos::supervisor::broker_entry::{BrokerGateExit, DormantBrokerProcess};
+use crate::backend::macos::supervisor::{ConnectionIdentity, SupervisorWireError};
 use crate::backend::macos::supervisor_watchdog::{SessionHandle, WatchdogTable};
 
 const EXIT_AFTER_START: &str = "IFS= read -r -n 1 <&3 || exit 71; exit 0";
@@ -40,6 +44,34 @@ extern "C" fn premain_wait_domain_hook() {
     }
     // SAFETY: getenv returned one NUL-terminated environment value.
     let mode = unsafe { CStr::from_ptr(mode) }.to_bytes();
+    if mode == b"control-broker" {
+        // SAFETY: the production-shaped spawn file actions installed the two
+        // fixed private descriptors before this pre-main initializer ran.
+        let success = match unsafe { DormantBrokerProcess::adopt_test_channels() } {
+            Ok(dormant) => match dormant.stage_plan() {
+                Ok(Ok(staged)) => match staged.wait_for_activation() {
+                    Ok(Ok(active)) => {
+                        let _plan = active.plan;
+                        matches!(
+                            active.gate.wait_for_service_death(),
+                            Ok(BrokerGateExit::ServiceGone)
+                        )
+                    }
+                    Ok(Err(
+                        BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone,
+                    )) => true,
+                    Err(_) => false,
+                },
+                Ok(Err(
+                    BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone,
+                )) => true,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        // SAFETY: the isolated broker helper must not run libtest callbacks.
+        unsafe { _exit(if success { 0 } else { 92 }) }
+    }
     if mode == b"ignored" || mode == b"no-cld-wait" {
         let action = super::super::DarwinSigaction {
             handler: usize::from(mode == b"ignored"),
@@ -118,9 +150,24 @@ fn test_image(script: &'static str) -> InstalledBrokerImage {
         path: fixed_cstring("/bin/sh").unwrap(),
         mode: fixed_cstring("-c").unwrap(),
         gate_argument: fixed_cstring(script).unwrap(),
+        control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),
+    }
+}
+
+fn test_control_image(test_name: &'static str) -> InstalledBrokerImage {
+    let executable = std::env::current_exe().unwrap();
+    InstalledBrokerImage {
+        path: CString::new(executable.as_os_str().as_bytes()).unwrap(),
+        mode: fixed_cstring("--exact").unwrap(),
+        gate_argument: fixed_cstring(test_name).unwrap(),
+        control_argument: fixed_cstring("--nocapture").unwrap(),
+        environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
+        environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
+        environment_locale: fixed_cstring("NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN=control-broker")
+            .unwrap(),
     }
 }
 
@@ -149,6 +196,92 @@ fn assigned_pending(
     let session = unsafe { FreshSessionId::from_fresh_random(session_id).unwrap() };
     let handle = session.handle();
     (pending.assign_session(session), owner, handle)
+}
+
+#[test]
+fn exact_assigned_reply_alone_can_stage_broker_plan_before_spawn() {
+    let (pending, owner, handle) = assigned_pending(3901, 0x91);
+    let expected_deadline = pending.output.spawn.wire_deadline().wire_value();
+    let expected_peer = pending.output.spawn.peer;
+    let expected_target = pending.output.spawn.target_identity;
+    let staged = pending
+        .stage_broker_plan()
+        .unwrap_or_else(|_| panic!("exact authenticated/session-assigned state failed to stage"));
+    assert!(ReceivedBrokerLaunchPlan::decode(staged.frame()).is_ok());
+    let frame = staged.frame();
+    assert_eq!(
+        u64::from_le_bytes(frame[16..24].try_into().unwrap()),
+        expected_deadline
+    );
+    assert_eq!(
+        u64::from_le_bytes(frame[24..32].try_into().unwrap()),
+        owner.get()
+    );
+    assert_eq!(u64::from_le_bytes(frame[32..40].try_into().unwrap()), 1);
+    assert_eq!(
+        u32::from_le_bytes(frame[40..44].try_into().unwrap()),
+        expected_peer.effective_uid
+    );
+    assert_eq!(
+        u32::from_le_bytes(frame[44..48].try_into().unwrap()),
+        expected_peer.effective_gid
+    );
+    assert_eq!(&frame[48..80], handle.bytes());
+    assert_eq!(&frame[80..112], expected_peer.audit_identity);
+    assert_eq!(&frame[112..144], expected_peer.code_identity);
+    assert_eq!(&frame[144..176], expected_target);
+    assert_eq!(owner.get(), 3901);
+    assert_ne!(handle.bytes(), [0; 32]);
+    drop(staged);
+
+    for mutation in 0..7 {
+        let generation = 3910 + mutation;
+        let (mut substituted, owner, handle) = assigned_pending(generation, 0xa0 + mutation as u8);
+        match mutation {
+            0 => substituted.freshness.generation += 1,
+            1 => {
+                substituted.freshness.connection = ConnectionIdentity(owner.get() + 100);
+                substituted.freshness.generation = owner.get() + 100;
+            }
+            2 => {
+                let mut other = handle.bytes();
+                other[31] ^= 1;
+                // SAFETY: this distinct nonzero session is local to the test.
+                substituted.bound_session =
+                    Some(unsafe { FreshSessionId::from_fresh_random(other).unwrap() }.handle());
+            }
+            3 => substituted.freshness.sequence = 2,
+            4 => substituted.freshness.client_nonce = [0; 32],
+            5 => substituted.freshness.service_nonce = [0; 32],
+            6 => substituted.freshness.service_nonce = substituted.freshness.client_nonce,
+            _ => unreachable!(),
+        }
+        let (retained, error) = substituted.stage_broker_plan().err().unwrap().into_parts();
+        assert_eq!(error, SupervisorWireError::ReplayOrSubstitution);
+        assert!(retained.bound_session.is_some());
+        assert_eq!(retained.output.session.handle(), handle);
+    }
+}
+
+#[test]
+fn staged_plan_is_acked_before_watchdog_can_release_exact_broker() {
+    const TEST_NAME: &str = "backend::macos::supervisor::auth_adapter::broker_spawn::tests::staged_plan_is_acked_before_watchdog_can_release_exact_broker";
+    let (pending, _owner, _handle) = assigned_pending(3903, 0x93);
+    let staged = pending
+        .stage_broker_plan()
+        .unwrap_or_else(|_| panic!("exact plan staging failed"));
+    let mut domain = test_wait_domain();
+    let pending = staged
+        .spawn_installed_broker(&test_control_image(TEST_NAME), &mut domain)
+        .unwrap_or_else(|error| {
+            let (_, _, _, error) = error.into_parts();
+            panic!("ACKed fixed-image spawn failed: {error:?}")
+        });
+    let mut table = WatchdogTable::new();
+    let registered = pending
+        .register_watchdog(&mut table)
+        .unwrap_or_else(|_| panic!("watchdog release after ACK failed"));
+    drop(registered);
 }
 
 fn pid(broker: &mut ExactBroker<DirectChildBrokerAuthority>) -> c_int {
@@ -192,7 +325,11 @@ fn installed_image_vectors_are_fixed_and_canonical() {
         image.gate_argument.to_bytes(),
         INSTALLED_GATE_ARGUMENT.as_bytes()
     );
-    assert!(argv[3].is_null());
+    assert_eq!(
+        image.control_argument.to_bytes(),
+        INSTALLED_CONTROL_ARGUMENT.as_bytes()
+    );
+    assert!(argv[4].is_null());
     assert!(image.environment()[3].is_null());
 }
 
@@ -234,10 +371,10 @@ fn watchdog_registration_releases_only_each_exact_pending_broker() {
     let (second, _second_owner, _second_handle) = assigned_pending(4102, 0xa2);
     let mut domain = test_wait_domain();
     let first = first
-        .spawn_installed_broker(&test_image(EXIT_AFTER_START), &mut domain)
+        .spawn_gate_only_test(&test_image(EXIT_AFTER_START), &mut domain)
         .unwrap_or_else(|_| panic!("first fixed-image spawn failed"));
     let second = second
-        .spawn_installed_broker(&test_image(EXIT_AFTER_START), &mut domain)
+        .spawn_gate_only_test(&test_image(EXIT_AFTER_START), &mut domain)
         .unwrap_or_else(|_| panic!("second fixed-image spawn failed"));
 
     // Both children have executed the fixed image but must still be blocked on
@@ -397,6 +534,7 @@ fn spawn_failure_mints_no_direct_child_authority() {
         path: fixed_cstring("/Library/PrivilegedHelperTools/.native-ipc-missing-broker").unwrap(),
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
+        control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),
@@ -415,11 +553,12 @@ fn spawn_failure_preserves_exact_reply_and_bound_session_error_path() {
         path: fixed_cstring("/Library/PrivilegedHelperTools/.native-ipc-missing-broker").unwrap(),
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
+        control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
         environment_path: fixed_cstring(CANONICAL_PATH).unwrap(),
         environment_lang: fixed_cstring(CANONICAL_LANG).unwrap(),
         environment_locale: fixed_cstring(CANONICAL_LOCALE).unwrap(),
     };
-    let error = match pending.spawn_installed_broker(&missing, &mut domain) {
+    let error = match pending.spawn_gate_only_test(&missing, &mut domain) {
         Ok(_) => panic!("missing fixed image minted child authority"),
         Err(error) => error,
     };
