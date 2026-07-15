@@ -1087,6 +1087,9 @@ impl ResumedTarget {
                     return Err(LauncherWaitError::UnexpectedStatus);
                 }
                 inner.phase = ExactPhase::Reaped;
+                // The facts come from this first terminal status; the child is
+                // only consumed once the duplicate report is drained too.
+                drain_exact_child(inner.pid);
                 barrier.take().unwrap_or_else(|| std::process::abort())(inner.gate());
                 probe_gate(inner.gate())?;
                 return exact_target_exit(status).ok_or(LauncherWaitError::UnexpectedStatus);
@@ -1186,7 +1189,11 @@ fn wait_for_exact_stop(
                     return Err(LauncherWaitError::UnexpectedStatus);
                 }
                 None => {
+                    // The launcher died instead of stopping. Marking it Reaped
+                    // stops Drop from cleaning up, so the duplicate terminal
+                    // report must be drained here or the child outlives us.
                     inner.phase = ExactPhase::Reaped;
+                    drain_exact_child(inner.pid);
                     return Err(LauncherWaitError::UnexpectedStatus);
                 }
             }
@@ -1298,23 +1305,49 @@ impl Drop for ExactLauncher {
             }
             ExactPhase::Reaped => return,
         }
-        loop {
-            let mut status = 0;
-            // SAFETY: this value retains sole exact unreaped-child authority.
-            let result = unsafe { waitpid(self.pid, &mut status, WUNTRACED) };
-            if result == self.pid {
-                if traced_stop_signal(status).is_some() {
-                    exact_ptrace_kill(self.pid);
-                    continue;
-                }
-                self.phase = ExactPhase::Reaped;
-                return;
+        // Drains every status, including Darwin's duplicate terminal report, so
+        // no exact child can outlive the authority that owned it.
+        drain_exact_child(self.pid);
+        self.phase = ExactPhase::Reaped;
+    }
+}
+
+/// Consumes every remaining status for this exact child, until the kernel
+/// reports the relation is gone.
+///
+/// Darwin hands a traced child's terminal status to its tracer *and* to its
+/// parent, which are the same process here, so one exact wait observes the
+/// death but does not consume the child. Measured on both paths: a natural
+/// exit reports `0x0300` twice, and a `SIGKILL` reports `0x0009` twice after
+/// its traced stop; only the following wait yields `ECHILD`. Stopping at the
+/// first terminal status therefore leaves a zombie for the broker's whole
+/// lifetime, which is precisely what this boundary exists to prevent.
+///
+/// `ECHILD` is the expected end here, unlike before a death is observed, where
+/// it would mean exact authority was lost and must abort.
+fn drain_exact_child(pid: c_int) {
+    loop {
+        let mut status = 0;
+        // SAFETY: this owner is the sole waiter for the exact unreaped child,
+        // whose death it has already observed.
+        let result = unsafe { waitpid(pid, &raw mut status, WUNTRACED) };
+        if result == pid {
+            // A tracee can still report stops while dying; keep ending it.
+            if traced_stop_signal(status).is_some() {
+                exact_ptrace_kill(pid);
             }
-            if result < 0 && last_errno() == EINTR {
+            continue;
+        }
+        if result < 0 {
+            let error = last_errno();
+            if error == EINTR {
                 continue;
             }
-            std::process::abort();
+            if error == ECHILD {
+                return;
+            }
         }
+        std::process::abort();
     }
 }
 

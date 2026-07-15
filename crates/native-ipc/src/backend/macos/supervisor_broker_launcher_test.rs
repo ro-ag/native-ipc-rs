@@ -29,6 +29,8 @@ const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::broker_launcher::tests::fixture_target";
 const PT_TRACE_ME: c_int = 0;
 const ENOENT: c_int = 2;
+const ECHILD: c_int = 10;
+const WNOHANG: c_int = 1;
 
 unsafe extern "C" {
     fn _exit(status: c_int) -> !;
@@ -734,6 +736,34 @@ fn ready_resume_commit_has_no_broker_side_deadline_veto() {
     let resumed = committed.resume_target().unwrap();
     drop(resumed);
     fixture.close_gate();
+}
+
+#[test]
+fn dropping_an_exact_launcher_drains_it_leaving_no_zombie() {
+    // Darwin hands a traced child's terminal status to its tracer AND to its
+    // parent, which are the same process here, so one exact wait observes the
+    // death without consuming the child. Cleanup must drain the duplicate or a
+    // zombie survives for the broker's whole life. No other test asserts
+    // ECHILD, which is why this went unseen.
+    let mut fixture = Fixture::spawn("valid-exec");
+    let deadline = fixture.deadline();
+    let (pid, held) = fixture.held_exec_until(deadline);
+    drop(held);
+    assert_no_reapable_status(pid);
+    fixture.close_gate();
+}
+
+/// The exact child must be gone from the kernel, not merely observed dead.
+fn assert_no_reapable_status(pid: c_int) {
+    let mut status = 0;
+    // SAFETY: status is writable and this fixture is the sole waiter for pid.
+    let result = unsafe { waitpid(pid, &raw mut status, WNOHANG | WUNTRACED) };
+    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    assert!(
+        result < 0 && error == ECHILD,
+        "exact child {pid} still had a reapable status: waitpid returned \
+         {result} (status 0x{status:04x}, errno {error}), so it is a zombie",
+    );
 }
 
 #[test]
