@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
-use super::supervisor::auth_adapter::broker_report::AuthenticatedBrokerTraceReport;
+use super::supervisor::auth_adapter::broker_report::{
+    AuthenticatedBrokerTraceReport, BrokerResumeSender,
+};
 use super::supervisor::{ConnectionIdentity, ValidatedSpawn};
 
 const MAX_LIVE_SESSIONS: usize = 64;
@@ -26,6 +28,8 @@ pub(super) enum WatchdogStateError {
     DeadlineExpired,
     /// The exact broker could not be released after registration completed.
     BrokerActivationFailed,
+    /// Ready was sent but the exact broker resume commit could not be delivered.
+    BrokerResumeFailed,
 }
 
 /// Fresh service-generated session identifier, consumed on registration.
@@ -278,6 +282,7 @@ impl ReapedBroker {
 pub(super) struct TraceEstablished {
     handle: SessionHandle,
     connection: ConnectionIdentity,
+    resume: Option<BrokerResumeSender>,
 }
 
 /// Linear proof that one registered session completed both trusted-launcher
@@ -286,6 +291,7 @@ pub(super) struct TraceEstablished {
 pub(super) struct ReadySessionProof {
     handle: SessionHandle,
     connection: ConnectionIdentity,
+    resume: Option<BrokerResumeSender>,
 }
 
 /// Armed delivery boundary retaining one session-specific exact entry.
@@ -360,6 +366,17 @@ impl<Authority: ExactBrokerAuthority> PendingReadyDelivery<Authority> {
         drop(entry);
         match send.send_once(proof.handle, proof.connection, deadline) {
             Ok(()) => {
+                if let Some(resume) = self
+                    .proof
+                    .as_mut()
+                    .expect("armed Ready proof")
+                    .resume
+                    .as_mut()
+                    && resume.commit_after_ready().is_err()
+                {
+                    self.cleanup_reason = TerminationReason::ProtocolViolation;
+                    return Err(WatchdogStateError::BrokerResumeFailed);
+                }
                 self.proof.take();
                 Ok(Ok(()))
             }
@@ -403,12 +420,12 @@ impl TraceEstablished {
         self.connection
     }
 
-    pub(super) const fn from_authenticated_broker_report(
-        report: AuthenticatedBrokerTraceReport,
-    ) -> Self {
+    pub(super) fn from_authenticated_broker_report(report: AuthenticatedBrokerTraceReport) -> Self {
+        let (handle, connection, resume) = report.into_parts();
         Self {
-            handle: report.handle(),
-            connection: report.connection(),
+            handle,
+            connection,
+            resume: Some(resume),
         }
     }
 
@@ -421,7 +438,28 @@ impl TraceEstablished {
         handle: SessionHandle,
         connection: ConnectionIdentity,
     ) -> Self {
-        Self { handle, connection }
+        Self {
+            handle,
+            connection,
+            resume: None,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The test must pair the reverse endpoint with this exact modeled broker
+    /// report and registered session.
+    #[cfg(test)]
+    pub(super) const unsafe fn from_broker_handshake_with_resume(
+        handle: SessionHandle,
+        connection: ConnectionIdentity,
+        resume: BrokerResumeSender,
+    ) -> Self {
+        Self {
+            handle,
+            connection,
+            resume: Some(resume),
+        }
     }
 }
 
@@ -731,6 +769,7 @@ fn transition_registered_for_delivery<Authority: ExactBrokerAuthority>(
         proof: Some(ReadySessionProof {
             handle: proof.handle,
             connection: proof.connection,
+            resume: proof.resume,
         }),
         cleanup_reason: TerminationReason::SpawnResultUndeliverable,
     })
@@ -920,6 +959,7 @@ impl<Authority: ExactBrokerAuthority> WatchdogTable<Authority> {
         Ok(ReadySessionProof {
             handle: proof.handle,
             connection: proof.connection,
+            resume: proof.resume,
         })
     }
 

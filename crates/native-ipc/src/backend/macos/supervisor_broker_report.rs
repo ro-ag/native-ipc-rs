@@ -1,6 +1,6 @@
 //! Exact one-shot broker trace report carried on the fixed service channel.
 
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(test)]
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -13,6 +13,7 @@ const MAGIC: [u8; 8] = *b"NIPCBTR1";
 const VERSION: u16 = 1;
 const EXEC_TRAP_HELD: u16 = 2;
 pub(super) const BROKER_TRACE_REPORT_BYTES: usize = 224;
+pub(in crate::backend::macos) const BROKER_RESUME_BYTE: [u8; 1] = [1];
 
 /// Exact canonical plan facts allowed in the broker's one-shot trace report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,7 +84,7 @@ impl BrokerTraceReportBinding {
 
 /// Nonblocking service-side receipt inseparable from one exact broker spawn.
 pub(in crate::backend::macos) struct BrokerTraceReportReceiver {
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     expected: BrokerTraceReportBinding,
     deadline: Instant,
     bytes: [u8; BROKER_TRACE_REPORT_BYTES],
@@ -105,7 +106,7 @@ impl BrokerTraceReportReceiver {
             .set_nonblocking(true)
             .map_err(|error| BrokerTraceReportError::Io(error.raw_os_error().unwrap_or(0)))?;
         Ok(Self {
-            stream,
+            stream: Some(stream),
             expected,
             deadline,
             bytes: [0; BROKER_TRACE_REPORT_BYTES],
@@ -120,11 +121,15 @@ impl BrokerTraceReportReceiver {
         if self.finished {
             return Err(BrokerTraceReportError::InvalidTransition);
         }
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(BrokerTraceReportError::InvalidTransition)?;
         if Instant::now() >= self.deadline {
             return Err(BrokerTraceReportError::DeadlineExpired);
         }
         while self.filled < self.bytes.len() {
-            match self.stream.read(&mut self.bytes[self.filled..]) {
+            match stream.read(&mut self.bytes[self.filled..]) {
                 Ok(0) => return Err(BrokerTraceReportError::Malformed),
                 Ok(count) => self.filled += count,
                 Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -140,7 +145,7 @@ impl BrokerTraceReportReceiver {
         }
         let mut extra = [0_u8; 1];
         loop {
-            match self.stream.read(&mut extra) {
+            match stream.read(&mut extra) {
                 Ok(0) => break,
                 Ok(_) => return Err(BrokerTraceReportError::Malformed),
                 Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -157,22 +162,32 @@ impl BrokerTraceReportReceiver {
         if Instant::now() >= self.deadline {
             return Err(BrokerTraceReportError::DeadlineExpired);
         }
-        let report = ReceivedBrokerTraceReport::decode(&self.bytes)?;
-        if report.binding != self.expected {
+        let binding = ReceivedBrokerTraceReport::decode(&self.bytes)?;
+        if binding != self.expected {
             return Err(BrokerTraceReportError::Binding);
         }
+        let resume = BrokerResumeSender {
+            stream: Some(
+                self.stream
+                    .take()
+                    .ok_or(BrokerTraceReportError::InvalidTransition)?,
+            ),
+        };
         self.finished = true;
-        Ok(Some(report))
+        Ok(Some(ReceivedBrokerTraceReport { binding, resume }))
     }
 }
 
 /// Canonical exact-frame report that still requires registered-session binding.
 pub(super) struct ReceivedBrokerTraceReport {
     binding: BrokerTraceReportBinding,
+    resume: BrokerResumeSender,
 }
 
 impl ReceivedBrokerTraceReport {
-    fn decode(bytes: &[u8; BROKER_TRACE_REPORT_BYTES]) -> Result<Self, BrokerTraceReportError> {
+    fn decode(
+        bytes: &[u8; BROKER_TRACE_REPORT_BYTES],
+    ) -> Result<BrokerTraceReportBinding, BrokerTraceReportError> {
         if bytes[..8] != MAGIC
             || get_u16(bytes, 8) != VERSION
             || get_u16(bytes, 10) != EXEC_TRAP_HELD
@@ -204,20 +219,24 @@ impl ReceivedBrokerTraceReport {
             plan_digest,
         );
         binding.validate()?;
-        Ok(Self { binding })
+        Ok(binding)
     }
 
     pub(super) fn authenticate_registered(
         self,
         handle: SessionHandle,
         connection: ConnectionIdentity,
-    ) -> Result<AuthenticatedBrokerTraceReport, BrokerTraceReportError> {
+    ) -> Result<AuthenticatedBrokerTraceReport, (BrokerTraceReportError, BrokerResumeSender)> {
         if self.binding.session != handle.bytes()
             || self.binding.connection_generation != connection.get()
         {
-            return Err(BrokerTraceReportError::Binding);
+            return Err((BrokerTraceReportError::Binding, self.resume));
         }
-        Ok(AuthenticatedBrokerTraceReport { handle, connection })
+        Ok(AuthenticatedBrokerTraceReport {
+            handle,
+            connection,
+            resume: self.resume,
+        })
     }
 }
 
@@ -225,6 +244,7 @@ impl ReceivedBrokerTraceReport {
 pub(in crate::backend::macos) struct AuthenticatedBrokerTraceReport {
     handle: SessionHandle,
     connection: ConnectionIdentity,
+    resume: BrokerResumeSender,
 }
 
 impl AuthenticatedBrokerTraceReport {
@@ -235,10 +255,53 @@ impl AuthenticatedBrokerTraceReport {
     pub(in crate::backend::macos) const fn connection(&self) -> ConnectionIdentity {
         self.connection
     }
+
+    pub(in crate::backend::macos) fn into_parts(
+        self,
+    ) -> (SessionHandle, ConnectionIdentity, BrokerResumeSender) {
+        (self.handle, self.connection, self.resume)
+    }
+}
+
+/// Linear reverse commit retained until the authenticated Ready send succeeds.
+pub(in crate::backend::macos) struct BrokerResumeSender {
+    stream: Option<UnixStream>,
+}
+
+impl BrokerResumeSender {
+    #[cfg(test)]
+    pub(in crate::backend::macos) fn from_test_stream(stream: UnixStream) -> Self {
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    pub(in crate::backend::macos) fn commit_after_ready(
+        &mut self,
+    ) -> Result<(), BrokerTraceReportError> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or(BrokerTraceReportError::InvalidTransition)?;
+        loop {
+            match stream.write(&BROKER_RESUME_BYTE) {
+                Ok(1) => break,
+                Ok(_) => return Err(BrokerTraceReportError::InvalidTransition),
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(BrokerTraceReportError::Io(
+                        error.raw_os_error().unwrap_or(0),
+                    ));
+                }
+            }
+        }
+        drop(self.stream.take());
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::backend::macos::supervisor) enum BrokerTraceReportError {
+pub(in crate::backend::macos) enum BrokerTraceReportError {
     Malformed,
     Binding,
     DeadlineExpired,

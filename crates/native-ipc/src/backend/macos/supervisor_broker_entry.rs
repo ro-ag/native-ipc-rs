@@ -24,7 +24,9 @@ use super::auth_adapter::broker_plan::{
     parse_broker_plan_prefix,
 };
 #[cfg(test)]
-use super::auth_adapter::broker_report::{encode_broker_trace_report, finish_broker_trace_report};
+use super::auth_adapter::broker_report::{
+    BROKER_RESUME_BYTE, encode_broker_trace_report, finish_broker_trace_report,
+};
 use super::auth_adapter::broker_spawn::{
     BROKER_CONTROL_FD, BROKER_GATE_FD, BROKER_TRACE_FD, INSTALLED_BROKER_MODE,
     INSTALLED_BROKER_PATH, INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT,
@@ -140,6 +142,13 @@ pub(super) struct ActiveBrokerProcess {
 /// Broker whose one exact exec-trap report has reached the service channel.
 #[cfg(test)]
 pub(super) struct ReportedActiveBroker {
+    pub(super) gate: ActiveBrokerGate,
+    pub(super) plan: ExactParentBrokerLaunchPlan,
+    trace: UnixStream,
+}
+
+#[cfg(test)]
+pub(super) struct ResumedActiveBroker {
     pub(super) gate: ActiveBrokerGate,
     pub(super) plan: ExactParentBrokerLaunchPlan,
 }
@@ -717,11 +726,10 @@ impl ActiveBrokerProcess {
         )? {
             return Ok(Err(exit));
         }
-        drop(self.trace);
-        set_nonblocking(self.gate.reader.as_raw_fd(), false)?;
         Ok(Ok(ReportedActiveBroker {
             gate: self.gate,
             plan: self.plan,
+            trace: self.trace,
         }))
     }
 
@@ -729,6 +737,105 @@ impl ActiveBrokerProcess {
     pub(in crate::backend::macos::supervisor) fn abandon_trace_for_test(self) -> ActiveBrokerGate {
         self.gate
     }
+}
+
+#[cfg(test)]
+impl ReportedActiveBroker {
+    pub(super) fn wait_for_ready_commit(
+        mut self,
+    ) -> Result<Result<ResumedActiveBroker, BrokerGateExit>, BrokerEntryError> {
+        let deadline = self.plan.deadline().local();
+        let mut resume = [0_u8; 1];
+        if read_resume_commit(
+            &mut self.trace,
+            self.gate.reader.as_raw_fd(),
+            &mut resume,
+            deadline,
+        )?
+        .is_some()
+        {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        if resume != BROKER_RESUME_BYTE {
+            return Err(BrokerEntryError::Plan(SupervisorWireError::Malformed));
+        }
+        if require_resume_commit_eof(&mut self.trace, self.gate.reader.as_raw_fd())?.is_some() {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        if final_resume_gate_probe(self.gate.reader.as_raw_fd())?.is_some() {
+            return Ok(Err(BrokerGateExit::ServiceGone));
+        }
+        drop(self.trace);
+        set_nonblocking(self.gate.reader.as_raw_fd(), false)?;
+        Ok(Ok(ResumedActiveBroker {
+            gate: self.gate,
+            plan: self.plan,
+        }))
+    }
+}
+
+#[cfg(test)]
+fn read_resume_commit(
+    trace: &mut UnixStream,
+    gate_fd: c_int,
+    resume: &mut [u8; 1],
+    deadline: Instant,
+) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
+    loop {
+        if let Some(exit) = probe_dormant_gate(gate_fd)? {
+            return Ok(Some(exit));
+        }
+        match trace.read(resume) {
+            Ok(0) => return Err(BrokerEntryError::Plan(SupervisorWireError::Malformed)),
+            Ok(1) => return Ok(None),
+            Ok(_) => unreachable!("one-byte read returned impossible length"),
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                ensure_deadline_live(Some(deadline))?;
+                if let Some(exit) =
+                    poll_control_and_gate(gate_fd, trace.as_raw_fd(), POLLIN, Some(deadline))?
+                {
+                    return Ok(Some(exit));
+                }
+            }
+            Err(error) => {
+                return Err(BrokerEntryError::Control(error.raw_os_error().unwrap_or(0)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn require_resume_commit_eof(
+    trace: &mut UnixStream,
+    gate_fd: c_int,
+) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
+    let mut extra = [0_u8; 1];
+    loop {
+        if let Some(exit) = probe_dormant_gate(gate_fd)? {
+            return Ok(Some(exit));
+        }
+        match trace.read(&mut extra) {
+            Ok(0) => return Ok(None),
+            Ok(1) => return Err(BrokerEntryError::Plan(SupervisorWireError::Malformed)),
+            Ok(_) => unreachable!("one-byte read returned impossible length"),
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(exit) = poll_control_and_gate(gate_fd, trace.as_raw_fd(), POLLIN, None)?
+                {
+                    return Ok(Some(exit));
+                }
+            }
+            Err(error) => {
+                return Err(BrokerEntryError::Control(error.raw_os_error().unwrap_or(0)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn final_resume_gate_probe(gate_fd: c_int) -> Result<Option<BrokerGateExit>, BrokerEntryError> {
+    Ok(probe_dormant_gate(gate_fd)?.map(|_| BrokerGateExit::ServiceGone))
 }
 
 #[cfg(test)]

@@ -63,6 +63,11 @@ broker spawn and watchdog registration. The service accepts only one fixed
 report plus EOF before the original deadline with exact plan digest,
 session/connection/sequence/nonces/credentials/target bindings. Missing,
 extended, late, or substituted output exact-cleans the registered broker. The
+authenticated reverse endpoint remains linear through Ready delivery: failed
+Ready sends emit no RESUME and exact-clean before endpoint drop; successful
+Ready is the final commit point and is followed by one fixed reverse byte plus
+EOF without a second clock veto. The broker admits resumed authority only after
+that exact frame and a final FD 3 service-death probe. The
 resulting active gate and report receipt expose no request-selected launch,
 path, PID, signal, task, or filesystem authority. START and report bytes alone
 cannot launch a target; the unsafe report-emission boundary still requires the
@@ -332,8 +337,10 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    binding, Ready encoding, and the exact send-once reply. Drop, substitution,
    deadline, encoding, and recoverable-send paths emergency exact-reap the
    bound broker before returning; an indeterminate Mach send exact-cleans and
-   then fail-stops. A successful zero-timeout send alone disarms the Ready
-   guard. The obligation does not borrow the whole table, so an unrelated
+   then fail-stops. A successful zero-timeout send commits the authenticated
+   reverse FD 5 RESUME; only successful RESUME disarms the Ready guard. Reverse
+   failure exact-cleans before dropping the retained endpoint. The obligation
+   does not borrow the whole table, so an unrelated
    session can still be terminated while one launch is pending; table shutdown
    also exact-cleans entries retained by outstanding obligations. Broker
    authority must arrive dormant: the exact entry is inserted first, then one

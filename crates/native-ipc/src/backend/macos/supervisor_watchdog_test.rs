@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{io::Read, os::unix::net::UnixStream};
 
 use static_assertions::assert_not_impl_any;
 
 use super::*;
+use crate::backend::macos::supervisor::auth_adapter::broker_report::BrokerResumeSender;
 use crate::backend::macos::supervisor::{
     ConnectionGeneration, FreshServiceNonce, SupervisorConnection,
 };
@@ -126,6 +128,39 @@ struct TestSendObservation {
 struct TestReadySend {
     outcome: TestSendOutcome,
     observation: Arc<Mutex<TestSendObservation>>,
+}
+
+struct OrderedReadySend {
+    outcome: TestSendOutcome,
+    broker_endpoint: UnixStream,
+}
+
+// SAFETY: this test sender performs one nonblocking observation and returns a
+// fixed result without allocation, callback, or waiting.
+unsafe impl NonblockingReadySend for OrderedReadySend {
+    type Error = &'static str;
+
+    fn cleanup_reason(_error: &Self::Error) -> TerminationReason {
+        TerminationReason::SpawnResultUndeliverable
+    }
+
+    fn send_once(
+        mut self,
+        _handle: SessionHandle,
+        _connection: ConnectionIdentity,
+        _deadline: Instant,
+    ) -> Result<(), Self::Error> {
+        let mut byte = [0_u8; 1];
+        assert!(matches!(
+            self.broker_endpoint.read(&mut byte),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        match self.outcome {
+            TestSendOutcome::Success => Ok(()),
+            TestSendOutcome::Error => Err("send"),
+            TestSendOutcome::Panic => unreachable!("ordered sender never panics"),
+        }
+    }
 }
 
 fn test_ready_send(outcome: TestSendOutcome) -> (TestReadySend, Arc<Mutex<TestSendObservation>>) {
@@ -556,6 +591,86 @@ fn ready_delivery_success_disarms_and_keeps_the_exact_session_live() {
     assert_eq!(
         table.terminate_for_client_request(handle, owner).unwrap(),
         Ok(())
+    );
+}
+
+#[test]
+fn reverse_resume_commit_occurs_only_after_successful_ready_send() {
+    for outcome in [TestSendOutcome::Success, TestSendOutcome::Error] {
+        let owner = connection();
+        let mut table = WatchdogTable::new();
+        let (broker, state) = broker(0);
+        let deadline = future_deadline();
+        let handle = table
+            .register_test(session(), launch(owner, deadline), broker)
+            .unwrap()
+            .handle();
+        let (service_endpoint, mut broker_endpoint) = UnixStream::pair().unwrap();
+        service_endpoint.set_nonblocking(true).unwrap();
+        broker_endpoint.set_nonblocking(true).unwrap();
+        let resume = BrokerResumeSender::from_test_stream(service_endpoint);
+        // SAFETY: the paired stream models this exact registered broker's
+        // authenticated FD5 report and reverse commit authority.
+        let trace =
+            unsafe { TraceEstablished::from_broker_handshake_with_resume(handle, owner, resume) };
+        let delivery = table.mark_traced_for_delivery(trace).unwrap();
+        let send_endpoint = broker_endpoint.try_clone().unwrap();
+        let result = delivery.deliver(OrderedReadySend {
+            outcome,
+            broker_endpoint: send_endpoint,
+        });
+        let mut byte = [0_u8; 1];
+        match outcome {
+            TestSendOutcome::Success => {
+                assert_eq!(result, Ok(Ok(())));
+                assert_eq!(broker_endpoint.read(&mut byte).unwrap(), 1);
+                assert_eq!(byte, [1]);
+                assert_eq!(broker_endpoint.read(&mut byte).unwrap(), 0);
+                assert!(table.contains_live(handle));
+                assert_eq!(state.lock().unwrap().emergency_attempts, 0);
+            }
+            TestSendOutcome::Error => {
+                assert_eq!(result, Ok(Err("send")));
+                assert_eq!(broker_endpoint.read(&mut byte).unwrap(), 0);
+                assert!(!table.contains_live(handle));
+                assert_eq!(state.lock().unwrap().emergency_attempts, 1);
+            }
+            TestSendOutcome::Panic => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn reverse_resume_write_failure_exactly_cleans_before_returning() {
+    let owner = connection();
+    let mut table = WatchdogTable::new();
+    let (broker, state) = broker(0);
+    let deadline = future_deadline();
+    let handle = table
+        .register_test(session(), launch(owner, deadline), broker)
+        .unwrap()
+        .handle();
+    let (service_endpoint, broker_endpoint) = UnixStream::pair().unwrap();
+    service_endpoint.set_nonblocking(true).unwrap();
+    drop(broker_endpoint);
+    let resume = BrokerResumeSender::from_test_stream(service_endpoint);
+    // SAFETY: the closed peer deliberately models failure of this exact
+    // registered broker's authenticated reverse FD5 endpoint.
+    let trace =
+        unsafe { TraceEstablished::from_broker_handshake_with_resume(handle, owner, resume) };
+    let delivery = table.mark_traced_for_delivery(trace).unwrap();
+    let (send, observation) = test_ready_send(TestSendOutcome::Success);
+
+    assert_eq!(
+        delivery.deliver(send),
+        Err(WatchdogStateError::BrokerResumeFailed)
+    );
+    assert_eq!(observation.lock().unwrap().calls, 1);
+    let state = state.lock().unwrap();
+    assert_eq!(state.emergency_attempts, 1);
+    assert_eq!(
+        state.emergency_reasons,
+        vec![Some(TerminationReason::ProtocolViolation)]
     );
 }
 

@@ -48,6 +48,24 @@ fn post_report_gate_eof_wins_before_reported_authority() {
     );
 }
 
+#[test]
+fn post_resume_eof_gate_eof_wins_before_resumed_authority() {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors has storage for the two pipe descriptors.
+    assert_eq!(unsafe { pipe(descriptors.as_mut_ptr()) }, 0);
+    // SAFETY: successful pipe returned two distinct owned descriptors.
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: successful pipe returned two distinct owned descriptors.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    set_nonblocking(reader.as_raw_fd(), true).unwrap();
+
+    drop(writer);
+    assert_eq!(
+        final_resume_gate_probe(reader.as_raw_fd()),
+        Ok(Some(BrokerGateExit::ServiceGone))
+    );
+}
+
 fn spawn_helper(mode: &str) -> Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command

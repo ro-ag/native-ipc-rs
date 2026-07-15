@@ -15,7 +15,9 @@ use crate::backend::macos::supervisor::auth_adapter::tests::{
 };
 use crate::backend::macos::supervisor::broker_entry::{BrokerGateExit, DormantBrokerProcess};
 use crate::backend::macos::supervisor::{ConnectionIdentity, SupervisorWireError};
-use crate::backend::macos::supervisor_watchdog::{SessionHandle, WatchdogTable};
+use crate::backend::macos::supervisor_watchdog::{
+    NonblockingReadySend, SessionHandle, TerminationReason, WatchdogTable,
+};
 
 const EXIT_AFTER_START: &str = "IFS= read -r -n 1 <&3 || exit 71; exit 0";
 const HOLD_UNTIL_EOF: &str = "IFS= read -r -n 1 <&3 || exit 71; IFS= read -r -n 1 <&3; exit 0";
@@ -23,6 +25,27 @@ const EXIT_IMMEDIATELY: &str = "exit 7";
 const CHECK_FD_TOPOLOGY: &str =
     "IFS= read -r -n 1 <&3 || exit 71; if true <&100 2>/dev/null; then sleep 30; else exit 0; fi";
 const PREMAIN_WAIT_DOMAIN_ENV: &[u8] = b"NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN\0";
+
+struct SuccessfulReadyCommit;
+
+// SAFETY: this test effect performs no allocation, callback, or blocking work
+// and models the already-prepared successful Mach Ready send boundary.
+unsafe impl NonblockingReadySend for SuccessfulReadyCommit {
+    type Error = ();
+
+    fn cleanup_reason(_error: &Self::Error) -> TerminationReason {
+        TerminationReason::SpawnResultUndeliverable
+    }
+
+    fn send_once(
+        self,
+        _handle: SessionHandle,
+        _connection: ConnectionIdentity,
+        _deadline: Instant,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 unsafe extern "C" {
     fn _exit(status: c_int) -> !;
@@ -58,10 +81,17 @@ extern "C" fn premain_wait_domain_hook() {
                             // SAFETY: this isolated fixture models the future
                             // broker having consumed both exact trace stops.
                             match unsafe { active.report_exact_trace_stops() } {
-                                Ok(Ok(reported)) => matches!(
-                                    reported.gate.wait_for_service_death(),
-                                    Ok(BrokerGateExit::ServiceGone)
-                                ),
+                                Ok(Ok(reported)) => match reported.wait_for_ready_commit() {
+                                    Ok(Ok(resumed)) => {
+                                        let _plan = resumed.plan;
+                                        matches!(
+                                            resumed.gate.wait_for_service_death(),
+                                            Ok(BrokerGateExit::ServiceGone)
+                                        )
+                                    }
+                                    Ok(Err(BrokerGateExit::ServiceGone)) => true,
+                                    _ => false,
+                                },
                                 Ok(Err(BrokerGateExit::ServiceGone)) => true,
                                 _ => false,
                             }
@@ -346,7 +376,8 @@ fn exact_trace_channel_report_binds_registered_session_before_ready() {
             }
             super::super::BrokerTraceBindingPoll::Bound(bound) => {
                 let ready = bound.establish_ready().unwrap();
-                drop(ready);
+                let super::super::PendingSpawnReply { output, .. } = ready;
+                assert_eq!(output.deliver(SuccessfulReadyCommit), Ok(Ok(())));
                 break;
             }
         }

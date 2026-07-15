@@ -1992,7 +1992,9 @@ impl PendingBrokerTraceReceipt {
             .authenticate_registered(self.output.handle(), self.output.connection())
         {
             Ok(authenticated) => authenticated,
-            Err(error) => return Err(trace_report_failure(self, error)),
+            Err((error, resume)) => {
+                return Err(trace_report_failure_deferred(self, error, resume));
+            }
         };
         let report = match self.output.consume_report() {
             Ok(report) => report,
@@ -2011,10 +2013,11 @@ impl PendingBrokerTraceReceipt {
         };
         drop(report);
         let trace = TraceEstablished::from_authenticated_broker_report(authenticated);
-        if self.output.bind_trace(trace).is_err() {
-            return Err(trace_report_failure(
+        if let Err(trace) = self.output.bind_trace(trace) {
+            return Err(trace_report_failure_deferred(
                 self,
                 broker_report::BrokerTraceReportError::InvalidTransition,
+                trace,
             ));
         }
         Ok(BrokerTraceBindingPoll::Bound(self))
@@ -2024,6 +2027,14 @@ impl PendingBrokerTraceReceipt {
 fn trace_report_failure(
     pending: PendingBrokerTraceReceipt,
     error: broker_report::BrokerTraceReportError,
+) -> Box<PendingSpawnReply<broker_report::BrokerTraceReportError>> {
+    trace_report_failure_deferred(pending, error, ())
+}
+
+fn trace_report_failure_deferred<Deferred>(
+    pending: PendingBrokerTraceReceipt,
+    error: broker_report::BrokerTraceReportError,
+    deferred: Deferred,
 ) -> Box<PendingSpawnReply<broker_report::BrokerTraceReportError>> {
     let PendingSpawnReply {
         reply,
@@ -2037,6 +2048,7 @@ fn trace_report_failure(
         output.mark_protocol_violation();
     }
     drop(output);
+    drop(deferred);
     Box::new(PendingSpawnReply {
         reply,
         freshness,

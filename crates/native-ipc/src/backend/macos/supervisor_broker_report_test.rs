@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use static_assertions::assert_not_impl_any;
@@ -7,6 +7,7 @@ use super::*;
 
 assert_not_impl_any!(BrokerTraceReportReceiver: Clone, Copy);
 assert_not_impl_any!(AuthenticatedBrokerTraceReport: Clone, Copy);
+assert_not_impl_any!(BrokerResumeSender: Clone, Copy);
 
 fn binding() -> BrokerTraceReportBinding {
     BrokerTraceReportBinding::new(
@@ -28,7 +29,7 @@ fn trace_report_codec_is_fixed_and_rejects_every_mutation() {
     let exact = encode_broker_trace_report(binding()).unwrap();
     assert_eq!(exact.len(), BROKER_TRACE_REPORT_BYTES);
     assert_eq!(
-        ReceivedBrokerTraceReport::decode(&exact).unwrap().binding,
+        ReceivedBrokerTraceReport::decode(&exact).unwrap(),
         binding()
     );
 
@@ -36,7 +37,7 @@ fn trace_report_codec_is_fixed_and_rejects_every_mutation() {
         let mut mutation = exact;
         mutation[offset] ^= 1;
         assert_ne!(
-            ReceivedBrokerTraceReport::decode(&mutation).map(|report| report.binding),
+            ReceivedBrokerTraceReport::decode(&mutation),
             Ok(binding()),
             "offset {offset}"
         );
@@ -92,4 +93,18 @@ fn receiver_requires_exact_frame_eof_and_expected_binding() {
         BrokerTraceReportReceiver::new(reader, binding(), Instant::now()),
         Err(BrokerTraceReportError::DeadlineExpired)
     ));
+}
+
+#[test]
+fn reverse_resume_commit_is_exact_one_byte_plus_eof() {
+    let (service, mut broker) = UnixStream::pair().unwrap();
+    service.set_nonblocking(true).unwrap();
+    let mut resume_sender = BrokerResumeSender {
+        stream: Some(service),
+    };
+    resume_sender.commit_after_ready().unwrap();
+    let mut resume = [0_u8; 2];
+    assert_eq!(broker.read(&mut resume).unwrap(), 1);
+    assert_eq!(resume[0], BROKER_RESUME_BYTE[0]);
+    assert_eq!(broker.read(&mut resume).unwrap(), 0);
 }

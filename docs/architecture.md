@@ -395,7 +395,13 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    before the original deadline, binds the complete plan digest, session,
    connection generation, sequence, nonces, target, and credentials, and alone
    can construct the production `TraceEstablished` proof. Missing, extended,
-   late, or substituted reports exact-clean the registered broker. The broker
+   late, or substituted reports exact-clean the registered broker. The same
+   socket's reverse endpoint then moves linearly with the authenticated proof
+   through the armed Ready guard. A failed Ready send emits no resume byte and
+   exact-cleans first; only a successful Ready send commits one fixed RESUME
+   byte and closes the endpoint, after which no second deadline veto can create
+   a Ready-but-never-resumed session. The broker requires exact byte plus EOF
+   and one final FD 3 death probe before resumed authority. The broker
    report emitter is an unsafe typestate boundary whose native two-stop caller
    and packaged effect loop remain to be implemented; tests use an explicit
    synthetic stop-proof fixture and make no launcher claim. A one-shot non-sendable
