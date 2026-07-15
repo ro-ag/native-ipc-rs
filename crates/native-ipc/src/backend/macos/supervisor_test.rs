@@ -126,8 +126,9 @@ fn authentication_and_installed_policy_precede_the_single_effect_request() {
     let mut authenticated = Fixture::new();
     authenticated.authenticate();
     let requested_deadline = Instant::now() + Duration::from_secs(5);
+    let requested_wire_deadline = SupervisorDeadline::from_instant(requested_deadline).unwrap();
     let bounded_request = SpawnRequest::new(
-        SupervisorDeadline::from_instant(requested_deadline).unwrap(),
+        requested_wire_deadline,
         b"com.example.receiver".to_vec(),
         vec![b"--mode=test".to_vec()],
         vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
@@ -142,6 +143,7 @@ fn authentication_and_installed_policy_precede_the_single_effect_request() {
         .unwrap();
     let after_admission = Instant::now();
     assert_eq!(admitted.peer(), authenticated.peer);
+    assert_eq!(admitted.wire_deadline(), requested_wire_deadline);
     assert!(admitted.deadline() > after_admission);
     assert!(admitted.deadline() <= requested_deadline);
     assert_eq!(admitted.policy_id(), b"com.example.receiver");
@@ -152,6 +154,10 @@ fn authentication_and_installed_policy_precede_the_single_effect_request() {
     );
     assert_eq!(admitted.environment()[0].key(), b"LANG");
     assert_eq!(admitted.environment()[0].value(), b"C");
+    assert_eq!(
+        admitted.launcher_parts_for_permit().deadline.wire(),
+        requested_wire_deadline
+    );
 
     assert_eq!(
         authenticated
@@ -180,8 +186,8 @@ fn transport_delay_never_restarts_or_extends_the_absolute_deadline() {
         .connection
         .receive_spawn(message(fixture.peer, &spawn))
         .unwrap();
-    assert!(admitted.deadline <= requested_deadline);
-    assert!(admitted.deadline > Instant::now());
+    assert!(admitted.deadline.local() <= requested_deadline);
+    assert!(admitted.deadline.local() > Instant::now());
 
     let mut expired = Fixture::new();
     expired.authenticate();

@@ -2,7 +2,8 @@ use static_assertions::assert_not_impl_any;
 
 use super::*;
 use crate::backend::macos::supervisor::{
-    ConnectionGeneration, FreshServiceNonce, SupervisorConnection, TargetEnvironmentEntry,
+    ConnectionGeneration, FreshServiceNonce, SupervisorConnection, SupervisorDeadlineBinding,
+    TargetEnvironmentEntry,
 };
 use crate::backend::macos::supervisor_watchdog::{
     ExactBrokerAuthority, ReapedBroker, TerminationReason,
@@ -55,9 +56,10 @@ fn verified_peer() -> VerifiedPeer {
 #[test]
 fn validated_exec_preparation_is_complete_and_null_terminated() {
     let peer = verified_peer();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let prepared = PreparedExec::from_validated(LauncherSpawnParts {
         peer,
-        deadline: std::time::Instant::now(),
+        deadline: SupervisorDeadlineBinding::from_test_instant(deadline).unwrap(),
         policy_id: b"com.example.receiver".to_vec(),
         target_identity: [0x77; 32],
         installed_executable: b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),

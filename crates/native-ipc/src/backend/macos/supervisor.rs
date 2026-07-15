@@ -147,6 +147,45 @@ impl SupervisorDeadline {
     }
 }
 
+mod deadline_binding {
+    use super::{Instant, SupervisorDeadline, SupervisorWireError};
+
+    /// Inseparable original wire deadline and its conservative local view.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::backend::macos) struct SupervisorDeadlineBinding {
+        wire: SupervisorDeadline,
+        local: Instant,
+    }
+
+    impl SupervisorDeadlineBinding {
+        pub(in crate::backend::macos) fn from_wire(
+            wire: SupervisorDeadline,
+        ) -> Result<Self, SupervisorWireError> {
+            Ok(Self {
+                wire,
+                local: wire.to_local_instant()?,
+            })
+        }
+
+        pub(in crate::backend::macos) const fn wire(self) -> SupervisorDeadline {
+            self.wire
+        }
+
+        pub(in crate::backend::macos) const fn local(self) -> Instant {
+            self.local
+        }
+
+        #[cfg(test)]
+        pub(in crate::backend::macos) fn from_test_instant(
+            deadline: Instant,
+        ) -> Result<Self, SupervisorWireError> {
+            Self::from_wire(SupervisorDeadline::from_instant(deadline)?)
+        }
+    }
+}
+
+pub(super) use deadline_binding::SupervisorDeadlineBinding;
+
 fn monotonic_now_nanos() -> Result<u64, SupervisorWireError> {
     let mut time = TimeSpec {
         tv_sec: 0,
@@ -460,7 +499,7 @@ impl SpawnRequest {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct AuthenticatedSpawnRequest {
     peer: VerifiedPeer,
-    deadline: Instant,
+    deadline: SupervisorDeadlineBinding,
     request: SpawnRequest,
 }
 
@@ -644,7 +683,7 @@ impl InstalledTargetPolicy {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct ValidatedSpawn {
     peer: VerifiedPeer,
-    deadline: Instant,
+    deadline: SupervisorDeadlineBinding,
     policy_id: Vec<u8>,
     target_identity: [u8; 32],
     installed_executable: Vec<u8>,
@@ -662,7 +701,13 @@ impl ValidatedSpawn {
     }
 
     pub(super) const fn deadline(&self) -> Instant {
-        self.deadline
+        self.deadline.local()
+    }
+
+    /// Original absolute CLOCK_UPTIME_RAW boundary suitable for exact
+    /// cross-exec serialization without reconstructing or extending it.
+    pub(super) const fn wire_deadline(&self) -> SupervisorDeadline {
+        self.deadline.wire()
     }
 
     pub(super) fn policy_id(&self) -> &[u8] {
@@ -699,7 +744,7 @@ impl ValidatedSpawn {
 /// Linear installed-policy launch data consumed only by the trusted launcher.
 pub(super) struct LauncherSpawnParts {
     pub(super) peer: VerifiedPeer,
-    pub(super) deadline: Instant,
+    pub(super) deadline: SupervisorDeadlineBinding,
     pub(super) policy_id: Vec<u8>,
     pub(super) target_identity: [u8; 32],
     pub(super) installed_executable: Vec<u8>,
@@ -813,7 +858,7 @@ impl SupervisorConnection {
         // the selected live connection untouched.
         self.state = ConnectionState::Poisoned;
         let request = decode_spawn_payload(&message.bytes[HEADER_LEN..])?;
-        let deadline = request.deadline.to_local_instant()?;
+        let deadline = SupervisorDeadlineBinding::from_wire(request.deadline)?;
         self.state = ConnectionState::SpawnConsumed;
         Ok(AuthenticatedSpawnRequest {
             peer,

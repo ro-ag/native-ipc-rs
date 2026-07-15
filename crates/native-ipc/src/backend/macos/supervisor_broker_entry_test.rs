@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString, c_int};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -233,7 +233,7 @@ fn service_data_after_activation_is_terminal_protocol_failure() {
         .arg("--nocapture")
         .env(HELPER_ENV, "active")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: same isolated fixed-fd installation as spawn_helper.
     unsafe {
@@ -252,14 +252,31 @@ fn service_data_after_activation_is_terminal_protocol_failure() {
         .unwrap()
         .write_all(&START_BYTE)
         .unwrap();
-    thread::sleep(Duration::from_millis(20));
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut sender = Some(sender);
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line == "NATIVE_IPC_GATE_ACTIVE"
+                && let Some(sender) = sender.take()
+            {
+                sender.send(line).unwrap();
+            }
+        }
+        if let Some(sender) = sender {
+            sender.send(String::new()).unwrap();
+        }
+    });
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "NATIVE_IPC_GATE_ACTIVE"
+    );
     child.stdin.as_mut().unwrap().write_all(&[2]).unwrap();
     drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        !output.status.success(),
-        "{EXTRA_MODE} unexpectedly succeeded"
-    );
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(!status.success(), "{EXTRA_MODE} unexpectedly succeeded");
 }
 
 #[test]
