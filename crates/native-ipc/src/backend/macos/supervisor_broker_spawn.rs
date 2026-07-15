@@ -15,16 +15,17 @@ use super::{DedicatedChildWaitDomain, PendingSpawnReply, SessionAssignedSpawn};
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
 
-const INSTALLED_BROKER_PATH: &str = "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.broker";
-const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
-const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
+pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_PATH: &str =
+    "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.broker";
+pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
+pub(in crate::backend::macos::supervisor) const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
 const CANONICAL_PATH: &str = "PATH=/usr/bin:/bin";
 const CANONICAL_LANG: &str = "LANG=C";
 const CANONICAL_LOCALE: &str = "LC_ALL=C";
 
-const BROKER_GATE_FD: c_int = 3;
+pub(in crate::backend::macos::supervisor) const BROKER_GATE_FD: c_int = 3;
 const STABLE_FD_MINIMUM: c_int = 10;
-const START_BYTE: [u8; 1] = [1];
+pub(in crate::backend::macos::supervisor) const START_BYTE: [u8; 1] = [1];
 
 const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
 const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;

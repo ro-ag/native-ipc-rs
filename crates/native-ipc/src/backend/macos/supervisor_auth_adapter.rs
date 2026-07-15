@@ -164,6 +164,8 @@ const SA_NOCLDWAIT: c_int = 0x0020;
 const WNOHANG: c_int = 1;
 
 static CHILD_WAIT_DOMAIN_CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static AUTH_WORKER_SIGNAL_MUST_NOT_RUN: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "bsm")]
 unsafe extern "C" {
@@ -1314,7 +1316,7 @@ impl DirectChildAuthWorkerAuthority {
         // SAFETY: no successful exact reap has occurred. If the child exited
         // after the preceding observation, its unreaped zombie still pins this
         // PID, so this call cannot target a replacement process.
-        if unsafe { kill(self.pid, SIGKILL) } == 0 {
+        if signal_exact_auth_worker(self.pid) == 0 {
             self.state = DirectChildState::TerminationSent;
             return Ok(());
         }
@@ -1338,7 +1340,20 @@ impl DirectChildAuthWorkerAuthority {
         ) {
             std::process::abort();
         }
-        if self.state == DirectChildState::Unreaped && self.signal_exact_child().is_err() {
+        loop {
+            match self.observe_exact_reap(WNOHANG) {
+                Ok(Some(proof)) => return proof,
+                Ok(None) => break,
+                Err(DirectChildAuthWorkerError::Wait(EINTR)) => continue,
+                Err(
+                    DirectChildAuthWorkerError::InvalidChild
+                    | DirectChildAuthWorkerError::WaitAuthorityLost
+                    | DirectChildAuthWorkerError::Wait(_)
+                    | DirectChildAuthWorkerError::Signal(_),
+                ) => std::process::abort(),
+            }
+        }
+        if self.signal_exact_child().is_err() {
             std::process::abort();
         }
         loop {
@@ -1355,6 +1370,20 @@ impl DirectChildAuthWorkerAuthority {
             }
         }
     }
+}
+
+fn signal_exact_auth_worker(pid: c_int) -> c_int {
+    #[cfg(test)]
+    if AUTH_WORKER_SIGNAL_MUST_NOT_RUN.swap(false, Ordering::AcqRel) {
+        // A distinct ordinary exit makes the stolen-wait regression prove that
+        // ECHILD was observed before this numeric-signal boundary. The former
+        // signal-first implementation would take this branch instead of the
+        // required fail-stop abort.
+        std::process::exit(92);
+    }
+    // SAFETY: every caller holds the unreaped exact direct-child relation that
+    // pins pid until a successful exact wait consumes it.
+    unsafe { kill(pid, SIGKILL) }
 }
 
 /// Exact worker cleanup and sole-waiter behavior.

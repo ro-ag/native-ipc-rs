@@ -1257,6 +1257,9 @@ fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Supe
 #[path = "supervisor_auth_adapter.rs"]
 pub(super) mod auth_adapter;
 
+#[path = "supervisor_broker_entry.rs"]
+pub(super) mod broker_entry;
+
 #[cfg(test)]
 #[path = "supervisor_test.rs"]
 mod tests;

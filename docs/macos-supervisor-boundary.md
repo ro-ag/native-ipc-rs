@@ -7,9 +7,9 @@ direct-fork, exact-stop/kill, and tracer-crash gaps in native tests. It does not
 yet satisfy the hostile-helper contract: same-UID target code can stop its
 broker indefinitely, and restored launchd/XPC delegation is outside the
 rlimit. Backend-private source models now constrain the future service protocol,
-watchdog ownership state, client authentication state, and launcher
-credential/exec transition, but they are not Mach-service or executable
-artifacts. No privileged service, signed launcher
+watchdog ownership state, client authentication state, launcher
+credential/exec transition, and the broker's fixed start/death gate, but they
+are not Mach-service or executable artifacts. No privileged service, signed launcher
 artifact, bundle, entitlement, installation fixture, or public macOS session
 adapter is implemented. Public macOS spawn/bootstrap remain fail-closed.
 
@@ -51,12 +51,31 @@ death produces EOF. Cleanup closes the gate, exact-waits before any signal,
 never treats `ESRCH` as reap proof, aborts on `ECHILD` without numeric fallback,
 and mints terminal proof only from exact `waitpid` reap.
 
+The matching source entry boundary accepts only the fixed absolute `argv[0]`,
+broker mode, and `--gate-fd=3`. It adopts only a read-only FIFO reader at FD 3,
+sets `FD_CLOEXEC` before any future launcher exec, blocks until exactly byte
+`1`, and distinguishes service EOF before activation, immediately after the
+start byte, and during the active lifetime. A wrong, repeated, or later byte is
+terminal. The resulting active gate exposes no launch, path, PID, signal, task,
+or filesystem authority; START alone cannot select or launch a target. The
+eventual broker needs a separate bounded session-bound control channel that
+stages and acknowledges one canonical launch plan before watchdog registration
+can release this gate.
+
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it
 does not prove that the eventual signed broker's dyld/constructor path reaches
-only trusted gate code, nor that the hard-coded production path is installed,
-root-owned, signed, packaged, or replacement-resistant. The concrete broker
-entrypoint, clean-exec worker/launcher artifacts, installed service loop,
+only trusted gate code. The gate-entry tests use both libtest subprocesses and
+a separately compiled harnessless fixture that invokes the hidden no-callback
+entry runner with the exact process vector and FD 3. The fixture still links
+the library test build and is not a minimal signed/package artifact or pre-main
+constructor audit. These tests also cannot distinguish an anonymous pipe from
+a named FIFO using public descriptor metadata; FIFO shape and START are
+explicitly non-authoritative until an exact-child/session/control-plan binding
+is authenticated. Nor do they prove that the hard-coded production path is
+installed, root-owned, signed, packaged, or replacement-resistant. The
+broker control channel and packaged executable, clean-exec worker/launcher
+artifacts, installed service loop,
 permanent credential drop, real client-death authority, and launchd/XPC
 delegation policy remain unresolved. Public macOS therefore remains
 fail-closed.
@@ -326,9 +345,9 @@ send-once reply ownership. It routes hello/spawn state only after validation and
    is stripped only when every padding byte is zero, leaving the exact logical
    record for the worker digest and later decoding. The deadline is rechecked immediately before the send, but that
    userspace check and kernel entry are not one atomic kernel deadline action.
-   This remains source/native mechanism evidence, not an installed
-   privileged service, atomic production broker spawner, or clean-exec
-   Security-worker executable/entrypoint.
+   This remains source/native mechanism evidence, not an installed privileged
+   service, packaged broker/control loop, or clean-exec Security-worker
+   executable/entrypoint.
 3. The service/watchdog is independently privileged so target code running as
    the client cannot signal-stop it. Privilege is retained only by the minimal
    broker/watchdog; the launcher permanently drops real/effective/saved IDs to

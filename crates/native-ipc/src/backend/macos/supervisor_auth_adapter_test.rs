@@ -2141,6 +2141,40 @@ fn stolen_wait_authority_fails_stop_without_pid_fallback() {
 }
 
 #[test]
+fn armed_drop_exact_waits_before_any_numeric_cleanup_signal() {
+    const CHILD_MARKER: &str = "NATIVE_IPC_TEST_AUTH_WORKER_DROP_ECHILD_ABORT";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let pid = spawned_pid(&mut Command::new("/usr/bin/true"));
+        // SAFETY: this subprocess initially owns the exact direct child and is
+        // its sole waiter with normal zombie semantics.
+        let worker = unsafe { ExactAuthWorker::from_test_spawned_direct_child(pid).unwrap() };
+        let mut status = 0;
+        loop {
+            // SAFETY: deliberately consume the exact relation before armed
+            // Drop. Emergency cleanup must discover ECHILD through WNOHANG and
+            // abort at that point, before attempting any numeric signal.
+            let result = unsafe { waitpid(pid, &raw mut status, 0) };
+            if result == pid {
+                break;
+            }
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(EINTR));
+        }
+        AUTH_WORKER_SIGNAL_MUST_NOT_RUN.store(true, Ordering::Release);
+        drop(worker);
+        panic!("lost wait authority must fail-stop before returning");
+    }
+
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("backend::macos::supervisor::auth_adapter::tests::armed_drop_exact_waits_before_any_numeric_cleanup_signal")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6));
+}
+
+#[test]
 fn every_result_binding_change_terminates_and_reaps_without_effect() {
     for mutation in 0..7 {
         let generation = 300 + mutation;

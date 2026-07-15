@@ -22,6 +22,17 @@ pub(super) mod supervisor_client;
 pub(super) mod supervisor_launcher;
 pub(super) mod supervisor_watchdog;
 
+/// Runs the fixed no-callback broker gate executable boundary.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed broker process-entry contract documented
+/// by the gate runner. This is exposed only for the separate executable crate.
+pub(crate) unsafe fn run_fixed_broker_gate_process() -> ! {
+    // SAFETY: the caller transfers the exact documented entry contract.
+    unsafe { supervisor::broker_entry::run_fixed_gate_process() }
+}
+
 type KernReturn = c_int;
 type MachPort = u32;
 type MachVmAddress = u64;

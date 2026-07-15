@@ -63,3 +63,8 @@ targets = [
 name = "receiver-main-downstream"
 path = "tests/receiver_main_downstream.rs"
 harness = false
+
+[[test]]
+name = "macos-broker-gate-entry"
+path = "tests/macos_broker_gate_entry.rs"
+harness = false
