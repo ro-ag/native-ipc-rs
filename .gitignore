@@ -1,3 +1,4 @@
 /target/
+/.local-native-tests/
 *.swp
 .DS_Store

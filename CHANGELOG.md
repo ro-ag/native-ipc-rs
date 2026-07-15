@@ -57,7 +57,14 @@ Versioning once a stable API is released.
   Mach bootstrap, canonical HELLO and challenged decisions, symmetric capacity
   preflight, bounded control, mixed READY/COMMIT activation, one-shot
   `receiver_main!`, and exact direct-child wait diagnostics. Public macOS
-  spawn/bootstrap remain fail-closed pending pre-bootstrap exact termination.
+  spawn/bootstrap remain fail-closed pending public crash-surviving exact
+  containment.
+- Start the private macOS helper suspended, capture a task-name right and
+  `TASK_AUDIT_TOKEN` before resume, and use the existing private audit-token
+  signal SPI to terminate a silent direct child without numeric-PID fallback.
+  Native probes show that ordinary `exec` invalidates the task-name right,
+  supervisor crash drops the authority, and a `setsid` descendant survives;
+  therefore this narrows the blocker but does not enable public macOS.
 - Record a preinstalled signed launchd/XPC service as a necessary macOS
   lifecycle candidate, together with its authentication, privilege, serialized
   reap, and native evidence obligations. The investigation also proves that
@@ -75,11 +82,101 @@ Versioning once a stable API is released.
   reuse-proof process identity to a termination primitive, launchd cleanup is
   process-group scoped and `setsid`-escapable, and no public sandbox
   entitlement denies fork. Public macOS composition remains fail-closed.
+- Narrow that negative result with a backend-private trusted-launcher gate.
+  The launcher authenticates its broker, proves cooperative tracing with an
+  explicit stop, installs hard `RLIMIT_NPROC=1`, and execs through the trace
+  trap before target code. Native tests prove post-exec fork denial, exact
+  stopped `PT_KILL`, and kernel tracee cleanup when the broker exits. A mutex
+  waiter gate prevents the background reaper from consuming handshake stops.
+- Record the remaining macOS authority blocker: a same-UID hostile tracee can
+  `SIGSTOP` its broker indefinitely, while the launchd bootstrap namespace
+  restored for libxpc permits delegated work outside the rlimit. Keep public
+  macOS fail-closed pending a packaged signed launcher and independently
+  privileged, authenticated, non-deputy service/watchdog.
+- Add backend-private source models for that future deployment boundary: an
+  authentication-only nonce exchange followed by one bounded installed-policy
+  spawn request; opaque connection-bound watchdog handles retaining linear
+  exact broker/reap authority across cleanup retries; and an abort-on-failure
+  launcher transition that clears supplementary groups, permanently drops real,
+  effective, and saved UID/GID to the authenticated nonroot client, then installs
+  hard and soft `RLIMIT_NPROC=1`. These models remain unreachable from public
+  macOS and are not signed-service, installed-launcher, or root-native evidence.
+- Bind the modeled supervisor request to an absolute Darwin
+  `CLOCK_UPTIME_RAW` deadline rather than restarting a relative timeout after
+  transport. Add a one-shot client authentication typestate that accepts
+  service generation/nonces only from an exact-message-authenticated reply.
+  Keep exact UID/GID authentication on a raw Mach audit trailer because public
+  XPC exposes only connection-time credential snapshots.
+- Retain the complete exact-message audit token in the authenticated supervisor
+  peer so an exec, PID-version change, or credential transition cannot cross
+  from the authentication hello into the spawn request. Restrict the unsafe
+  peer/message constructors to the future fused Mach receiver; only test-only
+  synthetic seams remain visible elsewhere.
+- Add the backend-private canonical raw Mach receiver and fixed worker pipe
+  codecs. Malformed, complex, and oversized messages release returned rights;
+  accepted requests retain one linear send-once reply. Authentication and exact
+  worker reap now precede hello/spawn routing, and wrong-peer/wrong-nonce traffic
+  cannot poison another live connection. This does not enable public macOS or
+  supply the installed privileged service and clean-exec Security workers.
+- Replace the modeled authentication-worker receipt with an actual linear
+  one-shot pipe capability. Submission is one atomic fixed frame; completion
+  requires exactly one fixed result plus EOF; every I/O, deadline, abnormal
+  exit, and exact-reap-pending outcome preserves the slot/generation needed for
+  exact cancellation or retry. Add a sole-waiter direct-child authority whose
+  unreaped zombie relation pins the PID, fails stop on `ECHILD`, and authorizes
+  a result only after normal status-zero reap.
+- Add a receive-only authenticated macOS spawn-result shape. The client waits
+  for exact service identity, generation, both nonces, and sequence one before
+  accepting either a redacted opaque handle or one of four coarse failures.
+  No production success encoder exists until watchdog readiness proof and
+  retained reply-right integration are implemented.
+- Bind every accepted spawn's decoded connection generation, sequence, and both
+  nonces to its linear Mach send-once reply through later success/error mapping.
+  Add a one-shot main-thread child-wait-domain prerequisite checker that rejects
+  threaded startup, nondefault SIGCHLD, and automatic reaping, then installs a
+  canonical blocked SIGCHLD policy. It intentionally cannot construct a
+  production child until the clean-exec spawner owns the atomic spawn-to-armed
+  transition.
+- Make watchdog readiness a linear proof minted only by the registered
+  unexpired `Starting` to exact-traced transition. An expired transition mints
+  no proof and enters exact deadline cleanup. If a future Ready reply is not
+  deliverable, consuming that proof records a distinct terminal reason and
+  exactly reaps or retains the same broker authority for retry. The proof is
+  not yet connected to a production reply encoder.
+- Characterize the public raw-Mach deployment path with ignored C/CMake probes:
+  launchd `bootstrap_check_in`/`bootstrap_look_up` delivers exact bidirectional
+  audit trailers, and Security accepts exactly 32 native audit-token bytes for
+  `kSecGuestAttributeAudit` while rejecting length and token mutations. These
+  mechanism probes do not replace signed/root packaged evidence.
+- Exercise the same raw-Mach boundary with a local Developer ID Application
+  identity: a hardened-runtime per-user launchd service validates the exact
+  request audit token against one fixed client designated requirement, accepts
+  only the matching client, rejects same-signer/wrong-identifier and ad-hoc
+  images, and observes unsigned or post-signature-mutated clients killed before
+  authorization. This is local signed mechanism evidence, not a privileged
+  installed-service or downstream distribution claim.
+- Add a backend-private fused authentication-adapter state model. One retained
+  exact Mach frame is bound to a fixed one-job worker through a domain-separated
+  digest, complete audit token, credentials, connection/generation, linear
+  private-endpoint receipt, and original absolute deadline. No result can mint
+  supervisor peer authority until a bounded nonblocking observation returns an
+  exact worker-reap proof; mismatched, late, wedged, or cancelled workers retain
+  exact cleanup authority and a slot cannot be replaced until reap. Live replay
+  state and the strictly increasing worker-generation allocator are bounded.
+- Extend the ignored Security probe across `exec`: a token captured from image A
+  is rejected after the same PID execs image B. Rework lookup helpers as clean
+  exec workers after stress exposed that calling Security.framework in a child
+  forked after framework initialization is not a safe worker topology.
+- Add a repeated nested-tracer native proof for watchdog recovery: the target
+  stops its broker, the outer tracer uses `PT_KILL` on that exact stopped
+  broker and reaps it, and XNU removes the broker's exact tracee without a
+  numeric-PID reacquisition. This is kernel-mechanism evidence, not signed/root
+  deployment evidence.
 - Adopt the standing decision that public macOS stays fail-closed instead of
   re-scoping the contract to a weaker documented containment class or
-  depending on private interfaces. The position is revisited only when a
-  macOS SDK documents a public exact-identity termination or containment
-  mechanism.
+  depending on private interfaces. Enabling it now requires proof of the
+  privileged watchdog, permanent nonroot target identity, hostile-stop
+  recovery, and an explicit delegated-XPC ownership boundary.
 - Record packaged-crate conformance: the three release-order `cargo package`
   artifacts rebuild from extracted sources and pass the all-feature and
   no-default workspace suites natively on physical Apple Silicon. Reconcile

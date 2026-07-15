@@ -1,43 +1,66 @@
 # macOS exact-lifecycle supervisor boundary
 
-Status: candidate boundary and negative result. A preinstalled signed XPC
-service solves the direct client's pre-bootstrap gap only while that service
-remains alive; it does not by itself preserve exact lifecycle authority across
-a service crash. No XPC service, bundle, entitlement, signing requirement, or
-public macOS session adapter is implemented by this document. The architecture
-milestone and public macOS spawn/bootstrap remain blocked.
+Status: backend-private traced-launcher core implemented; privileged deployment
+boundary unresolved. A cooperative `ptrace` launcher plus hard
+`RLIMIT_NPROC=1` now closes the first-target-instruction, post-exec identity,
+direct-fork, exact-stop/kill, and tracer-crash gaps in native tests. It does not
+yet satisfy the hostile-helper contract: same-UID target code can stop its
+broker indefinitely, and restored launchd/XPC delegation is outside the
+rlimit. Backend-private source models now constrain the future service protocol,
+watchdog ownership state, client authentication state, and launcher
+credential/exec transition, but they are not Mach-service or executable
+artifacts. No privileged service, signed launcher
+artifact, bundle, entitlement, installation fixture, or public macOS session
+adapter is implemented. Public macOS spawn/bootstrap remain fail-closed.
 
 A dedicated primary-source investigation (2026-07-13, recorded in project
-tracking) examined every public candidate for the crash-surviving gap and
-confirmed the negative result. The findings are recorded in
-[Public-API impossibility evidence](#public-api-impossibility-evidence) below.
+tracking) examined every then-known direct-kill candidate and produced the
+negative result later narrowed by the traced-launcher composition. The still
+applicable findings are recorded in
+[Residual public-API evidence](#residual-public-api-evidence) below.
+Native follow-up on 2026-07-14 first narrowed one premise: suspended spawn can
+retain a task-name right and read `TASK_AUDIT_TOKEN` before the child runs.
+Combined with private `proc_signal_with_audittoken`, that closes only the silent
+direct-child gap. Further source and native work found a stronger composition
+using public process primitives: a trusted launcher authenticates its broker,
+enters `PT_TRACE_ME`, performs a stopped proof handshake, lowers hard and soft
+`RLIMIT_NPROC` to one, and crosses exec through the kernel's trace trap before
+target code. Broker stop/`PT_KILL` and broker exit both act on the exact tracee.
+The backend-private implementation and adversarial corpus now exercise this
+chain.
 
 Standing decision (2026-07-13): the project keeps public macOS fail-closed
 rather than re-scoping the contract to a documented weaker containment class
 or depending on private libproc/proc_info interfaces. The exactness
 requirement is not negotiable for this backend. This position is revisited
-only when a new macOS SDK documents a public mechanism that binds a
-reuse-proof process identity to termination or containment authority; until
-then the R8.6/6d chain remains architecture-blocked by decision, not by
-outstanding investigation.
+only when an independently privileged service/watchdog can host the proven
+trace core without becoming an arbitrary-exec or signaling deputy, permanently
+drops the launcher/target to the authenticated nonroot client identity, and
+resolves launchd/XPC delegation ownership. Until then R8.6/6d remains
+architecture-blocked by decision.
 
 ## Decision
 
 Any viable production macOS session adapter requires an authority that exists
-before untrusted code runs. The current candidate is a preinstalled, signed,
-`launchd`-advertised XPC service. A broker that the library starts with
-`posix_spawn` is not sufficient: it merely moves the same silent-before-first-
-message cleanup problem from the untrusted helper to the broker. The client
-must connect to a service already represented by a launchd-owned Mach service;
-it must not create the supervisor process itself.
+before untrusted code runs and which the target cannot stop. The current
+candidate is a preinstalled, signed, independently privileged
+`launchd`-advertised service/watchdog hosting a minimal broker. A same-UID
+broker that the library starts with `posix_spawn` is insufficient: although
+cooperative tracing survives exec and broker exit kills the exact tracee, the
+tracee can send its same-UID broker unmaskable `SIGSTOP` and suspend all live
+cleanup. The client must connect to an already authenticated service authority
+outside the target's signal permission domain.
 
-That service is necessary but not sufficient. If it crashes, its in-memory
-session table and parent-only wait authority disappear, and its children are
-reparented. A restarted service cannot reconstruct an exact capability from a
-PID or session identifier. Public macOS therefore cannot be enabled until a
-documented OS-enforced containment mechanism survives the service crash,
-cannot be escaped by the helper, and gives a surviving trusted authority exact
-termination and reap responsibility.
+The privileged service must permanently drop the launcher/target to the
+authenticated client's nonroot real UID before untrusted exec while keeping
+the broker at an identity the target cannot signal. It must accept only a held,
+policy-authorized executable and bounded canonical arguments/environment; it
+cannot expose arbitrary privileged spawn, signal, task-port, or filesystem
+operations. A watchdog above a stopped or crashed broker must terminate the
+broker, relying on XNU's tracer-exit rule to kill the exact tracee. Restart must
+not reconstruct authority from a PID. The design must also resolve the launchd
+bootstrap namespace restored for libxpc: delegated XPC work must either be
+prevented or explicitly excluded from the owned-principal claim.
 
 This is a deployment boundary, not a new public session or region API. The
 backend reads the service name and designated code requirement from
@@ -50,15 +73,76 @@ closed with `BackendUnavailable` or a bounded native construction failure. The
 direct-spawn prototype remains private test machinery and is never an automatic
 fallback.
 
-Apple documents that a named XPC Mach service must be advertised in a
-`launchd.plist`, that the connection is one-to-one, and that service launch is
-on demand. Apple also explicitly warns that the PID returned for an XPC peer
-can become stale and be reused. Therefore neither the service connection PID
-nor a helper PID is a lifecycle capability.
+The current source-only boundary accepts an authentication-only first frame and
+then one bounded spawn request tied to the exact verified Mach audit trailer,
+fresh client/service nonces, a unique connection generation, and a monotonic
+sequence. The authenticated peer retains the complete 32-byte token, so any
+exec/PID-version/credential transition between hello and spawn changes peer
+identity even when snapshot-like fields still match. The token is identity
+evidence only, never termination authority. A one-shot client state accepts those service facts only from an
+exact-message-authenticated reply. The request carries one absolute Darwin
+`CLOCK_UPTIME_RAW` deadline, the same clock basis as Rust `Instant`, so transport
+delay cannot restart its budget. It resolves only an immutable installed policy;
+callers cannot select an executable path or request PID, signal, task, or
+filesystem effects. The
+watchdog model registers a fresh opaque session handle before execution and
+retains linear exact broker authority until an implementation returns a typed
+reap proof. All terminal causes converge on exact terminate-and-reap cleanup,
+and a failed attempt retains the same authority for retry. The launcher
+transition consumes the exact trace-established session and validated installed
+target, prepares the complete `execve` request before mutation, clears
+supplementary groups, permanently changes real/effective/saved UID and GID to
+the authenticated nonroot client, proves root cannot be regained, lowers hard
+and soft `RLIMIT_NPROC` to one, and immediately execs; any failure after the
+first mutation aborts. A nested-tracer native test further proves that an outer
+watchdog can consume a broker proof stop, recover after the hostile target stops
+that broker, exact-`PT_KILL`/reap it, and rely on tracer exit to remove the exact
+target. These are source and same-UID kernel-mechanism invariants only. They do
+not prove a root launch, signed installation, UID separation, or delegation
+policy.
+
+Public XPC can authenticate dynamic code from an exact message, but its public
+credential accessors expose connection-time UID/GID snapshots. That is weaker
+than this contract's exact-message credential continuity. The candidate runtime
+transport is therefore a launchd-advertised raw Mach service: the kernel's Mach
+audit trailer supplies the exact message token, BSM decoding supplies UID/GID,
+and Security validates dynamic code from the same audit token. No private
+`xpc_dictionary_get_audit_token` dependency is permitted. XPC peer PIDs and all
+other numeric PIDs remain diagnostic only, never lifecycle capabilities.
+
+Ignored native probes confirm the mechanism boundary without claiming
+deployment completion. The initial certificate-free corpus proves that a
+transient per-user launchd Mach service
+delivers exact audit trailers in both directions and cleans up by exact label;
+Security accepts a 32-byte native audit token for `kSecGuestAttributeAudit`,
+validates the ad-hoc code's designated requirement, and rejects a one-byte
+token mutation plus 31/33-byte values. A separately bounded stale-token probe
+reaped the subject first and then received `kPOSIXErrorESRCH` in all five runs.
+Another probe retained image A's token while the same live PID execed image B;
+100 clean-worker repetitions rejected the pre-exec token with
+`errSecCSNoSuchCode`. An earlier fork-without-exec lookup worker intermittently
+crashed after the parent initialized Security.framework, reinforcing that
+workers must be pre-created safely or enter through a clean exec image rather
+than call the framework in a post-initialization fork child. A separate local
+Developer ID Application matrix signs distinct hardened-runtime service and
+client Mach-O images. From the request's kernel audit trailer, the per-user
+launchd service accepts the exact client designated requirement, rejects a
+same-Team-ID image with the wrong identifier and an ad-hoc image with the right
+identifier (`errSecCSReqFailed`), while unsigned and post-signing-mutated
+clients are killed before authorization. Twenty repeated matrices covered 100
+client launches, and 100 signed exact-token/exec repetitions also passed; no
+probe process, launchd job, plist, or log survived.
+That negative result is characterization, not a liveness guarantee:
+Security.framework does not provide a cancellable, caller-deadline-bound lookup,
+so the production watchdog must isolate every dynamic guest lookup in a
+disposable worker process. These probes do not prove a privileged LaunchDaemon,
+root/nonroot separation, an immutable production requirement, downstream
+deployment, or notarization.
 
 Primary platform references:
 
-- [XPC Mach-service connection](https://developer.apple.com/documentation/xpc/xpc_connection_create_mach_service%28_%3A_%3A_%3A%29)
+- [Mach message audit trailers](https://developer.apple.com/documentation/kernel/mach_msg_audit_trailer_t)
+- [Audit-token Security guest attribute](https://developer.apple.com/documentation/security/ksecguestattributeaudit)
 - [XPC peer PID reuse warning](https://developer.apple.com/documentation/xpc/xpc_connection_get_pid%28_%3A%29)
 - [Code identity from the audit token attached to an XPC message](https://developer.apple.com/documentation/security/seccodecreatewithxpcmessage%28_%3A_%3A_%3A%29)
 - [launchd on-demand ownership](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
@@ -76,52 +160,143 @@ public direct-spawn primitives available to this crate:
 
 The library cannot take exclusive ownership of process-global signal
 disposition or every waiter in its host application. `waitpid(WNOHANG)`,
-`proc_pidpath`, a process-group ID, `kqueue` exit observation, or
-`POSIX_SPAWN_START_SUSPENDED` can narrow windows but cannot turn the later
-numeric signal into an exact capability. A task port would do so, but the
-normative contract forbids transferring or retaining task-port authority.
+`proc_pidpath`, a process-group ID, or `kqueue` exit observation cannot turn the
+later numeric signal into an exact capability. `POSIX_SPAWN_START_SUSPENDED`
+does permit a narrower private construction: while the fresh child cannot run,
+the parent captures a task-name right, reads its `TASK_AUDIT_TOKEN`, commits the
+lifecycle owner, and resumes or kills that exact execution with private
+`proc_signal_with_audittoken`. Native tests prove silent-before-bootstrap
+direct-child cleanup for that prototype.
 
-An audit token is exact for one execution because it includes a PID version,
-but it arrives only with the first audit-bearing message. It therefore cannot
-clean up a child that stays silent before bootstrap. A later `exec` changes the
-PID version, so a retained token also cannot terminate the new execution.
+That construction is not a public solution. The token-addressed signal is
+private SPI; the token names only one execution; and a real `exec` invalidated
+both the old token and retained task-name right in the native probe. The rights
+also disappear when the spawning process crashes, and exact direct-child
+termination does not contain a descendant that calls `setsid`. A task-control
+port could provide stronger live-process authority, but the normative contract
+forbids transferring or retaining it.
 
-A library-spawned supervisor has the same unsolved first step. Trusting it to
-send a prompt first message is not a bounded cleanup proof. Only a connection
-to an independently installed, authenticated service avoids spawning an
-unowned process before the lifecycle boundary exists.
+A trusted cooperative launcher improves this substantially without a task
+port. It receives the broker's complete audit token and real launchd bootstrap
+right over the authenticated private Mach channel, restores that bootstrap
+right, captures and compares the broker's task-name audit token and PPID, calls
+`PT_TRACE_ME`, revalidates, sends a ready marker, and raises `SIGSTOP`. The
+broker proves it owns the trace relationship by consuming and continuing that
+stop. The launcher installs hard and soft `RLIMIT_NPROC=1`, sends a second
+marker, and immediately execs. The broker consumes the exec `SIGTRAP` before
+the target's first instruction and continues it.
+
+While the broker runs, exact termination is `SIGSTOP` followed by parent-only
+`waitpid(WUNTRACED)` and `PT_KILL`; the sole unreaped-child relationship pins
+the PID throughout. If the broker exits, XNU kills and reaps its tracee. The
+hard nonroot process limit survives exec and native tests show direct fork and
+`posix_spawn` fail with `EAGAIN`. The backend uses a mutex waiter gate so its
+background reaper cannot consume either handshake stop.
+
+This still cannot be enabled from a same-UID library-spawned broker. Native
+adversarial testing proves the target can stop that broker indefinitely with
+`SIGSTOP`, suspending deadline and death-pipe handling. An outer authority can
+kill the stopped broker, after which XNU kills the exact tracee, so the safe
+recovery primitive exists but must live in an independently privileged
+watchdog. In addition, restoring launchd bootstrap is required to keep libxpc
+from hanging before `main` and permits delegated XPC work outside the rlimit;
+cooperative tracing also invokes XNU code-signing debug relaxation. These are
+the remaining deployment and principal-boundary blockers.
 
 ## Minimum candidate contract
 
-Even before the crash-surviving containment gap can be resolved, an XPC
-candidate must satisfy all of these conditions:
+Before the privileged authority and delegation gaps can be resolved, a raw
+Mach-service candidate must satisfy all of these conditions:
 
-1. The service is bundled or installed as a signed launchd/XPC job with a
+1. The service is bundled or installed as a signed launchd job with a
    private Mach service. No global library-created Mach service is registered.
 2. Authentication precedes every spawn or lifecycle effect. The client first
    sends a bounded authentication-only message containing a protocol version
    and fresh nonce, but no command, image, environment, or authority. The
-   service derives the sender's dynamic code with
-   `SecCodeCreateWithXPCMessage`, checks it with `SecCodeCheckValidity` against
-   an installed client requirement, and returns both the client nonce and a
-   fresh service nonce. The client performs the same two calls on that reply
-   against the requirement pinned in its signed bundle. Only then may the
-   service accept a spawn request bound to both nonces and that XPC connection
-   generation. A numeric `xpc_connection_get_pid` result is diagnostic only.
-3. The service is a nonprivileged same-user agent/service: its effective user
-   and group match the authenticated client, and it has no root, set-ID, or
-   entitlement capability that would make it a confused deputy. It launches
-   only a held, policy-authorized non-setid image, applies the requested
-   identity/signing rule, constructs environment variables from a fixed
-   allowlist, and rejects loader-injection and other privilege-bearing
-   variables. A privileged launch daemon accepting arbitrary executable policy
-   is nonconforming.
-4. The service accepts only a fixed, bounded canonical request containing the
-   command, explicit argv/environment, held-image facts, nonce, caller deadline,
-   and requested identity/signing policy. It accepts no caller PID as authority.
+   service requests an audit trailer and decodes UID/GID from that exact kernel
+   token. The permanent watchdog's lifecycle loop performs no Security.framework
+   call, filesystem lookup, or installed-catalog lookup. Instead it copies one
+   fixed, bounded job containing the complete 32-byte token, exact retained-wire
+   frame digest, worker generation, one live-job identifier, and original
+   absolute `CLOCK_UPTIME_RAW` deadline into one of a fixed number of
+   pre-created, one-job authentication-worker processes. A non-serializable
+   linear receipt binds the exact private reply endpoint to that job. Only that
+   worker resolves the
+   dynamic code through
+   `SecCodeCopyGuestWithAttributes(kSecGuestAttributeAudit)` and checks it with
+   `SecCodeCheckValidity` against an immutable installed client requirement.
+   Its bounded result must echo every binding exactly and arrive before the
+   original deadline. No client-supplied connection generation enters this
+   pre-authentication job or its capacity accounting. The permanent authority
+   uses only bounded nonblocking
+   reap progress; the result cannot mint peer authority until a typed exact
+   worker-reap proof exists. A late, replayed, mismatched, or wrong-generation
+   result retires the worker without creating or selecting connection state.
+   Saturation rejects immediately rather than
+   queueing. A wedged worker retains exact unreaped-child authority and is
+   exactly terminated and reaped before replacement, without restarting the
+   caller deadline. Slot identity plus a strictly increasing worker generation
+   makes old endpoints/results unreachable without an unbounded tombstone set.
+   The current source now makes the private endpoint literal rather than
+   documentary: the pool moves one `OwnedFd` request writer and result reader
+   into the dispatched linear token, writes the 152-byte job atomically, closes
+   the request writer, and accepts exactly 200 result bytes plus EOF. EINTR yields
+   immediately, EAGAIN retains the receipt, and every I/O/deadline/reap-pending
+   outcome carries the exact worker slot/generation for cancellation or retry.
+   Its sole waiter signals only while the direct child or unreaped zombie pins
+   the PID; `ECHILD` aborts without signaling, and only normal exit status zero
+   can authorize the result.
+   The service then returns both the client
+   nonce and a fresh service nonce. The client performs the symmetric
+   audit-token code check on that exact reply against the requirement pinned in
+   its signed bundle. Only then may the service accept a spawn request bound to
+   both nonces and that connection generation. No numeric PID is used as
+   identity or authority, and dynamic guest validation is never cached across
+   messages or audit tokens.
+
+The raw Mach boundary has an additional receive-shape obligation. Darwin does
+not provide a descriptor-free receive option: a hostile complex message can
+transfer rights into the service namespace before validation. The adapter must
+reject complex input, immediately call `mach_msg_destroy` on the complete
+received shape, and prove that no transferred right is inspected, retained, or
+forwarded. In particular it never deliberately requests, transfers, or uses a
+task-control port. If the normative prohibition is interpreted to forbid even
+this attacker-forced transient insertion before destruction, raw Mach cannot
+satisfy that stronger reading and the public backend must remain fail-closed.
+The backend-private receiver now proves the implementable portion: exact audit
+trailer extraction, exact logical receive limits, immediate complex/malformed
+destruction, oversized-head progress without `MACH_RCV_LARGE`, and linear
+send-once reply ownership. It routes hello/spawn state only after validation and
+   exact worker reap. A receive-only spawn-result decoder also authenticates
+   exact service freshness before revealing only an opaque handle or coarse
+   failure; there is no production success encoder. This remains source/native
+   mechanism evidence, not an installed privileged service or clean-exec
+   Security-worker executable/entrypoint.
+   The watchdog separately mints one noncopyable readiness proof only after the
+   unexpired registered session transitions from Starting to exact Traced. An
+   expired transition enters exact deadline cleanup and mints no proof. Consuming an
+   undeliverable proof records a distinct terminal cause and exactly cleans or
+   retains the broker authority. No production encoder can yet combine that
+   proof with the authenticated request's exact send-once reply right.
+3. The service/watchdog is independently privileged so target code running as
+   the client cannot signal-stop it. Privilege is retained only by the minimal
+   broker/watchdog; the launcher permanently drops real/effective/saved IDs to
+   the authenticated nonroot client identity before untrusted exec. It launches
+   only a held, installed-policy-authorized non-setid image, constructs
+   environment variables from a fixed allowlist, and rejects loader injection
+   and privilege-bearing variables. A privileged daemon accepting arbitrary
+   caller-selected executable or signal policy is nonconforming.
+4. The service accepts only a fixed, bounded canonical request containing an
+   installed policy ID, bounded additional argv/allowlisted environment values,
+   the authenticated connection freshness facts, and one caller deadline. The
+   immutable signed/root-owned catalog—not the caller—selects the executable,
+   argv0, held-image/code identity, client requirement, and target identity. It
+   accepts no caller path, PID, signal, task, filesystem operation, or signing
+   policy as authority.
 5. Before the helper can run, the service creates a fresh unguessable session
-   identifier, installs the complete lifecycle entry, creates the private Mach
-   bootstrap endpoint, and establishes itself as the sole helper waiter.
+   identifier, installs the complete lifecycle entry and watchdog relationship,
+   creates the private Mach bootstrap endpoint, and establishes the broker as
+   the sole helper waiter/tracer.
 6. The service keeps normal child-wait semantics: it does not use `SIGCHLD`
    auto-reap, has no broad competing waiter, and does not remove the lifecycle
    entry until the exact child is reaped. An exited-but-unreaped child pins its
@@ -129,16 +304,28 @@ candidate must satisfy all of these conditions:
    the signal syscall and (b) the reaping `waitpid` call and immediate
    signal-authority tombstone. The waiter holds that domain through reap and
    tombstoning, so no concurrent path can observe a reaped entry as signalable.
-7. Spawn starts suspended or otherwise cannot run untrusted code until the
-   lifecycle table, cleanup-on-client-disconnect hook, held image, endpoint,
-   and nonce are committed. Resume is a single audited transition.
+   The source-only auth-worker boundary now rejects non-main or already-threaded
+   initialization, nondefault SIGCHLD, and `SA_NOCLDWAIT`, then installs
+   canonical default disposition and blocks SIGCHLD for subsequently inherited
+   thread masks. The token is one-shot and non-sendable, but it cannot prove
+   absence of future broad waiters. It currently exposes no production
+   PID-taking constructor; the installed clean-exec spawner must own the whole
+   `posix_spawn` success-to-armed-authority sequence before this evidence can be
+   treated as a deployable sole-waiter domain.
+7. The signed trusted launcher authenticates its broker, establishes
+   `PT_TRACE_ME` with an explicit stopped handshake, drops to the nonroot client
+   identity, installs hard `RLIMIT_NPROC=1`, and execs only after the lifecycle
+   table, disconnect hook, held image, endpoint, nonce, and watchdog are
+   committed. The broker consumes the exec trap before target code runs.
 8. Client requests refer only to the opaque session identifier. The service
    resolves a signal under the live lifecycle entry; no wire command accepts a
    numeric helper PID, process-group ID, task port, or Mach task name.
-9. Cancellation, deadline expiry, malformed traffic, client disconnect, and
-   ambiguous transfer all request termination and exact wait/reap. A terminal
-   reply is sent only after reap or carries explicit incomplete native cleanup
-   facts. Session identifiers are never reused.
+9. Cancellation, deadline expiry, malformed traffic, client disconnect, broker
+   stop/crash, and ambiguous transfer all request termination. A live broker
+   uses stop/`PT_KILL`/reap; the independent watchdog kills a stopped/crashed
+   broker and relies on the kernel tracer-exit cascade for the exact tracee. A
+   terminal reply is sent only after observed cleanup or carries explicit
+   incomplete native facts. Session identifiers are never reused.
 10. The first helper Mach message binds its complete audit token, not only its
    PID. Every later helper message must carry the same execution identity.
    A changed PID version or image is terminal and asks the supervisor to clean
@@ -148,56 +335,57 @@ candidate must satisfy all of these conditions:
     rights required by the canonical protocol. It never transfers a task port,
     and every installed or malformed right has immediate RAII ownership.
 12. Service invalidation is reported distinctly from helper exit. A live
-    service cleans every session associated with a disconnected client. A
-    service crash is not exact cleanup: the candidate remains nonconforming
-    until separate OS-enforced containment survives that crash, prevents helper
-    escape, and performs exact termination and reap under a surviving authority.
+    service cleans every session associated with a disconnected client. Native
+    evidence must prove client death, broker stop, broker crash, and service
+    restart behavior without reconstructing authority from a PID. Delegated
+    launchd/XPC processes must be forbidden or explicitly outside the lifecycle
+    principal and capability-revocation claim.
 13. The service name, signing requirement, entitlements, bundle placement, and
     launchd configuration are release inputs checked by packaging and native
     conformance; crates.io source packaging alone is not sufficient evidence.
 
-## Conditional exactness while the service lives
+## Conditional exactness of the traced-launcher core
 
-Let one supervisor lifecycle entry own `(session_id, child_pid, child_wait,
-bootstrap_endpoint, image, nonce, client_generation)`.
+Let one broker lifecycle entry own `(session_id, tracee_pid, child_wait,
+bootstrap_endpoint, image, nonce, client_generation)` and let an independent
+watchdog own the broker.
 
-- Before resume, the entry exists and the XPC disconnect cleanup hook owns it,
-  so there is no running untrusted helper without a cleanup owner.
-- While the child is running, `child_pid` identifies that child. If it exits,
-  the supervisor's exclusive unreaped wait state prevents PID reuse. Signal
-  selection and the signal syscall run in the same per-entry serialization
-  domain. The terminal waiter holds that domain across the reaping `waitpid`
-  and conversion to a nonsignalable tombstone before any concurrent operation
-  can proceed. Therefore no path can signal a later process through the entry.
-- `exec` changes the helper execution identity but not the parent/child wait
-  entry. Full audit-token comparison rejects the new execution on the control
-  channel, while supervisor termination remains exact because it is based on
-  the pinned child entry rather than the stale audit token.
-- The terminal transition removes the entry only after exact wait/reap. A
-  replayed session identifier then has no authority and fails closed.
-- The client authenticates the supervisor from the audit token attached to an
-  XPC message and never treats an XPC PID as authority. Thus launch-on-demand or
-  service restart cannot silently substitute a differently signed supervisor.
+- Before the launcher resumes, the entry and watchdog relationship exist, so
+  there is no running untrusted target without a cleanup owner.
+- The launcher's full-token/PPID checks and explicit `PT_TRACE_ME`/`SIGSTOP`
+  proof establish the intended parent as the kernel tracer before untrusted
+  exec. A mutex waiter gate gives the broker exclusive ownership of that stop
+  and the later exec trap.
+- `exec` changes the execution token but preserves the trace relationship. XNU
+  stops the new image before its first target instruction. The broker consumes
+  that trap and only then permits target execution.
+- While the direct child is unreaped, a live tracee owns the PID and a naturally
+  exited tracee pins it as a zombie. Stop plus parent-only `PT_KILL` therefore
+  cannot target a replacement. Broker exit makes XNU kill the exact tracee.
+- Hard `RLIMIT_NPROC=1` is installed before exec and cannot be raised by the
+  nonroot target; native fork/spawn attempts fail with `EAGAIN`.
+- The terminal transition removes the opaque session entry only after observed
+  cleanup. A replayed identifier has no authority and fails closed.
 
-These steps establish the ordinary and concurrent path only while the service
-lives. They do not establish the required crash path. On service crash, the
-helper is reparented and the table and wait relationship are lost. The
-installed `launchd.plist(5)` documentation says launchd kills remaining
-processes with the job's process-group ID, but that is not sufficient for this
-hostile-helper model: a non-group-leader helper can call `setsid` to create a
-new session and process group, and the current direct-spawn contract already
-does so. No documented public SDK capability found in this investigation both
-survives the parent crash and provides exact, non-task-port helper authority.
-Consequently this is a narrowed conditional argument, not a complete boundary
-proof or an implementation claim.
+These statements are implemented and natively tested for the backend-private
+core. They do not prove the deployment boundary. A same-UID tracee can stop its
+broker indefinitely, so an independent privileged watchdog must remain outside
+the target's signal permission domain and kill a stopped broker. The launcher
+must permanently drop to the authenticated nonroot client identity, and the
+service must prove it is not a confused deputy. Restored launchd/XPC bootstrap
+also creates delegation outside the direct tracee/rlimit principal. Until those
+properties are implemented and tested, this is a conditional core proof rather
+than public-session evidence.
 
-## Public-API impossibility evidence
+## Residual public-API evidence
 
-The crash-surviving requirement decomposes into three properties that must
-hold simultaneously: an exact reuse-proof identity bound to the termination
-primitive, a termination authority that survives the supervisor crash, and an
-escape-proof containment set. On current macOS (Apple Silicon, shipped SDK),
-each property fails independently under public APIs:
+The earlier direct-kill investigation decomposed the requirement into an exact
+reuse-proof termination identity, crash survival, and escape-proof
+containment. Its individual observations remain relevant, but the traced-child
+relationship composes around two earlier assumptions: parent-only `PT_KILL`
+provides exact action without a kill-by-unique-ID API, and tracer exit makes the
+kernel kill the tracee. The remaining failure is independent authority against
+a hostile same-UID tracee plus delegated work outside that relationship:
 
 1. **No public reuse-proof kill identity.** The kernel keeps a never-reused
    64-bit process identity (`p_uniqueid`, with `p_idversion` for exec
@@ -211,27 +399,31 @@ each property fails independently under public APIs:
    process-group-addressed; the PID space is small (`PID_MAX` 99999, wraps to
    100), so verify-then-kill by numeric PID remains a documented TOCTOU
    vulnerability class. The audit token (`audit_token_t`, whose `val[7]` is the
-   PID version) is Apple's sanctioned fix for PID races, but it is an
-   IPC-sender identity available only from a live message or connection. The
-   token-addressed signal that this crate's private prototype uses while its
-   coordinator lives (`proc_signal_with_audittoken`) sits behind the same
-   private-interface disclaimer as the rest of `libproc.h`, and a token cannot
-   be reconstructed by a restarted supervisor holding only a numeric PID, so
-   neither closes the crash path.
-2. **The only crash-surviving authority cleans up inexactly.** launchd (PID 1)
-   is by construction the only termination authority that survives a
-   supervisor crash, and bundle-embedded XPC services are launched, restarted,
-   and killed by launchd rather than the client. But `launchd.plist(5)`
+   PID version) is Apple's sanctioned fix for PID races. The private prototype
+   can obtain it before resume by calling public Mach entry points
+   `task_name_for_pid` and `task_info(TASK_AUDIT_TOKEN)`, but no public signal
+   primitive accepts that identity. The token-addressed signal it uses while
+   its coordinator lives (`proc_signal_with_audittoken`) sits behind the
+   private-interface disclaimer in `libproc.h`. Native testing also found that
+   an ordinary `exec` invalidates the retained task-name right, and a restarted
+   supervisor cannot reconstruct the original token from a numeric PID, so the
+   construction closes neither the public nor crash path.
+2. **Process-group cleanup remains inexact, but tracer-exit cleanup is exact.**
+   launchd (PID 1) survives a supervisor crash, and bundle-embedded XPC
+   services are launched, restarted, and killed by launchd rather than the
+   client. `launchd.plist(5)`
    documents job-death cleanup as process-group scoped ("kills any remaining
    processes with the same process group ID as the job",
    `AbandonProcessGroup`), with no per-descendant or unique-identifier
    tracking; a helper that calls `setsid(2)` or `setpgid(2)` definitionally
    leaves the kill set, and Apple guidance (TN2083 era) historically
-   recommended exactly that call to survive job death. Termination of an XPC
-   service when its *client* crashes is not documented as a guarantee; only
-   the reverse direction (service crash observed as connection invalidation)
-   is.
-3. **No public escape-proof containment.** App Sandbox confinement survives
+   recommended exactly that call to survive job death. Cooperative tracing
+   supplies a different exact edge: XNU kills a live tracee when its tracer
+   exits. An independent watchdog can therefore kill a stopped broker and let
+   the kernel terminate that broker's exact tracee; native tests prove the
+   kernel edge. Its source ownership state is modeled, but no privileged
+   watchdog process is implemented or installed.
+3. **No complete public principal containment.** App Sandbox confinement survives
    `exec` (a differently-sandboxed image traps at profile-set time) and a
    spawned child of a sandboxed process inherits the static sandbox without
    needing its own entitlement, but sandboxed processes may `fork`/`posix_spawn`
@@ -249,16 +441,13 @@ each property fails independently under public APIs:
    accepts only the full control port (MIG conversion rejects read, inspect,
    and name ports), so no lesser flavor provides termination either.
 
-Consequently no composition of documented public mechanisms satisfies
-"OS-enforced, crash-surviving, exact containment without task ports". The
-strongest supported approximation — launchd-owned XPC service lifecycle plus
-inherited sandbox confinement plus `EVFILT_PROC`/Endpoint Security exit
-observation plus post-hoc identity verification — is crash-surviving and
-observable but not exact: it can neither atomically close the verify-then-kill
-race nor prevent process-group escape. R8.6 and 6d therefore remain
-architecture-blocked and the public macOS composition remains fail-closed
-until Apple ships a public exact-identity termination or containment
-primitive.
+Consequently the earlier blanket impossibility statement is narrowed: public
+`ptrace` and rlimit mechanisms provide an exact no-task-port direct-child core,
+including broker-crash cleanup, but a same-UID deployment is not live against
+hostile `SIGSTOP`, and restored launchd/XPC delegation is not contained by the
+rlimit. R8.6 and 6d remain architecture-blocked until the independent
+privileged service/watchdog and delegation policy are implemented and proven;
+the public macOS composition remains fail-closed.
 
 Additional primary references for this section:
 
@@ -270,7 +459,9 @@ Additional primary references for this section:
 - `launchd.plist(5)`, `kqueue(2)`, `setsid(2)` man pages; xnu
   `bsd/sys/proc_info_private.h`, `bsd/kern/kern_prot.c`
   (`set_security_token_task_internal`), `osfmk/mach/task.defs`
-  (`task_terminate`), `bsd/kern/kern_descrip.c` (`fg_sendable`).
+  (`task_terminate`), `osfmk/kern/task.c` (`task_name_for_pid`),
+  `osfmk/kern/task_info.c` (`TASK_AUDIT_TOKEN`), and
+  `bsd/kern/kern_descrip.c` (`fg_sendable`).
 
 ## Required native evidence before enabling public macOS
 
@@ -279,6 +470,12 @@ Additional primary references for this section:
   restart under the original absolute deadline;
 - silent helper before bootstrap, helper exit before reply, and helper `exec`
   before and after authentication;
+- packaged signed launcher/broker tracing under hardened runtime, including the
+  code-signing relaxation boundary and exec trap before target instructions;
+- permanent launcher/target UID drop, target attempts to signal-stop the
+  broker/watchdog, and watchdog recovery of a deliberately stopped broker;
+- hard-limit fork/`posix_spawn` denial before and after exec, root exclusion,
+  and launchd/XPC delegation characterization;
 - process-global hostile `SIGCHLD` settings in the client, demonstrating that
   only the service parent owns child waiting;
 - 0/1/2/16 and extra Mach rights, every XPC/Mach truncation and type mutation,
@@ -286,13 +483,14 @@ Additional primary references for this section:
   audit token/PID version;
 - first/middle/final spawn, table insertion, endpoint transfer, resume, signal,
   wait, reap, and reply failures with exact VM/port/process baselines;
-- client crash/disconnect and service crash characterization without claiming
-  cleanup that cannot be observed;
-- service-crash containment that is OS-enforced, exact, survives restart, and
-  cannot be escaped with `setsid`, `setpgid`, `fork`, or `exec`;
+- client crash/disconnect, broker stop/crash, and service/watchdog crash
+  characterization without claiming cleanup that cannot be observed;
+- exact tracer-exit cleanup across watchdog recovery and service restart,
+  without reconstructing signal authority from a numeric PID;
 - 10,000-cycle native Apple Silicon lifecycle/port baseline, strict warning
   freedom, packaged application/XPC-service verification, and exact hosted plus
   release-host evidence.
 
-Until a crash-surviving containment design and those tests exist, R8.6 and 6d
-remain architecture-blocked, and the public macOS facade remains fail-closed.
+Until the privileged service/watchdog, signed launcher packaging, delegation
+policy, and those tests exist, R8.6 and 6d remain architecture-blocked, and the
+public macOS facade remains fail-closed.

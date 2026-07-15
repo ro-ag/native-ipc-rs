@@ -64,11 +64,27 @@ still need attention; explicit abort invalidates retained mappings and preserves
 bounded cleanup diagnostics.
 
 The macOS Arm64 prototype reaches the same private reducer but remains
-fail-closed at public spawn/bootstrap because direct spawn cannot exactly kill a
-child silent before its first audit-bearing Mach message without forbidden task
-authority. A preinstalled signed launchd/XPC service is a necessary candidate,
-but it does not preserve exact authority across service crash without another
-OS-enforced containment mechanism; that architecture remains blocked.
+fail-closed at public spawn/bootstrap. Its backend-private trusted launcher
+authenticates the broker, enters cooperative `ptrace`, proves the relationship
+with a stopped handshake, installs hard `RLIMIT_NPROC=1`, and execs through the
+kernel's pre-first-instruction trap. Exact stopped `PT_KILL`, tracer-death kill,
+and post-exec fork denial pass native tests. The remaining authority boundary
+is not solved: same-UID target code can `SIGSTOP` the broker indefinitely. A
+nested-tracer native test proves an outer watchdog can exactly kill/reap that
+stopped broker and trigger exact tracer-exit cleanup of its target, but not the
+required production privilege separation. The launchd bootstrap namespace
+restored for libxpc permits delegated work outside the rlimit. Public
+composition therefore still requires an
+independently privileged authenticated service/watchdog and remains blocked.
+Backend-private source models constrain that future boundary to a verified
+installed policy, a bounded absolute-deadline nonce/generation-bound request, opaque watchdog
+handles retaining linear exact cleanup authority, and a permanent nonroot
+UID/GID/group drop. A fused source-only authentication adapter further binds
+the retained exact message/token to a fixed one-job worker and linear private
+reply receipt, then requires typed exact worker reap before peer authority can
+exist; no API falls back to signaling a reconstructed PID. They are not a
+packaged or installed service and do not
+constitute root, signing, installed-service, or public-session evidence.
 Windows publicly composes the same Negotiating/Ready typestate surface over its
 unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and

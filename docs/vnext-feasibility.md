@@ -985,18 +985,66 @@ conformance pass.
 
 The private macOS memory, transport, evidence, reducer, and activation owners
 now compose into a public-API-shaped prototype on Apple Silicon, but actual
-public spawn/bootstrap remain fail-closed. Direct spawn has no PID-reuse-safe
-termination capability before the first audit-bearing Mach message without
-forbidden task-port transfer, so a supervisor/XPC boundary is required before
-6d conformance. A preinstalled signed launchd/XPC service is necessary and a
-library-spawned broker is recursive, but the service alone loses its parent/wait
-authority on crash. No documented public crash-surviving exact containment
-primitive has been identified; a dedicated primary-source investigation
-confirmed the negative result, and a standing 2026-07-13 decision keeps public
-macOS fail-closed rather than re-scoping the contract or depending on private
-interfaces. See
+public spawn/bootstrap remain fail-closed. The private prototype now starts the
+direct child suspended, captures a task-name right and `TASK_AUDIT_TOKEN` before
+resume, and uses private `proc_signal_with_audittoken` for exact silent-child
+termination. Native probes also establish the limits: ordinary `exec`
+invalidates the name right and execution token, abrupt supervisor exit drops
+the authority without killing the child, and exact direct-child termination
+does not contain a `setsid` descendant. The signal primitive is private SPI, so
+this does not satisfy public 6d construction.
+
+The backend now additionally implements the stronger public-primitive core as
+private machinery. A trusted launcher receives the broker's full audit token
+and real launchd bootstrap right over the authenticated private channel,
+restores that bootstrap namespace, captures and compares the broker's retained
+task-name audit token plus PPID, calls `PT_TRACE_ME`, revalidates, and raises
+`SIGSTOP`. Only the intended broker can consume that traced stop and continue
+the launcher. The launcher then irreversibly lowers hard and soft
+`RLIMIT_NPROC` to one and execs. The broker consumes the exec `SIGTRAP` before
+the target's first instruction and continues it. Native tests prove that a
+post-exec process spawn fails with `EAGAIN`, running termination is exact
+`SIGSTOP`/`PT_KILL`/reap, and abrupt tracer exit makes XNU kill and reap the
+original tracee identity. A mutex waiter gate prevents the durable background
+reaper from racing either handshake stop.
+
+This closes the earlier first-instruction, post-exec identity, direct fork, and
+broker-crash exact-child gaps, but it reveals a narrower authority blocker. A
+same-UID hostile tracee can send unmaskable `SIGSTOP` to its broker and suspend
+deadline and death-pipe cleanup indefinitely. Restoring launchd bootstrap is
+required to avoid libxpc hanging before `main`, but it also permits XPC
+delegation outside `RLIMIT_NPROC`. Cooperative tracing relaxes code-signing
+enforcement for the participating processes. Public composition therefore
+needs an independently privileged signed service/watchdog that permanently
+drops the launcher/target to the authenticated nonroot client UID, cannot be
+stopped by that target, exposes no arbitrary-exec or signal deputy, and either
+forbids delegated work or defines it outside the owned principal. No such
+service artifact is implemented. Backend-private source work does now model
+the non-deputy boundary: complete exact-Mach-audit peer identity and fresh connection nonces
+authorize one bounded absolute-deadline installed-policy request; a client
+typestate authenticates service freshness before its one effect; opaque session handles never
+carry a PID, signal, task, or filesystem operation; terminal watchdog paths
+retain linear exact broker authority until a typed reap proof; and the future
+launcher has an abort-on-partial-failure transition that binds the established
+trace session and validated installed target to credential drop plus immediate
+exec. A fused authentication-adapter model retains the exact raw frame and
+audit token, binds one fixed worker through a domain-separated digest plus
+linear private-endpoint receipt, and permits no verified peer until bounded
+nonblocking cleanup returns a typed exact-worker-reap proof. Worker slots and
+generations cannot be reused before reap, and authority loss never falls back
+to a numeric PID. Unit tests and adversarial type checks cover those source invariants. A
+nested-tracer native test also proves the exact kernel recovery step when a
+target stops its broker. A local Developer ID matrix additionally proves that
+Security can apply the exact signed client's designated requirement to the
+kernel audit token on a raw launchd Mach request: wrong-identifier and ad-hoc
+clients fail that requirement, while unsigned and post-signing-mutated clients
+are killed before service authorization. This is per-user mechanism evidence:
+no root privileged-service installation, UID
+separation, immutable downstream policy, or delegation evidence exists. The
+standing 2026-07-13 decision keeps public
+macOS fail-closed rather than weakening the contract. See
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) for the
-evidence and native gate. No service artifact is implemented.
+evidence and native gate.
 The prototype coordinator opens an absolute
 regular non-setid executable with `O_NOFOLLOW`, retains its stable
 device/inode/size identity, launches the explicit argv/environment with
@@ -1006,8 +1054,10 @@ macOS does not provide a path-independent `posix_spawn`-from-fd operation here,
 so the claim is the exact documented pre/post stable-image comparison plus a
 retained opened owner, not Linux `execveat` equivalence or replacement denial.
 
-Before the deadline-bound private-port receive, the exact child is handed to a
-durable sole-waiter worker whose Drop only requests termination. Canonical
+Before the deadline-bound private-port receive, the suspended child's exact
+audit identity is installed in a durable sole-waiter worker and the child is
+resumed with that identity. The worker's Drop only requests termination.
+Canonical
 HELLO records bind runtime page/cache-line and lock-free atomic facts; a fresh
 challenge orders coordinator then receiver ACCEPT/REJECT. Role-scoped evidence
 is minted only after exact bilateral ACCEPT. Accepted control and mixed
@@ -1021,10 +1071,14 @@ Local Apple Silicon tests cover private production accept, both rejection
 directions, stalled post-authentication HELLO deadline, bounded duplex control,
 mixed activation, and exact `Exited(0)` direct-child facts. The public macOS
 facade has a non-ignored fail-closed regression; its success-path integration
-tests remain ignored until an exact pre-bootstrap lifecycle boundary exists.
-The audit-token signal path is execution-scoped: post-authentication `exec`
-changes the PID version, so a resulting `ESRCH` while the direct child remains
-alive is reported as incomplete cleanup and cannot establish termination.
+tests remain ignored until the independent privileged lifecycle boundary
+exists. The production-shaped direct-target prototype still uses the
+execution-scoped audit-token signal path: post-authentication `exec` changes
+the PID version and invalidates the retained task-name right, so a resulting
+`ESRCH` while the direct child remains alive is reported as incomplete cleanup.
+The private traced-launcher gate is deliberately not wired to that path until
+a separately packaged trusted launcher and independently privileged broker
+exist.
 Fresh-session descendants remain explicitly `FreshGroupUnverified`: the worker
 owns only the exact direct-child wait and does not claim a race-resistant group
 handle or capability revocation. Exact-tip hosted, exact-release packaged,
@@ -1038,10 +1092,12 @@ physical release-host, RT, and release evidence remain absent.
   PGID between any leader check and `kill(-pgid)`. Ordinary and escaped
   descendants therefore remain unverified without stronger trusted cgroup,
   broker, or namespace containment.
-- macOS: the private prototype spawn establishes a fresh POSIX session, while the durable
-  worker owns only the exact direct-child wait. Linux's pidfd evidence does not
-  establish a race-resistant macOS group handle, so descendants remain
-  `FreshGroupUnverified`.
+- macOS: the public-shaped direct-target prototype establishes a fresh POSIX
+  session, while the durable worker owns only the exact direct-child wait, so
+  descendants remain `FreshGroupUnverified`. The private traced-launcher gate
+  additionally proves direct fork/spawn denial with hard `RLIMIT_NPROC=1` and
+  exact ptrace cleanup, but same-UID broker `SIGSTOP` and launchd/XPC delegation
+  keep it out of the public construction.
 - Windows: feasible by creating the child suspended, assigning it to an
   unnamed kill-on-close Job before resume, rejecting setup if assignment or
   required Job policy fails, and retaining process/thread/Job handles in RAII.

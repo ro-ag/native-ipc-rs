@@ -244,16 +244,31 @@ one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
 lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
 composition prototype exists privately but the public entry points remain
-fail-closed: direct spawn has no PID-reuse-safe termination authority before the
-first audit-bearing Mach message without transferring a forbidden task port.
-A preinstalled signed launchd/XPC service is a necessary candidate boundary,
-but it is insufficient across supervisor crash without additional
-crash-surviving OS containment. A primary-source investigation confirmed no documented
-public mechanism provides crash-surviving exact containment without task
-ports, and a standing decision keeps public macOS fail-closed rather than
-re-scoping the contract; both are documented in
+fail-closed. The backend now privately implements a trusted-launcher gate: the
+launcher authenticates its broker, enters cooperative `ptrace`, proves the
+trace relationship with a stopped handshake, installs a hard
+`RLIMIT_NPROC=1`, and execs under the kernel's pre-first-instruction trap. The
+broker can stop and `PT_KILL` that exact unreaped tracee, and broker death makes
+XNU kill it. Native tests also prove the remaining blocker: same-UID target
+code can send unmaskable `SIGSTOP` to the broker and indefinitely suspend that
+authority. A repeated nested-tracer test now proves that an outer watchdog can
+`PT_KILL` and reap that exact stopped broker, after which XNU removes its exact
+tracee without a PID lookup; production privilege separation is still absent.
+Restoring launchd bootstrap for libxpc also leaves delegated XPC work outside
+the rlimit. Backend-private source models now additionally enforce one bounded,
+absolute-deadline, nonce/generation-bound installed-policy spawn request, opaque
+watchdog session handles with linear exact-broker/reap proofs, and an
+abort-on-failure permanent UID/GID/group drop for the future launcher. A fused
+authentication-adapter model also retains each exact Mach frame through a
+fixed one-job worker, binds its private reply endpoint with a linear receipt,
+and mints no peer authority before typed exact worker reap. Its cleanup API
+makes only bounded nonblocking progress and never reconstructs a worker from a
+PID. These models are not packaged service artifacts and have no positive
+root/signing evidence. Public macOS therefore still needs an independently
+privileged, authenticated launchd/Mach service/watchdog and remains fail-closed; the proof and residual
+constraints are documented in
 [`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md). No
-service artifact exists. The three extracted `cargo package` crates rebuild and
+service or launcher artifact exists. The three extracted `cargo package` crates rebuild and
 pass the all-feature and no-default workspace suites on physical Apple Silicon
 at its recorded head and on native Windows AMD64 in this working tree. Windows
 public sessions bind held executable identity, PID-authenticated message

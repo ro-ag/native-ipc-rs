@@ -5,7 +5,9 @@ Windows composition, and the blocked macOS 6d prototype. It is not vNext
 completion evidence. Linux and Windows compose the safe public session/control
 surface. macOS privately composes READY/COMMIT, all-or-nothing activation, and
 the active-resource ledger, but public spawn/bootstrap remain fail-closed
-pending exact pre-bootstrap termination.
+pending an independently privileged containment authority. The private
+bootstrap now also carries the cooperative trace handshake, hard no-fork
+limit, exec trap, and exact ptrace lifecycle used by its native proof corpus.
 
 ## Dead-code suppression inventory
 
@@ -23,8 +25,13 @@ yet reachable.
 | `lib.rs` | 4 | unfinished private modules | `batch`, `control`, `liveness`, and `negotiation` remain private until full composition. |
 | `backend/mod.rs` | 3 | unfinished role evidence and target-specific | The backend-wide allowance covers unreachable role-scoped evidence and accepted transport traits; target-only compilation retains the macOS and `linux_vnext` module allowances. The retained legacy-free Linux allocator overrides the blanket with `deny(dead_code)`. |
 | `memory.rs` | 4 | unfinished native batch composition | Incarnation, logical length, and native manifest derivation are consumed by the Linux private batch adapter and will be required by the other target adapters. |
-| `session.rs` | 9 | unfinished target negotiation composition | Verified atomic discovery and required-width validation remain private HELLO inputs; Linux and Windows consume the public variants, while blocked macOS variants preserve the reviewed prototype and production spawn/bootstrap fail closed pending exact pre-bootstrap termination. |
+| `session.rs` | 9 | unfinished target negotiation composition | Verified atomic discovery and required-width validation remain private HELLO inputs; Linux and Windows consume the public variants, while blocked macOS variants preserve the reviewed prototype and production spawn/bootstrap fail closed pending public crash-surviving exact containment. |
 | `backend/macos.rs` | 2 | target-specific landed backend | The consuming local/remote writer owners are used by the macOS transfer path; the broad struct allowances currently cover target-only fields and should be narrowed only with native macOS warning checks. |
+| `backend/macos/supervisor.rs` | module-private | future signed-service boundary | Bounded authentication/spawn framing, absolute Darwin deadline, exact-Mach-audit peer facts, freshness types, and immutable installed-policy resolution intentionally remain unreachable until the privileged raw Mach adapter exists. |
+| `backend/macos/supervisor_auth_adapter.rs` | module-private | future fused Mach/Security boundary | The source-native raw receiver enforces canonical audit trailers, bounded malformed/complex/oversize cleanup, linear send-once replies, and authentication-before-routing. Fixed-capacity one-job workers bind retained exact-message bytes/token/credentials/deadline to actual one-shot pipe FDs and typed exact clean reap. The direct-child owner signals only under a sole-waiter unreaped-child relation and fails stop after authority loss. Accepted spawn freshness remains bound to the request's send-once reply through later transformations. A one-shot non-sendable startup token verifies main-thread, pre-thread, default-zombie SIGCHLD prerequisites and blocks SIGCHLD, but intentionally exposes no production child constructor until the installed clean-exec spawner can own the whole spawn-to-armed transition. It exposes no PID, signal, task, path, requirement-string, or filesystem deputy and remains unreachable until an installed service supplies the separately packaged worker and complete process-wide waiter policy. |
+| `backend/macos/supervisor_client.rs` | module-private | future signed-service client | One-shot client authentication binds the installed service's exact-message identity, fresh reply facts, and single spawn effect. Its receive-only spawn result accepts only an authenticated opaque handle or coarse failure; no production ready encoder or public session consumes it yet. |
+| `backend/macos/supervisor_watchdog.rs` | module-private | future privileged watchdog | Opaque session state and linear exact broker/reap proofs model cleanup ownership without exposing PID/signal/task authority; no launchd service consumes them yet. |
+| `backend/macos/supervisor_launcher.rs` | module-private | future packaged launcher | The trace/session/target-bound irreversible ID drop and immediate-exec transition may run only in the separately packaged single-threaded launcher; the library process must never call it. |
 
 ### Obsolete Linux code removed
 
@@ -63,7 +70,7 @@ are concentrated as follows.
 | `backend/linux_vnext/memory.rs` | 121 | Exact Nth preparation/seal/advice/activation failures, native-object substitution, full-mixed-batch attenuation, mapping/drop observations, and fd/map baselines. |
 | `backend/linux_vnext/spawn.rs` | 27 | Entropy, inherited-fd, credential, send/receive, poison, and exact-child publication faults. |
 | `backend/linux_vnext/process.rs` | 15 | Signal, poll, wait/reap, auto-reap, and terminal-cleanup fault injection. |
-| `backend/macos/bootstrap.rs` | 16 | Mach send/receive shape and deadline faults, right-drop observations, exact-child wait interruption/delay, lifecycle extraction, and native helper behavior. |
+| `backend/macos/bootstrap.rs` | 39 | Mach send/receive shape and deadline faults, right-drop observations, exact-child wait interruption/delay, suspended task/audit and proc-identity characterization, task-identity-token exec behavior, cooperative trace/exec/crash/stop paths, hard no-fork limits, trusted-launcher handshake, exact ptrace lifecycle, and native helper behavior. |
 | `backend/macos.rs` | 5 | Mapping/right creation and protection-failure observations for adjacent native memory tests. |
 | `liveness.rs` | 7 | Session-ledger observations, exact charge accounting, and mapping-before-lease destruction evidence. |
 | `region.rs` | 7 | Prepared-owner destruction ordering observations. |

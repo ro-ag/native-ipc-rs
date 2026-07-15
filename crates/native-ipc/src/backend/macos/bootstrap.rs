@@ -55,7 +55,17 @@ const TIMEOUT_MS: u32 = 10_000;
 pub(super) const MAX_VNEXT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_VNEXT_CAPABILITIES: usize = 16;
 const WNOHANG: c_int = 1;
+const WUNTRACED: c_int = 2;
 const ESRCH: c_int = 3;
+const SIGSTOP: c_int = 17;
+const SIGCONT: c_int = 19;
+const PT_TRACE_ME: c_int = 0;
+const PT_CONTINUE: c_int = 7;
+const PT_KILL: c_int = 8;
+const RLIMIT_NPROC: c_int = 7;
+const TASK_AUDIT_TOKEN: c_int = 15;
+const TASK_AUDIT_TOKEN_COUNT: u32 = 8;
+const POSIX_SPAWN_START_SUSPENDED: i16 = 0x0080;
 const POSIX_SPAWN_SETSID: i16 = 0x0400;
 const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 
@@ -80,7 +90,14 @@ unsafe extern "C" {
     ) -> MachMsgReturn;
     fn mach_msg_destroy(message: *mut MachMsgHeader);
     fn proc_signal_with_audittoken(token: *mut AuditToken, signal: c_int) -> c_int;
+    fn getppid() -> Pid;
+    fn ptrace(request: c_int, pid: Pid, address: *mut c_void, data: c_int) -> c_int;
+    fn raise(signal: c_int) -> c_int;
+    fn setrlimit(resource: c_int, limit: *const ResourceLimit) -> c_int;
+    fn task_name_for_pid(task: MachPort, pid: Pid, name: *mut MachPort) -> c_int;
+    fn task_info(task: MachPort, flavor: c_int, information: *mut c_int, count: *mut u32) -> c_int;
     fn task_get_special_port(task: MachPort, which: c_int, port: *mut MachPort) -> c_int;
+    fn task_set_special_port(task: MachPort, which: c_int, port: MachPort) -> c_int;
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_setspecialport_np(
@@ -136,9 +153,15 @@ struct MachMsgPortDescriptor {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AuditToken {
     values: [u32; 8],
+}
+
+#[repr(C)]
+struct ResourceLimit {
+    current: u64,
+    maximum: u64,
 }
 
 #[repr(C)]
@@ -214,6 +237,11 @@ pub enum BootstrapError {
     DeadlineExpired,
     /// A send completed at the deadline boundary with ambiguous peer state.
     Ambiguous,
+    /// Exact child authority could not be retained, so no numeric signal was sent.
+    ExactAuthorityUnavailable {
+        /// Native capture error when one was available.
+        native_error: Option<c_int>,
+    },
 }
 
 impl fmt::Display for BootstrapError {
@@ -307,6 +335,71 @@ impl Drop for ReceiveRight {
     }
 }
 
+/// Low-privilege kernel identity for one exact Mach task.
+///
+/// Unlike a task-control port this right cannot suspend, mutate, or terminate
+/// the task. It lets the suspended-spawn path obtain an execution-scoped audit
+/// token before the child runs. Native testing shows that an ordinary `exec`
+/// invalidates this right, so it is not a cross-exec lifecycle capability.
+struct TaskNameRight(MachPort);
+
+impl TaskNameRight {
+    fn capture_suspended(pid: Pid) -> Result<(Self, AuditToken), BootstrapError> {
+        Self::capture(pid)
+    }
+
+    fn capture(pid: Pid) -> Result<(Self, AuditToken), BootstrapError> {
+        let mut name = MACH_PORT_NULL;
+        // SAFETY: the output pointer is valid. Callers that require a proof
+        // against PID reuse must independently establish that the process
+        // cannot exit during this numeric lookup; the production spawn path
+        // does so by keeping the fresh child suspended.
+        mach("task_name_for_pid", unsafe {
+            task_name_for_pid(current_task(), pid, &mut name)
+        })?;
+        if name == MACH_PORT_NULL {
+            return Err(BootstrapError::InvalidMessage);
+        }
+        let right = Self(name);
+        let audit = right.audit_token()?;
+        // SAFETY: `audit` came from TASK_AUDIT_TOKEN for this exact task.
+        let actual = unsafe { audit_token_to_pid(audit) };
+        if actual != pid {
+            return Err(BootstrapError::WrongPeer {
+                expected: pid as u32,
+                actual: actual as u32,
+            });
+        }
+        Ok((right, audit))
+    }
+
+    fn audit_token(&self) -> Result<AuditToken, BootstrapError> {
+        let mut audit = AuditToken { values: [0; 8] };
+        let mut count = TASK_AUDIT_TOKEN_COUNT;
+        // SAFETY: TASK_AUDIT_TOKEN writes exactly `count` natural words into
+        // the aligned audit-token storage, and this object owns a live task-
+        // name send right accepted by `task_info` for this flavor.
+        mach("task_info(TASK_AUDIT_TOKEN)", unsafe {
+            task_info(
+                self.0,
+                TASK_AUDIT_TOKEN,
+                audit.values.as_mut_ptr().cast(),
+                &mut count,
+            )
+        })?;
+        if count != TASK_AUDIT_TOKEN_COUNT {
+            return Err(BootstrapError::InvalidMessage);
+        }
+        Ok(audit)
+    }
+}
+
+impl Drop for TaskNameRight {
+    fn drop(&mut self) {
+        deallocate_port(current_task(), self.0);
+    }
+}
+
 /// Parent-owned exact helper and authenticated bidirectional Mach channel.
 pub struct SpawnedHelper {
     pid: Pid,
@@ -371,7 +464,7 @@ impl SpawnedHelper {
             spawn_result(unsafe {
                 posix_spawnattr_setflags(
                     &mut guard.0,
-                    POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT,
+                    POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT,
                 )
             })?;
         }
@@ -418,7 +511,33 @@ impl SpawnedHelper {
         deallocate_port(current_task(), receive.0);
         spawn_result(result)?;
         if let Some(owner) = &lifecycle {
+            let (task_name, mut audit_token) = match TaskNameRight::capture_suspended(pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // A hostile process-global SIGCHLD policy or broad waiter
+                    // can consume an externally killed child and release its
+                    // PID before this branch runs. Once exact task authority
+                    // acquisition fails, never fall back to a numeric signal.
+                    // Perform no PID-addressed action at all: after auto-reap,
+                    // even waitpid could consume a different concurrently
+                    // spawned direct child that reused the numeric PID. An
+                    // unobservable suspended child therefore remains an
+                    // explicit incomplete-cleanup failure of this private
+                    // prototype rather than a risk to another child.
+                    owner.request_termination();
+                    return Err(BootstrapError::ExactAuthorityUnavailable {
+                        native_error: bootstrap_native_error(&error),
+                    });
+                }
+            };
+            owner.install_task_identity(task_name, audit_token);
             owner.activate(pid);
+            // Resume the exact captured execution rather than addressing the
+            // reusable PID with a numeric SIGCONT.
+            if let Err(error) = signal_with_audit_token(&mut audit_token, SIGCONT) {
+                owner.request_termination();
+                return Err(BootstrapError::Spawn(error));
+            }
         }
         Ok(Self {
             pid,
@@ -461,7 +580,14 @@ impl SpawnedHelper {
                 return Err((error, lifecycle.terminate_and_reap_facts(deadline)));
             }
         };
-        lifecycle.install_audit_token(child_audit);
+        if let Err(error) = lifecycle.install_authenticated_audit_token(child_audit) {
+            drop(child_send);
+            drop(receive);
+            return Err((
+                bootstrap_lifecycle_error(error),
+                lifecycle.terminate_and_reap_facts(deadline),
+            ));
+        }
         let channel = ParentChannel {
             peer_send: child_send,
             _receive: receive,
@@ -561,12 +687,15 @@ struct MacChildLifecycleState {
     reaped: bool,
     last_error: Option<i32>,
     exit_status: Option<i32>,
+    task_name: Option<TaskNameRight>,
     audit_token: Option<AuditToken>,
 }
 
 struct MacChildLifecycleShared {
     pid: AtomicI32,
     terminate: AtomicBool,
+    traced: AtomicBool,
+    reaper_gate: Mutex<()>,
     state: Mutex<MacChildLifecycleState>,
     changed: Condvar,
     #[cfg(test)]
@@ -585,10 +714,13 @@ impl MacChildLifecycle {
         let shared = Arc::new(MacChildLifecycleShared {
             pid: AtomicI32::new(0),
             terminate: AtomicBool::new(false),
+            traced: AtomicBool::new(false),
+            reaper_gate: Mutex::new(()),
             state: Mutex::new(MacChildLifecycleState {
                 reaped: false,
                 last_error: None,
                 exit_status: None,
+                task_name: None,
                 audit_token: None,
             }),
             changed: Condvar::new(),
@@ -622,11 +754,55 @@ impl MacChildLifecycle {
         self.shared.pid.load(Ordering::Acquire) as u32
     }
 
-    fn install_audit_token(&self, audit_token: AuditToken) {
+    fn install_task_identity(&self, task_name: TaskNameRight, audit_token: AuditToken) {
         let mut state = lock_lifecycle(&self.shared.state);
+        debug_assert!(state.task_name.is_none());
         debug_assert!(state.audit_token.is_none());
+        state.task_name = Some(task_name);
         state.audit_token = Some(audit_token);
         self.shared.changed.notify_all();
+    }
+
+    fn install_authenticated_audit_token(
+        &self,
+        audit_token: AuditToken,
+    ) -> Result<(), SessionTransportError> {
+        let mut state = lock_lifecycle(&self.shared.state);
+        if let Some(task_name) = &state.task_name {
+            let current = task_name
+                .audit_token()
+                .map_err(bootstrap_lifecycle_transport_error)?;
+            if current != audit_token {
+                return Err(SessionTransportError::IdentityMismatch);
+            }
+        }
+        state.audit_token = Some(audit_token);
+        self.shared.changed.notify_all();
+        Ok(())
+    }
+
+    fn mark_traced(&self) {
+        self.shared.traced.store(true, Ordering::Release);
+        self.shared.changed.notify_all();
+    }
+
+    fn pause_reaping(&self) -> MacReapingPause<'_> {
+        MacReapingPause {
+            _guard: match self.shared.reaper_gate.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn current_task_audit_token_for_test(&self) -> Result<AuditToken, BootstrapError> {
+        let state = lock_lifecycle(&self.shared.state);
+        state
+            .task_name
+            .as_ref()
+            .ok_or(BootstrapError::InvalidMessage)?
+            .audit_token()
     }
 
     pub(super) fn try_poll(&self) -> Result<PeerState, SessionTransportError> {
@@ -721,6 +897,10 @@ impl MacChildLifecycle {
     pub(super) fn interrupt_wait_for_test(&self, count: u64) {
         self.shared.wait_interrupts.store(count, Ordering::Release);
     }
+}
+
+struct MacReapingPause<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
 }
 
 fn mac_child_cleanup_facts(result: Result<i32, SessionTransportError>) -> ChildCleanupFacts {
@@ -863,6 +1043,60 @@ impl ParentChannel {
             bytes: record.bytes,
             rights: record.rights,
         })
+    }
+
+    /// Completes the broker half of the cooperative traced-launcher gate.
+    ///
+    /// The child must call [`ChildChannel::prepare_traced_target_exec`] and
+    /// exec the target immediately after that method returns.
+    pub(super) fn start_traced_launcher(
+        &mut self,
+        lifecycle: &MacChildLifecycle,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        let pid = self.peer_pid as Pid;
+        if lifecycle.pid() != self.peer_pid {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        // Darwin reports traced stops to waitpid even without WUNTRACED. Keep
+        // the background sole waiter from consuming either handshake stop.
+        let _reaping_pause = lifecycle.pause_reaping();
+
+        let (_self_task, self_audit) = TaskNameRight::capture(std::process::id() as Pid)
+            .map_err(bootstrap_lifecycle_transport_error)?;
+        let mut launchd_bootstrap = MACH_PORT_NULL;
+        // SAFETY: output storage is valid for one copied send right.
+        let result = unsafe {
+            task_get_special_port(current_task(), TASK_BOOTSTRAP_PORT, &mut launchd_bootstrap)
+        };
+        if result != KERN_SUCCESS || launchd_bootstrap == MACH_PORT_NULL {
+            return Err(SessionTransportError::Native(Some(result)));
+        }
+        let launchd_bootstrap = SendRight(launchd_bootstrap);
+        self.send_vnext_capabilities(
+            &encode_audit_token(self_audit),
+            &[launchd_bootstrap.0],
+            deadline,
+        )?;
+
+        if self.receive_vnext_zero_rights(1, deadline)? != [1] {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        let status = wait_for_traced_stop_until(pid, deadline)?;
+        if traced_stop_signal(status) != Some(SIGSTOP) {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        lifecycle.mark_traced();
+        ptrace_continue(pid)?;
+
+        if self.receive_vnext_zero_rights(1, deadline)? != [2] {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        let status = wait_for_traced_stop_until(pid, deadline)?;
+        if traced_stop_signal(status) != Some(5) {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        ptrace_continue(pid)
     }
 
     #[cfg(test)]
@@ -1148,6 +1382,80 @@ impl ChildChannel {
             bytes: record.bytes,
             rights: record.rights,
         })
+    }
+
+    /// Establishes cooperative tracing and an irreversible no-descendants
+    /// limit before a trusted launcher execs untrusted target code.
+    pub(super) fn prepare_traced_target_exec(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        let bootstrap = self.receive_vnext_capabilities(32, deadline)?;
+        if bootstrap.bytes.len() != 32 || bootstrap.rights.len() != 1 {
+            return Err(SessionTransportError::MalformedRecord);
+        }
+        let expected_parent_audit = decode_audit_token(&bootstrap.bytes)?;
+        // SAFETY: the authenticated broker transferred one live send right to
+        // its launchd bootstrap namespace. The MIG call copies that send right
+        // into this task's special-port slot before target exec.
+        let result = unsafe {
+            task_set_special_port(current_task(), TASK_BOOTSTRAP_PORT, bootstrap.rights[0].0)
+        };
+        if result != KERN_SUCCESS {
+            return Err(SessionTransportError::Native(Some(result)));
+        }
+
+        let parent_pid = self.parent_pid as Pid;
+        let (parent_task, parent_audit) =
+            TaskNameRight::capture(parent_pid).map_err(bootstrap_lifecycle_transport_error)?;
+        if parent_audit != expected_parent_audit {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        // SAFETY: getppid has no preconditions.
+        if unsafe { getppid() } != parent_pid {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        // SAFETY: the trusted launcher voluntarily binds tracing to its exact
+        // current parent. XNU rechecks reparenting while establishing it.
+        if unsafe { ptrace(PT_TRACE_ME, 0, std::ptr::null_mut(), 0) } != 0 {
+            return Err(last_native_error());
+        }
+        if parent_task
+            .audit_token()
+            .map_err(bootstrap_lifecycle_transport_error)?
+            != parent_audit
+        {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+        // SAFETY: getppid has no preconditions.
+        if unsafe { getppid() } != parent_pid {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+
+        self.send_vnext_zero_rights(&[1], deadline)?;
+        // SAFETY: this creates a traced stop that only the intended broker can
+        // observe and continue, proving the relationship before target exec.
+        if unsafe { raise(SIGSTOP) } != 0 {
+            return Err(last_native_error());
+        }
+        if parent_task
+            .audit_token()
+            .map_err(bootstrap_lifecycle_transport_error)?
+            != parent_audit
+        {
+            return Err(SessionTransportError::IdentityMismatch);
+        }
+
+        let limit = ResourceLimit {
+            current: 1,
+            maximum: 1,
+        };
+        // SAFETY: install an irreversible hard per-UID process limit before
+        // target exec. Non-root code cannot raise it again.
+        if unsafe { setrlimit(RLIMIT_NPROC, &limit) } != 0 {
+            return Err(last_native_error());
+        }
+        self.send_vnext_zero_rights(&[2], deadline)
     }
 
     pub(super) fn try_poll_vnext_peer(&self) -> Result<PeerState, SessionTransportError> {
@@ -1803,6 +2111,23 @@ fn bootstrap_lifecycle_error(error: SessionTransportError) -> BootstrapError {
     }
 }
 
+fn bootstrap_lifecycle_transport_error(error: BootstrapError) -> SessionTransportError {
+    match error {
+        BootstrapError::Mach { code, .. } | BootstrapError::Spawn(code) => {
+            SessionTransportError::Native(Some(code))
+        }
+        BootstrapError::WrongPeer { .. } => SessionTransportError::IdentityMismatch,
+        BootstrapError::DeadlineExpired => SessionTransportError::DeadlineExpired,
+        BootstrapError::Ambiguous => SessionTransportError::Ambiguous,
+        BootstrapError::ExactAuthorityUnavailable { native_error } => {
+            SessionTransportError::Native(native_error)
+        }
+        BootstrapError::InvalidMessage | BootstrapError::InvalidEnvironment => {
+            SessionTransportError::MalformedRecord
+        }
+    }
+}
+
 fn destroy_legacy_received_if_complex(buffer: &mut ReceiveBuffer) {
     if buffer.message.header.bits & MACH_MSGH_BITS_COMPLEX != 0 {
         // SAFETY: the kernel delivered a complex message into this live buffer.
@@ -1816,6 +2141,96 @@ fn lock_lifecycle(
     match state.lock() {
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn encode_audit_token(token: AuditToken) -> [u8; 32] {
+    let mut encoded = [0_u8; 32];
+    for (destination, value) in encoded.chunks_exact_mut(4).zip(token.values) {
+        destination.copy_from_slice(&value.to_ne_bytes());
+    }
+    encoded
+}
+
+fn decode_audit_token(encoded: &[u8]) -> Result<AuditToken, SessionTransportError> {
+    if encoded.len() != 32 {
+        return Err(SessionTransportError::MalformedRecord);
+    }
+    let mut values = [0_u32; 8];
+    for (destination, source) in values.iter_mut().zip(encoded.chunks_exact(4)) {
+        *destination = u32::from_ne_bytes(
+            source
+                .try_into()
+                .map_err(|_| SessionTransportError::MalformedRecord)?,
+        );
+    }
+    Ok(AuditToken { values })
+}
+
+fn last_native_error() -> SessionTransportError {
+    SessionTransportError::Native(std::io::Error::last_os_error().raw_os_error())
+}
+
+fn traced_stop_signal(status: c_int) -> Option<c_int> {
+    (status & 0xff == 0x7f).then_some((status >> 8) & 0xff)
+}
+
+fn wait_for_traced_stop_until(
+    pid: Pid,
+    deadline: AbsoluteDeadline,
+) -> Result<c_int, SessionTransportError> {
+    loop {
+        let mut status = 0;
+        // SAFETY: the caller is the exact parent/tracer and output is valid.
+        let result = unsafe { waitpid(pid, &mut status, WNOHANG | WUNTRACED) };
+        if result == pid {
+            if traced_stop_signal(status).is_some() {
+                return Ok(status);
+            }
+            return Err(SessionTransportError::PeerExited);
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(SessionTransportError::Native(error.raw_os_error()));
+        }
+        if deadline.remaining().is_zero() {
+            return Err(SessionTransportError::DeadlineExpired);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn ptrace_continue(pid: Pid) -> Result<(), SessionTransportError> {
+    // SAFETY: address 1 is Darwin's sentinel for continuing at the current
+    // program counter; the caller already observed this exact tracee stopped.
+    if unsafe {
+        ptrace(
+            PT_CONTINUE,
+            pid,
+            std::ptr::without_provenance_mut::<c_void>(1),
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(last_native_error())
+    }
+}
+
+fn signal_with_audit_token(token: &mut AuditToken, signal: c_int) -> Result<(), i32> {
+    // SAFETY: the token was supplied by the kernel for the exact task-name
+    // right retained by this lifecycle owner.
+    let result = unsafe { proc_signal_with_audittoken(token, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(result))
     }
 }
 
@@ -1836,19 +2251,40 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             continue;
         }
 
+        // Serialize every lifecycle signal/wait decision with the launch
+        // handshake. A concurrent termination request must not inject a stop
+        // between the launcher's proof SIGSTOP and its exec SIGTRAP.
+        let reaper_gate = match shared.reaper_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
         if shared.terminate.load(Ordering::Acquire) && !termination_attempted {
-            let audit_token = lock_lifecycle(&shared.state).audit_token;
-            if let Some(mut audit_token) = audit_token {
+            if shared.traced.load(Ordering::Acquire) {
                 termination_attempted = true;
-                // SAFETY: this kernel-supplied audit token names the exact
-                // authenticated child execution, including its PID version.
-                let result = unsafe { proc_signal_with_audittoken(&mut audit_token, 9) };
-                // ESRCH is only benign if the exact direct child is already
-                // observable below. A post-authentication exec changes the
-                // audit-token PID version while leaving the child alive, so
-                // suppressing ESRCH here would strand the sole waiter.
-                if result != 0 {
-                    pending_signal_error = Some(result);
+                // The sole waiter has not reaped this direct child, so a live
+                // child owns this PID and an exited child remains a PID-pinning
+                // zombie. The numeric stop therefore cannot hit a replacement.
+                // SAFETY: pid is this worker's exact unreaped traced child.
+                if unsafe { kill(pid, SIGSTOP) } != 0 {
+                    let error = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(ESRCH);
+                    if error != ESRCH {
+                        pending_signal_error = Some(error);
+                    }
+                }
+            } else {
+                let audit_token = lock_lifecycle(&shared.state).audit_token;
+                if let Some(mut audit_token) = audit_token {
+                    termination_attempted = true;
+                    if let Err(error) = signal_with_audit_token(&mut audit_token, 9) {
+                        // A post-capture `exec` changes the audit-token PID version.
+                        // The private exact-signal SPI then returns ESRCH while the
+                        // direct child may still be alive; retain that incomplete
+                        // cleanup fact rather than falling back to its numeric PID.
+                        pending_signal_error = Some(error);
+                    }
                 }
             }
         }
@@ -1874,8 +2310,31 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
 
         let mut status = 0;
         // SAFETY: this worker is the sole waiter for the exact spawned PID.
-        let result = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        let wait_options = if termination_attempted && shared.traced.load(Ordering::Acquire) {
+            WNOHANG | WUNTRACED
+        } else {
+            WNOHANG
+        };
+        // The traced-launcher handshake holds this gate while it consumes the
+        // initial SIGSTOP and exec SIGTRAP. Excluding the background waiter is
+        // mandatory because Darwin reports trace stops to a direct parent even
+        // when its waitpid call omitted WUNTRACED.
+        // SAFETY: this worker is the sole background waiter for the exact
+        // spawned PID, and the handshake gate excludes its only peer.
+        let result = unsafe { waitpid(pid, &mut status, wait_options) };
         if result == pid {
+            if traced_stop_signal(status).is_some() {
+                // SAFETY: XNU accepts PT_KILL only from this tracee's exact
+                // tracer while the tracee is stopped.
+                if unsafe { ptrace(PT_KILL, pid, std::ptr::null_mut(), 0) } != 0 {
+                    pending_signal_error = Some(
+                        std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(ESRCH),
+                    );
+                }
+                continue;
+            }
             let mut state = lock_lifecycle(&shared.state);
             state.reaped = true;
             state.exit_status = Some(status);
@@ -1899,6 +2358,7 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             shared.changed.notify_all();
         }
 
+        drop(reaper_gate);
         let state = lock_lifecycle(&shared.state);
         let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
             Ok(result) => result,
@@ -1951,6 +2411,18 @@ fn spawn_result(code: c_int) -> Result<(), BootstrapError> {
         Ok(())
     } else {
         Err(BootstrapError::Spawn(code))
+    }
+}
+
+const fn bootstrap_native_error(error: &BootstrapError) -> Option<c_int> {
+    match error {
+        BootstrapError::Mach { code, .. } | BootstrapError::Spawn(code) => Some(*code),
+        BootstrapError::ExactAuthorityUnavailable { native_error } => *native_error,
+        BootstrapError::InvalidMessage
+        | BootstrapError::WrongPeer { .. }
+        | BootstrapError::InvalidEnvironment
+        | BootstrapError::DeadlineExpired
+        | BootstrapError::Ambiguous => None,
     }
 }
 fn hex(bytes: &[u8]) -> String {

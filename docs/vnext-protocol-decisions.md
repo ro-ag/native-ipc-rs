@@ -155,22 +155,99 @@ public API exposes this transport only from an authenticated `Session<Ready>`.
 The blocked macOS Arm64 prototype uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
 ownership plus the held image through prototype Ready; public construction
-remains fail-closed pending pre-bootstrap exact termination. Windows publicly
+remains fail-closed pending independently privileged exact containment. The
+backend-private trusted-launcher path authenticates its broker, establishes
+cooperative tracing before untrusted exec, proves the relationship with a
+stopped handshake, lowers hard `RLIMIT_NPROC` to one, and crosses exec through
+the kernel's trace trap before target code. This gives exact direct-child
+termination and fork denial while the broker runs, and XNU kills the tracee if
+the broker exits. It still does not satisfy the public contract because a
+same-UID target can `SIGSTOP` that broker indefinitely and restored launchd/XPC
+delegation is outside the rlimit. Windows publicly
 composes the canonical records over its exact-PID named pipe, held suspended
 image, and kill-on-close Job. Its Negotiating/Ready owners expose only the same
 portable control, mixed-batch, active-mapping, and lifecycle surface as Linux.
 
 ## macOS supervisor lifecycle candidate
 
-Any viable public macOS construction needs a preinstalled signed launchd/XPC
-service, not a broker spawned by the client library. An authentication-only
+Any viable public macOS construction needs a preinstalled, independently
+privileged signed launchd service/watchdog, not a same-UID broker spawned by
+the client library. An authentication-only
 nonce exchange and explicit code-requirement checks precede the spawn-bearing
-request, which carries bounded command/image/nonce/deadline policy. Lifecycle
+request, which carries only a bounded installed-policy identifier, additional
+arguments, allowlisted environment values, freshness facts, and one absolute
+deadline. The immutable signed/root-owned catalog selects the executable,
+argv0, code requirements, and target identity. Lifecycle
 commands carry only a fresh opaque session identifier; numeric helper PIDs and
 task ports are never wire authority. The service serializes signal selection
 with reap-and-tombstone and compares the complete helper audit execution
 identity on every Mach record. The candidate is insufficient across service
-crash because the parent wait authority and in-memory table disappear; no
-documented public crash-surviving exact containment primitive has been
-identified. Public macOS remains architecture-blocked and fail-closed; see
+deployment because a same-UID target can stop the broker indefinitely. The
+trace relationship now supplies exact broker-exit cleanup, and a nested-tracer
+native test proves an independent watchdog's exact stopped-broker recovery, but
+the privileged service boundary is not implemented. The backend-private
+protocol model now admits only one bounded, absolute-deadline,
+exact-message-authenticated installed-policy launch bound to fresh
+client/service nonces, a connection generation, and a sequence. A one-shot
+client authenticates the service reply before emitting that effect; exact
+UID/GID facts require a raw Mach audit trailer, not public XPC snapshots.
+The permanent watchdog must also keep Security.framework off its lifecycle
+loop. Each dynamic guest check runs in one of a fixed number of disposable
+worker processes over a private capability channel. The fixed job and result
+bind the exact 32-byte audit token, digest of the exact retained bytes, live-job
+ID, worker generation, and the original absolute deadline. Client-selected
+connection generations are excluded from pre-authentication jobs and capacity.
+A
+linear non-serializable receipt binds completion to the assigned private reply
+endpoint. That receipt now owns the actual nonblocking result FD: the parent
+submits one atomic 152-byte frame, closes the sole request writer, and accepts
+only one exact 200-byte result followed by EOF. Every pending/error token keeps
+the exact slot and generation for cancellation or reap retry. Late, replayed,
+mismatched, saturated, or wrong-worker results fail
+closed; authority is minted only after bounded nonblocking observation returns
+a typed normal-status-zero exact-worker-reap proof. A sole-waiter direct-child
+owner may signal the numeric PID only while a live child or unreaped zombie pins
+it; `ECHILD` fails stop without fallback. A wedged worker retains exact unreaped-child
+authority and is exactly terminated and reaped before replacement; no
+replacement restarts the deadline. Live replay state is bounded, and strictly
+increasing worker generations make a retired endpoint unreachable even if a
+random job ID coincidentally repeats. Only immutable installed requirements may
+be cached, never dynamic validation across tokens or messages. The
+backend-private raw receiver now authenticates before routing: a canonical hello
+may create fresh connection state only after full validation, while a spawn
+exposes its generation only after validation and exact worker reap. Wrong-peer
+or wrong-nonce traffic cannot poison the selected live connection.
+The client then remains in `AwaitingSpawnResult` until an exact authenticated
+sequence-one reply carries either a nonzero opaque handle or one of four coarse
+failures. The wire contains no PID, signal, path, task port, audit token, errno,
+or OSStatus. This is receive-only: production success emission remains absent
+until it can consume watchdog trace/readiness proof while retaining the exact
+Mach reply right.
+The watchdog-side proof is now a linear value minted only by the unexpired
+registered Starting-to-Traced transition. Expiry enters exact deadline cleanup
+and mints no proof. An undeliverable proof consumes into a distinct
+cleanup reason; exact-reap failure keeps the same table entry and first reason
+for retry. This still supplies no production Ready encoder: the next boundary
+must keep the proof and exact authenticated send-once right inseparable through
+send and cleanup. The accepted spawn wrapper now preserves the exact decoded
+generation, sequence, client nonce, and service nonce with that linear reply
+right through both successful and failed transformations. It still cannot emit
+Ready or substitute for the armed watchdog cleanup guard required at send time.
+The auth-worker source also has a one-shot, main-thread-only child wait-domain
+initializer that rejects an already-threaded process, custom/ignored SIGCHLD,
+and `SA_NOCLDWAIT`, installs canonical default zombie semantics, and blocks
+SIGCHLD before service threads inherit their masks. The production child
+constructor remains absent until one concrete clean-exec spawner can own the
+entire successful `posix_spawn` to armed exact-worker transition without a
+fallible PID-only gap.
+The watchdog model exposes only connection-bound opaque handles and retains
+linear exact broker authority through a typed reap proof. The launcher-only
+transition binds the exact traced session and validated installed target to
+group/credential drop and immediate exec. These are source constraints, not a
+signed or installed service. The production boundary must permanently
+drop the launcher/target to the authenticated nonroot client identity, expose
+no arbitrary signaling or execution deputy, survive client/broker stops, and
+prove that delegated launchd/XPC work is either forbidden or outside the
+owned-principal contract. Public macOS remains architecture-blocked and
+fail-closed; see
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
