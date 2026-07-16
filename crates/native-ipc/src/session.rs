@@ -46,14 +46,27 @@ static RECEIVER_BOOTSTRAP_TAKEN: AtomicBool = AtomicBool::new(false);
 ///
 /// This function may be invoked only by the ELF loader through a
 /// `.preinit_array` entry in the initial receiver executable. Its pointers must
-/// be the loader-supplied initial argument and environment vectors.
+/// be the loader-supplied initial argument and environment vectors. The hook is
+/// a no-op on non-Linux targets solely to keep the helper-only signature
+/// platform-neutral.
 #[doc(hidden)]
-#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn __receiver_bootstrap_preinit(
-    _argument_count: libc::c_int,
-    _arguments: *mut *mut libc::c_char,
-    environment: *mut *mut libc::c_char,
+    _argument_count: core::ffi::c_int,
+    _arguments: *mut *mut core::ffi::c_char,
+    environment: *mut *mut core::ffi::c_char,
 ) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the public hook forwards the loader-supplied environment under
+    // the same pre-initializer contract.
+    unsafe {
+        receiver_bootstrap_preinit_linux(environment);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = environment;
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn receiver_bootstrap_preinit_linux(environment: *mut *mut libc::c_char) {
     // This ELF pre-initializer runs before Rust main and ordinary init-array
     // constructors. It performs no allocation and publishes only after all
     // exact child/descriptor facts and immediate CLOEXEC installation pass.

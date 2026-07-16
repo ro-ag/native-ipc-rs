@@ -17,6 +17,11 @@ Supported targets are Linux and Windows on ARM64 or AMD64, and macOS on ARM64:
 `aarch64-apple-darwin`. Other OS/architecture combinations fail compilation
 instead of selecting an unaudited fallback.
 
+The consumer declarations are identical for a fixed feature set on all five
+targets. The published-0.4 versus unreleased-vNext boundary and complete module
+inventory are documented in the repository's
+[public API surface](https://github.com/ro-ag/native-ipc-rs/blob/main/docs/public-api.md).
+
 The `native_ipc::memory` module provides one allocation and lifecycle API for
 the best native object on the current target — sealed `memfd` on Linux, Mach
 VM memory entries on macOS, and unnamed sections on Windows — so application

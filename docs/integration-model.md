@@ -143,7 +143,9 @@ byte-for-byte the same types on every target. The only platform-specific public
 surface is a small set of `#[doc(hidden)]` macOS entry points
 (`__private_macos_*`) used solely when a deployer compiles the macOS helper
 executables; they are not part of the consumer API and do not appear in the
-rendered docs.
+rendered docs. The complete inventory, stability boundary, and enforcement are
+in [`public-api.md`](public-api.md). This is source compatibility, not a stable
+ABI or equal private type layout.
 
 ## Reference proofs
 

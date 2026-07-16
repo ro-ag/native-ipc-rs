@@ -120,7 +120,9 @@ platform; only the underlying kernel mechanism differs (see
 [supported targets](#supported-targets)). The shared-memory allocation core
 ships on all platforms. The unreleased vNext session composition is public on
 Linux and Windows, while public macOS spawn/bootstrap remain unavailable pending
-the explicit Plan 8b enable-or-defer decision.
+the explicit Plan 8b enable-or-defer decision. The exact module inventory,
+cross-target enforcement, and published-0.4 versus experimental-vNext boundary
+are recorded in [`docs/public-api.md`](docs/public-api.md).
 
 ## How memory is accessed
 
