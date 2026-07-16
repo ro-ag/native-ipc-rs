@@ -67,7 +67,8 @@ pub unsafe fn __private_macos_broker_gate_main(installed_path: &std::ffi::CStr) 
 /// pre-creates its fixed clean-exec authentication worker, spawns the fixed
 /// launcher, delivers the plan, verifies the target at its exec trap, reports
 /// the held trace state, and resumes only after the Ready-bound reverse commit.
-/// Public macOS construction remains fail-closed and does not call this entry.
+/// Public macOS construction uses the direct-spawn session path and does not
+/// call this entry.
 ///
 /// # Safety
 ///

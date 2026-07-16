@@ -73,7 +73,7 @@ runtime composition is unavailable:
 | --- | --- | --- |
 | Linux GNU AMD64/Arm64 | Available | `backend_status()` returns `BackendStatus::Available`; publicly composed. |
 | Windows AMD64/Arm64 | Available | `backend_status()` returns `BackendStatus::Available`; publicly composed. |
-| macOS Arm64 | Available | `backend_status()` returns `BackendStatus::Unavailable`; a valid public spawn/bootstrap attempt returns `SessionError::BackendUnavailable` and remains fail-closed. |
+| macOS Arm64 | Available | `backend_status()` returns `BackendStatus::Available`; publicly composed over the audit-token-authenticated direct-spawn path (enabled 2026-07-16). |
 
 Both the const status query and backend-unavailable result are behavior of the
 common API, not missing macOS declarations or target-specific compile features.

@@ -68,8 +68,12 @@ Graceful close returns the live session when active leases or child cleanup
 still need attention; explicit abort invalidates retained mappings and preserves
 bounded cleanup diagnostics.
 
-The macOS Arm64 prototype reaches the same private reducer but remains
-fail-closed at public spawn/bootstrap. Its backend-private trusted launcher
+macOS Arm64 publicly composes the same Negotiating/Ready typestate surface:
+public spawn opens and holds the configured executable, spawns it directly,
+authenticates the exact child over the audit-token/nonce Mach bootstrap,
+re-verifies the spawned image, and owns exact direct-child termination,
+reaping, and bounded cleanup facts. Separately, its backend-private trusted
+launcher
 authenticates the broker, enters cooperative `ptrace`, proves the relationship
 with a stopped handshake, installs hard `RLIMIT_NPROC=1`, and execs through the
 kernel's pre-first-instruction trap. Exact stopped `PT_KILL`, tracer-death kill,
@@ -77,13 +81,12 @@ and post-exec fork denial pass native tests. The inherited SBPL profile also
 denies outbound signals and launchd Mach lookup/registration before and after
 target exec. The hidden fixed broker caller composes launcher spawn, FD 4 plan
 delivery, clean-exec signature verification, FD 5 trace reporting/Ready-bound
-resume, and exact target reap through one child wait domain. These are
-source/native mechanism results only: deployer-supplied broker, launcher, and
-worker artifacts are not installed, signed, packaged, notarized, or proven
-replacement-resistant; no deployer capability allowlist is complete; and public
-enablement remains a separate user decision. Public macOS therefore remains
-`BackendUnavailable`. Consumers can query this common, const API before
-constructing a session, or handle the construction result directly:
+resume, and exact target reap through one child wait domain. That launcher
+machinery is for deployer-built helper artifacts and is not part of the public
+constructor path; its artifacts are not installed, signed, packaged,
+notarized, or proven replacement-resistant, and no deployer capability
+allowlist is complete. Consumers can query the common, const availability API
+before constructing a session, or handle the construction result directly:
 
 ```rust
 use native_ipc::session::{BackendStatus, SessionError, backend_status};
@@ -99,9 +102,10 @@ if let Err(SessionError::BackendUnavailable) = construction_result {
 }
 ```
 
-The declarations do not vary by target: Linux and Windows report `Available`,
-while macOS Arm64 reports `Unavailable`. This query concerns only the vNext
-session layer; the published native-memory API remains available on macOS.
+The declarations do not vary by target: Linux, macOS Arm64, and Windows all
+report `Available`; `Unavailable` remains reserved for targets whose adapter
+is not composed. This query concerns only the vNext session layer; the
+published native-memory API is available everywhere regardless.
 Windows publicly composes the same Negotiating/Ready typestate surface over its
 unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and
