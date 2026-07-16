@@ -155,8 +155,9 @@ public API exposes this transport only from an authenticated `Session<Ready>`.
 The blocked macOS Arm64 prototype uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
 ownership plus the held image through prototype Ready; public construction
-remains fail-closed pending completion of the decided enable path's installed
-same-user helper evidence (Option B chosen 2026-07-16; see
+remains fail-closed pending the decided enable path: public session wiring
+plus a green macOS run of the cross-platform public session conformance corpus
+(Option B chosen 2026-07-16; see
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md)). The
 backend-private trusted-launcher path authenticates its broker, establishes
 cooperative tracing before untrusted exec, proves the relationship with a
@@ -277,5 +278,6 @@ arbitrary signaling or execution deputy and forbids blanket launchd lookup and
 registration before target exec. An installed deployment must prove that
 immutable profile, survive client/broker stops, and account explicitly for any
 future service allowlist. Public macOS remains fail-closed until the decided
-enable path's installed evidence is complete; see
+enable path's public wiring and macOS conformance corpus are complete;
+installed-artifact proof is deployment responsibility. See
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).

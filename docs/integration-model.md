@@ -22,8 +22,9 @@ this one wins.
    (pidfd + owned cleanup; suspended spawn + kill-on-close Job). On macOS it is
    an unprivileged ptrace/sandbox design that is **not enabled** — the public
    macOS backend is currently `BackendUnavailable`; the enable path is decided
-   (2026-07-16) but flips only after installed-artifact evidence. The model
-   below describes the design and its scope, not a shipping macOS promise.
+   (2026-07-16) and flips once the public session wiring and the macOS run of
+   the cross-platform session conformance corpus are green. The model below
+   describes the design and its scope, not a shipping macOS promise.
 
 ## The integration model
 
@@ -112,8 +113,8 @@ payloads and must configure any desired filesystem, network, or platform sandbox
   delegation path in the backend-private design. A future deployer capability
   profile may replace that blanket denial only with an explicit service
   allowlist; each allowlisted service is delegated authority that the deployment
-  must account for. Public macOS remains disabled until its separate enablement
-  decision and installed-artifact evidence are complete.
+  must account for. Public macOS remains disabled until the decided enable
+  path's public wiring and macOS conformance corpus are complete.
 - **macOS mechanism caveat.** The unprivileged containment relies on
   `sandbox_init` (deprecated) and SBPL (undocumented). It is an empirical property
   of the current OS, verified by measurement, not a supported API contract.
