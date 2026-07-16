@@ -57,7 +57,7 @@ artifact can be changed retroactively.
 | `batch` | `TransferBatch`, `ExpectedRegion`, `ExpectedBatch`, `ActiveRegionSet`, `BatchError` | vNext bounded 1..=16 mixed-direction transaction and committed keyed result. |
 | `control` | `ControlFrame`, `ControlError`, `APPLICATION_CONTROL_KIND_MIN` | vNext bounded opaque application-control record. |
 | `active` | `ActiveReader`, `ActiveWriter`, `AccessError`, `PrefaultResult` | vNext checked runtime copy/fill/prefault access; raw pointers only with the explicit feature. |
-| `session` | role/state markers and `Session<Role, State>` aliases; bootstrap/command/options/limits/deadline; negotiation/control/batch operations; lifecycle, failure, peer, exit, cleanup, atomic, and lease facts | vNext authenticated exact-child session, negotiation, transfer, control, and lifecycle ownership. |
+| `session` | role/state markers and `Session<Role, State>` aliases; `BackendStatus`/`backend_status`; bootstrap/command/options/limits/deadline; negotiation/control/batch operations; lifecycle, failure, peer, exit, cleanup, atomic, and lease facts | vNext authenticated exact-child session, negotiation, transfer, control, and lifecycle ownership. |
 
 The two `RegionOptions` types are intentionally distinct during the migration:
 `memory::RegionOptions` belongs to the published 0.4 private-memory lifecycle;
@@ -71,14 +71,16 @@ runtime composition is unavailable:
 
 | Target | Published `memory` API | vNext public session construction |
 | --- | --- | --- |
-| Linux GNU AMD64/Arm64 | Available | Publicly composed. |
-| Windows AMD64/Arm64 | Available | Publicly composed. |
-| macOS Arm64 | Available | `CoordinatorSession::<Negotiating>::spawn` returns `SessionError::BackendUnavailable`; public bootstrap/session composition remains fail-closed. |
+| Linux GNU AMD64/Arm64 | Available | `backend_status()` returns `BackendStatus::Available`; publicly composed. |
+| Windows AMD64/Arm64 | Available | `backend_status()` returns `BackendStatus::Available`; publicly composed. |
+| macOS Arm64 | Available | `backend_status()` returns `BackendStatus::Unavailable`; a valid public spawn/bootstrap attempt returns `SessionError::BackendUnavailable` and remains fail-closed. |
 
-The backend-unavailable result is behavior of the common API, not a missing
-macOS declaration. Plan 8b task 58 owns any further first-class availability
-query or reporting shape. This inventory neither chooses nor authorizes the
-separate macOS enablement decision.
+Both the const status query and backend-unavailable result are behavior of the
+common API, not missing macOS declarations or target-specific compile features.
+Unsupported OS/architecture combinations still fail compilation at the crate
+boundary. The status concerns only vNext lifecycle/session construction; it
+does not disable the published macOS memory API. This inventory neither chooses
+nor authorizes the separate macOS enablement decision.
 
 ## Non-consumer hooks
 

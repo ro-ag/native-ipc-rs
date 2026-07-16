@@ -82,7 +82,26 @@ source/native mechanism results only: deployer-supplied broker, launcher, and
 worker artifacts are not installed, signed, packaged, notarized, or proven
 replacement-resistant; no deployer capability allowlist is complete; and public
 enablement remains a separate user decision. Public macOS therefore remains
-`BackendUnavailable`.
+`BackendUnavailable`. Consumers can query this common, const API before
+constructing a session, or handle the construction result directly:
+
+```rust
+use native_ipc::session::{BackendStatus, SessionError, backend_status};
+
+match backend_status() {
+    BackendStatus::Available => { /* construct the role-typed session */ }
+    BackendStatus::Unavailable => { /* use a supported fallback */ }
+}
+
+# let construction_result: Result<(), SessionError> = Ok(());
+if let Err(SessionError::BackendUnavailable) = construction_result {
+    // The target's public session composition is intentionally fail-closed.
+}
+```
+
+The declarations do not vary by target: Linux and Windows report `Available`,
+while macOS Arm64 reports `Unavailable`. This query concerns only the vNext
+session layer; the published native-memory API remains available on macOS.
 Windows publicly composes the same Negotiating/Ready typestate surface over its
 unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and

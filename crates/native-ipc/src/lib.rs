@@ -139,10 +139,3 @@ pub unsafe fn __private_macos_auth_worker_main(
         backend::macos::run_fixed_auth_worker_process(installed_path, requirement, code_identity)
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum BackendStatus {
-    Available,
-    Incomplete(&'static str),
-}

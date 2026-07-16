@@ -147,6 +147,13 @@ rendered docs. The complete inventory, stability boundary, and enforcement are
 in [`public-api.md`](public-api.md). This is source compatibility, not a stable
 ABI or equal private type layout.
 
+`session::backend_status()` makes lifecycle availability explicit through the
+same `BackendStatus` type on every supported target. Linux and Windows report
+`Available`; macOS Arm64 reports `Unavailable`, and valid construction attempts
+return `SessionError::BackendUnavailable`. This does not compile out any
+consumer declaration, disable macOS shared memory, or enable the private macOS
+supervisor.
+
 ## Reference proofs
 
 The mechanism is demonstrated end to end, unprivileged, in

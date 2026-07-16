@@ -123,6 +123,12 @@ Linux and Windows, while public macOS spawn/bootstrap remain unavailable pending
 the explicit Plan 8b enable-or-defer decision. The exact module inventory,
 cross-target enforcement, and published-0.4 versus experimental-vNext boundary
 are recorded in [`docs/public-api.md`](docs/public-api.md).
+Consumers can inspect this through the common const
+`native_ipc::session::backend_status()` API: Linux and Windows report
+`BackendStatus::Available`, while macOS Arm64 reports
+`BackendStatus::Unavailable` and valid construction attempts return
+`SessionError::BackendUnavailable`. The status applies only to the vNext
+session layer; macOS shared-memory allocation remains available.
 
 ## How memory is accessed
 

@@ -13,6 +13,16 @@ assert_impl_all!(ReceiverBootstrap: Send);
 assert_not_impl_any!(ReceiverBootstrap: Sync, Clone, Copy);
 
 #[test]
+fn public_session_backend_status_is_first_class_and_target_exact() {
+    let expected = if cfg!(target_os = "macos") {
+        BackendStatus::Unavailable
+    } else {
+        BackendStatus::Available
+    };
+    assert_eq!(backend_status(), expected);
+}
+
+#[test]
 fn public_session_inputs_are_explicit_bounded_and_role_typed() {
     let command = SessionCommand::new("/absolute/helper")
         .arg("--mode")
@@ -74,6 +84,7 @@ fn public_session_inputs_are_explicit_bounded_and_role_typed() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_public_spawn_remains_fail_closed_until_explicit_enablement() {
+    assert_eq!(backend_status(), BackendStatus::Unavailable);
     let command = SessionCommand::new(std::env::current_exe().unwrap());
     let options = SessionOptions::new(
         AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),

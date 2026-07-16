@@ -241,6 +241,34 @@ pub struct Negotiating;
 /// Bilaterally accepted state that may carry bounded application control.
 pub struct Ready;
 
+/// Availability of the public lifecycle/session composition on this target.
+///
+/// This status applies only to the vNext session layer. The published shared-
+/// memory API remains available on every supported target. Consumers may use
+/// [`backend_status`] as a const preflight or handle
+/// [`SessionError::BackendUnavailable`] from a construction attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    /// Public spawn and inherited-bootstrap session construction are composed.
+    Available,
+    /// The target is supported, but public session construction is fail-closed.
+    Unavailable,
+}
+
+/// Reports whether the public lifecycle/session composition is available.
+///
+/// Linux and Windows report [`BackendStatus::Available`]. macOS Arm64 reports
+/// [`BackendStatus::Unavailable`]; a valid public spawn or bootstrap attempt
+/// returns [`SessionError::BackendUnavailable`] without enabling the private
+/// experimental supervisor path.
+pub const fn backend_status() -> BackendStatus {
+    if cfg!(target_os = "macos") {
+        BackendStatus::Unavailable
+    } else {
+        BackendStatus::Available
+    }
+}
+
 /// Accepted wire protocol version bound into both challenged ACCEPT frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolVersion {

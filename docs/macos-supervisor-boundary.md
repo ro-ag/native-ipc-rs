@@ -3,6 +3,8 @@
 Status: backend-private same-user launcher lifecycle implemented and natively
 tested; public macOS session construction remains `BackendUnavailable` pending
 the explicit Plan 8b enable-or-defer decision and installed-artifact evidence.
+The common `session::backend_status()` query therefore reports
+`BackendStatus::Unavailable` on macOS Arm64.
 
 This document is subordinate to
 [`integration-model.md`](integration-model.md) and the normative
