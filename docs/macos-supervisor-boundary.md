@@ -106,7 +106,22 @@ death is reaped before a PID-free outcome is returned; any later traced stop
 is terminal and exact-cleaned. Service EOF or a bad gate byte wins through a
 final post-wait probe: a still-live or stopped target exact-cleans, while an
 already reaped target only changes the terminal classification. The fixed
-launcher spawner/entry remains unimplemented.
+launcher spawner and entry exist as source mechanisms, but no production
+service caller or separately installed launcher artifact exists yet.
+
+A native pre-main fixture now enters through the production
+`LauncherSpawnResources` file actions and attributes rather than reconstructing
+them in test code. Inside the spawned image it verifies the exact fixed argv,
+three-entry canonical environment, `/dev/null` descriptors 0 through 2,
+read-only anonymous FIFO readers at FD 3
+and FD 4 with `FD_CLOEXEC` cleared only for those destinations, and no open
+descriptor above FD 4. The parent deliberately retains an inheritable sentinel
+descriptor, so the fixture also proves `POSIX_SPAWN_CLOEXEC_DEFAULT` excludes
+unrelated broker authority. It inspects `TASK_BOOTSTRAP_PORT` and rejects a
+receive right, but deliberately accepts either the requested dead name or the
+known live send-right residual: current Darwin restores a live launchd
+bootstrap right, so this fixture does not claim launchd is unreachable. That
+delegation gap remains issue #9 and keeps public macOS fail-closed.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it
