@@ -50,6 +50,94 @@ fn manifest(entries: Vec<crate::protocol::ManifestEntry>) -> TransferManifest {
     .unwrap()
 }
 
+fn run_full_cycle(count: usize) {
+    let (batch, expected) = build_batch(count);
+    let prepared =
+        MacMixedDirectionBatch::prepare(batch, NativeAuthorityProfile::MacMachV1, deadline())
+            .unwrap();
+    let transfer = manifest(prepared.manifest_entries());
+    let rights = prepared.copied_capabilities_for_test().unwrap();
+    let expected =
+        MacExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+            .unwrap();
+    let imported = expected.import(&transfer, rights).unwrap();
+    // Drop both sides: the imported activation owners and the coordinator-side
+    // prepared batch. Every native mapping, memory entry, and send right must
+    // be released here.
+    drop(imported.into_active_region_owners());
+    drop(prepared);
+}
+
+#[test]
+fn native_owner_lifecycle_has_no_leak_across_ten_thousand_cycles() {
+    const COUNT: usize = 2;
+    const CYCLES: usize = 10_000;
+    // Calibrate the exact native drop events for one full prepare, import,
+    // activate, and drop cycle.
+    let calibration = Arc::new(Mutex::new(Vec::new()));
+    set_vnext_drop_observer_for_test(Some(calibration.clone()));
+    run_full_cycle(COUNT);
+    set_vnext_drop_observer_for_test(None);
+    let per_cycle = calibration.lock().unwrap().len();
+    assert!(per_cycle > 0, "a full cycle must drop native owners");
+    // Every subsequent cycle must drop exactly the same owners. Any leak,
+    // double-drop, or accumulation over ten thousand iterations changes the
+    // total, so an exact multiple is the leak baseline.
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    set_vnext_drop_observer_for_test(Some(drops.clone()));
+    for _ in 0..CYCLES {
+        run_full_cycle(COUNT);
+    }
+    set_vnext_drop_observer_for_test(None);
+    assert_eq!(
+        drops.lock().unwrap().len(),
+        per_cycle * CYCLES,
+        "every native owner released across {CYCLES} cycles with no leak"
+    );
+}
+
+#[test]
+fn native_owner_drop_order_is_leak_free_in_both_permutations() {
+    fn cycle_drops(drop_imported_first: bool) -> usize {
+        let (batch, expected) = build_batch(4);
+        let prepared =
+            MacMixedDirectionBatch::prepare(batch, NativeAuthorityProfile::MacMachV1, deadline())
+                .unwrap();
+        let transfer = manifest(prepared.manifest_entries());
+        let rights = prepared.copied_capabilities_for_test().unwrap();
+        let expected =
+            MacExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+                .unwrap();
+        let owners = expected
+            .import(&transfer, rights)
+            .unwrap()
+            .into_active_region_owners();
+        // Observe only the two owner drops so the count reflects the release
+        // order under test, not the transient import churn.
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        set_vnext_drop_observer_for_test(Some(drops.clone()));
+        if drop_imported_first {
+            drop(owners);
+            drop(prepared);
+        } else {
+            drop(prepared);
+            drop(owners);
+        }
+        set_vnext_drop_observer_for_test(None);
+        drops.lock().unwrap().len()
+    }
+    let imported_first = cycle_drops(true);
+    let prepared_first = cycle_drops(false);
+    assert!(
+        imported_first > 0,
+        "dropping the owners must release natives"
+    );
+    assert_eq!(
+        imported_first, prepared_first,
+        "both endpoints release the same native owners regardless of drop order"
+    );
+}
+
 #[test]
 fn mixed_batches_prepare_import_and_activate_complementary_authority() {
     for count in [1, 2, 4, 16] {
