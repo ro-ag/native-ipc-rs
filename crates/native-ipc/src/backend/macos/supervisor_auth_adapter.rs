@@ -42,7 +42,7 @@ pub(super) mod broker_plan;
 pub(in crate::backend::macos) mod broker_report;
 
 #[path = "supervisor_auth_worker_spawn.rs"]
-mod auth_worker_spawn;
+pub(in crate::backend::macos::supervisor) mod auth_worker_spawn;
 
 #[path = "supervisor_auth_worker_entry.rs"]
 pub(in crate::backend::macos) mod auth_worker_entry;
@@ -1066,7 +1066,7 @@ const fn wait_status_is_clean_exit(status: c_int) -> bool {
 
 /// Failure to establish the permanent process-wide auth-worker wait domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ChildWaitDomainError {
+pub(in crate::backend::macos::supervisor) enum ChildWaitDomainError {
     /// Another owner already claimed the process-wide auth-worker wait domain.
     AlreadyClaimed,
     /// The current SIGCHLD disposition could not be queried.
@@ -1115,7 +1115,8 @@ impl DedicatedChildWaitDomain {
     /// must serialize every later child creation through an exclusive borrow
     /// of this domain, never race a raw fork/spawn against pipe CLOEXEC setup,
     /// and never change SIGCHLD disposition or enable `SA_NOCLDWAIT`.
-    unsafe fn establish_at_service_startup() -> Result<Self, ChildWaitDomainError> {
+    pub(in crate::backend::macos::supervisor) unsafe fn establish_at_service_startup()
+    -> Result<Self, ChildWaitDomainError> {
         // SAFETY: these public Darwin queries have no arguments or side effects.
         if unsafe { pthread_main_np() } == 0 {
             return Err(ChildWaitDomainError::NotMainThread);
@@ -1184,7 +1185,9 @@ impl DedicatedChildWaitDomain {
         })
     }
 
-    fn verify_single_threaded_spawn(&mut self) -> Result<(), ChildWaitDomainError> {
+    pub(in crate::backend::macos::supervisor) fn verify_single_threaded_spawn(
+        &mut self,
+    ) -> Result<(), ChildWaitDomainError> {
         #[cfg(test)]
         if self.bypass_spawn_recheck {
             return Ok(());
@@ -1214,6 +1217,14 @@ impl DedicatedChildWaitDomain {
             return Err(ChildWaitDomainError::SigchldNotBlocked);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::backend::macos::supervisor) fn for_spawn_test() -> Self {
+        Self {
+            _not_send_or_sync: PhantomData,
+            bypass_spawn_recheck: true,
+        }
     }
 
     fn query_disposition() -> Result<DarwinSigaction, ChildWaitDomainError> {
@@ -1271,7 +1282,7 @@ enum DirectChildState {
 /// version, or other reconstructible identity. Its only permission to use the
 /// numeric PID is the kernel's unreaped-direct-child relation: a live child or
 /// zombie pins the PID until this authority's exact `waitpid` consumes it.
-struct DirectChildAuthWorkerAuthority {
+pub(in crate::backend::macos::supervisor) struct DirectChildAuthWorkerAuthority {
     pid: c_int,
     state: DirectChildState,
 }

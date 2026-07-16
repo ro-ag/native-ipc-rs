@@ -42,7 +42,7 @@ use super::super::SupervisorWireError;
 use super::super::auth_adapter::broker_report::{BROKER_RESUME_BYTE, encode_broker_trace_report};
 use super::super::auth_adapter::{
     AuthAdapterError, AuthWorkerPipeFailure, AuthWorkerPool, AuthWorkerResultPoll,
-    ExactAuthWorkerAuthority, FreshAuthJobId,
+    DedicatedChildWaitDomain, ExactAuthWorkerAuthority, FreshAuthJobId,
 };
 use super::{
     ActiveBrokerGate, ActiveBrokerProcess, BrokerEntryError, BrokerGateExit, EAGAIN, EINTR,
@@ -174,6 +174,8 @@ pub(super) enum LauncherSpawnFailure {
     InvalidGate,
     /// A fixed channel pipe failed with this Darwin error number.
     Pipe(c_int),
+    /// The broker no longer owned the permanent single-threaded child wait domain.
+    InvalidWaitDomain,
     /// A descriptor operation failed with this Darwin error number.
     Descriptor(c_int),
     /// A spawn file action failed with this error number.
@@ -400,8 +402,9 @@ pub(super) struct SpawnedLauncher {
 pub(super) fn spawn_fixed_launcher(
     active: ActiveBrokerProcess,
     image: &InstalledLauncherImage,
+    wait_domain: &mut DedicatedChildWaitDomain,
 ) -> Result<SpawnedLauncher, Box<LauncherSpawnError>> {
-    PreparedLauncherSpawn::prepare(active, image)?.spawn_and_arm()
+    PreparedLauncherSpawn::prepare(active, image, wait_domain)?.spawn_and_arm(wait_domain)
 }
 
 /// Complete pre-spawn state for exactly one launcher child.
@@ -429,8 +432,9 @@ impl<'image> PreparedLauncherSpawn<'image> {
     fn prepare(
         active: ActiveBrokerProcess,
         image: &'image InstalledLauncherImage,
+        wait_domain: &mut DedicatedChildWaitDomain,
     ) -> Result<Self, Box<LauncherSpawnError>> {
-        match LauncherSpawnResources::acquire(&active, image) {
+        match LauncherSpawnResources::acquire(&active, image, wait_domain) {
             Ok(resources) => Ok(Self {
                 image,
                 active,
@@ -445,14 +449,15 @@ impl LauncherSpawnResources {
     fn acquire(
         active: &ActiveBrokerProcess,
         image: &InstalledLauncherImage,
+        wait_domain: &mut DedicatedChildWaitDomain,
     ) -> Result<Self, LauncherSpawnFailure> {
         let frame = active
             .plan
             .launcher_frame()
             .map_err(LauncherSpawnFailure::Plan)?;
         let expected_launcher = image.fixed_identity();
-        let (death_reader, death_writer) = create_launcher_pipe()?;
-        let (plan_reader, plan_writer) = create_launcher_pipe()?;
+        let (death_reader, death_writer) = create_launcher_pipe(wait_domain)?;
+        let (plan_reader, plan_writer) = create_launcher_pipe(wait_domain)?;
         // The broker never writes the death pipe and must outlive a launcher
         // that dies mid-frame, so neither retained writer may raise SIGPIPE.
         set_no_sigpipe(death_writer.as_raw_fd())?;
@@ -506,7 +511,10 @@ impl LauncherSpawnResources {
 }
 
 impl PreparedLauncherSpawn<'_> {
-    fn spawn_and_arm(self) -> Result<SpawnedLauncher, Box<LauncherSpawnError>> {
+    fn spawn_and_arm(
+        self,
+        wait_domain: &mut DedicatedChildWaitDomain,
+    ) -> Result<SpawnedLauncher, Box<LauncherSpawnError>> {
         let Self {
             image,
             active,
@@ -524,6 +532,12 @@ impl PreparedLauncherSpawn<'_> {
         // absolute deadline both outrank creating a new process.
         if let Err(failure) = ensure_spawn_admissible(&active) {
             return Err(Box::new(LauncherSpawnError { active, failure }));
+        }
+        if wait_domain.verify_single_threaded_spawn().is_err() {
+            return Err(Box::new(LauncherSpawnError {
+                active,
+                failure: LauncherSpawnFailure::InvalidWaitDomain,
+            }));
         }
 
         let argv = image.argv();
@@ -603,7 +617,12 @@ fn spawn_gate_failure(error: LauncherWaitError) -> LauncherSpawnFailure {
     }
 }
 
-fn create_launcher_pipe() -> Result<(OwnedFd, OwnedFd), LauncherSpawnFailure> {
+fn create_launcher_pipe(
+    wait_domain: &mut DedicatedChildWaitDomain,
+) -> Result<(OwnedFd, OwnedFd), LauncherSpawnFailure> {
+    wait_domain
+        .verify_single_threaded_spawn()
+        .map_err(|_| LauncherSpawnFailure::InvalidWaitDomain)?;
     let mut descriptors = [-1; 2];
     // SAFETY: descriptors points to two writable integers.
     if unsafe { pipe(descriptors.as_mut_ptr()) } != 0 {

@@ -33,6 +33,27 @@ pub(crate) unsafe fn run_fixed_broker_gate_process(installed_path: &std::ffi::CS
     unsafe { supervisor::broker_entry::run_fixed_gate_process(installed_path) }
 }
 
+/// Runs the complete fixed broker launcher lifecycle.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed broker process-entry contract and supply
+/// only verified, deployer-compiled absolute helper paths.
+pub(crate) unsafe fn run_fixed_broker_process(
+    installed_path: &std::ffi::CStr,
+    launcher_path: &std::ffi::CStr,
+    auth_worker_path: &std::ffi::CStr,
+) -> ! {
+    // SAFETY: the caller transfers the complete documented entry contract.
+    unsafe {
+        supervisor::broker_entry::run_fixed_broker_process(
+            installed_path,
+            launcher_path,
+            auth_worker_path,
+        )
+    }
+}
+
 /// Runs the fixed trusted-launcher boundary.
 ///
 /// # Safety

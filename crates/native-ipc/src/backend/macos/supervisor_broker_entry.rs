@@ -17,6 +17,9 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
+use super::auth_adapter::auth_worker_spawn::{
+    InstalledAuthWorkerImage, spawn_installed_auth_worker,
+};
 use super::auth_adapter::broker_plan::{
     AcknowledgedBrokerLaunchPlan, BROKER_ACK_BYTES, BROKER_PLAN_PREFIX_BYTES,
     ExactParentBrokerLaunchPlan, MAX_BROKER_PLAN_BYTES, ReceivedBrokerLaunchPlan, broker_plan_ack,
@@ -29,10 +32,17 @@ use super::auth_adapter::broker_spawn::{
     BROKER_CONTROL_FD, BROKER_GATE_FD, BROKER_TRACE_FD, INSTALLED_BROKER_MODE,
     INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT, INSTALLED_TRACE_ARGUMENT, START_BYTE,
 };
+use super::auth_adapter::{
+    AuthWorkerPool, DedicatedChildWaitDomain, DirectChildAuthWorkerAuthority, FreshAuthJobId,
+    FreshAuthWorkerGeneration,
+};
 use super::{SupervisorWireError, is_deployer_helper_path};
 
 #[path = "supervisor_broker_launcher.rs"]
 pub(super) mod broker_launcher;
+
+use crate::backend::macos::bootstrap::random_nonce;
+use broker_launcher::{InstalledLauncherImage, spawn_fixed_launcher};
 
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
@@ -873,6 +883,148 @@ impl ActiveBrokerGate {
     fn descriptor(&self) -> c_int {
         self.reader.as_raw_fd()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedBrokerProcessFailure {
+    InvalidEntry,
+    Setup,
+    Protocol,
+    ServiceGone,
+    Launcher,
+}
+
+/// Runs the fixed broker's complete launcher lifecycle.
+///
+/// The caller supplies only deployer-compiled installation constants. The
+/// canonical parent plan remains the sole selector for the target, arguments,
+/// environment, identity, and deadline. One permanent wait-domain token owns
+/// both the pre-created authentication worker and the launcher/target direct
+/// child; no public macOS session path calls this entry while the backend is
+/// fail-closed.
+///
+/// # Safety
+///
+/// This must run in the just-execed dedicated broker before threads, children,
+/// policy, or effect-bearing endpoints. The fixed broker spawner must
+/// exclusively transfer descriptors 3 through 5 and the installed process
+/// vector. All three paths must be absolute, deployer-compiled constants whose
+/// exact installed images were verified before the broker was spawned.
+pub(in crate::backend::macos) unsafe fn run_fixed_broker_process(
+    installed_path: &CStr,
+    launcher_path: &CStr,
+    auth_worker_path: &CStr,
+) -> ! {
+    let status = match fixed_broker_process(installed_path, launcher_path, auth_worker_path) {
+        Ok(()) | Err(FixedBrokerProcessFailure::ServiceGone) => 0,
+        Err(FixedBrokerProcessFailure::InvalidEntry) => 64,
+        Err(FixedBrokerProcessFailure::Setup | FixedBrokerProcessFailure::Protocol) => 65,
+        Err(FixedBrokerProcessFailure::Launcher) => 67,
+    };
+    // SAFETY: every owned child and descriptor has reached a terminal RAII
+    // boundary. Avoid arbitrary process-global exit callbacks in the broker.
+    unsafe { _exit(status) }
+}
+
+fn fixed_broker_process(
+    installed_path: &CStr,
+    launcher_path: &CStr,
+    auth_worker_path: &CStr,
+) -> Result<(), FixedBrokerProcessFailure> {
+    validate_fixed_arguments(installed_path, std::env::args_os())
+        .map_err(|_| FixedBrokerProcessFailure::InvalidEntry)?;
+    // SAFETY: the fixed entry contract requires this call on the just-execed
+    // single-threaded broker before any child or competing waiter exists.
+    let mut wait_domain = unsafe { DedicatedChildWaitDomain::establish_at_service_startup() }
+        .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    // SAFETY: the hidden entry contract requires both helper paths to be
+    // deployer-compiled, already verified installation constants.
+    let launcher_image =
+        unsafe { InstalledLauncherImage::from_verified_installation(launcher_path) }
+            .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    // SAFETY: same contract for the fixed clean-exec worker image.
+    let auth_worker_image =
+        unsafe { InstalledAuthWorkerImage::from_verified_installation(auth_worker_path) }
+            .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    // SAFETY: validation above proved the fixed vector; the process-entry
+    // contract transfers exclusive ownership of descriptors 3 through 5.
+    let dormant = unsafe { DormantBrokerGate::adopt_fixed_process(installed_path) }
+        .map_err(|_| FixedBrokerProcessFailure::InvalidEntry)?;
+    let staged = match dormant
+        .stage_plan()
+        .map_err(|_| FixedBrokerProcessFailure::Protocol)?
+    {
+        Ok(staged) => staged,
+        Err(BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone) => {
+            return Err(FixedBrokerProcessFailure::ServiceGone);
+        }
+    };
+    let active = match staged
+        .wait_for_activation()
+        .map_err(|_| FixedBrokerProcessFailure::Protocol)?
+    {
+        Ok(active) => active,
+        Err(BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone) => {
+            return Err(FixedBrokerProcessFailure::ServiceGone);
+        }
+    };
+
+    let random_job = random_nonce().map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    // SAFETY: arc4random_buf returned this nonzero one-job identifier and this
+    // broker creates exactly one auth job during its entire process lifetime.
+    let job_id = unsafe { FreshAuthJobId::from_fresh_random(random_job) }
+        .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    // SAFETY: this broker creates exactly one worker generation in its entire
+    // process lifetime, so generation one is nonzero and never reused.
+    let generation = unsafe { FreshAuthWorkerGeneration::from_unique_service_value(1) }
+        .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    let worker = spawn_installed_auth_worker(&auth_worker_image, generation, &mut wait_domain)
+        .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+    let mut pool: AuthWorkerPool<DirectChildAuthWorkerAuthority> =
+        AuthWorkerPool::from_spawned_workers(vec![worker])
+            .map_err(|_| FixedBrokerProcessFailure::Setup)?;
+
+    let spawned = spawn_fixed_launcher(active, &launcher_image, &mut wait_domain)
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    let initial = spawned
+        .wait_initial_stop()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    let mut awaiting = initial
+        .prove_trace_and_continue_to_exec()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    awaiting
+        .deliver_plan()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    let held = awaiting
+        .wait_exec_trap()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    let verified = held
+        .verify_signature(&mut pool, job_id)
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    let reported = match verified
+        .report_trace_stops()
+        .map_err(|_| FixedBrokerProcessFailure::Protocol)?
+    {
+        Ok(reported) => reported,
+        Err(BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone) => {
+            return Err(FixedBrokerProcessFailure::ServiceGone);
+        }
+    };
+    let committed = match reported
+        .wait_for_ready_commit()
+        .map_err(|_| FixedBrokerProcessFailure::Protocol)?
+    {
+        Ok(committed) => committed,
+        Err(BrokerGateExit::ServiceGoneBeforeActivation | BrokerGateExit::ServiceGone) => {
+            return Err(FixedBrokerProcessFailure::ServiceGone);
+        }
+    };
+    committed
+        .resume_target()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?
+        .wait_for_exit()
+        .map_err(|_| FixedBrokerProcessFailure::Launcher)?;
+    Ok(())
 }
 
 /// Runs the no-callback fixed broker-entry process used by the executable fixture.

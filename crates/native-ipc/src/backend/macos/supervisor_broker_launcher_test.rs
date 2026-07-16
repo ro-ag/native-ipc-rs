@@ -32,6 +32,7 @@ const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::broker_launcher::tests::fixture_target";
 const DEPLOYER_LAUNCHER_PATH: &CStr =
     c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
+const PRODUCTION_BROKER_FIXTURE_SUFFIX: &[u8] = b".native-ipc-production-broker-fixture";
 const PT_TRACE_ME: c_int = 0;
 const ENOENT: c_int = 2;
 const ECHILD: c_int = 10;
@@ -305,11 +306,14 @@ fn uninstalled_fixed_launcher_image_fails_only_at_the_exact_spawn() {
         "this boundary test is only meaningful while the fixed image is absent",
     );
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
-    let (active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("an absent fixed launcher image cannot spawn")
-            .into_parts();
+    let (active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("an absent fixed launcher image cannot spawn")
+    .into_parts();
     // Every pipe, descriptor relocation, file action, spawn attribute, dead-end
     // bootstrap name, expected identity, and the canonical frame were prepared
     // successfully; only the absent fixed path failed. Darwin forks before it
@@ -344,7 +348,11 @@ fn production_spawn_installs_exact_launcher_fd_topology_and_characterizes_bootst
     // SAFETY: the successful F_DUPFD result is a fresh owned descriptor.
     let inherited_sentinel = unsafe { OwnedFd::from_raw_fd(inherited_sentinel) };
 
-    let spawned = match spawn_fixed_launcher(boundary.take_active(), &image) {
+    let spawned = match spawn_fixed_launcher(
+        boundary.take_active(),
+        &image,
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    ) {
         Ok(spawned) => spawned,
         Err(error) => {
             let (_active, failure) = error.into_parts();
@@ -364,11 +372,14 @@ fn production_spawn_installs_exact_launcher_fd_topology_and_characterizes_bootst
 fn service_death_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
     boundary.close_gate();
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("service death must preempt the spawn")
-            .into_parts();
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("service death must preempt the spawn")
+    .into_parts();
     // Service loss outranks creating a child. This must never reach
     // posix_spawn, so it cannot report the absent image instead.
     assert_eq!(failure, LauncherSpawnFailure::ServiceGone);
@@ -378,11 +389,14 @@ fn service_death_preempts_the_fixed_launcher_spawn() {
 fn expired_deadline_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(2));
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("an expired deadline must preempt the spawn")
-            .into_parts();
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("an expired deadline must preempt the spawn")
+    .into_parts();
     // The original absolute deadline is checked while no child exists, so an
     // expired request can never create one.
     assert_eq!(failure, LauncherSpawnFailure::DeadlineExpired);
@@ -393,11 +407,14 @@ fn expired_deadline_preempts_the_fixed_launcher_spawn() {
 fn a_gate_byte_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
     boundary.poison_gate();
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("a noncanonical gate byte must preempt the spawn")
-            .into_parts();
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("a noncanonical gate byte must preempt the spawn")
+    .into_parts();
     // Only EOF is canonical on the gate. A byte is a protocol failure and must
     // not be mistaken for a live service that may spawn a launcher.
     assert_eq!(failure, LauncherSpawnFailure::InvalidGate);
@@ -409,11 +426,25 @@ fn a_gate_byte_preempts_the_fixed_launcher_spawn() {
 static EXACT_LAUNCHER_HOOK: extern "C" fn() = exact_launcher_hook;
 
 extern "C" fn exact_launcher_hook() {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument.as_bytes() == INSTALLED_LAUNCHER_MODE.as_bytes())
-        && production_spawn_has_canonical_environment()
-    {
+    let mut arguments = std::env::args_os();
+    let argument0 = arguments.next();
+    let launcher_mode = arguments
+        .next()
+        .is_some_and(|argument| argument.as_bytes() == INSTALLED_LAUNCHER_MODE.as_bytes());
+    if launcher_mode && production_spawn_has_canonical_environment() {
+        if let Some(argument0) = argument0
+            && argument0
+                .as_bytes()
+                .ends_with(PRODUCTION_BROKER_FIXTURE_SUFFIX)
+        {
+            let installed = CString::new(argument0.as_bytes()).unwrap_or_else(|_| {
+                // SAFETY: the isolated fixture cannot satisfy the entry ABI.
+                unsafe { _exit(105) }
+            });
+            // SAFETY: the production-broker sibling fixture installed this
+            // exact path/vector and the sole FD3/FD4 ownership before exec.
+            unsafe { super::super::super::launcher_entry::run_fixed_launcher_process(&installed) }
+        }
         production_spawn_containment_hook();
     }
 

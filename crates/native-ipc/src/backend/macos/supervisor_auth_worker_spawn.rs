@@ -80,7 +80,7 @@ unsafe extern "C" {
 
 /// Failure before one exact clean-exec worker bundle is armed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AuthWorkerSpawnError {
+pub(in crate::backend::macos::supervisor) enum AuthWorkerSpawnError {
     /// The verified installation vector could not be represented exactly.
     InvalidFixedImage,
     /// The permanent service wait-domain invariant no longer held.
@@ -102,7 +102,7 @@ pub(super) enum AuthWorkerSpawnError {
 /// The worker path, mode, descriptors, and environment are never selected by
 /// a request. The installed runtime must verify the deployer-supplied signed
 /// image before constructing this value.
-pub(super) struct InstalledAuthWorkerImage {
+pub(in crate::backend::macos::supervisor) struct InstalledAuthWorkerImage {
     spawn_path: CString,
     argument0: CString,
     mode: CString,
@@ -122,7 +122,7 @@ impl InstalledAuthWorkerImage {
     /// deployer's helper artifact, not request data. The caller must have
     /// verified that exact path as a replacement-resistant signed clean-exec
     /// worker for this service.
-    pub(super) unsafe fn from_verified_installation(
+    pub(in crate::backend::macos::supervisor) unsafe fn from_verified_installation(
         path: &CStr,
     ) -> Result<Self, AuthWorkerSpawnError> {
         let spawn_path =
@@ -162,7 +162,7 @@ impl InstalledAuthWorkerImage {
 /// One freshly spawned worker inseparably carrying its generation, exact child
 /// authority, and the matching private parent pipe ends.
 #[must_use = "a spawned authentication worker must enter its exact pool slot"]
-pub(super) struct SpawnedAuthWorker {
+pub(in crate::backend::macos::supervisor) struct SpawnedAuthWorker {
     generation: FreshAuthWorkerGeneration,
     worker: ExactAuthWorker<DirectChildAuthWorkerAuthority>,
     endpoint: AuthWorkerEndpoint,
@@ -182,7 +182,7 @@ impl SpawnedAuthWorker {
 
 impl AuthWorkerPool<DirectChildAuthWorkerAuthority> {
     /// Builds the fixed-capacity pool only from complete spawned bundles.
-    pub(super) fn from_spawned_workers(
+    pub(in crate::backend::macos::supervisor) fn from_spawned_workers(
         workers: Vec<SpawnedAuthWorker>,
     ) -> Result<Self, AuthAdapterError<DirectChildAuthWorkerError>> {
         Self::from_precreated_workers(
@@ -209,7 +209,7 @@ impl AuthWorkerPool<DirectChildAuthWorkerAuthority> {
 ///
 /// No fallible work or callback occurs between a positive `posix_spawn`
 /// result and the armed exact direct-child owner.
-pub(super) fn spawn_installed_auth_worker(
+pub(in crate::backend::macos::supervisor) fn spawn_installed_auth_worker(
     image: &InstalledAuthWorkerImage,
     generation: FreshAuthWorkerGeneration,
     wait_domain: &mut DedicatedChildWaitDomain,

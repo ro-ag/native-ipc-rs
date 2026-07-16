@@ -105,9 +105,14 @@ sole-waiter loop with no post-Ready clock veto. Exact natural exit or signal
 death is reaped before a PID-free outcome is returned; any later traced stop
 is terminal and exact-cleaned. Service EOF or a bad gate byte wins through a
 final post-wait probe: a still-live or stopped target exact-cleans, while an
-already reaped target only changes the terminal classification. The fixed
-launcher spawner and entry exist as source mechanisms, but no production
-service caller or separately installed launcher artifact exists yet.
+already reaped target only changes the terminal classification. The hidden
+fixed broker entry now supplies the production source caller for this complete
+chain. It establishes one permanent child wait domain, pre-creates one
+clean-exec authentication worker, and uses that same linear domain for both
+launcher pipe creation and the final launcher spawn. It then drives fixed
+launcher spawn, initial-stop proof, FD 4 plan delivery, exec-trap signature
+verification, FD 5 reporting, Ready-bound RESUME, and exact target exit. No
+separately installed broker, launcher, or worker artifact exists yet.
 
 A native pre-main fixture now enters through the production
 `LauncherSpawnResources` file actions and attributes rather than reconstructing
@@ -122,6 +127,17 @@ receive right, but deliberately accepts either the requested dead name or the
 known live send-right residual: current Darwin restores a live launchd
 bootstrap right, so this fixture does not claim launchd is unreachable. That
 delegation gap remains issue #9 and keeps public macOS fail-closed.
+
+The sibling production-caller fixture copies the test image to one canonical
+absolute path and dispatches its fixed broker, launcher, and worker roles before
+main. Its positive case stages the real broker plan, uses the real launcher
+spawn and FD 4 delivery, submits the held target token to the real clean-exec
+worker, receives the exact FD 5 report, commits RESUME, and observes exact
+target exit. Its negative case substitutes the worker's installed identity and
+proves that neither report nor resume authority can be emitted. The worker uses
+the test-only `always` requirement so this fixture proves orchestration and
+binding, not production certificate policy; the separate opt-in Developer ID
+matrix remains the evidence for a deployer requirement.
 
 This remains source and native mechanism evidence. The test image is a fixed
 local shell used to characterize pipe, spawn, and direct-child semantics; it
