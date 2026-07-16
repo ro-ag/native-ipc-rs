@@ -63,3 +63,18 @@ targets = [
 name = "receiver-main-downstream"
 path = "tests/receiver_main_downstream.rs"
 harness = false
+
+[[test]]
+name = "macos-broker-gate-entry"
+path = "tests/macos_broker_gate_entry.rs"
+harness = false
+
+[[test]]
+name = "macos-auth-worker-entry"
+path = "tests/macos_auth_worker_entry.rs"
+harness = false
+
+[[test]]
+name = "macos-auth-worker-requirement-matrix"
+path = "tests/macos_auth_worker_requirement_matrix.rs"
+harness = false

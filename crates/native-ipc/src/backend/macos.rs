@@ -17,6 +17,51 @@ use native_ipc_core::mapping::{
 };
 
 pub mod bootstrap;
+pub(super) mod supervisor;
+pub(super) mod supervisor_client;
+pub(super) mod supervisor_watchdog;
+
+/// Runs the fixed no-callback broker gate executable boundary.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed broker process-entry contract documented
+/// by the gate runner. This is exposed only for the separate executable crate.
+pub(crate) unsafe fn run_fixed_broker_gate_process() -> ! {
+    // SAFETY: the caller transfers the exact documented entry contract.
+    unsafe { supervisor::broker_entry::run_fixed_gate_process() }
+}
+
+/// Runs the fixed trusted-launcher boundary.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed launcher process-entry contract
+/// documented by the launcher runner. This is exposed only for the separate
+/// executable crate the deployer builds and signs.
+pub(crate) unsafe fn run_fixed_launcher_process() -> ! {
+    // SAFETY: the caller transfers the exact documented entry contract.
+    unsafe { supervisor::launcher_entry::run_fixed_launcher_process() }
+}
+
+/// Runs the fixed clean-exec authentication-worker boundary.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed worker process-entry contract and supply
+/// only compiled installed-policy constants from the separate worker artifact.
+pub(crate) unsafe fn run_fixed_auth_worker_process(
+    requirement: &std::ffi::CStr,
+    code_identity: [u8; 32],
+) -> ! {
+    // SAFETY: the caller transfers the complete documented worker contract.
+    unsafe {
+        supervisor::auth_adapter::auth_worker_entry::run_fixed_auth_worker_process(
+            requirement,
+            code_identity,
+        )
+    }
+}
 
 type KernReturn = c_int;
 type MachPort = u32;

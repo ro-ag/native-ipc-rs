@@ -277,9 +277,24 @@ impl MacCoordinatorNegotiatingSession {
                 .expect("fixed public bootstrap environment"),
         );
 
-        let helper = SpawnedHelper::spawn_explicit(&path, &arguments, &environment)
-            .map_err(map_bootstrap_error)
-            .map_err(MacCoordinatorSessionFailure::before_child)?;
+        let helper = match SpawnedHelper::spawn_explicit(&path, &arguments, &environment) {
+            Ok(helper) => helper,
+            Err(BootstrapError::ExactAuthorityUnavailable { native_error }) => {
+                return Err(MacCoordinatorSessionFailure::after_spawn(
+                    MacPublicSessionError::Native(native_error),
+                    ChildCleanupFacts::new(
+                        None,
+                        DescendantCleanupStatus::FreshGroupUnverified,
+                        native_error,
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(MacCoordinatorSessionFailure::before_child(
+                    map_bootstrap_error(error),
+                ));
+            }
+        };
         let child_pid = helper.pid();
         let (mut channel, lifecycle) = helper
             .authenticate_vnext_until(options.deadline())
@@ -1122,6 +1137,9 @@ fn map_bootstrap_error(error: BootstrapError) -> MacPublicSessionError {
         }
         BootstrapError::Spawn(code) => MacPublicSessionError::Native(Some(code)),
         BootstrapError::Mach { code, .. } => MacPublicSessionError::Native(Some(code)),
+        BootstrapError::ExactAuthorityUnavailable { native_error } => {
+            MacPublicSessionError::Native(native_error)
+        }
     }
 }
 

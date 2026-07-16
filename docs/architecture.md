@@ -315,18 +315,126 @@ cleanup.
 
 The macOS 6d working branch has a private prototype shaped like the public
 typestate surface, but public macOS spawn/bootstrap remain fail-closed. Direct
-spawn cannot exactly terminate a child silent before its first audit-bearing
-Mach message without reusable-PID risk or forbidden task-port authority; a
-supervisor/XPC boundary is required. The private audit-token signal path is
-also execution-scoped: a hostile authenticated child can `exec`, invalidate
-the retained PID version, and remain alive. That `ESRCH` is reported as
-incomplete cleanup rather than suppressed, but exact termination still
-requires the supervisor/XPC boundary. A preinstalled signed launchd/XPC
-service, not a library-spawned broker, is a necessary candidate; it is not
-sufficient across service crash without additional OS-enforced containment.
-The negative result, the primary-source public-API impossibility
-evidence, and the standing 2026-07-13 decision to keep public macOS
-fail-closed are recorded in
+spawn now starts suspended and, in private prototype code, captures a task-name
+right plus `TASK_AUDIT_TOKEN` before resume. Private
+`proc_signal_with_audittoken` therefore exactly terminates a silent direct
+child. The newer backend-private trusted-launcher path continues beyond that
+execution-scoped SPI: it authenticates its broker by full audit token and PPID,
+calls `PT_TRACE_ME`, completes an explicit stopped handshake, installs hard
+`RLIMIT_NPROC=1`, and execs under the kernel's trace trap. The broker consumes
+the exec `SIGTRAP` before target code, and later termination uses stop plus
+`PT_KILL` while the unreaped direct child pins its PID. XNU also kills the exact
+tracee if its tracer exits. A waiter mutex gives the handshake exclusive
+ownership of both trace stops so the background reaper cannot consume them.
+
+This remains a private proof, not a public lifecycle solution. Native
+adversarial evidence shows same-UID target code can send unmaskable `SIGSTOP`
+to its broker and indefinitely suspend deadline/death cleanup. A nested-tracer
+test now proves that an outer watchdog can exact-`PT_KILL`/reap that stopped
+broker and trigger exact tracer-exit cleanup of its target, but the production
+privilege boundary is still absent. The launcher
+must also restore the ordinary launchd bootstrap port before target exec for
+libxpc initialization, so delegated XPC work is not governed by the target's
+rlimit. Cooperative tracing relaxes code-signing enforcement for the
+participating processes and therefore belongs in a minimal boundary. A
+conforming design now requires an independently privileged authenticated
+service/watchdog that the target cannot stop, with the target permanently
+dropped to a nonroot client identity and no confused-deputy signaling or
+arbitrary-exec surface. Backend-private source models now make the proposed
+boundary narrower: the service accepts one bounded absolute-deadline
+connection/nonces/sequence-bound installed-policy launch, a one-shot client
+authenticates the service reply, the watchdog exposes only opaque handles while
+retaining exact broker authority until a typed reap proof, and the launcher
+clears supplementary groups before permanently dropping real/effective/saved
+UID/GID and installing `RLIMIT_NPROC=1`. Exact credentials require a raw Mach
+audit trailer rather than public XPC's connection-time UID/GID snapshots. Those
+exact-message credentials still require Security.framework dynamic-code
+validation, but the permanent watchdog lifecycle loop must never call that
+framework, the filesystem, or the installed catalog. It dispatches a fixed
+bounded audit-token/frame/generation/deadline job to one of a fixed number of
+disposable authentication-worker processes. A result has effect only if it
+echoes every binding before the original deadline. Saturation rejects
+   immediately; a wedged worker is exactly killed and reaped before replacement;
+   late or replayed output is discarded. The source implementation now owns the
+   parent pipe ends linearly, submits one atomic fixed frame, requires exactly one
+   result plus EOF, and retains the exact slot/generation across every pending or
+   failure outcome. Its sole-waiter direct-child owner uses the unreaped child or
+   zombie to pin the PID, fails stop on `ECHILD`, and accepts a result only after
+   normal status-zero reap. Only immutable compiled requirements may
+be cached, never a dynamic guest result across tokens or messages. The
+backend-private fused adapter implements the raw Mach receive half and models
+the remaining clean-exec side as pre-created one-job workers,
+linear private-endpoint reply receipts, domain-separated exact-frame digests,
+strictly increasing worker generations, live-only replay state, and bounded
+nonblocking reap progress. It cannot mint a verified peer until typed exact
+worker reap. The receiver uses exact audit trailers and logical receive limits,
+destroys malformed/complex/oversized input, retains a linear send-once reply,
+   and routes connection state only after authentication and reap. The client-side
+   spawn result is likewise receive-only and reveals only an opaque handle or a
+   coarse failure after exact reply authentication; there is intentionally no
+   production success encoder yet. The watchdog now mints a noncopyable Ready
+   proof only after the unexpired registered broker consumes both trace stops;
+   an expired transition enters exact deadline cleanup without a proof; an
+   undeliverable proof exact-cleans or retains the same broker and reason for
+   retry. The authenticated spawn request now retains its exact decoded
+   generation, sequence, and both nonces with the linear Mach reply through
+   success and error transformations, but the Ready proof and reply right are
+   not fused yet. Before broker creation, only that complete reply plus its
+   assigned opaque session can mint the canonical bounded broker plan. The
+   authority-free frame preserves the original `CLOCK_UPTIME_RAW` deadline,
+   full exact-message peer identities, freshness, installed-policy target,
+   argv, and environment. Broker receipt parses into a distinct untrusted type,
+   conservatively rejects an expired or extended deadline, and still requires
+   proof of the exact inherited parent channel plus complete-frame EOF/ACK and
+   the later sole FD 3 START before any broker-consumable type exists. The
+   source FD 4 stream transport uses gate-first polling, exact outer/inner
+   lengths, one conservative deadline binding, sender write-half close, digest
+   ACK, and a deadline-bounded dormant FD 3/FD 4 transition. A separate fixed
+   FD 5 stream is minted with the same exact broker spawn and remains sealed
+   through watchdog registration. It accepts only one fixed report plus EOF
+   before the original deadline, binds the complete plan digest, session,
+   connection generation, sequence, nonces, target, and credentials, and alone
+   can construct the production `TraceEstablished` proof. Missing, extended,
+   late, or substituted reports exact-clean the registered broker. The same
+   socket's reverse endpoint then moves linearly with the authenticated proof
+   through the armed Ready guard. A failed Ready send emits no resume byte and
+   exact-cleans first; only a successful Ready send commits one fixed RESUME
+   byte and closes the endpoint, after which no second deadline veto can create
+   a Ready-but-never-resumed session. The broker requires exact byte plus EOF
+   and one final FD 3 death probe before resumed authority. The broker
+   source broker-local waiter now retains the exact active plan, gate, report
+   endpoint, and original deadline across a sole-waiter child typestate. It
+   distinguishes an unproven initial stop from successful ptrace continuation
+   and requires changed audit PID version, complete real/effective credential
+   equality, and exact installed `proc_pidpath` at the exec trap. That token now
+   alone emits FD 5, retains the stopped target through Ready-bound RESUME+EOF,
+   rechecks service liveness at the continuation boundary, and resumes once
+   without a post-report broker clock veto; every rejection exact-cleans. The
+   watchdog enters `ReadyCommitted` only after Ready and reverse commit both
+   succeed, so stale deadline work cannot kill the committed session; all
+   non-deadline terminal causes remain valid. Resumed authority enters a
+   gate-first exact-wait loop without a post-Ready clock veto. Natural exit or
+   signal death consumes the exact reap before returning a PID-free outcome;
+   any later traced stop, service EOF, or invalid gate byte exact-cleans, with
+   a post-wait gate probe preserving service-death priority. The fixed launcher
+   spawner/entry remains to be implemented. A one-shot non-sendable
+   child-wait-domain initializer checks
+   main-thread/single-threaded startup, canonicalizes default SIGCHLD zombie
+   semantics, and blocks SIGCHLD for inheriting service threads. The fixed
+   source spawner now creates private one-job pipes, installs only FD 3/FD 4,
+   and converts a positive `posix_spawn` result directly into exact direct-child
+   authority before any fallible work. Its separate clean-exec entry validates
+   the fixed vector and descriptors, dynamically loads Security.framework only
+   inside that worker, authenticates the exact audit token, writes one atomic
+   result, and retains the result writer until process exit. Native tests compose
+   that spawner, real entry, Security validation, pool routing, and exact reap
+   while proving the enclosing test/service image has no static Security or
+   CoreFoundation dependency. The worker is still not separately packaged,
+   signed, root-installed, or verified as replacement-resistant; the spawner is
+   not wired to Mach transport or a complete process-wide waiter policy, and no
+   positive installed-root evidence exists. The negative result for unprivileged same-UID
+constructions, the primary-source evidence, and the standing fail-closed
+decision are recorded in
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md). In the
 post-authentication prototype the
 coordinator retains an opened regular non-setid
@@ -341,7 +449,10 @@ Prototype Ready control and mixed transfers reuse the common dispatcher, includi
 bilateral capacity preflight that returns both endpoints cleanly to Ready on an
 asymmetric active limit. Direct-child status is reported only after the sole
 waiter reaps it; descendant cleanup is `FreshGroupUnverified` because macOS has
-no retained race-resistant process-group handle here. The macOS lifecycle
+no retained race-resistant process-group handle in the public session path.
+The private traced-launcher proof prevents direct fork/spawn by the nonroot
+target but is not wired into public sessions until its privileged broker and
+delegation boundary exist. The macOS lifecycle
 boundary, native Windows Arm64 runtime, physical Arm64 and exact-release
 packaged evidence, exact-tip hosted CI, and release evidence remain
 outstanding; local Windows AMD64 source and extracted-package verification are
