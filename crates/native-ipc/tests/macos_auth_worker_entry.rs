@@ -2,13 +2,13 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos {
-    use std::ffi::{c_int, c_long};
+    use std::ffi::{CStr, c_int, c_long};
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
-    const INSTALLED_PATH: &str = "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.auth-worker";
+    const DEPLOYER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-auth-worker";
     const MODE: &str = "--supervisor-auth-worker";
     const REQUEST: &str = "--request-fd=3";
     const RESULT: &str = "--result-fd=4";
@@ -34,13 +34,13 @@ mod macos {
     fn is_fixed_child_invocation() -> bool {
         std::env::args_os()
             .next()
-            .is_some_and(|argument| argument.as_bytes() == INSTALLED_PATH.as_bytes())
+            .is_some_and(|argument| argument.as_bytes() == DEPLOYER_PATH.to_bytes())
     }
 
     fn spawn(mode: &str, request: &str, result: &str) -> Child {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .arg0(INSTALLED_PATH)
+            .arg0(std::ffi::OsStr::from_bytes(DEPLOYER_PATH.to_bytes()))
             .arg(mode)
             .arg(request)
             .arg(result)
@@ -158,7 +158,13 @@ mod macos {
         if is_fixed_child_invocation() {
             // SAFETY: `always` and CODE_IDENTITY are compiled fixture
             // constants; the pre-exec hook transferred sole FD3/FD4 ownership.
-            unsafe { native_ipc::__private_macos_auth_worker_main(c"always", CODE_IDENTITY) }
+            unsafe {
+                native_ipc::__private_macos_auth_worker_main(
+                    DEPLOYER_PATH,
+                    c"always",
+                    CODE_IDENTITY,
+                )
+            }
         }
 
         assert_no_static_security_framework_dependency();

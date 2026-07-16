@@ -28,12 +28,13 @@ use std::time::{Duration, Instant};
 
 use super::super::auth_adapter::broker_plan::ExactParentBrokerLaunchPlan;
 use super::super::broker_entry::broker_launcher::{
-    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PATH,
-    INSTALLED_LAUNCHER_PLAN_ARGUMENT,
+    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PLAN_ARGUMENT,
 };
 
 const IDENTITY_ENV: &str = "NATIVE_IPC_TEST_SIGN_IDENTITY";
 const SUBJECT_IDENTIFIER: &str = "com.ro-ag.native-ipc.lifecycle-subject";
+const DEPLOYER_LAUNCHER_PATH: &CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
 
 /// A real system binary is the target, not the test binary. Re-exec'ing the
 /// heavy Rust/libtest runtime under the launcher's `(deny signal)` sandbox and
@@ -82,12 +83,12 @@ static LIFECYCLE_HOOK: extern "C" fn() = lifecycle_hook;
 extern "C" fn lifecycle_hook() {
     let is_launcher = std::env::args_os()
         .next()
-        .is_some_and(|value| value.as_bytes() == INSTALLED_LAUNCHER_PATH.as_bytes());
+        .is_some_and(|value| value.as_bytes() == DEPLOYER_LAUNCHER_PATH.to_bytes());
     if is_launcher {
         // SAFETY: the broker role spawns this child with the exact fixed vector
         // and sole ownership of descriptors 3 and 4, satisfying the entry
         // contract. This is the real production launcher entry.
-        unsafe { super::run_fixed_launcher_process() }
+        unsafe { super::run_fixed_launcher_process(DEPLOYER_LAUNCHER_PATH) }
     }
     // Any other invocation is the ordinary libtest process; fall through.
 }
@@ -438,7 +439,9 @@ fn real_launcher_entry_proves_identity_contains_the_target_and_reaps_exactly() {
     let plan_child_fd = plan_reader.as_raw_fd();
     let mut command = Command::new(&subject);
     command
-        .arg0(INSTALLED_LAUNCHER_PATH)
+        .arg0(std::ffi::OsStr::from_bytes(
+            DEPLOYER_LAUNCHER_PATH.to_bytes(),
+        ))
         .arg(INSTALLED_LAUNCHER_MODE)
         .arg(INSTALLED_LAUNCHER_DEATH_ARGUMENT)
         .arg(INSTALLED_LAUNCHER_PLAN_ARGUMENT)

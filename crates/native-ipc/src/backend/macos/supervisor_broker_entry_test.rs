@@ -1,7 +1,9 @@
-use std::ffi::{OsStr, OsString, c_int};
+use std::ffi::{CStr, CString, OsStr, OsString, c_int, c_long};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -15,15 +17,74 @@ use super::*;
 const HELPER_ENV: &str = "NATIVE_IPC_TEST_BROKER_GATE_ENTRY";
 const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::tests::fixed_gate_entry_subprocess";
+const DEPLOYER_BROKER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-broker";
+const PRODUCTION_BROKER_FIXTURE_SUFFIX: &str = ".native-ipc-production-broker-fixture";
+const PRODUCTION_CODE_IDENTITY: [u8; 32] = [0x5a; 32];
+const BROKER_TRACE_REPORT_BYTES: usize = 224;
+const F_DUPFD_CLOEXEC: c_int = 67;
+
+#[repr(C)]
+struct TimeSpec {
+    tv_sec: c_long,
+    tv_nsec: c_long,
+}
 
 unsafe extern "C" {
+    fn clock_gettime(clock_id: c_int, time: *mut TimeSpec) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn dup2(source: c_int, destination: c_int) -> c_int;
+    fn getegid() -> u32;
+    fn getdtablesize() -> c_int;
+    fn geteuid() -> u32;
     fn pipe(descriptors: *mut c_int) -> c_int;
 }
 
 assert_not_impl_any!(DormantBrokerGate: Clone, Copy);
 assert_not_impl_any!(ActiveBrokerGate: Clone, Copy);
+
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static PRODUCTION_BROKER_PROCESS_HOOK: extern "C" fn() = production_broker_process_hook;
+
+extern "C" fn production_broker_process_hook() {
+    let mut arguments = std::env::args_os();
+    let Some(argument0) = arguments.next() else {
+        return;
+    };
+    if !argument0
+        .as_bytes()
+        .ends_with(PRODUCTION_BROKER_FIXTURE_SUFFIX.as_bytes())
+    {
+        return;
+    }
+    let Some(mode) = arguments.next() else {
+        return;
+    };
+    let installed = CString::new(argument0.as_bytes()).unwrap_or_else(|_| {
+        // SAFETY: the isolated fixture cannot satisfy any fixed entry ABI.
+        unsafe { super::_exit(106) }
+    });
+    match mode.as_bytes() {
+        b"--supervisor-broker" => {
+            // SAFETY: the sibling fixture installed the exact broker vector,
+            // descriptors 3 through 5, and one copied absolute helper image.
+            unsafe { super::run_fixed_broker_process(&installed, &installed, &installed) }
+        }
+        b"--supervisor-auth-worker" => {
+            // SAFETY: the production broker installed the exact fixed worker
+            // vector and sole FD3/FD4 ends. `always` is test-only; production
+            // artifacts compile their designated signing requirement here.
+            unsafe {
+                super::super::auth_adapter::auth_worker_entry::run_fixed_auth_worker_process(
+                    &installed,
+                    c"always",
+                    PRODUCTION_CODE_IDENTITY,
+                )
+            }
+        }
+        _ => {}
+    }
+}
 
 #[test]
 fn post_report_gate_eof_wins_before_reported_authority() {
@@ -92,16 +153,262 @@ fn finish(mut child: Child) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+struct FixtureImage(std::path::PathBuf);
+
+impl Drop for FixtureImage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct ProductionBroker {
+    child: Child,
+    control: UnixStream,
+    trace: UnixStream,
+    _image: FixtureImage,
+}
+
+fn production_fixture_image(tag: &str) -> FixtureImage {
+    let path = std::env::temp_dir().join(format!(
+        "native-ipc-{tag}-{}{}",
+        std::process::id(),
+        PRODUCTION_BROKER_FIXTURE_SUFFIX,
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+    FixtureImage(std::fs::canonicalize(path).unwrap())
+}
+
+fn spawn_production_broker(tag: &str) -> ProductionBroker {
+    let image = production_fixture_image(tag);
+    let (control, child_control) = UnixStream::pair().unwrap();
+    let (trace, child_trace) = UnixStream::pair().unwrap();
+    // SAFETY: both live child ends are collision-safely duplicated above the
+    // fixed ABI; successful results are fresh owned descriptors.
+    let control_fd = unsafe { fcntl(child_control.as_raw_fd(), F_DUPFD_CLOEXEC, 10) };
+    assert!(control_fd >= 10);
+    // SAFETY: successful fcntl returned one fresh owned descriptor.
+    let control_fd = unsafe { OwnedFd::from_raw_fd(control_fd) };
+    // SAFETY: same exact duplication for the trace channel.
+    let trace_fd = unsafe { fcntl(child_trace.as_raw_fd(), F_DUPFD_CLOEXEC, 10) };
+    assert!(trace_fd >= 10);
+    // SAFETY: successful fcntl returned one fresh owned descriptor.
+    let trace_fd = unsafe { OwnedFd::from_raw_fd(trace_fd) };
+    let child_control_fd = control_fd.as_raw_fd();
+    let child_trace_fd = trace_fd.as_raw_fd();
+    // SAFETY: read-only process limit query before the child is created.
+    let descriptor_limit = unsafe { getdtablesize() };
+    assert!(descriptor_limit > BROKER_TRACE_FD);
+
+    let mut command = Command::new(&image.0);
+    command
+        .arg0(&image.0)
+        .arg(INSTALLED_BROKER_MODE)
+        .arg(INSTALLED_GATE_ARGUMENT)
+        .arg(INSTALLED_CONTROL_ARGUMENT)
+        .arg(INSTALLED_TRACE_ARGUMENT)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: the isolated just-forked child performs only async-signal-safe
+    // dup2 calls before exec and transfers fixed FD3/FD4/FD5 ownership.
+    unsafe {
+        command.pre_exec(move || {
+            if dup2(0, BROKER_GATE_FD) == BROKER_GATE_FD
+                && dup2(child_control_fd, BROKER_CONTROL_FD) == BROKER_CONTROL_FD
+                && dup2(child_trace_fd, BROKER_TRACE_FD) == BROKER_TRACE_FD
+            {
+                // SAFETY: fixed descriptors 0 through 5 are now complete;
+                // close is async-signal-safe and prevents cross-test ownership
+                // of any other live pipe in this inherited descriptor table.
+                for fd in (BROKER_TRACE_FD + 1)..descriptor_limit {
+                    let _ = close(fd);
+                }
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(control_fd);
+    drop(trace_fd);
+    drop(child_control);
+    drop(child_trace);
+    ProductionBroker {
+        child,
+        control,
+        trace,
+        _image: image,
+    }
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn production_plan_frame(target_identity: [u8; 32]) -> Vec<u8> {
+    const TARGET: &[u8] = b"/usr/bin/true";
+    const ARGUMENT: &[u8] = b"true";
+    const POLICY: &[u8] = b"test.production-caller";
+    let mut now = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: now is writable and CLOCK_UPTIME_RAW is Darwin clock 8.
+    assert_eq!(unsafe { clock_gettime(8, &raw mut now) }, 0);
+    let deadline = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
+        + u64::try_from(now.tv_nsec).unwrap()
+        + 20_000_000_000;
+    // SAFETY: credential getters have no preconditions and the fixed broker
+    // and target must remain same-user and unprivileged.
+    let effective_uid = unsafe { geteuid() };
+    // SAFETY: same current-process credential snapshot.
+    let effective_gid = unsafe { getegid() };
+    assert_ne!(
+        effective_uid, 0,
+        "the macOS broker fixture must not run as root"
+    );
+    assert_ne!(
+        effective_gid, 0,
+        "the macOS broker fixture needs a nonroot group"
+    );
+
+    let mut bytes = vec![0_u8; 256];
+    bytes[..8].copy_from_slice(b"NIPCBP01");
+    put_u16(&mut bytes, 8, 1);
+    put_u64(&mut bytes, 16, deadline);
+    put_u64(&mut bytes, 24, 1);
+    put_u64(&mut bytes, 32, 1);
+    put_u32(&mut bytes, 40, effective_uid);
+    put_u32(&mut bytes, 44, effective_gid);
+    for (range, value) in [
+        (48..80, 1),
+        (80..112, 2),
+        (112..144, 3),
+        (176..208, 5),
+        (208..240, 6),
+    ] {
+        bytes[range].fill(value);
+    }
+    bytes[144..176].copy_from_slice(&target_identity);
+    put_u32(&mut bytes, 240, u32::try_from(POLICY.len()).unwrap());
+    put_u32(&mut bytes, 244, u32::try_from(TARGET.len()).unwrap());
+    put_u16(&mut bytes, 248, 1);
+    bytes.extend_from_slice(POLICY);
+    bytes.extend_from_slice(TARGET);
+    bytes.extend_from_slice(&u32::try_from(ARGUMENT.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(ARGUMENT);
+    let frame_len = u32::try_from(bytes.len()).unwrap();
+    put_u32(&mut bytes, 12, frame_len);
+    bytes
+}
+
+fn stage_production_plan(broker: &mut ProductionBroker, frame: &[u8]) -> [u8; 40] {
+    broker
+        .control
+        .write_all(&u32::try_from(frame.len()).unwrap().to_le_bytes())
+        .unwrap();
+    broker.control.write_all(frame).unwrap();
+    broker.control.shutdown(Shutdown::Write).unwrap();
+    let mut ack = [0_u8; 40];
+    broker.control.read_exact(&mut ack).unwrap();
+    assert_eq!(&ack[..8], b"NIPCBPA1");
+    ack
+}
+
+fn wait_with_gate_live(broker: &mut ProductionBroker) -> (std::process::ExitStatus, Vec<u8>) {
+    let status = broker.child.wait().unwrap();
+    let mut stderr = Vec::new();
+    broker
+        .child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    drop(broker.child.stdin.take());
+    (status, stderr)
+}
+
+#[test]
+fn production_broker_caller_drives_launcher_plan_signature_report_resume_and_exact_exit() {
+    let mut broker = spawn_production_broker("accept");
+    let frame = production_plan_frame(PRODUCTION_CODE_IDENTITY);
+    let ack = stage_production_plan(&mut broker, &frame);
+    broker
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&START_BYTE)
+        .unwrap();
+
+    let mut report = [0_u8; BROKER_TRACE_REPORT_BYTES];
+    if let Err(error) = broker.trace.read_exact(&mut report) {
+        let (status, stderr) = wait_with_gate_live(&mut broker);
+        panic!(
+            "broker closed trace before report: {error:?}, status {status:?}, stderr {stderr:?}"
+        );
+    }
+    let mut extra = [0_u8; 1];
+    assert_eq!(broker.trace.read(&mut extra).unwrap(), 0);
+    assert_eq!(&report[..8], b"NIPCBTR1");
+    assert_eq!(u16::from_le_bytes(report[10..12].try_into().unwrap()), 2);
+    assert_eq!(&report[144..176], &PRODUCTION_CODE_IDENTITY);
+    assert_eq!(&report[176..208], &ack[8..]);
+
+    broker.trace.write_all(&[1]).unwrap();
+    broker.trace.shutdown(Shutdown::Write).unwrap();
+    let (status, stderr) = wait_with_gate_live(&mut broker);
+    assert!(status.success(), "broker status {status:?}: {stderr:?}");
+}
+
+#[test]
+fn production_broker_caller_rejects_substituted_worker_identity_before_report_or_resume() {
+    let mut broker = spawn_production_broker("reject");
+    let frame = production_plan_frame([0x6b; 32]);
+    stage_production_plan(&mut broker, &frame);
+    broker
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&START_BYTE)
+        .unwrap();
+
+    let mut report = Vec::new();
+    broker.trace.read_to_end(&mut report).unwrap();
+    let (status, stderr) = wait_with_gate_live(&mut broker);
+    assert_eq!(status.code(), Some(67), "broker stderr: {stderr:?}");
+    assert!(report.is_empty(), "rejected target emitted trace authority");
+}
+
 #[test]
 fn fixed_arguments_accept_only_the_installed_vector() {
     let exact = [
-        OsStr::new(INSTALLED_BROKER_PATH),
+        OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes()),
         OsStr::new(INSTALLED_BROKER_MODE),
         OsStr::new(INSTALLED_GATE_ARGUMENT),
         OsStr::new(INSTALLED_CONTROL_ARGUMENT),
         OsStr::new(INSTALLED_TRACE_ARGUMENT),
     ];
-    assert_eq!(validate_fixed_arguments(exact), Ok(()));
+    assert_eq!(
+        validate_fixed_arguments(DEPLOYER_BROKER_PATH, exact),
+        Ok(())
+    );
 
     let mutations = [
         vec![
@@ -112,27 +419,27 @@ fn fixed_arguments_accept_only_the_installed_vector() {
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from("--other-mode"),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from("--gate-fd=4"),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
@@ -142,10 +449,34 @@ fn fixed_arguments_accept_only_the_installed_vector() {
     ];
     for mutation in mutations {
         assert_eq!(
-            validate_fixed_arguments(mutation),
+            validate_fixed_arguments(DEPLOYER_BROKER_PATH, mutation),
             Err(BrokerEntryError::InvalidArguments)
         );
     }
+
+    let substituted_path = [
+        OsStr::new("/other/NativeIPC.app/Contents/Helpers/native-ipc-broker"),
+        OsStr::new(INSTALLED_BROKER_MODE),
+        OsStr::new(INSTALLED_GATE_ARGUMENT),
+        OsStr::new(INSTALLED_CONTROL_ARGUMENT),
+        OsStr::new(INSTALLED_TRACE_ARGUMENT),
+    ];
+    assert_eq!(
+        validate_fixed_arguments(DEPLOYER_BROKER_PATH, substituted_path),
+        Err(BrokerEntryError::InvalidArguments)
+    );
+
+    let relative_configuration = [
+        OsStr::new("relative-broker"),
+        OsStr::new(INSTALLED_BROKER_MODE),
+        OsStr::new(INSTALLED_GATE_ARGUMENT),
+        OsStr::new(INSTALLED_CONTROL_ARGUMENT),
+        OsStr::new(INSTALLED_TRACE_ARGUMENT),
+    ];
+    assert_eq!(
+        validate_fixed_arguments(c"relative-broker", relative_configuration),
+        Err(BrokerEntryError::InvalidArguments)
+    );
 }
 
 #[test]

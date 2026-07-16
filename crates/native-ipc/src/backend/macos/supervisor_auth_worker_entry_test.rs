@@ -1,5 +1,8 @@
 use super::*;
 
+const DEPLOYER_AUTH_WORKER_PATH: &std::ffi::CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-auth-worker";
+
 unsafe extern "C" {
     fn close(fd: c_int) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
@@ -8,29 +11,62 @@ unsafe extern "C" {
 #[test]
 fn fixed_worker_arguments_are_exact() {
     assert_eq!(
-        validate_fixed_arguments([
-            INSTALLED_AUTH_WORKER_PATH,
-            INSTALLED_AUTH_WORKER_MODE,
-            INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
-            INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
-        ]),
+        validate_fixed_arguments(
+            DEPLOYER_AUTH_WORKER_PATH,
+            [
+                DEPLOYER_AUTH_WORKER_PATH.to_str().unwrap(),
+                INSTALLED_AUTH_WORKER_MODE,
+                INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
+                INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
+            ]
+        ),
         Ok(())
     );
     assert!(
-        validate_fixed_arguments([
-            INSTALLED_AUTH_WORKER_PATH,
-            INSTALLED_AUTH_WORKER_MODE,
-            INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
-        ])
+        validate_fixed_arguments(
+            DEPLOYER_AUTH_WORKER_PATH,
+            [
+                DEPLOYER_AUTH_WORKER_PATH.to_str().unwrap(),
+                INSTALLED_AUTH_WORKER_MODE,
+                INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
+            ]
+        )
         .is_err()
     );
     assert!(
-        validate_fixed_arguments([
-            INSTALLED_AUTH_WORKER_PATH,
-            INSTALLED_AUTH_WORKER_MODE,
-            "--request-fd=4",
-            INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
-        ])
+        validate_fixed_arguments(
+            DEPLOYER_AUTH_WORKER_PATH,
+            [
+                DEPLOYER_AUTH_WORKER_PATH.to_str().unwrap(),
+                INSTALLED_AUTH_WORKER_MODE,
+                "--request-fd=4",
+                INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_fixed_arguments(
+            DEPLOYER_AUTH_WORKER_PATH,
+            [
+                "/other/native-ipc-auth-worker",
+                INSTALLED_AUTH_WORKER_MODE,
+                INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
+                INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        validate_fixed_arguments(
+            c"relative-worker",
+            [
+                "relative-worker",
+                INSTALLED_AUTH_WORKER_MODE,
+                INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
+                INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
+            ],
+        )
         .is_err()
     );
 }

@@ -23,26 +23,27 @@
 //! 2. Decode the plan, and prepare every exec input, while still fully
 //!    reversible. No allocation or fallible call may follow containment.
 //! 3. Contain: sandbox, then `RLIMIT_NPROC`. Both survive `execve`.
-//! 4. Close FD3 and FD4, then `execve` immediately. `dup2` cleared their
-//!    close-on-exec flags and `POSIX_SPAWN_CLOEXEC_DEFAULT` covered only the
-//!    broker's spawn, so without this the target would inherit the
-//!    broker-death pipe and any undelivered plan bytes.
+//! 4. Mark FD3 and FD4 close-on-exec before containment, then close them and
+//!    call `execve` immediately. `dup2` cleared their close-on-exec flags and
+//!    `POSIX_SPAWN_CLOEXEC_DEFAULT` covered only the broker's spawn. The flag
+//!    is the fail-closed guarantee; explicit close is defense in depth.
 //!
 //! FD3 carries no data; its only signal is EOF, meaning the broker died. It is
 //! probed at every step where a decision follows. Broker death also closes the
 //! FD4 writer, so a blocking plan read cannot hang past it.
 
 use std::convert::Infallible;
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 use super::auth_adapter::broker_plan::{
     LAUNCHER_PLAN_PREFIX_BYTES, LauncherExecParts, MAX_BROKER_PLAN_BYTES, ReceivedLauncherExecPlan,
     parse_launcher_plan_prefix,
 };
 use super::broker_entry::broker_launcher::{
-    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PATH,
-    INSTALLED_LAUNCHER_PLAN_ARGUMENT, LAUNCHER_DEATH_FD, LAUNCHER_PLAN_FD,
+    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PLAN_ARGUMENT,
+    LAUNCHER_DEATH_FD, LAUNCHER_PLAN_FD,
 };
+use super::is_deployer_helper_path;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -51,8 +52,10 @@ const PT_TRACE_ME: c_int = 0;
 const SIGSTOP: c_int = 17;
 const RLIMIT_NPROC: c_int = 7;
 const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+const FD_CLOEXEC: c_int = 1;
 const O_NONBLOCK: c_int = 0x0000_0004;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 35;
@@ -62,24 +65,29 @@ const EAGAIN: c_int = 35;
 /// `(deny signal)` is the load-bearing rule for the cooperative tier. Without
 /// it a target can send the broker an unmaskable `SIGSTOP` and suspend every
 /// deadline and death-pipe check. Native measurement on this platform: from
-/// inside this profile, outbound signals are denied with `EPERM`, the profile
-/// cannot be relaxed by a second `sandbox_init` or by `execve`, and
-/// self-signalling (`raise`, `abort`, `pthread_kill`) still works so targets
-/// do not break.
+/// inside this profile, outbound signals are denied with `EPERM`, Mach service
+/// lookup/registration is denied, the profile cannot be relaxed by a second
+/// `sandbox_init` or by `execve`, and self-signalling (`raise`, `abort`,
+/// `pthread_kill`) still works so targets do not break.
 ///
 /// This binds the exact contained process, not the user. It does not make the
 /// broker safe from a *malicious* same-user principal: a sibling process the
-/// broker never sandboxed can still `SIGSTOP` it, and adversarial review found
-/// `launchd` reachable from inside this profile, so a delegated helper escapes
-/// both this rule and `RLIMIT_NPROC`. Those attacks are out of scope for this
-/// lifecycle boundary; defending against them would need the privileged
-/// watchdog this design deliberately does not require. The guarantee here is
-/// that an *uncooperative* target cannot stop the process that must reap it.
+/// broker never sandboxed can still `SIGSTOP` it. That attack is out of scope
+/// for this lifecycle boundary. The inherited profile closes the runner's
+/// `launchd` delegation path by denying all Mach lookup and registration; a
+/// future deployer capability profile may replace that blanket rule only with
+/// an explicit service allowlist.
 ///
 /// The mechanism is also not a durable contract: `sandbox_init` is deprecated
 /// and SBPL is undocumented, so this is an empirical property of the current
 /// OS, not a supported API boundary.
-const LAUNCHER_SANDBOX_PROFILE: &str = "(version 1)\n(allow default)\n(deny signal)\n";
+const LAUNCHER_SANDBOX_PROFILE: &str = concat!(
+    "(version 1)\n",
+    "(allow default)\n",
+    "(deny signal)\n",
+    "(deny mach-lookup)\n",
+    "(deny mach-register)\n",
+);
 
 /// One process. Set only after the sandbox, and never as root, because Darwin
 /// exempts root from this limit entirely.
@@ -162,9 +170,9 @@ impl LauncherEntryError {
 /// process vector, fixed descriptor 3 (broker death) and descriptor 4 (plan)
 /// must come from this library's launcher spawner, and no other Rust value may
 /// own either descriptor.
-pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process() -> ! {
+pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process(installed_path: &CStr) -> ! {
     // SAFETY: the caller promises the complete fixed process-entry contract.
-    let status = match unsafe { run_launcher() } {
+    let status = match unsafe { run_launcher(installed_path) } {
         Ok(infallible) => match infallible {},
         Err(error) => error.status(),
     };
@@ -174,13 +182,15 @@ pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process() -> ! {
     unsafe { _exit(status) }
 }
 
-unsafe fn run_launcher() -> Result<Infallible, LauncherEntryError> {
-    validate_fixed_arguments(std::env::args_os())?;
+unsafe fn run_launcher(installed_path: &CStr) -> Result<Infallible, LauncherEntryError> {
+    validate_fixed_arguments(installed_path, std::env::args_os())?;
     // SAFETY: read-only liveness queries before either fixed descriptor is
     // used; the entry contract transfers sole ownership of both.
     unsafe {
         require_live(LAUNCHER_DEATH_FD)?;
         require_live(LAUNCHER_PLAN_FD)?;
+        set_close_on_exec(LAUNCHER_DEATH_FD)?;
+        set_close_on_exec(LAUNCHER_PLAN_FD)?;
         adopt_death_pipe()?;
     }
 
@@ -214,9 +224,9 @@ unsafe fn run_launcher() -> Result<Infallible, LauncherEntryError> {
     // Last look before the target exists. After this the broker's exec trap
     // and exact child authority are the only controls that remain.
     probe_broker_death()?;
-    // SAFETY: both fixed descriptors are owned by this process and must not
-    // survive into the target, which would otherwise inherit the broker-death
-    // pipe and any plan bytes this launcher did not consume.
+    // SAFETY: both fixed descriptors are owned by this process. They were
+    // already marked close-on-exec while failure was still reportable, so a
+    // rare close failure cannot leak either descriptor into the target.
     unsafe {
         close(LAUNCHER_DEATH_FD);
         close(LAUNCHER_PLAN_FD);
@@ -461,12 +471,30 @@ unsafe fn require_live(fd: c_int) -> Result<(), LauncherEntryError> {
     Ok(())
 }
 
+/// Makes descriptor non-inheritance fail closed before containment.
+unsafe fn set_close_on_exec(fd: c_int) -> Result<(), LauncherEntryError> {
+    // SAFETY: F_GETFD is a read-only query on the live fixed descriptor.
+    let flags = unsafe { fcntl(fd, F_GETFD) };
+    if flags < 0 {
+        return Err(LauncherEntryError::InvalidDescriptor);
+    }
+    // SAFETY: F_SETFD accepts the existing descriptor flags plus FD_CLOEXEC.
+    if unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) } != 0 {
+        return Err(LauncherEntryError::InvalidDescriptor);
+    }
+    Ok(())
+}
+
 fn validate_fixed_arguments(
+    installed_path: &CStr,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Result<(), LauncherEntryError> {
+    if !is_deployer_helper_path(installed_path) {
+        return Err(LauncherEntryError::InvalidArguments);
+    }
     let mut arguments = arguments.into_iter();
     let expected = [
-        INSTALLED_LAUNCHER_PATH.as_bytes(),
+        installed_path.to_bytes(),
         INSTALLED_LAUNCHER_MODE.as_bytes(),
         INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes(),
         INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes(),

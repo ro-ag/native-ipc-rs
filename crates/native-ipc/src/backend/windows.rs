@@ -54,7 +54,6 @@ use windows_sys::Win32::System::Threading::{
     QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::BackendStatus;
 use crate::protocol::{
     CONTROL_FRAME_LEN, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
     TransferProvenance, mint_channel_id,
@@ -1715,11 +1714,6 @@ fn last_os(operation: &'static str) -> WindowsError {
         operation,
         code: unsafe { GetLastError() },
     }
-}
-
-/// Reports the native backend's enforced capability policy.
-pub const fn status() -> BackendStatus {
-    BackendStatus::Available
 }
 
 #[path = "windows_vnext/memory.rs"]

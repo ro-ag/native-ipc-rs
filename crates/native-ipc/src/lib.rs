@@ -50,13 +50,44 @@ mod protocol;
 /// This must run in the just-execed dedicated broker before threads, children,
 /// policy, or effect-bearing endpoints. The exact fixed spawner must
 /// exclusively transfer descriptors 3 and 4 and the installed process vector;
-/// no Rust value may already own either descriptor. Read-only fixture dispatch
-/// over `argv[0]` is permitted before entry.
+/// no Rust value may already own either descriptor. `installed_path` must be an
+/// absolute compile-time constant in the deployer's broker artifact and must
+/// not derive from request data. Read-only fixture dispatch over `argv[0]` is
+/// permitted before entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[doc(hidden)]
-pub unsafe fn __private_macos_broker_gate_main() -> ! {
+pub unsafe fn __private_macos_broker_gate_main(installed_path: &std::ffi::CStr) -> ! {
     // SAFETY: the caller supplies the complete fixed process-entry contract.
-    unsafe { backend::macos::run_fixed_broker_gate_process() }
+    unsafe { backend::macos::run_fixed_broker_gate_process(installed_path) }
+}
+
+/// Runs the complete fixed macOS broker launcher lifecycle without callbacks.
+///
+/// This hidden artifact entry stages and activates the exact parent plan,
+/// pre-creates its fixed clean-exec authentication worker, spawns the fixed
+/// launcher, delivers the plan, verifies the target at its exec trap, reports
+/// the held trace state, and resumes only after the Ready-bound reverse commit.
+/// Public macOS construction remains fail-closed and does not call this entry.
+///
+/// # Safety
+///
+/// This must run in the just-execed dedicated broker before threads, children,
+/// policy, or effect-bearing endpoints. The exact fixed spawner must
+/// exclusively transfer descriptors 3 through 5 and the installed process
+/// vector. Each path must be an absolute compile-time constant in the
+/// deployer's broker artifact, must not derive from request data, and must name
+/// the exact replacement-resistant signed image verified by the installation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub unsafe fn __private_macos_broker_main(
+    installed_path: &std::ffi::CStr,
+    launcher_path: &std::ffi::CStr,
+    auth_worker_path: &std::ffi::CStr,
+) -> ! {
+    // SAFETY: the caller supplies the complete fixed process-entry contract.
+    unsafe {
+        backend::macos::run_fixed_broker_process(installed_path, launcher_path, auth_worker_path)
+    }
 }
 
 /// Runs the fixed macOS trusted-launcher boundary without callbacks.
@@ -72,11 +103,13 @@ pub unsafe fn __private_macos_broker_gate_main() -> ! {
 /// effect-bearing endpoints exist. The fixed spawner must exclusively transfer
 /// descriptor 3 (broker death) and descriptor 4 (plan) plus the installed
 /// process vector; no Rust value may already own either descriptor.
+/// `installed_path` must be an absolute compile-time constant in the deployer's
+/// launcher artifact and must not derive from request data.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[doc(hidden)]
-pub unsafe fn __private_macos_launcher_main() -> ! {
+pub unsafe fn __private_macos_launcher_main(installed_path: &std::ffi::CStr) -> ! {
     // SAFETY: the caller supplies the complete fixed process-entry contract.
-    unsafe { backend::macos::run_fixed_launcher_process() }
+    unsafe { backend::macos::run_fixed_launcher_process(installed_path) }
 }
 
 /// Runs the fixed macOS clean-exec authentication-worker boundary.
@@ -89,22 +122,20 @@ pub unsafe fn __private_macos_launcher_main() -> ! {
 /// # Safety
 ///
 /// This must run in the just-execed dedicated worker before threads or
-/// Security.framework initialization. `requirement` and `code_identity` must
-/// be compile-time installed-policy constants in that artifact, and the exact
-/// spawner must exclusively transfer descriptors 3 and 4 plus the fixed vector.
+/// Security.framework initialization. `installed_path`, `requirement`, and
+/// `code_identity` must be compile-time installed-policy constants in that
+/// artifact; `installed_path` must be absolute. None may derive from request
+/// data. The exact spawner must exclusively transfer descriptors 3 and 4 plus
+/// the fixed vector.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[doc(hidden)]
 pub unsafe fn __private_macos_auth_worker_main(
+    installed_path: &std::ffi::CStr,
     requirement: &std::ffi::CStr,
     code_identity: [u8; 32],
 ) -> ! {
     // SAFETY: the caller supplies the complete fixed process-entry contract.
-    unsafe { backend::macos::run_fixed_auth_worker_process(requirement, code_identity) }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum BackendStatus {
-    Available,
-    Incomplete(&'static str),
+    unsafe {
+        backend::macos::run_fixed_auth_worker_process(installed_path, requirement, code_identity)
+    }
 }

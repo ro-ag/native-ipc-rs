@@ -21,14 +21,14 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos {
-    use std::ffi::{CString, c_int, c_long};
+    use std::ffi::{CStr, CString, c_int, c_long};
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
-    const INSTALLED_PATH: &str = "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.auth-worker";
+    const DEPLOYER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-auth-worker";
     const MODE: &str = "--supervisor-auth-worker";
     const REQUEST: &str = "--request-fd=3";
     const RESULT: &str = "--result-fd=4";
@@ -62,7 +62,7 @@ mod macos {
     fn is_fixed_child_invocation() -> bool {
         std::env::args_os()
             .next()
-            .is_some_and(|argument| argument.as_bytes() == INSTALLED_PATH.as_bytes())
+            .is_some_and(|argument| argument.as_bytes() == DEPLOYER_PATH.to_bytes())
     }
 
     /// How the subject worker image is signed before it is spawned.
@@ -283,7 +283,7 @@ mod macos {
     fn verdict(subject: &Path, requirement: &str) -> Option<bool> {
         let mut command = Command::new(subject);
         command
-            .arg0(INSTALLED_PATH)
+            .arg0(std::ffi::OsStr::from_bytes(DEPLOYER_PATH.to_bytes()))
             .arg(MODE)
             .arg(REQUEST)
             .arg(RESULT)
@@ -356,7 +356,13 @@ mod macos {
             // fixed vector and sole FD3/FD4 ownership. The requirement is a
             // fixture input rather than an installed constant precisely so the
             // deployer's own certificate can be supplied at run time.
-            unsafe { native_ipc::__private_macos_auth_worker_main(&requirement, CODE_IDENTITY) }
+            unsafe {
+                native_ipc::__private_macos_auth_worker_main(
+                    DEPLOYER_PATH,
+                    &requirement,
+                    CODE_IDENTITY,
+                )
+            }
         }
 
         let Some(identity) = signing_identity() else {

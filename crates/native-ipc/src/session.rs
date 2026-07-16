@@ -46,14 +46,27 @@ static RECEIVER_BOOTSTRAP_TAKEN: AtomicBool = AtomicBool::new(false);
 ///
 /// This function may be invoked only by the ELF loader through a
 /// `.preinit_array` entry in the initial receiver executable. Its pointers must
-/// be the loader-supplied initial argument and environment vectors.
+/// be the loader-supplied initial argument and environment vectors. The hook is
+/// a no-op on non-Linux targets solely to keep the helper-only signature
+/// platform-neutral.
 #[doc(hidden)]
-#[cfg(target_os = "linux")]
 pub unsafe extern "C" fn __receiver_bootstrap_preinit(
-    _argument_count: libc::c_int,
-    _arguments: *mut *mut libc::c_char,
-    environment: *mut *mut libc::c_char,
+    _argument_count: core::ffi::c_int,
+    _arguments: *mut *mut core::ffi::c_char,
+    environment: *mut *mut core::ffi::c_char,
 ) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the public hook forwards the loader-supplied environment under
+    // the same pre-initializer contract.
+    unsafe {
+        receiver_bootstrap_preinit_linux(environment);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = environment;
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn receiver_bootstrap_preinit_linux(environment: *mut *mut libc::c_char) {
     // This ELF pre-initializer runs before Rust main and ordinary init-array
     // constructors. It performs no allocation and publishes only after all
     // exact child/descriptor facts and immediate CLOEXEC installation pass.
@@ -227,6 +240,34 @@ pub struct Receiver;
 pub struct Negotiating;
 /// Bilaterally accepted state that may carry bounded application control.
 pub struct Ready;
+
+/// Availability of the public lifecycle/session composition on this target.
+///
+/// This status applies only to the vNext session layer. The published shared-
+/// memory API remains available on every supported target. Consumers may use
+/// [`backend_status`] as a const preflight or handle
+/// [`SessionError::BackendUnavailable`] from a construction attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    /// Public spawn and inherited-bootstrap session construction are composed.
+    Available,
+    /// The target is supported, but public session construction is fail-closed.
+    Unavailable,
+}
+
+/// Reports whether the public lifecycle/session composition is available.
+///
+/// Linux and Windows report [`BackendStatus::Available`]. macOS Arm64 reports
+/// [`BackendStatus::Unavailable`]; a valid public spawn or bootstrap attempt
+/// returns [`SessionError::BackendUnavailable`] without enabling the private
+/// experimental supervisor path.
+pub const fn backend_status() -> BackendStatus {
+    if cfg!(target_os = "macos") {
+        BackendStatus::Unavailable
+    } else {
+        BackendStatus::Available
+    }
+}
 
 /// Accepted wire protocol version bound into both challenged ACCEPT frames.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

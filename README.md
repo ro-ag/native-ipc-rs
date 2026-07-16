@@ -97,28 +97,38 @@ tool for running an unknown program safely.
 The intended shape is a main **host** process, a disposable **child runner**
 (a small program you write and sign) that loads one untrusted artifact — a VST3
 plugin, a model runner, a third-party C library — as an in-process shared object,
-and `native-ipc` shared memory as the only, validated channel between them. The
-untrusted artifact never touches the host directly; it only operates on the
-region the host grants.
+and `native-ipc` shared memory as the bulk data channel between them. A bounded
+authenticated control channel handles negotiation, capability transfer, and
+non-real-time lifecycle messages. The untrusted artifact operates only on the
+regions and opaque control payloads the host grants.
 
 The contract is that the library launches only code you control. Untrusted logic
-runs solely as an in-process library inside a signed runner, never as a
-standalone process the library was handed. Within that contract the child
-runner's lifecycle guarantee is: it is verified to be your code before it runs,
-it is contained (no new processes, no signalling out, an optional capability
-profile bounds files and network), and it is terminated deterministically and
-reaped with no leaked process or zombie — all **without root**. The library does
-not attempt to sandbox an arbitrary untrusted *process*, which is not achievable
-under public macOS APIs without a task port; it confines untrusted code to an
-in-process library instead. See
+runs solely as an in-process library inside that runner, never as a standalone
+process the library was handed. Applications own signing, sandbox, filesystem,
+network, and deployment policy; the library binds the launch to the configured
+exact executable identity. It owns race-resistant direct-child lifecycle and
+reports incomplete cleanup honestly when the kernel cannot complete it. Windows
+adds non-breakaway Job containment, Linux does not promise hostile escaped-
+descendant cleanup, and the private macOS design empirically denies process
+creation, outbound signals, and launchd service use. None of the supported model
+requires or permits root. See
 [`docs/integration-model.md`](docs/integration-model.md) for the full scope,
 the honest residuals, and the per-platform mechanism.
 
-The **public API is identical on every supported platform**; only the underlying
-kernel mechanism differs (see [supported targets](#supported-targets)). The
-macOS lifecycle supervisor is a design that is not yet enabled — the public
-macOS backend is currently unavailable by decision — while the shared-memory
-core ships on all platforms.
+The consumer type surface is intended to be identical on every supported
+platform; only the underlying kernel mechanism differs (see
+[supported targets](#supported-targets)). The shared-memory allocation core
+ships on all platforms. The unreleased vNext session composition is public on
+Linux and Windows, while public macOS spawn/bootstrap remain unavailable pending
+the explicit Plan 8b enable-or-defer decision. The exact module inventory,
+cross-target enforcement, and published-0.4 versus experimental-vNext boundary
+are recorded in [`docs/public-api.md`](docs/public-api.md).
+Consumers can inspect this through the common const
+`native_ipc::session::backend_status()` API: Linux and Windows report
+`BackendStatus::Available`, while macOS Arm64 reports
+`BackendStatus::Unavailable` and valid construction attempts return
+`SessionError::BackendUnavailable`. The status applies only to the vNext
+session layer; macOS shared-memory allocation remains available.
 
 ## How memory is accessed
 
@@ -276,56 +286,29 @@ one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
 lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
 composition prototype exists privately but the public entry points remain
-fail-closed. The backend now privately implements a trusted-launcher gate: the
-launcher authenticates its broker, enters cooperative `ptrace`, proves the
-trace relationship with a stopped handshake, installs a hard
-`RLIMIT_NPROC=1`, and execs under the kernel's pre-first-instruction trap. The
-broker can stop and `PT_KILL` that exact unreaped tracee, and broker death makes
-XNU kill it. Native tests also prove the remaining blocker: same-UID target
-code can send unmaskable `SIGSTOP` to the broker and indefinitely suspend that
-authority. A repeated nested-tracer test now proves that an outer watchdog can
-`PT_KILL` and reap that exact stopped broker, after which XNU removes its exact
-tracee without a PID lookup; production privilege separation is still absent.
-Restoring launchd bootstrap for libxpc also leaves delegated XPC work outside
-the rlimit. Backend-private source models now additionally enforce one bounded,
-absolute-deadline, nonce/generation-bound installed-policy spawn request, opaque
-watchdog session handles with linear exact-broker/reap proofs, and an
-abort-on-failure permanent UID/GID/group drop for the future launcher. A fused
-authentication-adapter model also retains each exact Mach frame through a
-fixed one-job worker, binds its private reply endpoint with a linear receipt,
-and mints no peer authority before typed exact worker reap. Its cleanup API
-makes only bounded nonblocking progress and never reconstructs a worker from a
-PID. The spawn-reply model also assigns the opaque session before broker
-creation and retains one session-specific armed watchdog obligation through a
-real zero-timeout Mach Ready send, without blocking unrelated session cleanup.
-Every broker authority is dormant on arrival: watchdog insertion completes
-before one nonblocking, non-callback activation operation, and activation
-failure exact-reaps and tombstones before returning.
-Its launch permit carries a revocable session-specific registration without
-holding a long-lived table borrow: same-session cleanup remains operable, and
-the launcher revalidates a short final guard immediately before its no-callback
-credential-drop/exec transition. Copied launch bytes cannot commit after the
-watchdog has reaped the session. The obligation exact-cleans every tested
-abandonment, substitution, freshness, deadline, and recoverable-send path. The
-raw Mach ingress now also separates its service poll bound from authentication:
-Spawn authentication uses the earlier of the fixed service cap and the exact
-wire deadline, and only verified zero Darwin alignment bytes are removed before
-the logical record is authenticated. These models are
-not packaged service artifacts and have no positive
-root/signing evidence. Public macOS therefore still needs an independently
-privileged, authenticated launchd/Mach service/watchdog and remains fail-closed; the proof and residual
-constraints are documented in
-[`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md). No
-service or launcher artifact exists. The three extracted `cargo package` crates rebuild and
-pass the all-feature and no-default workspace suites on physical Apple Silicon
-at its recorded head and on native Windows AMD64 in this working tree. Windows
+fail-closed. The backend-private same-user launcher authenticates its broker,
+enters cooperative `ptrace`, proves the relationship with an initial stop,
+installs the inherited SBPL/`RLIMIT_NPROC=1` profile, and crosses `exec` through
+the kernel trap before target code. The hidden fixed broker caller composes
+launcher spawn, FD 4 plan delivery, clean-exec signature verification, FD 5
+trace reporting/Ready-bound resume, and exact reap through one child wait
+domain. Native tests prove exact FD topology, launchd lookup/registration denial,
+fork/spawn denial, signal denial, exec inheritance, target substitution
+rejection, and Darwin's reap-to-`ECHILD` behavior. This remains source/mechanism
+evidence: no deployer-supplied minimal helpers are installed, signed, packaged,
+notarized, or proven replacement-resistant, no capability allowlist is complete,
+and public enablement is not authorized. The exact evidence and residuals are in
+[`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md).
+The three extracted `cargo package` crates rebuild and pass the all-feature and
+no-default workspace suites on physical Apple Silicon at its recorded head and
+on native Windows AMD64 at the recorded Windows checkpoint. Windows
 public sessions bind held executable identity, PID-authenticated message
 transport, exact process/whole-Job lifecycle, full-manifest
 IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation. Exact-release reruns,
 native Windows Arm64 runtime evidence, physical Linux Arm64 evidence, the macOS
 architecture, and release authorization remain outstanding.
 
-Implemented through `0.4.0`:
+Implemented in the current source tree (`0.4.0` plus unreleased vNext work):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -341,8 +324,8 @@ Implemented through `0.4.0`:
 - macOS Mach VM quiescent/local-writer/remote-writer typestates, including live
   permission probes, authenticated bootstrap, memory-entry transfer/import,
   READY/COMMIT exchange, and a bidirectional helper-process fixture;
-- Linux sealed `memfd`, short-read-safe exact `SCM_RIGHTS`, `SO_PEERCRED`,
-  `pidfd`, and owned helper lifecycle;
+- Linux sealed `memfd`, short-read-safe exact `SCM_RIGHTS`, per-record
+  `SCM_CREDENTIALS`, clone-time `pidfd`, and owned helper lifecycle;
 - Windows least-rights unnamed sections, exact-PID private named pipes,
   suspended Job-contained helpers, and cross-process handle import;
 - portable golden vectors, deterministic adversarial fixtures, Miri, and
@@ -354,9 +337,9 @@ Implemented through `0.4.0`:
 
 | Platform | Architecture | Rust target | Shared-memory capability | Peer authentication | Lifecycle containment |
 | --- | --- | --- | --- | --- | --- |
-| Linux | AMD64 | `x86_64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
-| Linux | ARM64 | `aarch64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | `SO_PEERCRED` | `pidfd` + owned helper cleanup |
-| macOS | ARM64 | `aarch64-apple-darwin` | Mach memory-entry send rights | Mach audit-token PID | private bootstrap port + reap |
+| Linux | AMD64 | `x86_64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | per-record `SCM_CREDENTIALS` bound to exact child | clone-time `pidfd` + owned helper cleanup |
+| Linux | ARM64 | `aarch64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | per-record `SCM_CREDENTIALS` bound to exact child | clone-time `pidfd` + owned helper cleanup |
+| macOS | ARM64 | `aarch64-apple-darwin` | Mach memory-entry send rights | Mach audit token + private signature gate | private same-user ptrace/SBPL core; public session unavailable |
 | Windows | AMD64 | `x86_64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 

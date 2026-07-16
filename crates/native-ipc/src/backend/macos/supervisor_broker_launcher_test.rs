@@ -1,11 +1,14 @@
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use static_assertions::assert_not_impl_any;
@@ -27,33 +30,134 @@ const UNTRACED_STOP: &[u8] = b"untraced-stop";
 const SUBSTITUTE_EXEC: &[u8] = b"substitute-exec";
 const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::broker_launcher::tests::fixture_target";
+const DEPLOYER_LAUNCHER_PATH: &CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
+const PRODUCTION_BROKER_FIXTURE_SUFFIX: &[u8] = b".native-ipc-production-broker-fixture";
 const PT_TRACE_ME: c_int = 0;
 const ENOENT: c_int = 2;
 const ECHILD: c_int = 10;
 const WNOHANG: c_int = 1;
+const F_DUPFD: c_int = 0;
+const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
+const O_ACCMODE: c_int = 3;
+const FD_CLOEXEC: c_int = 1;
+const MACH_PORT_TYPE_SEND: u32 = 1 << 16;
+const MACH_PORT_TYPE_RECEIVE: u32 = 1 << 17;
+const MACH_PORT_TYPE_DEAD_NAME: u32 = 1 << 20;
 
 unsafe extern "C" {
     fn _exit(status: c_int) -> !;
+    fn getdtablesize() -> c_int;
     fn getenv(name: *const c_char) -> *mut c_char;
     fn getegid() -> u32;
     fn getgid() -> u32;
     fn geteuid() -> u32;
     fn getuid() -> u32;
+    fn mach_port_type(task: u32, name: u32, port_type: *mut u32) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn raise(signal: c_int) -> c_int;
     fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+    fn task_get_special_port(task: u32, which: c_int, port: *mut u32) -> c_int;
 }
 
 assert_not_impl_any!(SpawnedLauncher: Clone, Copy, Send, Sync);
 assert_not_impl_any!(InitialStopObserved: Clone, Copy, Send, Sync);
 assert_not_impl_any!(AwaitingExecTrap: Clone, Copy, Send, Sync);
 assert_not_impl_any!(ExecTrapHeld: Clone, Copy, Send, Sync);
+assert_not_impl_any!(SignatureVerifiedExecTrap: Clone, Copy, Send, Sync);
+
+struct FakeSignatureWorkerAuthority;
+
+unsafe impl super::super::super::auth_adapter::ExactAuthWorkerAuthority
+    for FakeSignatureWorkerAuthority
+{
+    type Failure = ();
+
+    fn try_reap_after_result(
+        &mut self,
+    ) -> Result<Option<super::super::super::auth_adapter::ReapedAuthWorker>, Self::Failure> {
+        Ok(Some(
+            super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit(),
+        ))
+    }
+
+    fn try_terminate_and_reap(
+        &mut self,
+    ) -> Result<Option<super::super::super::auth_adapter::ReapedAuthWorker>, Self::Failure> {
+        Ok(Some(
+            super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit(),
+        ))
+    }
+
+    fn emergency_terminate_and_reap(
+        &mut self,
+    ) -> super::super::super::auth_adapter::ReapedAuthWorker {
+        super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit()
+    }
+}
+
+fn signature_job_id(byte: u8) -> super::super::super::auth_adapter::FreshAuthJobId {
+    // SAFETY: each test uses one fresh nonzero value for its one-job pool.
+    unsafe {
+        super::super::super::auth_adapter::FreshAuthJobId::from_fresh_random([byte; 32]).unwrap()
+    }
+}
+
+fn signature_worker_pool(
+    code_identity: [u8; 32],
+    expected_audit_identity: [u8; 32],
+) -> (
+    super::super::super::auth_adapter::AuthWorkerPool<FakeSignatureWorkerAuthority>,
+    JoinHandle<()>,
+) {
+    use super::super::super::auth_adapter::{
+        AuthWorkerEndpoint, AuthWorkerJob, AuthWorkerPool, ExactAuthWorker,
+        FreshAuthWorkerGeneration,
+    };
+
+    let (request_reader, request_writer) = test_pipe();
+    let (result_reader, result_writer) = test_pipe();
+    super::set_nonblocking(request_writer.as_raw_fd(), true).unwrap();
+    super::set_nonblocking(result_reader.as_raw_fd(), true).unwrap();
+    // SAFETY: the request writer is a live pipe descriptor retained by the
+    // parent endpoint; Darwin applies this setting without consuming it.
+    assert_eq!(
+        unsafe { fcntl(request_writer.as_raw_fd(), F_SETNOSIGPIPE, 1) },
+        0
+    );
+    // SAFETY: these are the sole parent ends for one fresh private worker.
+    let endpoint =
+        unsafe { AuthWorkerEndpoint::from_private_parent_pipe_ends(request_writer, result_reader) };
+    // SAFETY: this fake models one exact unreaped worker owned by the pool.
+    let worker =
+        unsafe { ExactAuthWorker::from_test_unreaped_direct_child(FakeSignatureWorkerAuthority) };
+    // SAFETY: this generation is nonzero and unique within this one-worker pool.
+    let generation = unsafe { FreshAuthWorkerGeneration::from_unique_service_value(1).unwrap() };
+    let pool =
+        AuthWorkerPool::from_test_precreated_workers(vec![(generation, worker, endpoint)]).unwrap();
+    let worker_thread = std::thread::spawn(move || {
+        let mut request = Vec::new();
+        std::fs::File::from(request_reader)
+            .read_to_end(&mut request)
+            .unwrap();
+        let job = AuthWorkerJob::decode_pipe_frame(&request).unwrap();
+        assert_eq!(job.audit_identity(), expected_audit_identity);
+        let result = job.encode_test_result(code_identity);
+        std::fs::File::from(result_writer)
+            .write_all(&result)
+            .unwrap();
+    });
+    (pool, worker_thread)
+}
 
 #[test]
 fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
     // SAFETY: this source-level vector test does not claim the fixed image is
     // installed or verified; it inspects only the installation-bound values.
-    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let image =
+        unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }
+            .unwrap();
     let argv = image.argv();
     let environment = image.environment();
     let argv = argv[..argv.len() - 1]
@@ -67,7 +171,7 @@ fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
     assert_eq!(
         argv,
         [
-            INSTALLED_LAUNCHER_PATH.as_bytes(),
+            DEPLOYER_LAUNCHER_PATH.to_bytes(),
             INSTALLED_LAUNCHER_MODE.as_bytes(),
             INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes(),
             INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes(),
@@ -87,7 +191,12 @@ fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
         assert_eq!(identity.real_gid, getgid());
         assert_eq!(identity.effective_gid, getegid());
     }
-    assert_eq!(identity.executable, INSTALLED_LAUNCHER_PATH.as_bytes());
+    assert_eq!(identity.executable, DEPLOYER_LAUNCHER_PATH.to_bytes());
+    // SAFETY: the invalid test value is rejected before any child can exist.
+    assert!(matches!(
+        unsafe { InstalledLauncherImage::from_verified_installation(c"relative-launcher") },
+        Err(LauncherSpawnFailure::InvalidFixedImage)
+    ));
 }
 
 #[test]
@@ -101,7 +210,9 @@ fn launcher_identity_never_expects_or_requires_root() {
         "the unprivileged supervisor's tests must not run as root",
     );
     // SAFETY: source-level vector construction only; see above.
-    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let image =
+        unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }
+            .unwrap();
     let identity = image.fixed_identity();
     assert_ne!(identity.real_uid, 0);
     assert_ne!(identity.effective_uid, 0);
@@ -178,25 +289,31 @@ fn test_pipe() -> (OwnedFd, OwnedFd) {
 }
 
 /// Source-level vectors only. No test claims the fixed image is installed,
-/// root-owned, signed, or verified.
+/// signed, installed, or verified.
 fn uninstalled_fixed_image() -> InstalledLauncherImage {
     // SAFETY: this inspects installation-bound values and deliberately drives
     // the spawn against an absent path; it asserts no installation evidence.
-    unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap()
+    unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }.unwrap()
 }
 
 #[test]
 fn uninstalled_fixed_launcher_image_fails_only_at_the_exact_spawn() {
     assert!(
-        !std::path::Path::new(INSTALLED_LAUNCHER_PATH).exists(),
+        !std::path::Path::new(std::ffi::OsStr::from_bytes(
+            DEPLOYER_LAUNCHER_PATH.to_bytes()
+        ))
+        .exists(),
         "this boundary test is only meaningful while the fixed image is absent",
     );
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
-    let (active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("an absent fixed launcher image cannot spawn")
-            .into_parts();
+    let (active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("an absent fixed launcher image cannot spawn")
+    .into_parts();
     // Every pipe, descriptor relocation, file action, spawn attribute, dead-end
     // bootstrap name, expected identity, and the canonical frame were prepared
     // successfully; only the absent fixed path failed. Darwin forks before it
@@ -211,15 +328,59 @@ fn uninstalled_fixed_launcher_image_fails_only_at_the_exact_spawn() {
 }
 
 #[test]
+fn production_spawn_installs_exact_launcher_fd_topology_and_characterizes_bootstrap() {
+    let executable = std::env::current_exe().unwrap();
+    let installed_path = CString::new(executable.as_os_str().as_bytes()).unwrap();
+    // SAFETY: this fixture treats the absolute current test image as the one
+    // deployer-verified launcher solely to exercise production spawn actions
+    // and attributes. It establishes no installation or signing evidence.
+    let image =
+        unsafe { InstalledLauncherImage::from_verified_installation(&installed_path) }.unwrap();
+    let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
+    let sentinel = fs::File::open("/dev/null").unwrap();
+    // SAFETY: duplicate one live broker descriptor above the fixed child ABI,
+    // then deliberately clear CLOEXEC. The production spawn's
+    // POSIX_SPAWN_CLOEXEC_DEFAULT attribute must still exclude it.
+    let inherited_sentinel = unsafe { fcntl(sentinel.as_raw_fd(), F_DUPFD, 100) };
+    assert!(inherited_sentinel >= 100);
+    // SAFETY: the new descriptor is live and F_SETFD accepts zero flags.
+    assert_eq!(unsafe { fcntl(inherited_sentinel, F_SETFD, 0) }, 0);
+    // SAFETY: the successful F_DUPFD result is a fresh owned descriptor.
+    let inherited_sentinel = unsafe { OwnedFd::from_raw_fd(inherited_sentinel) };
+
+    let spawned = match spawn_fixed_launcher(
+        boundary.take_active(),
+        &image,
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let (_active, failure) = error.into_parts();
+            panic!("production-shaped launcher fixture failed to spawn: {failure:?}")
+        }
+    };
+    let initial = spawned.wait_initial_stop().unwrap();
+
+    // Dropping the exact stopped direct-child owner kills and drains through
+    // ECHILD. No numeric PID is retained or reconstructed after this point.
+    drop(initial);
+    drop(inherited_sentinel);
+    boundary.close_gate();
+}
+
+#[test]
 fn service_death_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
     boundary.close_gate();
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("service death must preempt the spawn")
-            .into_parts();
-    // Service loss outranks creating a privileged child. This must never reach
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("service death must preempt the spawn")
+    .into_parts();
+    // Service loss outranks creating a child. This must never reach
     // posix_spawn, so it cannot report the absent image instead.
     assert_eq!(failure, LauncherSpawnFailure::ServiceGone);
 }
@@ -228,11 +389,14 @@ fn service_death_preempts_the_fixed_launcher_spawn() {
 fn expired_deadline_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(2));
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("an expired deadline must preempt the spawn")
-            .into_parts();
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("an expired deadline must preempt the spawn")
+    .into_parts();
     // The original absolute deadline is checked while no child exists, so an
     // expired request can never create one.
     assert_eq!(failure, LauncherSpawnFailure::DeadlineExpired);
@@ -243,11 +407,14 @@ fn expired_deadline_preempts_the_fixed_launcher_spawn() {
 fn a_gate_byte_preempts_the_fixed_launcher_spawn() {
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
     boundary.poison_gate();
-    let (_active, failure) =
-        spawn_fixed_launcher(boundary.take_active(), &uninstalled_fixed_image())
-            .err()
-            .expect("a noncanonical gate byte must preempt the spawn")
-            .into_parts();
+    let (_active, failure) = spawn_fixed_launcher(
+        boundary.take_active(),
+        &uninstalled_fixed_image(),
+        &mut DedicatedChildWaitDomain::for_spawn_test(),
+    )
+    .err()
+    .expect("a noncanonical gate byte must preempt the spawn")
+    .into_parts();
     // Only EOF is canonical on the gate. A byte is a protocol failure and must
     // not be mistaken for a live service that may spawn a launcher.
     assert_eq!(failure, LauncherSpawnFailure::InvalidGate);
@@ -259,6 +426,28 @@ fn a_gate_byte_preempts_the_fixed_launcher_spawn() {
 static EXACT_LAUNCHER_HOOK: extern "C" fn() = exact_launcher_hook;
 
 extern "C" fn exact_launcher_hook() {
+    let mut arguments = std::env::args_os();
+    let argument0 = arguments.next();
+    let launcher_mode = arguments
+        .next()
+        .is_some_and(|argument| argument.as_bytes() == INSTALLED_LAUNCHER_MODE.as_bytes());
+    if launcher_mode && production_spawn_has_canonical_environment() {
+        if let Some(argument0) = argument0
+            && argument0
+                .as_bytes()
+                .ends_with(PRODUCTION_BROKER_FIXTURE_SUFFIX)
+        {
+            let installed = CString::new(argument0.as_bytes()).unwrap_or_else(|_| {
+                // SAFETY: the isolated fixture cannot satisfy the entry ABI.
+                unsafe { _exit(105) }
+            });
+            // SAFETY: the production-broker sibling fixture installed this
+            // exact path/vector and the sole FD3/FD4 ownership before exec.
+            unsafe { super::super::super::launcher_entry::run_fixed_launcher_process(&installed) }
+        }
+        production_spawn_containment_hook();
+    }
+
     // SAFETY: getenv reads one static NUL-terminated name before main. The
     // returned pointer, when nonnull, remains valid until this process exits.
     let mode = unsafe { getenv(FIXTURE_ENV.as_ptr().cast()) };
@@ -363,6 +552,125 @@ extern "C" fn exact_launcher_hook() {
     let _ = error;
     // SAFETY: exec returned, so the fixture cannot satisfy the protocol.
     unsafe { _exit(97) }
+}
+
+fn production_spawn_containment_hook() -> ! {
+    if !production_spawn_has_exact_arguments()
+        || !production_spawn_has_canonical_environment()
+        || !production_spawn_has_null_stdio()
+        || !production_spawn_has_exact_descriptors()
+        || !production_spawn_has_bounded_bootstrap_right()
+    {
+        // SAFETY: the isolated fixture must not enter libtest after observing
+        // a production launcher-spawn contract violation.
+        unsafe { _exit(102) }
+    }
+
+    // The parent uses the production initial-stop path as the fixture's one
+    // success receipt. If it observes this stop, every check above ran inside
+    // the exact image created by LauncherSpawnResources.
+    // SAFETY: this isolated fixture designates its actual parent as tracer and
+    // then produces the launcher's canonical initial stop.
+    if unsafe { ptrace(PT_TRACE_ME, 0, std::ptr::null_mut(), 0) } != 0
+        || unsafe { raise(SIGSTOP) } != 0
+    {
+        // SAFETY: the fixture cannot continue safely without exact tracing.
+        unsafe { _exit(103) }
+    }
+    // SAFETY: the parent exact-kills this stopped fixture; resumption is a
+    // protocol failure rather than permission to enter libtest.
+    unsafe { _exit(104) }
+}
+
+fn production_spawn_has_canonical_environment() -> bool {
+    let mut environment = std::env::vars_os()
+        .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    environment.sort_unstable();
+    environment
+        == [
+            (b"LANG".to_vec(), b"C".to_vec()),
+            (b"LC_ALL".to_vec(), b"C".to_vec()),
+            (b"PATH".to_vec(), b"/usr/bin:/bin".to_vec()),
+        ]
+}
+
+fn production_spawn_has_exact_arguments() -> bool {
+    let arguments = std::env::args_os()
+        .map(|argument| argument.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    arguments.len() == 4
+        && arguments[0].first() == Some(&b'/')
+        && arguments[1] == INSTALLED_LAUNCHER_MODE.as_bytes()
+        && arguments[2] == INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes()
+        && arguments[3] == INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes()
+}
+
+fn production_spawn_has_null_stdio() -> bool {
+    let Ok(null) = fs::metadata("/dev/null") else {
+        return false;
+    };
+    (0..=2).all(|descriptor| {
+        let Ok(metadata) = fs::metadata(format!("/dev/fd/{descriptor}")) else {
+            return false;
+        };
+        metadata.file_type().is_char_device()
+            && metadata.dev() == null.dev()
+            && metadata.ino() == null.ino()
+            && metadata.rdev() == null.rdev()
+    })
+}
+
+fn production_spawn_has_exact_descriptors() -> bool {
+    for descriptor in [LAUNCHER_DEATH_FD, LAUNCHER_PLAN_FD] {
+        // SAFETY: these are read-only descriptor queries on fixed nonnegative
+        // numbers; the fixture owns no Rust value for either child descriptor.
+        let descriptor_flags = unsafe { fcntl(descriptor, F_GETFD) };
+        let status_flags = unsafe { fcntl(descriptor, F_GETFL) };
+        let Ok(metadata) = fs::metadata(format!("/dev/fd/{descriptor}")) else {
+            return false;
+        };
+        if descriptor_flags < 0
+            || descriptor_flags & FD_CLOEXEC != 0
+            || status_flags < 0
+            || status_flags & O_ACCMODE != 0
+            || !metadata.file_type().is_fifo()
+        {
+            return false;
+        }
+    }
+
+    // SAFETY: getdtablesize is a read-only process limit query.
+    let descriptor_limit = unsafe { getdtablesize() };
+    descriptor_limit > LAUNCHER_PLAN_FD
+        && (0..descriptor_limit).all(|descriptor| {
+            // SAFETY: F_GETFD only observes whether this numeric slot is live.
+            let is_open = unsafe { fcntl(descriptor, F_GETFD) } >= 0;
+            is_open == (0..=LAUNCHER_PLAN_FD).contains(&descriptor)
+        })
+}
+
+fn production_spawn_has_bounded_bootstrap_right() -> bool {
+    let task = crate::backend::macos::current_task();
+    let mut bootstrap = 0;
+    // SAFETY: bootstrap points to writable storage for one copied special-port
+    // right in this isolated child.
+    if unsafe { task_get_special_port(task, TASK_BOOTSTRAP_PORT, &raw mut bootstrap) } != 0
+        || bootstrap == 0
+    {
+        return false;
+    }
+    if bootstrap == MACH_PORT_DEAD {
+        return true;
+    }
+
+    let mut port_type = 0;
+    // SAFETY: bootstrap is live in this task and port_type is writable.
+    let result = unsafe { mach_port_type(task, bootstrap, &raw mut port_type) };
+    crate::backend::macos::deallocate_port(task, bootstrap);
+    result == 0
+        && port_type & MACH_PORT_TYPE_RECEIVE == 0
+        && port_type & (MACH_PORT_TYPE_SEND | MACH_PORT_TYPE_DEAD_NAME) != 0
 }
 
 struct Fixture {
@@ -506,11 +814,23 @@ impl Fixture {
         drop(self.gate_writer.take());
     }
 
-    fn held_exec(&mut self) -> (c_int, ExecTrapHeld) {
+    fn held_exec(&mut self) -> (c_int, SignatureVerifiedExecTrap) {
         self.held_exec_until(self.deadline())
     }
 
-    fn held_exec_until(&mut self, deadline: Instant) -> (c_int, ExecTrapHeld) {
+    fn held_exec_until(&mut self, deadline: Instant) -> (c_int, SignatureVerifiedExecTrap) {
+        let (pid, held) = self.held_exec_unverified_until(deadline);
+        // SAFETY: legacy launcher lifecycle tests isolate properties after the
+        // new signature boundary. Dedicated tests above exercise the real
+        // auth-worker accept/reject transition.
+        (pid, unsafe { held.assume_signature_verified_for_test() })
+    }
+
+    fn held_exec_unverified(&mut self) -> (c_int, ExecTrapHeld) {
+        self.held_exec_unverified_until(self.deadline())
+    }
+
+    fn held_exec_unverified_until(&mut self, deadline: Instant) -> (c_int, ExecTrapHeld) {
         let pid = c_int::try_from(self.child.id()).unwrap();
         let initial = self.spawned_launcher(deadline).wait_initial_stop().unwrap();
         let running = initial.prove_trace_and_continue_to_exec().unwrap();
@@ -543,6 +863,45 @@ fn real_exec_changes_audit_pid_version_at_exact_trap() {
     assert_eq!(held.exact_pid_for_test(), pid);
     drop(held);
     fixture.close_gate();
+}
+
+#[test]
+fn exec_trap_signature_gate_accepts_the_installed_target_identity() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (pid, held) = fixture.held_exec_unverified();
+    let expected_audit_identity = held._after_exec.audit_identity();
+    let (mut pool, worker) = signature_worker_pool([4; 32], expected_audit_identity);
+
+    let verified = held
+        .verify_signature(&mut pool, signature_job_id(0x71))
+        .unwrap();
+
+    assert_eq!(verified.exact_pid_for_test(), pid);
+    worker.join().unwrap();
+    drop(verified);
+    assert_no_reapable_status(pid);
+    fixture.close_gate();
+}
+
+#[test]
+fn exec_trap_signature_gate_rejects_zero_or_substituted_identity_and_exact_cleans() {
+    for (job_byte, code_identity) in [(0x72, [0; 32]), (0x73, [9; 32])] {
+        let mut fixture = Fixture::spawn("valid-exec");
+        let (pid, held) = fixture.held_exec_unverified();
+        let expected_audit_identity = held._after_exec.audit_identity();
+        let (mut pool, worker) = signature_worker_pool(code_identity, expected_audit_identity);
+
+        assert!(matches!(
+            held.verify_signature(&mut pool, signature_job_id(job_byte)),
+            Err(LauncherSignatureError::Auth(
+                super::super::super::auth_adapter::AuthAdapterError::AuthenticationRejected
+            ))
+        ));
+
+        worker.join().unwrap();
+        assert_no_reapable_status(pid);
+        fixture.close_gate();
+    }
 }
 
 #[test]

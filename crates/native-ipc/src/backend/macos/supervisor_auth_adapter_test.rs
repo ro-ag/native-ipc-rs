@@ -557,13 +557,13 @@ pub(super) fn installed_catalog() -> InstalledPolicyCatalog {
         b"com.example.receiver".to_vec(),
         CLIENT_CODE_IDENTITY,
         TARGET_CODE_IDENTITY,
-        b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
+        b"/example/NativeIPC.app/Contents/Helpers/receiver".to_vec(),
         b"receiver".to_vec(),
         4,
         vec![b"LANG".to_vec()],
     )
     .unwrap();
-    // SAFETY: this test models one immutable root-owned installed catalog.
+    // SAFETY: this test models one immutable deployer-owned installed catalog.
     unsafe { InstalledPolicyCatalog::from_verified_installation(vec![definition]).unwrap() }
 }
 

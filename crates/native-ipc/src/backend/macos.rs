@@ -26,10 +26,32 @@ pub(super) mod supervisor_watchdog;
 /// # Safety
 ///
 /// The caller must satisfy the fixed broker process-entry contract documented
-/// by the gate runner. This is exposed only for the separate executable crate.
-pub(crate) unsafe fn run_fixed_broker_gate_process() -> ! {
+/// by the gate runner and supply its absolute compile-time installation path.
+/// This is exposed only for the separate executable crate.
+pub(crate) unsafe fn run_fixed_broker_gate_process(installed_path: &std::ffi::CStr) -> ! {
     // SAFETY: the caller transfers the exact documented entry contract.
-    unsafe { supervisor::broker_entry::run_fixed_gate_process() }
+    unsafe { supervisor::broker_entry::run_fixed_gate_process(installed_path) }
+}
+
+/// Runs the complete fixed broker launcher lifecycle.
+///
+/// # Safety
+///
+/// The caller must satisfy the fixed broker process-entry contract and supply
+/// only verified, deployer-compiled absolute helper paths.
+pub(crate) unsafe fn run_fixed_broker_process(
+    installed_path: &std::ffi::CStr,
+    launcher_path: &std::ffi::CStr,
+    auth_worker_path: &std::ffi::CStr,
+) -> ! {
+    // SAFETY: the caller transfers the complete documented entry contract.
+    unsafe {
+        supervisor::broker_entry::run_fixed_broker_process(
+            installed_path,
+            launcher_path,
+            auth_worker_path,
+        )
+    }
 }
 
 /// Runs the fixed trusted-launcher boundary.
@@ -37,11 +59,12 @@ pub(crate) unsafe fn run_fixed_broker_gate_process() -> ! {
 /// # Safety
 ///
 /// The caller must satisfy the fixed launcher process-entry contract
-/// documented by the launcher runner. This is exposed only for the separate
-/// executable crate the deployer builds and signs.
-pub(crate) unsafe fn run_fixed_launcher_process() -> ! {
+/// documented by the launcher runner and supply its absolute compile-time
+/// installation path. This is exposed only for the separate executable crate
+/// the deployer builds and signs.
+pub(crate) unsafe fn run_fixed_launcher_process(installed_path: &std::ffi::CStr) -> ! {
     // SAFETY: the caller transfers the exact documented entry contract.
-    unsafe { supervisor::launcher_entry::run_fixed_launcher_process() }
+    unsafe { supervisor::launcher_entry::run_fixed_launcher_process(installed_path) }
 }
 
 /// Runs the fixed clean-exec authentication-worker boundary.
@@ -49,14 +72,17 @@ pub(crate) unsafe fn run_fixed_launcher_process() -> ! {
 /// # Safety
 ///
 /// The caller must satisfy the fixed worker process-entry contract and supply
-/// only compiled installed-policy constants from the separate worker artifact.
+/// only compiled installed-policy constants, including its absolute path, from
+/// the separate worker artifact.
 pub(crate) unsafe fn run_fixed_auth_worker_process(
+    installed_path: &std::ffi::CStr,
     requirement: &std::ffi::CStr,
     code_identity: [u8; 32],
 ) -> ! {
     // SAFETY: the caller transfers the complete documented worker contract.
     unsafe {
         supervisor::auth_adapter::auth_worker_entry::run_fixed_auth_worker_process(
+            installed_path,
             requirement,
             code_identity,
         )

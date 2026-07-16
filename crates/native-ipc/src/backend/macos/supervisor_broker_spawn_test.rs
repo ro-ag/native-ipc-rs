@@ -25,6 +25,7 @@ const EXIT_IMMEDIATELY: &str = "exit 7";
 const CHECK_FD_TOPOLOGY: &str =
     "IFS= read -r -n 1 <&3 || exit 71; if true <&100 2>/dev/null; then sleep 30; else exit 0; fi";
 const PREMAIN_WAIT_DOMAIN_ENV: &[u8] = b"NATIVE_IPC_TEST_PREMAIN_WAIT_DOMAIN\0";
+const DEPLOYER_BROKER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-broker";
 
 struct SuccessfulReadyCommit;
 
@@ -461,11 +462,12 @@ fn assert_exactly_reaped(pid: c_int) {
 
 #[test]
 fn installed_image_vectors_are_fixed_and_canonical() {
-    // SAFETY: this source-only test checks only the fixed in-memory vectors;
-    // it does not claim the hard-coded path is installed, signed, or verified.
-    let image = unsafe { InstalledBrokerImage::from_verified_installation() }.unwrap();
+    // SAFETY: this source-only test checks only the deployer-bound in-memory
+    // vectors; it does not claim the path is installed, signed, or verified.
+    let image =
+        unsafe { InstalledBrokerImage::from_verified_installation(DEPLOYER_BROKER_PATH) }.unwrap();
     let argv = image.argv();
-    assert_eq!(image.path.to_bytes(), INSTALLED_BROKER_PATH.as_bytes());
+    assert_eq!(image.path.to_bytes(), DEPLOYER_BROKER_PATH.to_bytes());
     assert_eq!(argv[0], image.path.as_ptr().cast_mut());
     assert_eq!(image.mode.to_bytes(), INSTALLED_BROKER_MODE.as_bytes());
     assert_eq!(
@@ -482,6 +484,12 @@ fn installed_image_vectors_are_fixed_and_canonical() {
     );
     assert!(argv[5].is_null());
     assert!(image.environment()[3].is_null());
+    // SAFETY: the invalid test value deliberately fails before it can become
+    // an installation-bound spawn vector.
+    assert!(matches!(
+        unsafe { InstalledBrokerImage::from_verified_installation(c"relative-broker") },
+        Err(BrokerSpawnError::InvalidFixedImage)
+    ));
 }
 
 #[test]
@@ -682,7 +690,7 @@ fn immediate_exit_retains_zombie_pid_pin_until_exact_reap() {
 #[test]
 fn spawn_failure_mints_no_direct_child_authority() {
     let image = InstalledBrokerImage {
-        path: fixed_cstring("/Library/PrivilegedHelperTools/.native-ipc-missing-broker").unwrap(),
+        path: fixed_cstring("/example/NativeIPC.app/Contents/Helpers/missing-broker").unwrap(),
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
         control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),
@@ -702,7 +710,7 @@ fn spawn_failure_preserves_exact_reply_and_bound_session_error_path() {
     let (pending, _owner, handle) = assigned_pending(4103, 0xa3);
     let mut domain = test_wait_domain();
     let missing = InstalledBrokerImage {
-        path: fixed_cstring("/Library/PrivilegedHelperTools/.native-ipc-missing-broker").unwrap(),
+        path: fixed_cstring("/example/NativeIPC.app/Contents/Helpers/missing-broker").unwrap(),
         mode: fixed_cstring(INSTALLED_BROKER_MODE).unwrap(),
         gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT).unwrap(),
         control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT).unwrap(),

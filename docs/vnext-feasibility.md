@@ -983,6 +983,20 @@ conformance pass.
 
 ## Blocked macOS 6d public-session prototype
 
+Current decision: the backend-private lifecycle is a same-user, unprivileged
+fixed broker/launcher construction, while public macOS remains fail-closed.
+There is no root helper, set-ID transition, root-owned catalog, privileged
+watchdog, or requirement to restore general launchd reachability in the
+selected model. The inherited launcher profile instead denies signals and Mach
+lookup/registration, and a disposable clean-exec worker performs dynamic
+Security.framework validation. All supervisor children start in fresh sessions;
+FD3/FD4 are fail-closed close-on-exec before containment. Exact direct-child
+reap is implemented, but ordinary-descendant group cleanup is unverified.
+
+The following paragraphs are a chronological feasibility record and include
+superseded privileged-service proposals. They are not the current architecture;
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) is authoritative.
+
 The private macOS memory, transport, evidence, reducer, and activation owners
 now compose into a public-API-shaped prototype on Apple Silicon, but actual
 public spawn/bootstrap remain fail-closed. The private prototype now starts the
