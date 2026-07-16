@@ -2,6 +2,23 @@ use super::*;
 
 const DEPLOYER_LAUNCHER_PATH: &std::ffi::CStr =
     c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
+const LAUNCHD_LOOKUP_PROBE: &str =
+    "backend::macos::supervisor::launcher_entry::tests::launchd_lookup_probe_helper";
+const LAUNCHD_LOOKUP_PROBE_ENV: &str = "NATIVE_IPC_LAUNCHD_LOOKUP_PROBE";
+const LOOKUP_ALLOWED_EXIT: i32 = 78;
+const LOOKUP_DENIED_EXIT: i32 = 79;
+const TASK_BOOTSTRAP_PORT: c_int = 4;
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn bootstrap_look_up(
+        bootstrap_port: u32,
+        service_name: *const c_char,
+        service_port: *mut u32,
+    ) -> c_int;
+    fn mach_port_deallocate(task: u32, name: u32) -> c_int;
+    fn task_get_special_port(task: u32, which: c_int, port: *mut u32) -> c_int;
+}
 
 #[test]
 fn fixed_arguments_accept_only_the_installed_launcher_vector() {
@@ -92,7 +109,7 @@ fn broker_death_is_the_only_clean_launcher_exit() {
 }
 
 #[test]
-fn the_sandbox_profile_denies_signals_and_survives_exec() {
+fn the_sandbox_profile_denies_signals_launchd_and_survives_exec() {
     // The load-bearing containment claim: without it a target can SIGSTOP the
     // broker and suspend all cleanup, which is the sole reason this design once
     // required a privileged watchdog. Applying the profile to this process
@@ -164,8 +181,81 @@ fn the_sandbox_profile_denies_signals_and_survives_exec() {
         "the profile must still deny signals after exec",
     );
 
+    // Establish that the measured launchd service is reachable without the
+    // profile, then prove the same exact lookup is denied inside the profile.
+    let current_exe = std::env::current_exe().unwrap();
+    let baseline = launchd_probe(&current_exe).status().unwrap();
+    assert_eq!(
+        baseline.code(),
+        Some(LOOKUP_ALLOWED_EXIT),
+        "the launchd probe service must be reachable for this measurement",
+    );
+    let contained_lookup = launchd_probe_via_sandbox(&current_exe).status().unwrap();
+    assert_eq!(
+        contained_lookup.code(),
+        Some(LOOKUP_DENIED_EXIT),
+        "the inherited profile must deny launchd Mach lookup",
+    );
+
     victim.kill().unwrap();
     victim.wait().unwrap();
+}
+
+fn launchd_probe(current_exe: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(current_exe);
+    command
+        .args(["--ignored", "--exact", LAUNCHD_LOOKUP_PROBE])
+        .env(LAUNCHD_LOOKUP_PROBE_ENV, "1");
+    command
+}
+
+fn launchd_probe_via_sandbox(current_exe: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+    command
+        .arg("-p")
+        .arg(LAUNCHER_SANDBOX_PROFILE)
+        .arg(current_exe)
+        .args(["--ignored", "--exact", LAUNCHD_LOOKUP_PROBE])
+        .env(LAUNCHD_LOOKUP_PROBE_ENV, "1");
+    command
+}
+
+#[test]
+#[ignore = "spawned alone by the launcher sandbox launchd-lookup measurement"]
+fn launchd_lookup_probe_helper() {
+    if std::env::var_os(LAUNCHD_LOOKUP_PROBE_ENV).is_none() {
+        return;
+    }
+    // SAFETY: the task-self getter and special-port query have public Darwin
+    // ABI; all out-parameters are writable for one port name.
+    let task = unsafe { mach_task_self_ };
+    let mut bootstrap = 0_u32;
+    let special = unsafe { task_get_special_port(task, TASK_BOOTSTRAP_PORT, &raw mut bootstrap) };
+    if special != 0 || bootstrap == 0 {
+        std::process::exit(LOOKUP_DENIED_EXIT);
+    }
+
+    let mut service = 0_u32;
+    // This is the same stable service used by the original issue-9
+    // measurement. The parent first proves it exists without the profile.
+    let lookup = unsafe {
+        bootstrap_look_up(
+            bootstrap,
+            c"com.apple.system.notification_center".as_ptr(),
+            &raw mut service,
+        )
+    };
+    if service != 0 {
+        // SAFETY: a successful lookup returned one send-right reference.
+        let _ = unsafe { mach_port_deallocate(task, service) };
+    }
+    // SAFETY: task_get_special_port returned one send-right reference.
+    let _ = unsafe { mach_port_deallocate(task, bootstrap) };
+    std::process::exit(if lookup == 0 {
+        LOOKUP_ALLOWED_EXIT
+    } else {
+        LOOKUP_DENIED_EXIT
+    });
 }
 
 #[test]

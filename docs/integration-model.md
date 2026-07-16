@@ -92,12 +92,13 @@ and is not reachable from the plugin.
   who already runs their own separate process as your user. A malicious plugin
   shipped as a library does not by itself grant that; an attacker who already has
   independent code execution as your user is outside scope.
-- **macOS residual — `launchd` delegation.** An in-process plugin can still reach
-  `launchd` and ask it to spawn a helper outside the runner's containment. This is
-  the one path by which in-process code can reach a separate uncontained process.
-  It is closed by denying Mach service lookup in the runner's profile (allowlisting
-  only the services the runner genuinely needs); until a deployment does that, it
-  is an honest residual, not a closed door.
+- **macOS `launchd` delegation.** The fixed launcher profile denies Mach service
+  lookup and registration before the runner image executes, closing the blanket
+  delegation path in the backend-private design. A future deployer capability
+  profile may replace that blanket denial only with an explicit service
+  allowlist; each allowlisted service is delegated authority that the deployment
+  must account for. Public macOS remains disabled until its separate enablement
+  decision and installed-artifact evidence are complete.
 - **macOS mechanism caveat.** The unprivileged containment relies on
   `sandbox_init` (deprecated) and SBPL (undocumented). It is an empirical property
   of the current OS, verified by measurement, not a supported API contract.

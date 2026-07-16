@@ -63,24 +63,29 @@ const EAGAIN: c_int = 35;
 /// `(deny signal)` is the load-bearing rule for the cooperative tier. Without
 /// it a target can send the broker an unmaskable `SIGSTOP` and suspend every
 /// deadline and death-pipe check. Native measurement on this platform: from
-/// inside this profile, outbound signals are denied with `EPERM`, the profile
-/// cannot be relaxed by a second `sandbox_init` or by `execve`, and
-/// self-signalling (`raise`, `abort`, `pthread_kill`) still works so targets
-/// do not break.
+/// inside this profile, outbound signals are denied with `EPERM`, Mach service
+/// lookup/registration is denied, the profile cannot be relaxed by a second
+/// `sandbox_init` or by `execve`, and self-signalling (`raise`, `abort`,
+/// `pthread_kill`) still works so targets do not break.
 ///
 /// This binds the exact contained process, not the user. It does not make the
 /// broker safe from a *malicious* same-user principal: a sibling process the
-/// broker never sandboxed can still `SIGSTOP` it, and adversarial review found
-/// `launchd` reachable from inside this profile, so a delegated helper escapes
-/// both this rule and `RLIMIT_NPROC`. Those attacks are out of scope for this
-/// lifecycle boundary; defending against them would need the privileged
-/// watchdog this design deliberately does not require. The guarantee here is
-/// that an *uncooperative* target cannot stop the process that must reap it.
+/// broker never sandboxed can still `SIGSTOP` it. That attack is out of scope
+/// for this lifecycle boundary. The inherited profile closes the runner's
+/// `launchd` delegation path by denying all Mach lookup and registration; a
+/// future deployer capability profile may replace that blanket rule only with
+/// an explicit service allowlist.
 ///
 /// The mechanism is also not a durable contract: `sandbox_init` is deprecated
 /// and SBPL is undocumented, so this is an empirical property of the current
 /// OS, not a supported API boundary.
-const LAUNCHER_SANDBOX_PROFILE: &str = "(version 1)\n(allow default)\n(deny signal)\n";
+const LAUNCHER_SANDBOX_PROFILE: &str = concat!(
+    "(version 1)\n",
+    "(allow default)\n",
+    "(deny signal)\n",
+    "(deny mach-lookup)\n",
+    "(deny mach-register)\n",
+);
 
 /// One process. Set only after the sandbox, and never as root, because Darwin
 /// exempts root from this limit entirely.

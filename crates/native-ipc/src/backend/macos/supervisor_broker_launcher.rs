@@ -52,6 +52,9 @@ use super::{
 };
 use crate::backend::macos::bootstrap::{TaskAuditIdentity, capture_task_audit_identity};
 use crate::backend::macos::supervisor::deployer_helper_path;
+use crate::backend::macos::supervisor::spawn_primitives::{
+    SpawnAttributes, SpawnFileActions, spawn,
+};
 
 const SIGKILL: c_int = 9;
 const SIGSTOP: c_int = 17;
@@ -90,16 +93,10 @@ const F_DUPFD_CLOEXEC: c_int = 67;
 const F_SETNOSIGPIPE: c_int = 73;
 const O_RDWR: c_int = 2;
 
-const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
-const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
-const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 const TASK_BOOTSTRAP_PORT: c_int = 4;
 /// `MACH_PORT_DEAD`. XNU gates the spawn port action's copyin on
 /// `MACH_PORT_VALID`, so this name is stored verbatim rather than copied in.
 const MACH_PORT_DEAD: u32 = !0;
-
-type PosixSpawnAttr = *mut c_void;
-type PosixSpawnFileActions = *mut c_void;
 
 #[repr(C)]
 struct PollFd {
@@ -116,45 +113,8 @@ unsafe extern "C" {
     fn kill(pid: c_int, signal: c_int) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn poll(descriptors: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
-    fn posix_spawn(
-        pid: *mut c_int,
-        path: *const c_char,
-        file_actions: *const PosixSpawnFileActions,
-        attributes: *const PosixSpawnAttr,
-        argv: *const *mut c_char,
-        environment: *const *mut c_char,
-    ) -> c_int;
-    fn posix_spawn_file_actions_addclose(actions: *mut PosixSpawnFileActions, fd: c_int) -> c_int;
-    fn posix_spawn_file_actions_adddup2(
-        actions: *mut PosixSpawnFileActions,
-        source: c_int,
-        destination: c_int,
-    ) -> c_int;
-    fn posix_spawn_file_actions_addopen(
-        actions: *mut PosixSpawnFileActions,
-        fd: c_int,
-        path: *const c_char,
-        flags: c_int,
-        mode: u16,
-    ) -> c_int;
-    fn posix_spawn_file_actions_destroy(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawn_file_actions_init(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
-    fn posix_spawnattr_setsigdefault(attributes: *mut PosixSpawnAttr, signals: *const u32)
-    -> c_int;
-    fn posix_spawnattr_setsigmask(attributes: *mut PosixSpawnAttr, signals: *const u32) -> c_int;
-    fn posix_spawnattr_setspecialport_np(
-        attributes: *mut PosixSpawnAttr,
-        port: u32,
-        which: c_int,
-    ) -> c_int;
     fn ptrace(request: c_int, pid: c_int, address: *mut c_void, data: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut u8, count: usize) -> isize;
-    fn sigdelset(set: *mut u32, signal: c_int) -> c_int;
-    fn sigemptyset(set: *mut u32) -> c_int;
-    fn sigfillset(set: *mut u32) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
 }
@@ -324,9 +284,9 @@ struct ExactLauncher {
 ///
 /// Closing `death_writer` is the launcher's only broker-death signal, so exact
 /// cleanup drops it before any signal: a launcher blocked on its own FD3 probe
-/// then wakes and self-terminates even if the kill races. Dropping the private
-/// bootstrap port destroys the launcher's inherited namespace rather than
-/// reconnecting it to `launchd`.
+/// then wakes and self-terminates even if the kill races. The spawn-time dead
+/// bootstrap action removes inherited authority only; the launcher's inherited
+/// sandbox profile is the load-bearing `launchd` lookup/registration denial.
 /// Field order is release order: dropping this value closes the plan writer
 /// first, then the death writer.
 pub(super) struct RetainedLauncherChannels {
@@ -420,8 +380,8 @@ struct PreparedLauncherSpawn<'image> {
 
 /// Every fallible resource one launcher child needs, all already acquired.
 struct LauncherSpawnResources {
-    actions: FileActionsGuard,
-    attributes: SpawnAttributesGuard,
+    actions: SpawnFileActions,
+    attributes: SpawnAttributes,
     death_reader: OwnedFd,
     plan_reader: OwnedFd,
     channels: RetainedLauncherChannels,
@@ -466,7 +426,7 @@ impl LauncherSpawnResources {
         // state, so it must never block on a launcher that stopped reading.
         set_writer_nonblocking(plan_writer.as_raw_fd())?;
 
-        let mut actions = FileActionsGuard::new()?;
+        let mut actions = SpawnFileActions::new().map_err(LauncherSpawnFailure::FileActions)?;
         // Canonical stdio: the launcher inherits no terminal. Together with
         // CLOEXEC_DEFAULT below, the launcher receives exactly fds 0-4 and no
         // channel back to the broker or service. This covers the launcher
@@ -474,10 +434,16 @@ impl LauncherSpawnResources {
         // is scoped to this spawn, so fds 3 and 4 survive the launcher's own
         // exec. The launcher entry must close both before execing the target.
         for fd in LAUNCHER_STDIO_FDS {
-            actions.add_open_null(fd, &image.null_device)?;
+            actions
+                .add_open(fd, image.null_device.as_c_str(), O_RDWR, 0)
+                .map_err(LauncherSpawnFailure::FileActions)?;
         }
-        actions.add_dup2(death_reader.as_raw_fd(), LAUNCHER_DEATH_FD)?;
-        actions.add_dup2(plan_reader.as_raw_fd(), LAUNCHER_PLAN_FD)?;
+        actions
+            .add_dup2(death_reader.as_raw_fd(), LAUNCHER_DEATH_FD)
+            .map_err(LauncherSpawnFailure::FileActions)?;
+        actions
+            .add_dup2(plan_reader.as_raw_fd(), LAUNCHER_PLAN_FD)
+            .map_err(LauncherSpawnFailure::FileActions)?;
         // The relocated ends are already close-on-exec, but file actions run
         // before exec, so every parent-retained end is closed explicitly.
         for fd in [
@@ -486,12 +452,18 @@ impl LauncherSpawnResources {
             plan_reader.as_raw_fd(),
             plan_writer.as_raw_fd(),
         ] {
-            actions.add_close(fd)?;
+            actions
+                .add_close(fd)
+                .map_err(LauncherSpawnFailure::FileActions)?;
         }
 
-        let mut attributes = SpawnAttributesGuard::new()?;
-        attributes.configure_canonical_signals()?;
-        attributes.configure_dead_end_bootstrap()?;
+        let mut attributes = SpawnAttributes::new().map_err(LauncherSpawnFailure::Attributes)?;
+        attributes
+            .configure_canonical_signals()
+            .map_err(LauncherSpawnFailure::Attributes)?;
+        attributes
+            .set_special_port(MACH_PORT_DEAD, TASK_BOOTSTRAP_PORT)
+            .map_err(LauncherSpawnFailure::Attributes)?;
 
         Ok(Self {
             actions,
@@ -542,26 +514,26 @@ impl PreparedLauncherSpawn<'_> {
 
         let argv = image.argv();
         let environment = image.environment();
-        let mut pid = 0;
         // SAFETY: every C string, pointer array, file action, spawn attribute,
         // bootstrap right, and pipe end was completely prepared above and
         // remains live for the duration of this call.
-        let result = unsafe {
-            posix_spawn(
-                &raw mut pid,
-                image.path.as_ptr(),
-                &raw const actions.0,
-                &raw const attributes.0,
-                argv.as_ptr(),
-                environment.as_ptr(),
+        let pid = match unsafe {
+            spawn(
+                image.path.as_c_str(),
+                &actions,
+                &attributes,
+                &argv,
+                &environment,
             )
+        } {
+            Ok(pid) => pid,
+            Err(error) => {
+                return Err(Box::new(LauncherSpawnError {
+                    active,
+                    failure: LauncherSpawnFailure::Spawn(error),
+                }));
+            }
         };
-        if result != 0 {
-            return Err(Box::new(LauncherSpawnError {
-                active,
-                failure: LauncherSpawnFailure::Spawn(result),
-            }));
-        }
         if pid <= 0 {
             std::process::abort();
         }
@@ -671,149 +643,6 @@ fn set_writer_nonblocking(fd: c_int) -> Result<(), LauncherSpawnFailure> {
         Ok(())
     } else {
         Err(LauncherSpawnFailure::Descriptor(last_errno()))
-    }
-}
-
-struct FileActionsGuard(PosixSpawnFileActions);
-
-impl FileActionsGuard {
-    fn new() -> Result<Self, LauncherSpawnFailure> {
-        let mut actions = std::ptr::null_mut();
-        // SAFETY: actions points to writable opaque storage.
-        let result = unsafe { posix_spawn_file_actions_init(&raw mut actions) };
-        if result == 0 {
-            Ok(Self(actions))
-        } else {
-            Err(LauncherSpawnFailure::FileActions(result))
-        }
-    }
-
-    fn add_open_null(&mut self, fd: c_int, path: &CString) -> Result<(), LauncherSpawnFailure> {
-        // SAFETY: actions is initialized, fd is nonnegative, and path is the
-        // installed image's live fixed device C string.
-        spawn_file_action_result(unsafe {
-            posix_spawn_file_actions_addopen(&raw mut self.0, fd, path.as_ptr(), O_RDWR, 0)
-        })
-    }
-
-    fn add_dup2(&mut self, source: c_int, destination: c_int) -> Result<(), LauncherSpawnFailure> {
-        // SAFETY: actions is initialized and both descriptors are nonnegative.
-        spawn_file_action_result(unsafe {
-            posix_spawn_file_actions_adddup2(&raw mut self.0, source, destination)
-        })
-    }
-
-    fn add_close(&mut self, fd: c_int) -> Result<(), LauncherSpawnFailure> {
-        // SAFETY: actions is initialized and fd is nonnegative.
-        spawn_file_action_result(unsafe { posix_spawn_file_actions_addclose(&raw mut self.0, fd) })
-    }
-}
-
-impl Drop for FileActionsGuard {
-    fn drop(&mut self) {
-        // These guards are destroyed only after a successful spawn has already
-        // armed the exact launcher, and abort() would skip ExactLauncher::drop
-        // and orphan a live root child. Destroy can only fail on storage this
-        // type never constructs, so the no-stranded-child law outranks a
-        // fail-stop here and the result is deliberately ignored.
-        // SAFETY: initialized actions are destroyed exactly once.
-        let _ = unsafe { posix_spawn_file_actions_destroy(&raw mut self.0) };
-    }
-}
-
-fn spawn_file_action_result(result: c_int) -> Result<(), LauncherSpawnFailure> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(LauncherSpawnFailure::FileActions(result))
-    }
-}
-
-struct SpawnAttributesGuard(PosixSpawnAttr);
-
-impl SpawnAttributesGuard {
-    fn new() -> Result<Self, LauncherSpawnFailure> {
-        let mut attributes = std::ptr::null_mut();
-        // SAFETY: attributes points to writable opaque storage.
-        let result = unsafe { posix_spawnattr_init(&raw mut attributes) };
-        if result == 0 {
-            Ok(Self(attributes))
-        } else {
-            Err(LauncherSpawnFailure::Attributes(result))
-        }
-    }
-
-    fn configure_canonical_signals(&mut self) -> Result<(), LauncherSpawnFailure> {
-        let mut defaults = 0_u32;
-        let mut mask = 0_u32;
-        // SAFETY: both values are Darwin sigset_t storage. SIGKILL and SIGSTOP
-        // cannot be caught or reset, so they are removed from the default set.
-        if unsafe { sigfillset(&raw mut defaults) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGKILL) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGSTOP) } != 0
-            || unsafe { sigemptyset(&raw mut mask) } != 0
-        {
-            return Err(LauncherSpawnFailure::Attributes(last_errno()));
-        }
-        // SAFETY: initialized attributes and signal sets remain live.
-        let result = unsafe { posix_spawnattr_setsigdefault(&raw mut self.0, &raw const defaults) };
-        if result != 0 {
-            return Err(LauncherSpawnFailure::Attributes(result));
-        }
-        // SAFETY: initialized attributes and empty signal mask remain live.
-        let result = unsafe { posix_spawnattr_setsigmask(&raw mut self.0, &raw const mask) };
-        if result != 0 {
-            return Err(LauncherSpawnFailure::Attributes(result));
-        }
-        // SAFETY: flags are public Darwin posix_spawn flags. No suspended-spawn
-        // or containment-claiming session flag is used; the launcher stops
-        // itself under PT_TRACE_ME instead.
-        let result = unsafe {
-            posix_spawnattr_setflags(
-                &raw mut self.0,
-                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(LauncherSpawnFailure::Attributes(result))
-        }
-    }
-
-    /// Sets the child's `TASK_BOOTSTRAP_PORT` special port to a dead name.
-    ///
-    /// The intent is to deny the launcher and its target any `launchd` service
-    /// lookup. It is not sufficient on its own: adversarial measurement on the
-    /// current OS shows a child spawned this way still obtains a live bootstrap
-    /// port and reaches `launchd`, so this only removes the *inherited* port and
-    /// does not close the delegation path. Cutting off `launchd` is an open
-    /// problem tracked for the adversarial tier, not something this call proves.
-    ///
-    /// A dead name is used rather than a live port the broker owns but never
-    /// services: a never-drained receive right would let the child's first
-    /// bootstrap message queue and then block it forever in `mach_msg`, which
-    /// `ResumedTarget::wait_for_exit` could not preempt because Ready delivery
-    /// is the final deadline commit. A dead name owns no resource to retain.
-    fn configure_dead_end_bootstrap(&mut self) -> Result<(), LauncherSpawnFailure> {
-        // SAFETY: initialized attributes and a name the kernel stores verbatim.
-        let result = unsafe {
-            posix_spawnattr_setspecialport_np(&raw mut self.0, MACH_PORT_DEAD, TASK_BOOTSTRAP_PORT)
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(LauncherSpawnFailure::Attributes(result))
-        }
-    }
-}
-
-impl Drop for SpawnAttributesGuard {
-    fn drop(&mut self) {
-        // Ignored for the same reason as FileActionsGuard::drop: this runs
-        // after the exact launcher is armed, and abort() would strand it.
-        // SAFETY: initialized attributes are destroyed exactly once.
-        let _ = unsafe { posix_spawnattr_destroy(&raw mut self.0) };
     }
 }
 

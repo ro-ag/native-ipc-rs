@@ -1,6 +1,6 @@
 //! Fixed-image broker spawn and exact direct-child lifecycle authority.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::Shutdown;
@@ -21,15 +21,15 @@ use super::broker_plan::{BROKER_ACK_BYTES, StagedBrokerSpawn, broker_plan_ack};
 use super::broker_report::BrokerTraceReportReceiver;
 use super::{DedicatedChildWaitDomain, PendingSpawnReply};
 use crate::backend::macos::supervisor::deployer_helper_path;
+use crate::backend::macos::supervisor::spawn_primitives::{
+    SpawnAttributes, SpawnFileActions, spawn,
+};
 
 pub(super) type FixedImageAtomicBroker =
     AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority, BrokerTraceReportReceiver>;
 pub(super) type PendingFixedImageBroker = PendingSpawnReply<FixedImageAtomicBroker>;
 type FixedImageSpawnResult =
     Result<PendingFixedImageBroker, Box<PendingSpawnReply<BrokerSpawnError>>>;
-
-type PosixSpawnAttr = *mut c_void;
-type PosixSpawnFileActions = *mut c_void;
 
 pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
@@ -44,10 +44,6 @@ pub(in crate::backend::macos::supervisor) const BROKER_CONTROL_FD: c_int = 4;
 pub(in crate::backend::macos::supervisor) const BROKER_TRACE_FD: c_int = 5;
 const STABLE_FD_MINIMUM: c_int = 10;
 pub(in crate::backend::macos::supervisor) const START_BYTE: [u8; 1] = [1];
-
-const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
-const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
-const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
@@ -82,31 +78,6 @@ unsafe extern "C" {
     fn kill(pid: c_int, signal: c_int) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
     fn poll(descriptors: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
-    fn posix_spawn(
-        pid: *mut c_int,
-        path: *const c_char,
-        file_actions: *const PosixSpawnFileActions,
-        attributes: *const PosixSpawnAttr,
-        argv: *const *mut c_char,
-        environment: *const *mut c_char,
-    ) -> c_int;
-    fn posix_spawn_file_actions_addclose(actions: *mut PosixSpawnFileActions, fd: c_int) -> c_int;
-    fn posix_spawn_file_actions_adddup2(
-        actions: *mut PosixSpawnFileActions,
-        source: c_int,
-        destination: c_int,
-    ) -> c_int;
-    fn posix_spawn_file_actions_destroy(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawn_file_actions_init(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
-    fn posix_spawnattr_setsigdefault(attributes: *mut PosixSpawnAttr, signals: *const u32)
-    -> c_int;
-    fn posix_spawnattr_setsigmask(attributes: *mut PosixSpawnAttr, signals: *const u32) -> c_int;
-    fn sigdelset(set: *mut u32, signal: c_int) -> c_int;
-    fn sigemptyset(set: *mut u32) -> c_int;
-    fn sigfillset(set: *mut u32) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
 }
@@ -520,42 +491,58 @@ fn spawn_fixed_image_internal(
         .verify_single_threaded_spawn()
         .map_err(|_| BrokerSpawnError::InvalidWaitDomain)?;
     let (gate_reader, gate_writer) = create_gate_pipe()?;
-    let mut actions = FileActionsGuard::new()?;
-    actions.add_dup2(gate_reader.as_raw_fd(), BROKER_GATE_FD)?;
-    actions.add_close(gate_reader.as_raw_fd())?;
-    actions.add_close(gate_writer.as_raw_fd())?;
+    let mut actions = SpawnFileActions::new().map_err(BrokerSpawnError::FileActions)?;
+    actions
+        .add_dup2(gate_reader.as_raw_fd(), BROKER_GATE_FD)
+        .map_err(BrokerSpawnError::FileActions)?;
+    actions
+        .add_close(gate_reader.as_raw_fd())
+        .map_err(BrokerSpawnError::FileActions)?;
+    actions
+        .add_close(gate_writer.as_raw_fd())
+        .map_err(BrokerSpawnError::FileActions)?;
     if let (Some(child_control), Some(parent_control)) = (child_control, parent_control) {
-        actions.add_dup2(child_control.as_raw_fd(), BROKER_CONTROL_FD)?;
-        actions.add_close(child_control.as_raw_fd())?;
-        actions.add_close(parent_control.as_raw_fd())?;
+        actions
+            .add_dup2(child_control.as_raw_fd(), BROKER_CONTROL_FD)
+            .map_err(BrokerSpawnError::FileActions)?;
+        actions
+            .add_close(child_control.as_raw_fd())
+            .map_err(BrokerSpawnError::FileActions)?;
+        actions
+            .add_close(parent_control.as_raw_fd())
+            .map_err(BrokerSpawnError::FileActions)?;
     }
     if let (Some(child_trace), Some(parent_trace)) = (child_trace, parent_trace) {
-        actions.add_dup2(child_trace.as_raw_fd(), BROKER_TRACE_FD)?;
-        actions.add_close(child_trace.as_raw_fd())?;
-        actions.add_close(parent_trace.as_raw_fd())?;
+        actions
+            .add_dup2(child_trace.as_raw_fd(), BROKER_TRACE_FD)
+            .map_err(BrokerSpawnError::FileActions)?;
+        actions
+            .add_close(child_trace.as_raw_fd())
+            .map_err(BrokerSpawnError::FileActions)?;
+        actions
+            .add_close(parent_trace.as_raw_fd())
+            .map_err(BrokerSpawnError::FileActions)?;
     }
 
-    let mut attributes = SpawnAttributesGuard::new()?;
-    attributes.configure_canonical_signals()?;
+    let mut attributes = SpawnAttributes::new().map_err(BrokerSpawnError::Attributes)?;
+    attributes
+        .configure_canonical_signals()
+        .map_err(BrokerSpawnError::Attributes)?;
 
     let argv = image.argv();
     let environment = image.environment();
-    let mut pid = 0;
     // SAFETY: all CString storage, pointer arrays, file actions, attributes,
     // and pipe topology were completely prepared and remain live for the call.
-    let result = unsafe {
-        posix_spawn(
-            &raw mut pid,
-            image.path.as_ptr(),
-            &raw const actions.0,
-            &raw const attributes.0,
-            argv.as_ptr(),
-            environment.as_ptr(),
+    let pid = unsafe {
+        spawn(
+            image.path.as_c_str(),
+            &actions,
+            &attributes,
+            &argv,
+            &environment,
         )
-    };
-    if result != 0 {
-        return Err(BrokerSpawnError::Spawn(result));
     }
+    .map_err(BrokerSpawnError::Spawn)?;
     if pid <= 0 {
         std::process::abort();
     }
@@ -772,111 +759,6 @@ fn set_nonblocking(fd: c_int) -> Result<(), BrokerSpawnError> {
         Ok(())
     } else {
         Err(BrokerSpawnError::Descriptor(last_error(ECHILD)))
-    }
-}
-
-struct FileActionsGuard(PosixSpawnFileActions);
-
-impl FileActionsGuard {
-    fn new() -> Result<Self, BrokerSpawnError> {
-        let mut actions = std::ptr::null_mut();
-        // SAFETY: actions points to writable opaque storage.
-        let result = unsafe { posix_spawn_file_actions_init(&raw mut actions) };
-        if result == 0 {
-            Ok(Self(actions))
-        } else {
-            Err(BrokerSpawnError::FileActions(result))
-        }
-    }
-
-    fn add_dup2(&mut self, source: c_int, destination: c_int) -> Result<(), BrokerSpawnError> {
-        // SAFETY: actions is initialized and both descriptors are nonnegative.
-        spawn_file_action_result(unsafe {
-            posix_spawn_file_actions_adddup2(&raw mut self.0, source, destination)
-        })
-    }
-
-    fn add_close(&mut self, fd: c_int) -> Result<(), BrokerSpawnError> {
-        // SAFETY: actions is initialized and fd is nonnegative.
-        spawn_file_action_result(unsafe { posix_spawn_file_actions_addclose(&raw mut self.0, fd) })
-    }
-}
-
-impl Drop for FileActionsGuard {
-    fn drop(&mut self) {
-        // SAFETY: initialized actions are destroyed exactly once.
-        if unsafe { posix_spawn_file_actions_destroy(&raw mut self.0) } != 0 {
-            std::process::abort();
-        }
-    }
-}
-
-fn spawn_file_action_result(result: c_int) -> Result<(), BrokerSpawnError> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(BrokerSpawnError::FileActions(result))
-    }
-}
-
-struct SpawnAttributesGuard(PosixSpawnAttr);
-
-impl SpawnAttributesGuard {
-    fn new() -> Result<Self, BrokerSpawnError> {
-        let mut attributes = std::ptr::null_mut();
-        // SAFETY: attributes points to writable opaque storage.
-        let result = unsafe { posix_spawnattr_init(&raw mut attributes) };
-        if result == 0 {
-            Ok(Self(attributes))
-        } else {
-            Err(BrokerSpawnError::Attributes(result))
-        }
-    }
-
-    fn configure_canonical_signals(&mut self) -> Result<(), BrokerSpawnError> {
-        let mut defaults = 0_u32;
-        let mut mask = 0_u32;
-        // SAFETY: both values are Darwin sigset_t storage. SIGKILL and SIGSTOP
-        // cannot be caught or reset, so they are removed from the default set.
-        if unsafe { sigfillset(&raw mut defaults) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGKILL) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGSTOP) } != 0
-            || unsafe { sigemptyset(&raw mut mask) } != 0
-        {
-            return Err(BrokerSpawnError::Attributes(last_error(ECHILD)));
-        }
-        // SAFETY: initialized attributes and signal sets remain live.
-        let result = unsafe { posix_spawnattr_setsigdefault(&raw mut self.0, &raw const defaults) };
-        if result != 0 {
-            return Err(BrokerSpawnError::Attributes(result));
-        }
-        // SAFETY: initialized attributes and empty signal mask remain live.
-        let result = unsafe { posix_spawnattr_setsigmask(&raw mut self.0, &raw const mask) };
-        if result != 0 {
-            return Err(BrokerSpawnError::Attributes(result));
-        }
-        // SAFETY: flags are public Darwin posix_spawn flags. No suspended-spawn
-        // or containment-claiming session flag is used.
-        let result = unsafe {
-            posix_spawnattr_setflags(
-                &raw mut self.0,
-                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(BrokerSpawnError::Attributes(result))
-        }
-    }
-}
-
-impl Drop for SpawnAttributesGuard {
-    fn drop(&mut self) {
-        // SAFETY: initialized attributes are destroyed exactly once.
-        if unsafe { posix_spawnattr_destroy(&raw mut self.0) } != 0 {
-            std::process::abort();
-        }
     }
 }
 

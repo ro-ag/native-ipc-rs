@@ -158,12 +158,13 @@ ownership plus the held image through prototype Ready; public construction
 remains fail-closed pending independently privileged exact containment. The
 backend-private trusted-launcher path authenticates its broker, establishes
 cooperative tracing before untrusted exec, proves the relationship with a
-stopped handshake, lowers hard `RLIMIT_NPROC` to one, and crosses exec through
-the kernel's trace trap before target code. This gives exact direct-child
-termination and fork denial while the broker runs, and XNU kills the tracee if
-the broker exits. It still does not satisfy the public contract because a
-same-UID target can `SIGSTOP` that broker indefinitely and restored launchd/XPC
-delegation is outside the rlimit. Windows publicly
+stopped handshake, lowers hard `RLIMIT_NPROC` to one, denies Mach lookup and
+registration in an inherited profile, and crosses exec through the kernel's
+trace trap before target code. This gives exact direct-child termination, fork
+denial, and launchd delegation denial while the broker runs, and XNU kills the
+tracee if the broker exits. Public macOS remains disabled by decision and has
+no installed-artifact proof; a separate malicious same-user principal also
+remains outside the integration model. Windows publicly
 composes the canonical records over its exact-PID named pipe, held suspended
 image, and kill-on-close Job. Its Negotiating/Ready owners expose only the same
 portable control, mixed-batch, active-mapping, and lifecycle surface as Linux.
@@ -240,15 +241,15 @@ SIGCHLD before service threads inherit their masks. The fixed source spawner
 owns the entire successful `posix_spawn` to armed exact-worker transition
 without a fallible PID-only gap, and its clean-exec entry retains result FD4
 through success or rejection until `_exit`. The separately packaged, signed,
-root-installed worker and complete service-wide waiter policy remain absent.
+same-user worker and complete service-wide waiter policy remain absent.
 The watchdog model exposes only connection-bound opaque handles and retains
 linear exact broker authority through a typed reap proof. The launcher-only
 transition binds the exact traced session and validated installed target to
 group/credential drop and immediate exec. These are source constraints, not a
-signed or installed service. The production boundary must permanently
-drop the launcher/target to the authenticated nonroot client identity, expose
-no arbitrary signaling or execution deputy, survive client/broker stops, and
-prove that delegated launchd/XPC work is either forbidden or outside the
-owned-principal contract. Public macOS remains architecture-blocked and
+signed or installed service. The source production boundary exposes no
+arbitrary signaling or execution deputy and forbids blanket launchd lookup and
+registration before target exec. An installed deployment must prove that
+immutable profile, survive client/broker stops, and account explicitly for any
+future service allowlist. Public macOS remains architecture-blocked by decision and
 fail-closed; see
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).

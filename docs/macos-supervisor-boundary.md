@@ -14,13 +14,14 @@
 > [`docs/integration-model.md`](integration-model.md). Public macOS remains
 > `BackendUnavailable` by decision.
 
-Status: backend-private traced-launcher core implemented; privileged deployment
-boundary unresolved. A cooperative `ptrace` launcher plus hard
+Status: backend-private traced-launcher core implemented; public deployment and
+enablement remain unresolved. A cooperative `ptrace` launcher plus hard
 `RLIMIT_NPROC=1` now closes the first-target-instruction, post-exec identity,
-direct-fork, exact-stop/kill, and tracer-crash gaps in native tests. It does not
-yet satisfy the hostile-helper contract: same-UID target code can stop its
-broker indefinitely, and restored launchd/XPC delegation is outside the
-rlimit. Backend-private source models now constrain the future service protocol,
+direct-fork, exact-stop/kill, and tracer-crash gaps in native tests. Its inherited
+SBPL profile denies outbound signals plus Mach lookup and registration before
+target exec, so target code cannot delegate a helper through `launchd`. A
+separate malicious same-user principal can still stop the broker and remains
+outside the canonical integration model. Backend-private source models constrain the future service protocol,
 watchdog ownership state, client authentication state, launcher
 credential/exec transition, and the broker's fixed start/death gate, but they
 are not Mach-service or executable artifacts. No privileged service, signed launcher
@@ -53,7 +54,11 @@ entry-vector substitution fail closed; no request field selects any helper
 path. The child receives only one collision-normalized start/death pipe reader. Darwin
 `POSIX_SPAWN_CLOEXEC_DEFAULT`, `POSIX_SPAWN_SETSIGDEF`, and
 `POSIX_SPAWN_SETSIGMASK` close unrelated descriptors, restore explicit signal
-defaults, and install an empty child mask without changing the parent mask.
+defaults, and install an empty child mask without changing the parent mask. One
+shared `spawn_primitives` module owns those Darwin file-action, attribute, and
+spawn ABIs for the broker, launcher, and authentication worker. Every
+preparation failure returns its raw native error for boundary-specific mapping;
+destructors share the no-abort rule required after exact child authority arms.
 Because Darwin has no atomic CLOEXEC pipe constructor, the dedicated service
 must remain permanently single-threaded: immediately before every pipe/spawn
 transition the linear wait-domain token rechecks the main thread and Darwin's
@@ -125,8 +130,13 @@ descriptor, so the fixture also proves `POSIX_SPAWN_CLOEXEC_DEFAULT` excludes
 unrelated broker authority. It inspects `TASK_BOOTSTRAP_PORT` and rejects a
 receive right, but deliberately accepts either the requested dead name or the
 known live send-right residual: current Darwin restores a live launchd
-bootstrap right, so this fixture does not claim launchd is unreachable. That
-delegation gap remains issue #9 and keeps public macOS fail-closed.
+bootstrap right. The fixed launcher entry therefore applies a second,
+load-bearing boundary before target exec: its inherited SBPL profile denies
+`mach-lookup` and `mach-register`. A sibling native measurement proves the
+notification-center service is reachable without the profile and the exact
+lookup is denied inside it; signal denial and inheritance across exec remain
+covered in the same test. The live port is no longer mistaken for usable
+delegation authority.
 
 The sibling production-caller fixture copies the test image to one canonical
 absolute path and dispatches its fixed broker, launcher, and worker roles before
@@ -153,8 +163,8 @@ is authenticated. Nor do they prove that any deployer-supplied production path
 is installed, signed, packaged, or replacement-resistant. The
 packaged executable and clean-exec launcher artifact,
 installed service loop,
-permanent credential drop, real client-death authority, and launchd/XPC
-delegation policy remain unresolved. Public macOS therefore remains
+real client-death authority, and installed-artifact proof that the immutable
+profile is applied before target exec remain unresolved. Public macOS therefore remains
 fail-closed.
 
 Standing decision (2026-07-13): the project keeps public macOS fail-closed
@@ -164,7 +174,7 @@ requirement is not negotiable for this backend. This position is revisited
 only when an independently privileged service/watchdog can host the proven
 trace core without becoming an arbitrary-exec or signaling deputy, permanently
 drops the launcher/target to the authenticated nonroot client identity, and
-resolves launchd/XPC delegation ownership. Until then R8.6/6d remains
+proves the packaged launcher's immutable containment profile. Until then R8.6/6d remains
 architecture-blocked by decision.
 
 ## Decision
@@ -528,9 +538,10 @@ core. They do not prove the deployment boundary. A same-UID tracee can stop its
 broker indefinitely, so an independent privileged watchdog must remain outside
 the target's signal permission domain and kill a stopped broker. The launcher
 must permanently drop to the authenticated nonroot client identity, and the
-service must prove it is not a confused deputy. Restored launchd/XPC bootstrap
-also creates delegation outside the direct tracee/rlimit principal. Until those
-properties are implemented and tested, this is a conditional core proof rather
+service must prove it is not a confused deputy. The source launcher now denies
+Mach lookup and registration before target exec despite Darwin restoring a live
+bootstrap send right; installed-artifact evidence must prove that same profile.
+Until those properties are implemented and tested, this is a conditional core proof rather
 than public-session evidence.
 
 ## Residual public-API evidence
@@ -598,11 +609,11 @@ a hostile same-UID tracee plus delegated work outside that relationship:
    and name ports), so no lesser flavor provides termination either.
 
 Consequently the earlier blanket impossibility statement is narrowed: public
-`ptrace` and rlimit mechanisms provide an exact no-task-port direct-child core,
-including broker-crash cleanup, but a same-UID deployment is not live against
-hostile `SIGSTOP`, and restored launchd/XPC delegation is not contained by the
-rlimit. R8.6 and 6d remain architecture-blocked until the independent
-privileged service/watchdog and delegation policy are implemented and proven;
+`ptrace`, rlimit, and the inherited deny-signal/deny-Mach-service profile provide
+an exact no-task-port direct-child core, including broker-crash cleanup and
+launchd delegation denial. A same-UID deployment is still not live against a
+separate hostile same-user principal's `SIGSTOP`. R8.6 and 6d remain
+architecture-blocked by the public decision and installed deployment evidence;
 the public macOS composition remains fail-closed.
 
 Additional primary references for this section:
@@ -631,7 +642,7 @@ Additional primary references for this section:
 - permanent launcher/target UID drop, target attempts to signal-stop the
   broker/watchdog, and watchdog recovery of a deliberately stopped broker;
 - hard-limit fork/`posix_spawn` denial before and after exec, root exclusion,
-  and launchd/XPC delegation characterization;
+  and exact launchd lookup denial before and after exec;
 - process-global hostile `SIGCHLD` settings in the client, demonstrating that
   only the service parent owns child waiting;
 - 0/1/2/16 and extra Mach rights, every XPC/Mach truncation and type mutation,
@@ -647,6 +658,7 @@ Additional primary references for this section:
   freedom, packaged application/XPC-service verification, and exact hosted plus
   release-host evidence.
 
-Until the privileged service/watchdog, signed launcher packaging, delegation
-policy, and those tests exist, R8.6 and 6d remain architecture-blocked, and the
+Until the public contract decision, signed launcher packaging, native
+installed-profile proof, and those tests exist, R8.6 and 6d remain
+architecture-blocked, and the
 public macOS facade remains fail-closed.

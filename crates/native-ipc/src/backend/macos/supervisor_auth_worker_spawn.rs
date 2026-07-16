@@ -1,6 +1,6 @@
 //! Fixed-image clean-exec authentication-worker spawn boundary.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use super::{
@@ -9,9 +9,9 @@ use super::{
     FreshAuthWorkerGeneration,
 };
 use crate::backend::macos::supervisor::deployer_helper_path;
-
-type PosixSpawnAttr = *mut c_void;
-type PosixSpawnFileActions = *mut c_void;
+use crate::backend::macos::supervisor::spawn_primitives::{
+    SpawnAttributes, SpawnFileActions, spawn,
+};
 
 pub(super) const INSTALLED_AUTH_WORKER_MODE: &str = "--supervisor-auth-worker";
 pub(super) const INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT: &str = "--request-fd=3";
@@ -24,10 +24,6 @@ pub(super) const AUTH_WORKER_REQUEST_FD: c_int = 3;
 pub(super) const AUTH_WORKER_RESULT_FD: c_int = 4;
 const STABLE_FD_MINIMUM: c_int = 10;
 
-const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
-const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
-const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
-
 const F_SETFL: c_int = 4;
 const F_SETFD: c_int = 2;
 const F_DUPFD_CLOEXEC: c_int = 67;
@@ -37,45 +33,11 @@ const O_NONBLOCK: c_int = 0x0000_0004;
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const ECHILD: c_int = 10;
-const SIGKILL: c_int = 9;
-const SIGSTOP: c_int = 17;
-const DEV_NULL: &[u8] = b"/dev/null\0";
+const DEV_NULL: &CStr = c"/dev/null";
 
 unsafe extern "C" {
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn pipe(descriptors: *mut c_int) -> c_int;
-    fn posix_spawn(
-        pid: *mut c_int,
-        path: *const c_char,
-        file_actions: *const PosixSpawnFileActions,
-        attributes: *const PosixSpawnAttr,
-        argv: *const *mut c_char,
-        environment: *const *mut c_char,
-    ) -> c_int;
-    fn posix_spawn_file_actions_addclose(actions: *mut PosixSpawnFileActions, fd: c_int) -> c_int;
-    fn posix_spawn_file_actions_adddup2(
-        actions: *mut PosixSpawnFileActions,
-        source: c_int,
-        destination: c_int,
-    ) -> c_int;
-    fn posix_spawn_file_actions_addopen(
-        actions: *mut PosixSpawnFileActions,
-        fd: c_int,
-        path: *const c_char,
-        flags: c_int,
-        mode: u16,
-    ) -> c_int;
-    fn posix_spawn_file_actions_destroy(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawn_file_actions_init(actions: *mut PosixSpawnFileActions) -> c_int;
-    fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
-    fn posix_spawnattr_setsigdefault(attributes: *mut PosixSpawnAttr, signals: *const u32)
-    -> c_int;
-    fn posix_spawnattr_setsigmask(attributes: *mut PosixSpawnAttr, signals: *const u32) -> c_int;
-    fn sigdelset(set: *mut u32, signal: c_int) -> c_int;
-    fn sigemptyset(set: *mut u32) -> c_int;
-    fn sigfillset(set: *mut u32) -> c_int;
 }
 
 /// Failure before one exact clean-exec worker bundle is armed.
@@ -223,44 +185,54 @@ pub(in crate::backend::macos::supervisor) fn spawn_installed_auth_worker(
     set_nonblocking(result_reader.as_raw_fd())?;
     set_nosigpipe(request_writer.as_raw_fd())?;
 
-    let mut actions = FileActionsGuard::new()?;
-    actions.add_open(0, O_RDONLY)?;
-    actions.add_open(1, O_WRONLY)?;
-    actions.add_open(2, O_WRONLY)?;
-    actions.add_dup2(request_reader.as_raw_fd(), AUTH_WORKER_REQUEST_FD)?;
-    actions.add_dup2(result_writer.as_raw_fd(), AUTH_WORKER_RESULT_FD)?;
+    let mut actions = SpawnFileActions::new().map_err(AuthWorkerSpawnError::FileActions)?;
+    actions
+        .add_open(0, DEV_NULL, O_RDONLY, 0)
+        .map_err(AuthWorkerSpawnError::FileActions)?;
+    actions
+        .add_open(1, DEV_NULL, O_WRONLY, 0)
+        .map_err(AuthWorkerSpawnError::FileActions)?;
+    actions
+        .add_open(2, DEV_NULL, O_WRONLY, 0)
+        .map_err(AuthWorkerSpawnError::FileActions)?;
+    actions
+        .add_dup2(request_reader.as_raw_fd(), AUTH_WORKER_REQUEST_FD)
+        .map_err(AuthWorkerSpawnError::FileActions)?;
+    actions
+        .add_dup2(result_writer.as_raw_fd(), AUTH_WORKER_RESULT_FD)
+        .map_err(AuthWorkerSpawnError::FileActions)?;
     for descriptor in [
         request_reader.as_raw_fd(),
         request_writer.as_raw_fd(),
         result_reader.as_raw_fd(),
         result_writer.as_raw_fd(),
     ] {
-        actions.add_close(descriptor)?;
+        actions
+            .add_close(descriptor)
+            .map_err(AuthWorkerSpawnError::FileActions)?;
     }
-    let mut attributes = SpawnAttributesGuard::new()?;
-    attributes.configure_canonical_signals()?;
+    let mut attributes = SpawnAttributes::new().map_err(AuthWorkerSpawnError::Attributes)?;
+    attributes
+        .configure_canonical_signals()
+        .map_err(AuthWorkerSpawnError::Attributes)?;
 
     wait_domain
         .verify_single_threaded_spawn()
         .map_err(|_| AuthWorkerSpawnError::InvalidWaitDomain)?;
     let argv = image.argv();
     let environment = image.environment();
-    let mut pid = 0;
     // SAFETY: all CString storage, pointer arrays, actions, and attributes are
     // complete and remain live for the fixed exact-path spawn.
-    let result = unsafe {
-        posix_spawn(
-            &raw mut pid,
-            image.spawn_path.as_ptr(),
-            &raw const actions.0,
-            &raw const attributes.0,
-            argv.as_ptr(),
-            environment.as_ptr(),
+    let pid = unsafe {
+        spawn(
+            image.spawn_path.as_c_str(),
+            &actions,
+            &attributes,
+            &argv,
+            &environment,
         )
-    };
-    if result != 0 {
-        return Err(AuthWorkerSpawnError::Spawn(result));
     }
+    .map_err(AuthWorkerSpawnError::Spawn)?;
     if pid <= 0 {
         std::process::abort();
     }
@@ -344,122 +316,6 @@ fn set_nosigpipe(fd: c_int) -> Result<(), AuthWorkerSpawnError> {
         Ok(())
     } else {
         Err(AuthWorkerSpawnError::Descriptor(last_errno()))
-    }
-}
-
-struct FileActionsGuard(PosixSpawnFileActions);
-
-impl FileActionsGuard {
-    fn new() -> Result<Self, AuthWorkerSpawnError> {
-        let mut actions = std::ptr::null_mut();
-        // SAFETY: actions points to writable opaque file-action storage.
-        let result = unsafe { posix_spawn_file_actions_init(&raw mut actions) };
-        if result == 0 {
-            Ok(Self(actions))
-        } else {
-            Err(AuthWorkerSpawnError::FileActions(result))
-        }
-    }
-
-    fn add_dup2(&mut self, source: c_int, destination: c_int) -> Result<(), AuthWorkerSpawnError> {
-        // SAFETY: self owns initialized actions and both descriptors are exact.
-        let result =
-            unsafe { posix_spawn_file_actions_adddup2(&raw mut self.0, source, destination) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(AuthWorkerSpawnError::FileActions(result))
-        }
-    }
-
-    fn add_open(&mut self, fd: c_int, flags: c_int) -> Result<(), AuthWorkerSpawnError> {
-        // SAFETY: self owns initialized actions and DEV_NULL is one fixed
-        // NUL-terminated absolute path. No request data selects this open.
-        let result = unsafe {
-            posix_spawn_file_actions_addopen(
-                &raw mut self.0,
-                fd,
-                DEV_NULL.as_ptr().cast(),
-                flags,
-                0,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(AuthWorkerSpawnError::FileActions(result))
-        }
-    }
-
-    fn add_close(&mut self, fd: c_int) -> Result<(), AuthWorkerSpawnError> {
-        // SAFETY: self owns initialized actions and fd is one prepared source.
-        let result = unsafe { posix_spawn_file_actions_addclose(&raw mut self.0, fd) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(AuthWorkerSpawnError::FileActions(result))
-        }
-    }
-}
-
-impl Drop for FileActionsGuard {
-    fn drop(&mut self) {
-        // SAFETY: this guard owns initialized action storage.
-        let _ = unsafe { posix_spawn_file_actions_destroy(&raw mut self.0) };
-    }
-}
-
-struct SpawnAttributesGuard(PosixSpawnAttr);
-
-impl SpawnAttributesGuard {
-    fn new() -> Result<Self, AuthWorkerSpawnError> {
-        let mut attributes = std::ptr::null_mut();
-        // SAFETY: attributes points to writable opaque attribute storage.
-        let result = unsafe { posix_spawnattr_init(&raw mut attributes) };
-        if result == 0 {
-            Ok(Self(attributes))
-        } else {
-            Err(AuthWorkerSpawnError::Attributes(result))
-        }
-    }
-
-    fn configure_canonical_signals(&mut self) -> Result<(), AuthWorkerSpawnError> {
-        let mut defaults = 0_u32;
-        let mut empty = 0_u32;
-        // SAFETY: these are writable Darwin sigset_t values.
-        if unsafe { sigfillset(&raw mut defaults) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGKILL) } != 0
-            || unsafe { sigdelset(&raw mut defaults, SIGSTOP) } != 0
-            || unsafe { sigemptyset(&raw mut empty) } != 0
-        {
-            return Err(AuthWorkerSpawnError::Attributes(last_errno()));
-        }
-        // SAFETY: self owns initialized attributes and the sets remain live.
-        let defaults_result =
-            unsafe { posix_spawnattr_setsigdefault(&raw mut self.0, &raw const defaults) };
-        if defaults_result != 0 {
-            return Err(AuthWorkerSpawnError::Attributes(defaults_result));
-        }
-        // SAFETY: same initialized attributes and live empty set.
-        let mask_result = unsafe { posix_spawnattr_setsigmask(&raw mut self.0, &raw const empty) };
-        if mask_result != 0 {
-            return Err(AuthWorkerSpawnError::Attributes(mask_result));
-        }
-        let flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
-        // SAFETY: self owns initialized attributes and flags are public Darwin bits.
-        let flags_result = unsafe { posix_spawnattr_setflags(&raw mut self.0, flags) };
-        if flags_result == 0 {
-            Ok(())
-        } else {
-            Err(AuthWorkerSpawnError::Attributes(flags_result))
-        }
-    }
-}
-
-impl Drop for SpawnAttributesGuard {
-    fn drop(&mut self) {
-        // SAFETY: this guard owns initialized attribute storage.
-        let _ = unsafe { posix_spawnattr_destroy(&raw mut self.0) };
     }
 }
 

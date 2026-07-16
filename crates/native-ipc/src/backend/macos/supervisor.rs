@@ -1322,6 +1322,9 @@ pub(super) mod broker_entry;
 #[path = "supervisor_launcher_entry.rs"]
 pub(super) mod launcher_entry;
 
+#[path = "supervisor_spawn_primitives.rs"]
+mod spawn_primitives;
+
 #[cfg(test)]
 #[path = "supervisor_test.rs"]
 mod tests;
