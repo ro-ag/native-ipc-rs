@@ -162,7 +162,7 @@ fn fixed_worker_spawn_round_trips_private_job_and_exact_clean_reap() {
         )
     };
     let receipt = pool
-        .dispatch(raw, job_id(0x81), deadline_after(Duration::from_secs(30)))
+        .dispatch(raw, job_id(0x81), deadline_after(Duration::from_secs(25)))
         .unwrap()
         .submit()
         .unwrap();
@@ -190,7 +190,7 @@ fn fixed_worker_spawn_round_trips_private_job_and_exact_clean_reap() {
         )
     };
     let receipt = pool
-        .dispatch(raw, job_id(0x82), deadline_after(Duration::from_secs(30)))
+        .dispatch(raw, job_id(0x82), deadline_after(Duration::from_secs(25)))
         .unwrap()
         .submit()
         .unwrap();
@@ -222,7 +222,7 @@ fn fixed_spawner_real_security_entry_and_pool_exact_reap_compose() {
         )
     };
     let receipt = pool
-        .dispatch(raw, job_id(0x83), deadline_after(Duration::from_secs(30)))
+        .dispatch(raw, job_id(0x83), deadline_after(Duration::from_secs(25)))
         .unwrap()
         .submit()
         .unwrap();
