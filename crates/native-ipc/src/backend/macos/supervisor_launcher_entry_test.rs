@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::AsRawFd;
 
 const DEPLOYER_LAUNCHER_PATH: &std::ffi::CStr =
     c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
@@ -106,6 +107,16 @@ fn broker_death_is_the_only_clean_launcher_exit() {
         assert_ne!(status, 0, "{refusal:?} must not look like a clean exit");
         assert!(seen.insert(status), "{refusal:?} reuses status {status}");
     }
+}
+
+#[test]
+fn fixed_launcher_descriptors_are_made_close_on_exec_before_containment() {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let fd = file.as_raw_fd();
+    // SAFETY: this test owns the live descriptor for the duration of the call.
+    unsafe { set_close_on_exec(fd) }.unwrap();
+    // SAFETY: F_GETFD is a read-only query on the still-live descriptor.
+    assert_ne!(unsafe { fcntl(fd, F_GETFD) } & FD_CLOEXEC, 0);
 }
 
 #[test]

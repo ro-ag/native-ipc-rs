@@ -87,8 +87,9 @@ kernel's native mechanism:
   after permanently downgrading the local mapping. Current and maximum
   permissions exclude execute.
 - Linux uses sealed anonymous `memfd` objects, inherited irreversible MDWE,
-  exact private `SCM_RIGHTS` transfer, `SO_PEERCRED`, `pidfd`, and parent-owned
-  helper cleanup. Inside the MDWE-inheriting process tree, MDWE blocks
+  exact private `SCM_RIGHTS` transfer, per-record `SCM_CREDENTIALS`, a
+  clone-time `pidfd`, and parent-owned helper cleanup. Cached `SO_PEERCRED` is
+  not used as post-exec proof. Inside the MDWE-inheriting process tree, MDWE blocks
   permission upgrades and a single RWX view. The kernel still permits RX
   aliases; for receiver-writer setup, an unrelated process receiving the fd
   before future-write sealing can retain RW and later upgrade it. Every such
@@ -312,6 +313,36 @@ reported only as endpoint disconnection; exact direct-child exit is claimed
 only after coordinator reap. Graceful close returns its owner when leases or
 cleanup remain pending, and terminal abort reports any incomplete exact-child
 cleanup.
+
+### Current macOS lifecycle boundary
+
+Public macOS session construction remains fail-closed. The backend-private
+source implements a same-user, unprivileged fixed broker/launcher path: shared
+`posix_spawn` preparation creates each supervisor child in a fresh session,
+the launcher establishes `PT_TRACE_ME`, the broker verifies the initial stop
+and exec trap, and the launcher installs an inherited `(deny signal)`,
+`(deny mach-lookup)`, `(deny mach-register)` profile plus hard
+`RLIMIT_NPROC=1` before it becomes the application-owned runner. FD3/FD4 are
+made close-on-exec while failure remains reportable and then explicitly closed
+before target exec. Security.framework is loaded dynamically only in a
+disposable clean-exec authentication worker.
+
+This design uses no root, set-ID transition, root-owned path, privileged
+service, or request-selected executable. Applications own signing, packaging,
+notarization, and any additional filesystem/network policy. Exact direct-child
+termination/reap is implemented; race-resistant ordinary-descendant group
+termination is not claimed. A separate malicious same-user process is outside
+the host/runner integration model. The authoritative current description and
+enablement gate are in
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
+
+### Historical macOS prototype record
+
+The remainder of this macOS subsection records earlier feasibility milestones
+and rejected designs. It is non-normative: references below to privileged
+watchdogs, root installation, credential dropping, or restored launchd access
+do not describe the current architecture and confer no implementation or
+release claim.
 
 The macOS 6d working branch has a private prototype shaped like the public
 typestate surface, but public macOS spawn/bootstrap remain fail-closed. Direct

@@ -1,6 +1,65 @@
 use super::*;
 use crate::session::SessionLimits;
 
+#[test]
+fn public_memory_transport_vocabulary_remains_application_neutral() {
+    const PUBLIC_MODULES: [(&str, &str); 6] = [
+        ("memory", include_str!("memory.rs")),
+        ("session", include_str!("session.rs")),
+        ("region", include_str!("region.rs")),
+        ("batch", include_str!("batch.rs")),
+        ("control", include_str!("control.rs")),
+        ("active", include_str!("active.rs")),
+    ];
+    const FORBIDDEN: [&str; 9] = [
+        "vst3",
+        "audio",
+        "bus",
+        "sample",
+        "event",
+        "parameter",
+        "plugin",
+        "slot",
+        "ring",
+    ];
+
+    for (module, source) in PUBLIC_MODULES {
+        for (line_number, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") && !trimmed.starts_with("///") {
+                continue;
+            }
+            let lowercase = trimmed.to_ascii_lowercase();
+            let words = lowercase
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty());
+            for word in words {
+                assert!(
+                    !FORBIDDEN.contains(&word),
+                    "application vocabulary {word:?} escaped into {module}.rs:{}",
+                    line_number + 1
+                );
+            }
+            assert!(
+                !lowercase.contains("plug-in"),
+                "application vocabulary escaped into {module}.rs:{}",
+                line_number + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn base_manifest_has_no_application_layout_dependency() {
+    let source = include_str!("protocol.rs");
+    for forbidden in ["native_ipc_core", "native-ipc-core", "crate::core"] {
+        assert!(
+            !source.contains(forbidden),
+            "base native protocol depends on {forbidden}"
+        );
+    }
+}
+
 fn entry(role: u32) -> ManifestEntry {
     let spec = NativeRegionSpec::new(role.into(), [role as u8; 16], 1, 4096, 4096).unwrap();
     ManifestEntry::from_native(spec, PeerAccess::ReadOnly)

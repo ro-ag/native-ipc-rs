@@ -2,7 +2,7 @@
 
 > **Scope.** This document covers the shared-memory and wire-protocol trust
 > boundaries. For the integration model (host / child runner / shared memory),
-> the "launch only your own signed code" contract, and the unprivileged
+> the "launch only your configured application-owned runner" contract, and the unprivileged
 > cooperative-tier lifecycle scope, see
 > [`docs/integration-model.md`](integration-model.md), which is the canonical
 > scope statement.
@@ -80,9 +80,12 @@ not establish payload integrity. Protocol decoders must reject inconsistent
 owned payloads. A malicious sole writer can forge any unkeyed checksum or
 seqlock state, so neither is described as integrity here.
 
-Linux authenticates Unix peers with `SO_PEERCRED` and tracks exit with pidfds;
-macOS authenticates Mach audit trailers; Windows checks both named-pipe endpoint
-PIDs and assigns the still-suspended helper to a kill-on-close Job. Native
+Linux requires per-record `SCM_CREDENTIALS` and binds those credentials to its
+clone-time pidfd child identity; cached `SO_PEERCRED` is explicitly insufficient.
+The private macOS path authenticates Mach audit trailers and may apply a
+deployer-compiled signing requirement, while Windows checks both named-pipe
+endpoint PIDs and assigns the still-suspended helper to a kill-on-close Job.
+Signing and deployment policy belong to the embedding application. Native
 integration tests exercise capability transfer in real helper processes.
 
 ## Severity Calibration (Critical, High, Medium, Low)

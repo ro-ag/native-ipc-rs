@@ -23,10 +23,10 @@
 //! 2. Decode the plan, and prepare every exec input, while still fully
 //!    reversible. No allocation or fallible call may follow containment.
 //! 3. Contain: sandbox, then `RLIMIT_NPROC`. Both survive `execve`.
-//! 4. Close FD3 and FD4, then `execve` immediately. `dup2` cleared their
-//!    close-on-exec flags and `POSIX_SPAWN_CLOEXEC_DEFAULT` covered only the
-//!    broker's spawn, so without this the target would inherit the
-//!    broker-death pipe and any undelivered plan bytes.
+//! 4. Mark FD3 and FD4 close-on-exec before containment, then close them and
+//!    call `execve` immediately. `dup2` cleared their close-on-exec flags and
+//!    `POSIX_SPAWN_CLOEXEC_DEFAULT` covered only the broker's spawn. The flag
+//!    is the fail-closed guarantee; explicit close is defense in depth.
 //!
 //! FD3 carries no data; its only signal is EOF, meaning the broker died. It is
 //! probed at every step where a decision follows. Broker death also closes the
@@ -52,8 +52,10 @@ const PT_TRACE_ME: c_int = 0;
 const SIGSTOP: c_int = 17;
 const RLIMIT_NPROC: c_int = 7;
 const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+const FD_CLOEXEC: c_int = 1;
 const O_NONBLOCK: c_int = 0x0000_0004;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 35;
@@ -187,6 +189,8 @@ unsafe fn run_launcher(installed_path: &CStr) -> Result<Infallible, LauncherEntr
     unsafe {
         require_live(LAUNCHER_DEATH_FD)?;
         require_live(LAUNCHER_PLAN_FD)?;
+        set_close_on_exec(LAUNCHER_DEATH_FD)?;
+        set_close_on_exec(LAUNCHER_PLAN_FD)?;
         adopt_death_pipe()?;
     }
 
@@ -220,9 +224,9 @@ unsafe fn run_launcher(installed_path: &CStr) -> Result<Infallible, LauncherEntr
     // Last look before the target exists. After this the broker's exec trap
     // and exact child authority are the only controls that remain.
     probe_broker_death()?;
-    // SAFETY: both fixed descriptors are owned by this process and must not
-    // survive into the target, which would otherwise inherit the broker-death
-    // pipe and any plan bytes this launcher did not consume.
+    // SAFETY: both fixed descriptors are owned by this process. They were
+    // already marked close-on-exec while failure was still reportable, so a
+    // rare close failure cannot leak either descriptor into the target.
     unsafe {
         close(LAUNCHER_DEATH_FD);
         close(LAUNCHER_PLAN_FD);
@@ -462,6 +466,20 @@ unsafe fn adopt_death_pipe() -> Result<(), LauncherEntryError> {
 unsafe fn require_live(fd: c_int) -> Result<(), LauncherEntryError> {
     // SAFETY: F_GETFD is a read-only descriptor query.
     if unsafe { fcntl(fd, F_GETFD) } < 0 {
+        return Err(LauncherEntryError::InvalidDescriptor);
+    }
+    Ok(())
+}
+
+/// Makes descriptor non-inheritance fail closed before containment.
+unsafe fn set_close_on_exec(fd: c_int) -> Result<(), LauncherEntryError> {
+    // SAFETY: F_GETFD is a read-only query on the live fixed descriptor.
+    let flags = unsafe { fcntl(fd, F_GETFD) };
+    if flags < 0 {
+        return Err(LauncherEntryError::InvalidDescriptor);
+    }
+    // SAFETY: F_SETFD accepts the existing descriptor flags plus FD_CLOEXEC.
+    if unsafe { fcntl(fd, F_SETFD, flags | FD_CLOEXEC) } != 0 {
         return Err(LauncherEntryError::InvalidDescriptor);
     }
     Ok(())

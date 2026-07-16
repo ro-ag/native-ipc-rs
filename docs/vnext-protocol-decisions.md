@@ -155,7 +155,8 @@ public API exposes this transport only from an authenticated `Session<Ready>`.
 The blocked macOS Arm64 prototype uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
 ownership plus the held image through prototype Ready; public construction
-remains fail-closed pending independently privileged exact containment. The
+remains fail-closed pending the explicit enable-or-defer decision and installed
+same-user helper evidence. The
 backend-private trusted-launcher path authenticates its broker, establishes
 cooperative tracing before untrusted exec, proves the relationship with a
 stopped handshake, lowers hard `RLIMIT_NPROC` to one, denies Mach lookup and
@@ -169,7 +170,31 @@ composes the canonical records over its exact-PID named pipe, held suspended
 image, and kill-on-close Job. Its Negotiating/Ready owners expose only the same
 portable control, mixed-batch, active-mapping, and lifecycle surface as Linux.
 
-## macOS supervisor lifecycle candidate
+## macOS supervisor lifecycle decision
+
+The selected source design is same-user and unprivileged. Fixed
+deployer-compiled broker, launcher, and clean-exec worker paths are never
+selected by requests. Every supervisor child starts in a fresh session with
+canonical signals and close-on-exec defaults. The launcher establishes
+cooperative tracing, marks staging descriptors close-on-exec before irreversible
+containment, installs the inherited SBPL/`RLIMIT_NPROC` boundary, and immediately
+execs the configured application-owned runner. Security.framework is loaded
+only in the disposable worker. No root, set-ID transition, root-owned catalog,
+privileged launchd watchdog, or arbitrary-exec/signal deputy is part of the
+model.
+
+Public macOS stays `BackendUnavailable` until the explicit enable-or-defer
+decision and installed-artifact evidence are complete. Exact direct-child
+termination/reap is implemented; ordinary-descendant group cleanup remains
+unverified and is not inferred from a fresh session. Signing, packaging,
+notarization, and optional capability policy belong to the embedding
+application. See [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md)
+for the current protocol and evidence boundary.
+
+### Superseded design exploration
+
+The text below preserves the earlier privileged-service exploration as design
+history only. It is non-normative and is not the selected implementation.
 
 Any viable public macOS construction needs a preinstalled, independently
 privileged signed launchd service/watchdog, not a same-UID broker spawned by

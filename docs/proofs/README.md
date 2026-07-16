@@ -50,11 +50,12 @@ sandbox rests on `sandbox_init(3)`, which is deprecated, and on SBPL, which
 Apple does not document.
 
 It proves containment of the exact contained **process**, not of a same-user
-**principal**. Adversarial review confirmed the limits: a same-user sibling the
-broker never sandboxed can still `SIGSTOP` the broker, and `launchd` remains
-reachable from inside the containment (setting the child's bootstrap port to a
-dead name does not stop it), so a delegated helper escapes both `(deny signal)`
-and `RLIMIT_NPROC`. Those are the adversarial-tier attacks this design places
-out of scope; defending against them is what would still require a privileged
-watchdog. The guarantee demonstrated here is the cooperative one: an
-uncooperative or hung target is contained and reaped exactly, with no leak.
+**principal**. Adversarial review confirmed that a same-user sibling the broker
+never sandboxed can still `SIGSTOP` the broker. This standalone proof uses only
+`(deny signal)`, so it also does not prove launchd-delegation denial. The Rust
+launcher separately measures an inherited profile that denies `mach-lookup`
+and `mach-register`; that stronger source/native result must not be attributed
+to this C proof. The guarantee demonstrated here is the narrower unprivileged
+mechanism: the traced direct target cannot signal its broker, cannot fork, and
+is terminated and reaped exactly. Installed-artifact and public-session claims
+remain absent.

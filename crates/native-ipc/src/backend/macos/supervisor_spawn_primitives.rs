@@ -12,6 +12,7 @@ type PosixSpawnFileActions = *mut c_void;
 
 const POSIX_SPAWN_SETSIGDEF: i16 = 0x0004;
 const POSIX_SPAWN_SETSIGMASK: i16 = 0x0008;
+const POSIX_SPAWN_SETSID: i16 = 0x0400;
 const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
 const SIGKILL: c_int = 9;
 const SIGSTOP: c_int = 17;
@@ -131,11 +132,17 @@ impl SpawnAttributes {
         result(unsafe { posix_spawnattr_setsigdefault(&raw mut self.0, &raw const defaults) })?;
         // SAFETY: initialized attributes and the live empty mask.
         result(unsafe { posix_spawnattr_setsigmask(&raw mut self.0, &raw const mask) })?;
-        // SAFETY: initialized attributes and public Darwin spawn flags.
+        // SAFETY: initialized attributes and public Darwin spawn flags. Every
+        // supervisor child starts a fresh session, so it cannot inherit the
+        // embedding application's foreground process group or job-control
+        // signals. Its PID is also its initial process-group ID.
         result(unsafe {
             posix_spawnattr_setflags(
                 &raw mut self.0,
-                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK,
+                POSIX_SPAWN_CLOEXEC_DEFAULT
+                    | POSIX_SPAWN_SETSID
+                    | POSIX_SPAWN_SETSIGDEF
+                    | POSIX_SPAWN_SETSIGMASK,
             )
         })
     }

@@ -47,7 +47,7 @@ cargo run -p native-ipc --example common_memory
 
 ## Unreleased vNext session API
 
-The current source tree exposes the Linux vNext composition through role- and
+The current source tree exposes the Linux and Windows vNext compositions through role- and
 state-typed `CoordinatorSession<Negotiating>` and
 `ReceiverSession<Negotiating>` owners. `receiver_main!` adopts the inherited
 bootstrap exactly once before ordinary receiver code, bilateral application
@@ -68,28 +68,21 @@ fail-closed at public spawn/bootstrap. Its backend-private trusted launcher
 authenticates the broker, enters cooperative `ptrace`, proves the relationship
 with a stopped handshake, installs hard `RLIMIT_NPROC=1`, and execs through the
 kernel's pre-first-instruction trap. Exact stopped `PT_KILL`, tracer-death kill,
-and post-exec fork denial pass native tests. The remaining authority boundary
-is not solved: same-UID target code can `SIGSTOP` the broker indefinitely. A
-nested-tracer native test proves an outer watchdog can exactly kill/reap that
-stopped broker and trigger exact tracer-exit cleanup of its target, but not the
-required production privilege separation. The launchd bootstrap namespace
-restored for libxpc permits delegated work outside the rlimit. Public
-composition therefore still requires an
-independently privileged authenticated service/watchdog and remains blocked.
-Backend-private source models constrain that future boundary to a verified
-installed policy, a bounded absolute-deadline nonce/generation-bound request, opaque watchdog
-handles retaining linear exact cleanup authority, and a permanent nonroot
-UID/GID/group drop. A fused source-only authentication adapter further binds
-the retained exact message/token to a fixed one-job worker and linear private
-reply receipt, then requires typed exact worker reap before peer authority can
-exist; no API falls back to signaling a reconstructed PID. They are not a
-packaged or installed service and do not
-constitute root, signing, installed-service, or public-session evidence.
+and post-exec fork denial pass native tests. The inherited SBPL profile also
+denies outbound signals and launchd Mach lookup/registration before and after
+target exec. The hidden fixed broker caller composes launcher spawn, FD 4 plan
+delivery, clean-exec signature verification, FD 5 trace reporting/Ready-bound
+resume, and exact target reap through one child wait domain. These are
+source/native mechanism results only: deployer-supplied broker, launcher, and
+worker artifacts are not installed, signed, packaged, notarized, or proven
+replacement-resistant; no deployer capability allowlist is complete; and public
+enablement remains a separate user decision. Public macOS therefore remains
+`BackendUnavailable`.
 Windows publicly composes the same Negotiating/Ready typestate surface over its
 unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and
 post-COMMIT active ledger. Native Windows AMD64 source-tree and extracted-package
-all-feature/no-default suites pass in the recorded working tree. Native Windows
+all-feature/no-default suites pass at the recorded checkpoint. Native Windows
 Arm64 runtime, exact-release packaged conformance, the macOS lifecycle
 architecture, and release evidence remain pending. The existing cross-platform
 native-memory lifecycle API remains available independently.
