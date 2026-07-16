@@ -783,9 +783,11 @@ numeric PID as wire authority, reject helper audit-token PID-version changes,
 and never transfer a task port. It MUST additionally use an OS-enforced exact
 containment mechanism that survives service crash and cannot be escaped by the
 helper. No documented public macOS primitive satisfying that last condition is
-currently known, so the architecture and public adapter remain blocked. The
-analysis and native evidence gate are specified in
-[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
+currently known, so this signed-XPC crash-surviving adapter architecture
+remains unimplemented. Public macOS sessions are enabled (2026-07-16) over the
+simpler audit-token-authenticated direct-spawn baseline, which does not claim
+service-crash-surviving containment. The analysis and native evidence gate are
+specified in [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
 
 ### 8.4 Windows AMD64/Arm64
 

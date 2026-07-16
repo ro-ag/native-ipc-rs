@@ -296,9 +296,10 @@ trace reporting/Ready-bound resume, and exact reap through one child wait
 domain. Native tests prove exact FD topology, launchd lookup/registration denial,
 fork/spawn denial, signal denial, exec inheritance, target substitution
 rejection, and Darwin's reap-to-`ECHILD` behavior. This remains source/mechanism
-evidence: no deployer-supplied minimal helpers are installed, signed, packaged,
-notarized, or proven replacement-resistant, no capability allowlist is complete,
-and public enablement is not authorized. The exact evidence and residuals are in
+evidence for the backend-private launcher: no deployer-supplied minimal helpers
+are installed, signed, packaged, notarized, or proven replacement-resistant, and
+no capability allowlist is complete. Public macOS sessions themselves are enabled
+(2026-07-16) over the direct-spawn path. The exact evidence and residuals are in
 [`docs/macos-supervisor-boundary.md`](docs/macos-supervisor-boundary.md).
 The three extracted `cargo package` crates rebuild and pass the all-feature and
 no-default workspace suites on physical Apple Silicon at its recorded head and
@@ -306,8 +307,8 @@ on native Windows AMD64 at the recorded Windows checkpoint. Windows
 public sessions bind held executable identity, PID-authenticated message
 transport, exact process/whole-Job lifecycle, full-manifest
 IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation. Exact-release reruns,
-native Windows Arm64 runtime evidence, physical Linux Arm64 evidence, the macOS
-architecture, and release authorization remain outstanding.
+native Windows Arm64 runtime evidence, physical Linux Arm64 evidence, the installed/signed macOS helper
+(launcher) architecture, and release authorization remain outstanding.
 
 Implemented in the current source tree (`0.4.0` plus unreleased vNext work):
 
@@ -346,7 +347,7 @@ Implemented in the current source tree (`0.4.0` plus unreleased vNext work):
 
 The public facade fails compilation on other target combinations. The
 platform-neutral `native-ipc-core` crate remains usable
-wherever its documented 64-bit atomic requirement is met. CI runs the full
+wherever its documented 64-bit atomic requirement is met. The CI matrix is configured to run the full
 workspace and native permission/helper-process tests on all five targets; no
 Intel macOS support is claimed. Linux AMD64 additionally runs every workspace
 and native lifecycle test under AddressSanitizer. Leak detection and

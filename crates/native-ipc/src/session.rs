@@ -251,7 +251,9 @@ pub struct Ready;
 pub enum BackendStatus {
     /// Public spawn and inherited-bootstrap session construction are composed.
     Available,
-    /// The target is supported, but public session construction is fail-closed.
+    /// Reserved for a supported target whose lifecycle adapter is not composed.
+    /// Every target the crate currently compiles for reports [`Self::Available`];
+    /// no supported target returns this today.
     Unavailable,
 }
 
@@ -922,7 +924,10 @@ pub enum SessionTransactionState {
     Negotiating,
     /// The accepted control reducer was idle and ready.
     Ready,
-    /// A native capability transaction had begun.
+    /// A native capability transaction had begun. Only backends whose batch
+    /// activation is non-atomic report this state (Linux); macOS and Windows
+    /// activate atomically and expose no partially-open transaction, so a
+    /// portable consumer must not depend on observing it on every target.
     TransactionOpen,
     /// The session reducer was terminally poisoned.
     Poisoned,

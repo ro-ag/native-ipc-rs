@@ -52,7 +52,7 @@ cargo run -p native-ipc --example common_memory
 
 ## Unreleased vNext session API
 
-The current source tree exposes the Linux and Windows vNext compositions through role- and
+The current source tree exposes the Linux, macOS Arm64, and Windows vNext compositions through role- and
 state-typed `CoordinatorSession<Negotiating>` and
 `ReceiverSession<Negotiating>` owners. `receiver_main!` adopts the inherited
 bootstrap exactly once before ordinary receiver code, bilateral application
@@ -98,7 +98,8 @@ match backend_status() {
 
 # let construction_result: Result<(), SessionError> = Ok(());
 if let Err(SessionError::BackendUnavailable) = construction_result {
-    // The target's public session composition is intentionally fail-closed.
+    // Reserved for a supported target whose adapter is not composed; no
+    // currently supported target reaches this arm.
 }
 ```
 
@@ -111,8 +112,8 @@ unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and
 post-COMMIT active ledger. Native Windows AMD64 source-tree and extracted-package
 all-feature/no-default suites pass at the recorded checkpoint. Native Windows
-Arm64 runtime, exact-release packaged conformance, the macOS lifecycle
-architecture, and release evidence remain pending. The existing cross-platform
+Arm64 runtime, exact-release packaged conformance, the installed/signed
+macOS helper (launcher) architecture, and release evidence remain pending. The existing cross-platform
 native-memory lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy

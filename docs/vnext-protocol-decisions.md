@@ -152,9 +152,9 @@ single owned record allocation and advances the receive sequence once. Send
 and receive sequences are independent; exhaustion, replay/reorder, malformed
 peer input, partial receive, and transaction conflict are terminal. The Linux
 public API exposes this transport only from an authenticated `Session<Ready>`.
-The blocked macOS Arm64 prototype uses the same canonical wire records over an
+The macOS Arm64 direct-spawn path uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
-ownership plus the held image through prototype Ready; public construction
+ownership plus the held image through Ready; public construction
 composes this path (Option B enabled 2026-07-16 after the cross-platform
 public session conformance corpus ran green on macOS; see
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md)). The
