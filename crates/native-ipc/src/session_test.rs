@@ -12,6 +12,29 @@ assert_not_impl_any!(Session<Receiver, Ready>: Sync, Clone);
 assert_impl_all!(ReceiverBootstrap: Send);
 assert_not_impl_any!(ReceiverBootstrap: Sync, Clone, Copy);
 
+// Minimal Mach surface for asserting, through the public API, that a macOS
+// reader mapping's kernel maximum protection excludes write and execute. The
+// signatures mirror the private backend externs in `backend/macos.rs`.
+#[cfg(all(target_os = "macos", feature = "raw-pointer"))]
+mod mach_attenuation_probe {
+    use core::ffi::c_int;
+    pub const KERN_SUCCESS: c_int = 0;
+    pub const VM_PROT_READ: c_int = 1;
+    pub const VM_PROT_WRITE: c_int = 2;
+    pub const VM_PROT_EXECUTE: c_int = 4;
+    unsafe extern "C" {
+        pub static mach_task_self_: u32;
+        pub fn mach_vm_protect(
+            target_task: u32,
+            address: u64,
+            size: u64,
+            set_maximum: c_int,
+            new_protection: c_int,
+        ) -> c_int;
+        pub fn getpagesize() -> c_int;
+    }
+}
+
 #[test]
 fn public_session_backend_status_is_first_class_and_target_exact() {
     assert_eq!(backend_status(), BackendStatus::Available);
@@ -598,6 +621,37 @@ fn public_ready_activates_one_mixed_batch_atomically() {
         let mut byte = [0];
         reader.read_into(1, &mut byte).unwrap();
         assert_eq!(byte, [0xc0 + ordinal as u8]);
+        // Section 5 negative, reached through the public API on macOS: the
+        // kernel maximum protection of a live public reader mapping excludes
+        // write and execute, so neither upgrade may succeed. The probe leaves
+        // the mapping unchanged on the expected failure.
+        #[cfg(all(target_os = "macos", feature = "raw-pointer"))]
+        {
+            use mach_attenuation_probe::{
+                KERN_SUCCESS, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, getpagesize,
+                mach_task_self_, mach_vm_protect,
+            };
+            // SAFETY: `as_ptr` returns the base of the exact live imported
+            // reader mapping; probing one page of it with `mach_vm_protect`
+            // reads the kernel maximum and changes nothing when it is denied.
+            let base = unsafe { reader.as_ptr() }.unwrap() as u64;
+            let page = unsafe { getpagesize() } as u64;
+            let task = unsafe { mach_task_self_ };
+            // SAFETY: system call on the current task with a valid sub-range.
+            let deny_write =
+                unsafe { mach_vm_protect(task, base, page, 0, VM_PROT_READ | VM_PROT_WRITE) };
+            assert_ne!(
+                deny_write, KERN_SUCCESS,
+                "public macOS reader mapping must reject a writable upgrade"
+            );
+            // SAFETY: system call on the current task with a valid sub-range.
+            let deny_exec =
+                unsafe { mach_vm_protect(task, base, page, 0, VM_PROT_READ | VM_PROT_EXECUTE) };
+            assert_ne!(
+                deny_exec, KERN_SUCCESS,
+                "public macOS reader mapping must reject an executable upgrade"
+            );
+        }
     }
     assert!(active.is_empty());
     assert!(ready.active_leases().is_empty());
