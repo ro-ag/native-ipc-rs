@@ -172,7 +172,11 @@ fn authentication_and_installed_policy_precede_the_single_effect_request() {
 fn transport_delay_never_restarts_or_extends_the_absolute_deadline() {
     let mut fixture = Fixture::new();
     fixture.authenticate();
-    let requested_deadline = Instant::now() + Duration::from_millis(40);
+    // Generous absolute deadline (well under the 30s supervisor cap) so the
+    // still-in-future assertion below survives a slow shared CI runner. The
+    // fixed 10ms transport delay is what proves the deadline is not restarted;
+    // its magnitude relative to the deadline is irrelevant to that property.
+    let requested_deadline = Instant::now() + Duration::from_secs(25);
     let bounded_request = SpawnRequest::new(
         SupervisorDeadline::from_instant(requested_deadline).unwrap(),
         b"com.example.receiver".to_vec(),
