@@ -21,8 +21,9 @@ this one wins.
    child process. On Linux and Windows this rides the platform's own primitives
    (pidfd + owned cleanup; suspended spawn + kill-on-close Job). On macOS it is
    an unprivileged ptrace/sandbox design that is **not enabled** — the public
-   macOS backend is currently `BackendUnavailable` by decision. The model below
-   describes the design and its scope, not a shipping macOS promise.
+   macOS backend is currently `BackendUnavailable`; the enable path is decided
+   (2026-07-16) but flips only after installed-artifact evidence. The model
+   below describes the design and its scope, not a shipping macOS promise.
 
 ## The integration model
 

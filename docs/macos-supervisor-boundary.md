@@ -226,13 +226,20 @@ provide and verify:
 
 ## Public decision boundary
 
-Plan 8b task #57 is deliberately user-gated:
+Plan 8b task #57 was deliberately user-gated between:
 
 - **Option A:** keep public macOS fail-closed and document the source mechanism
   as experimental/private; or
 - **Option B:** complete the installed evidence above and wire the already
   reviewed private lifecycle into public sessions.
 
-Until the user makes that choice and Option B's evidence is complete, public
-macOS remains `BackendUnavailable`. No agent may infer enablement from the
-existence of private source code.
+**Decision (user, 2026-07-16): Option B**, under the lib-in-signed-host
+integration model — the library launches only deployer-signed code, verified at
+the exec trap against the deployer's designated requirement through the
+process-unique audit token (PID + pidversion), and terminates exactly its own
+unreaped direct child, never any other process.
+
+The decision authorizes the enable path; it does not enable anything by
+itself. Until Option B's installed evidence above is complete, public macOS
+remains `BackendUnavailable`. No agent may infer enablement from the existence
+of private source code or from this decision record.
