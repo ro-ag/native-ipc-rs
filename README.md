@@ -119,16 +119,15 @@ The consumer type surface is intended to be identical on every supported
 platform; only the underlying kernel mechanism differs (see
 [supported targets](#supported-targets)). The shared-memory allocation core
 ships on all platforms. The unreleased vNext session composition is public on
-Linux and Windows, while public macOS spawn/bootstrap remain unavailable pending
-the explicit Plan 8b enable-or-defer decision. The exact module inventory,
-cross-target enforcement, and published-0.4 versus experimental-vNext boundary
-are recorded in [`docs/public-api.md`](docs/public-api.md).
+Linux, macOS Arm64, and Windows (macOS enabled 2026-07-16 after the shared
+public session conformance corpus ran green there). The exact module
+inventory, cross-target enforcement, and published-0.4 versus
+experimental-vNext boundary are recorded in
+[`docs/public-api.md`](docs/public-api.md).
 Consumers can inspect this through the common const
-`native_ipc::session::backend_status()` API: Linux and Windows report
-`BackendStatus::Available`, while macOS Arm64 reports
-`BackendStatus::Unavailable` and valid construction attempts return
-`SessionError::BackendUnavailable`. The status applies only to the vNext
-session layer; macOS shared-memory allocation remains available.
+`native_ipc::session::backend_status()` API: every supported target reports
+`BackendStatus::Available`; `Unavailable` remains reserved for targets whose
+adapter is not composed.
 
 ## How memory is accessed
 
@@ -281,12 +280,14 @@ A fresh implementation session can start from
 
 ## Current status
 
-The unreleased vNext branch composes the safe public session API on Linux and Windows:
+The unreleased vNext branch composes the safe public session API on Linux,
+macOS Arm64, and Windows:
 one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
-lease-aware close/abort, and bounded failure/cleanup diagnostics. A macOS Arm64
-composition prototype exists privately but the public entry points remain
-fail-closed. The backend-private same-user launcher authenticates its broker,
+lease-aware close/abort, and bounded failure/cleanup diagnostics. The public
+macOS path spawns the configured executable directly, authenticates it over
+the audit-token/nonce Mach bootstrap, and owns exact direct-child cleanup.
+Separately, the backend-private same-user launcher authenticates its broker,
 enters cooperative `ptrace`, proves the relationship with an initial stop,
 installs the inherited SBPL/`RLIMIT_NPROC=1` profile, and crosses `exec` through
 the kernel trap before target code. The hidden fixed broker caller composes
@@ -339,7 +340,7 @@ Implemented in the current source tree (`0.4.0` plus unreleased vNext work):
 | --- | --- | --- | --- | --- | --- |
 | Linux | AMD64 | `x86_64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | per-record `SCM_CREDENTIALS` bound to exact child | clone-time `pidfd` + owned helper cleanup |
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` | Sealed anonymous `memfd` + exact `SCM_RIGHTS` | per-record `SCM_CREDENTIALS` bound to exact child | clone-time `pidfd` + owned helper cleanup |
-| macOS | ARM64 | `aarch64-apple-darwin` | Mach memory-entry send rights | Mach audit token + private signature gate | private same-user ptrace/SBPL core; public session unavailable |
+| macOS | ARM64 | `aarch64-apple-darwin` | Mach memory-entry send rights | Mach audit token + nonce bootstrap (+ private signature gate in the deployer launcher) | audit-token-authenticated direct spawn + exact reap; private same-user ptrace/SBPL launcher for deployer helpers |
 | Windows | AMD64 | `x86_64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | Least-rights unnamed section handles | both named-pipe endpoint PIDs | suspended spawn + kill-on-close Job |
 

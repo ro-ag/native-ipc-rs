@@ -155,9 +155,8 @@ public API exposes this transport only from an authenticated `Session<Ready>`.
 The blocked macOS Arm64 prototype uses the same canonical wire records over an
 audit-PID/nonce-authenticated private Mach port and retains exact-child wait
 ownership plus the held image through prototype Ready; public construction
-remains fail-closed pending the decided enable path: public session wiring
-plus a green macOS run of the cross-platform public session conformance corpus
-(Option B chosen 2026-07-16; see
+composes this path (Option B enabled 2026-07-16 after the cross-platform
+public session conformance corpus ran green on macOS; see
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md)). The
 backend-private trusted-launcher path authenticates its broker, establishes
 cooperative tracing before untrusted exec, proves the relationship with a
@@ -165,8 +164,8 @@ stopped handshake, lowers hard `RLIMIT_NPROC` to one, denies Mach lookup and
 registration in an inherited profile, and crosses exec through the kernel's
 trace trap before target code. This gives exact direct-child termination, fork
 denial, and launchd delegation denial while the broker runs, and XNU kills the
-tracee if the broker exits. Public macOS remains disabled until that
-evidence completes and has no installed-artifact proof; a separate malicious
+tracee if the broker exits. The launcher path remains backend-private
+deployer machinery with no installed-artifact proof; a separate malicious
 same-user principal also remains outside the integration model. Windows publicly
 composes the canonical records over its exact-PID named pipe, held suspended
 image, and kill-on-close Job. Its Negotiating/Ready owners expose only the same
@@ -185,8 +184,8 @@ only in the disposable worker. No root, set-ID transition, root-owned catalog,
 privileged launchd watchdog, or arbitrary-exec/signal deputy is part of the
 model.
 
-Public macOS stays `BackendUnavailable` until the explicit enable-or-defer
-decision and installed-artifact evidence are complete. Exact direct-child
+Public macOS sessions are enabled (2026-07-16) over the direct-spawn path;
+the launcher machinery here stays backend-private. Exact direct-child
 termination/reap is implemented; ordinary-descendant group cleanup remains
 unverified and is not inferred from a fresh session. Signing, packaging,
 notarization, and optional capability policy belong to the embedding
@@ -277,7 +276,7 @@ signed or installed service. The source production boundary exposes no
 arbitrary signaling or execution deputy and forbids blanket launchd lookup and
 registration before target exec. An installed deployment must prove that
 immutable profile, survive client/broker stops, and account explicitly for any
-future service allowlist. Public macOS remains fail-closed until the decided
-enable path's public wiring and macOS conformance corpus are complete;
+future service allowlist. Public macOS sessions compose over the direct-spawn
+path (enabled 2026-07-16); this launcher boundary remains backend-private and
 installed-artifact proof is deployment responsibility. See
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).

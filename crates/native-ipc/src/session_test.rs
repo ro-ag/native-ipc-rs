@@ -14,12 +14,7 @@ assert_not_impl_any!(ReceiverBootstrap: Sync, Clone, Copy);
 
 #[test]
 fn public_session_backend_status_is_first_class_and_target_exact() {
-    let expected = if cfg!(target_os = "macos") {
-        BackendStatus::Unavailable
-    } else {
-        BackendStatus::Available
-    };
-    assert_eq!(backend_status(), expected);
+    assert_eq!(backend_status(), BackendStatus::Available);
 }
 
 #[test]
@@ -83,9 +78,9 @@ fn public_session_inputs_are_explicit_bounded_and_role_typed() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_public_spawn_remains_fail_closed_until_explicit_enablement() {
-    assert_eq!(backend_status(), BackendStatus::Unavailable);
-    let command = SessionCommand::new(std::env::current_exe().unwrap());
+fn macos_public_spawn_is_wired_and_no_longer_fails_closed() {
+    let command = SessionCommand::new(std::env::current_exe().unwrap())
+        .env("NATIVE_IPC_MACH_NONCE", "forged");
     let options = SessionOptions::new(
         AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
@@ -93,7 +88,8 @@ fn macos_public_spawn_remains_fail_closed_until_explicit_enablement() {
     let failure = CoordinatorSession::<Negotiating>::spawn(command, options)
         .err()
         .unwrap();
-    assert_eq!(failure.reason(), SessionError::BackendUnavailable);
+    assert_ne!(failure.reason(), SessionError::BackendUnavailable);
+    assert_eq!(failure.reason(), SessionError::InvalidInput);
     assert_eq!(
         failure.transaction_state(),
         SessionTransactionState::NotEstablished
@@ -104,7 +100,6 @@ fn macos_public_spawn_remains_fail_closed_until_explicit_enablement() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "macOS public composition awaits explicit enablement and installed evidence"]
 fn macos_public_pre_spawn_failure_is_not_misreported_as_negotiating() {
     let failure = CoordinatorSession::<Negotiating>::spawn(
         SessionCommand::new("relative-helper"),
@@ -282,10 +277,6 @@ fn atomic_facts_and_absolute_deadline_fail_closed() {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS public composition awaits explicit enablement and installed evidence"
-)]
 fn public_typestate_negotiates_controls_and_reports_exact_exit() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
@@ -396,7 +387,6 @@ fn public_receiver_helper() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "macOS public composition awaits explicit enablement and installed evidence"]
 fn macos_public_unknown_rejection_preserves_cleanup_facts() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
@@ -447,7 +437,6 @@ fn macos_public_unknown_reject_helper() {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "macOS public composition awaits explicit enablement and installed evidence"]
 fn macos_public_abort_uses_exact_audit_token_and_closes_inherited_fds() {
     use std::os::fd::AsRawFd;
 
@@ -548,10 +537,6 @@ fn public_native_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS public composition awaits explicit enablement and installed evidence"
-)]
 fn public_ready_activates_one_mixed_batch_atomically() {
     use crate::region::RegionId;
 
@@ -684,10 +669,6 @@ fn one_active_region_options() -> SessionOptions {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS public composition awaits explicit enablement and installed evidence"
-)]
 fn public_capacity_rejection_keeps_both_sessions_synchronized() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)

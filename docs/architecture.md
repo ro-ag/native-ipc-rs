@@ -316,7 +316,8 @@ cleanup.
 
 ### Current macOS lifecycle boundary
 
-Public macOS session construction remains fail-closed. The backend-private
+Public macOS session construction composes the audit-token-authenticated
+direct-spawn path (enabled 2026-07-16). Separately, the backend-private
 source implements a same-user, unprivileged fixed broker/launcher path: shared
 `posix_spawn` preparation creates each supervisor child in a fresh session,
 the launcher establishes `PT_TRACE_ME`, the broker verifies the initial stop
@@ -344,8 +345,8 @@ watchdogs, root installation, credential dropping, or restored launchd access
 do not describe the current architecture and confer no implementation or
 release claim.
 
-The macOS 6d working branch has a private prototype shaped like the public
-typestate surface, but public macOS spawn/bootstrap remain fail-closed. Direct
+The macOS 6d direct-spawn composition is now the public typestate surface;
+public macOS spawn/bootstrap compose it (enabled 2026-07-16). Direct
 spawn now starts suspended and, in private prototype code, captures a task-name
 right plus `TASK_AUDIT_TOKEN` before resume. Private
 `proc_signal_with_audittoken` therefore exactly terminates a silent direct
@@ -464,8 +465,8 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
    signed, root-installed, or verified as replacement-resistant; the spawner is
    not wired to Mach transport or a complete process-wide waiter policy, and no
    positive installed-root evidence exists. The negative result for unprivileged same-UID
-constructions, the primary-source evidence, and the standing fail-closed
-decision are recorded in
+constructions, the primary-source evidence, and the enable decision history
+are recorded in
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md). In the
 post-authentication prototype the
 coordinator retains an opened regular non-setid

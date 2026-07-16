@@ -257,16 +257,12 @@ pub enum BackendStatus {
 
 /// Reports whether the public lifecycle/session composition is available.
 ///
-/// Linux and Windows report [`BackendStatus::Available`]. macOS Arm64 reports
-/// [`BackendStatus::Unavailable`]; a valid public spawn or bootstrap attempt
-/// returns [`SessionError::BackendUnavailable`] without enabling the private
-/// experimental supervisor path.
+/// Linux, macOS Arm64, and Windows all report [`BackendStatus::Available`]:
+/// public spawn and inherited-bootstrap session construction are composed on
+/// every supported target. [`BackendStatus::Unavailable`] remains reserved for
+/// targets whose adapter is not composed.
 pub const fn backend_status() -> BackendStatus {
-    if cfg!(target_os = "macos") {
-        BackendStatus::Unavailable
-    } else {
-        BackendStatus::Available
-    }
+    BackendStatus::Available
 }
 
 /// Accepted wire protocol version bound into both challenged ACCEPT frames.
@@ -581,16 +577,12 @@ enum SessionInner {
     #[cfg(target_os = "linux")]
     ReceiverReady(crate::backend::linux_vnext::spawn::LinuxReceiverReadySession),
     #[cfg(target_os = "macos")]
-    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
     CoordinatorNegotiating(crate::backend::macos::vnext_session::MacCoordinatorNegotiatingSession),
     #[cfg(target_os = "macos")]
-    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
     ReceiverNegotiating(crate::backend::macos::vnext_session::MacReceiverNegotiatingSession),
     #[cfg(target_os = "macos")]
-    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
     CoordinatorReady(crate::backend::macos::vnext_session::MacCoordinatorReadySession),
     #[cfg(target_os = "macos")]
-    #[allow(dead_code, reason = "blocked macOS public composition prototype")]
     ReceiverReady(crate::backend::macos::vnext_session::MacReceiverReadySession),
     #[cfg(target_os = "windows")]
     CoordinatorNegotiating(
@@ -1347,12 +1339,33 @@ impl Session<Coordinator, Negotiating> {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = command;
-            Err(SessionFailure::new(
-                SessionOperation::Spawn,
-                SessionTransactionState::NotEstablished,
-                SessionError::BackendUnavailable,
-            ))
+            let inner =
+                crate::backend::macos::vnext_session::MacCoordinatorNegotiatingSession::spawn(
+                    &command, &options,
+                )
+                .map_err(|failure| {
+                    let transaction_state = match failure.state {
+                        crate::backend::macos::vnext_session::MacCoordinatorFailureState::NotEstablished => {
+                            SessionTransactionState::NotEstablished
+                        }
+                        crate::backend::macos::vnext_session::MacCoordinatorFailureState::Spawned => {
+                            SessionTransactionState::Spawned
+                        }
+                        crate::backend::macos::vnext_session::MacCoordinatorFailureState::Negotiating => {
+                            SessionTransactionState::Negotiating
+                        }
+                    };
+                    mac_session_failure(
+                        SessionOperation::Spawn,
+                        transaction_state,
+                        failure.error,
+                        failure.poisoned,
+                    )
+                    .with_optional_cleanup(failure.cleanup)
+                })?;
+            Ok(Self::from_inner(SessionInner::CoordinatorNegotiating(
+                inner,
+            )))
         }
         #[cfg(target_os = "windows")]
         {
@@ -1517,11 +1530,23 @@ impl Session<Receiver, Negotiating> {
         #[cfg(target_os = "macos")]
         {
             let _bootstrap = bootstrap;
-            Err(SessionFailure::new(
-                SessionOperation::Bootstrap,
-                SessionTransactionState::NotEstablished,
-                SessionError::BackendUnavailable,
-            ))
+            let inner =
+                crate::backend::macos::vnext_session::MacReceiverNegotiatingSession::from_environment(
+                    options.limits,
+                    options.application_payload,
+                    options.require_atomic_u32,
+                    options.require_atomic_u64,
+                    options.deadline,
+                )
+                .map_err(|error| {
+                    mac_session_failure(
+                        SessionOperation::Bootstrap,
+                        SessionTransactionState::Negotiating,
+                        error,
+                        true,
+                    )
+                })?;
+            Ok(Self::from_inner(SessionInner::ReceiverNegotiating(inner)))
         }
         #[cfg(target_os = "windows")]
         {

@@ -13,18 +13,21 @@ this one wins.
    shared memory with a single allocation/preparation API across every supported
    platform: private regions, direction-specific reader/writer capabilities,
    and a bounded wire/layout codec. The unreleased vNext session layer adds
-   authenticated capability transfer; it is publicly composed on Linux and
-   Windows, while public macOS session construction remains fail-closed.
+   authenticated capability transfer; it is publicly composed on Linux,
+   macOS Arm64, and Windows (macOS enabled 2026-07-16 after the cross-platform
+   public session conformance corpus ran green there).
 
-2. **Lifecycle supervisor (vNext design, not yet public on macOS).** The spawn,
-   identity-verification, containment, and exact-termination machinery for a
-   child process. On Linux and Windows this rides the platform's own primitives
-   (pidfd + owned cleanup; suspended spawn + kill-on-close Job). On macOS it is
-   an unprivileged ptrace/sandbox design that is **not enabled** — the public
-   macOS backend is currently `BackendUnavailable`; the enable path is decided
-   (2026-07-16) and flips once the public session wiring and the macOS run of
-   the cross-platform session conformance corpus are green. The model below
-   describes the design and its scope, not a shipping macOS promise.
+2. **Lifecycle supervisor.** The spawn, identity-verification, containment,
+   and exact-termination machinery for a child process. On Linux and Windows
+   this rides the platform's own primitives (pidfd + owned cleanup; suspended
+   spawn + kill-on-close Job). On macOS the public session path spawns the
+   configured executable directly, authenticates it through the audit-token/
+   nonce Mach bootstrap, verifies the spawned image, and owns exact
+   direct-child termination and reaping. The additional hardened launcher —
+   cooperative `ptrace` exec-trap, clean-exec signature gate, inherited
+   SBPL/`RLIMIT_NPROC` containment — is backend-private machinery for
+   deployer-built helper artifacts and is not part of the public constructor
+   path.
 
 ## The integration model
 
@@ -113,8 +116,8 @@ payloads and must configure any desired filesystem, network, or platform sandbox
   delegation path in the backend-private design. A future deployer capability
   profile may replace that blanket denial only with an explicit service
   allowlist; each allowlisted service is delegated authority that the deployment
-  must account for. Public macOS remains disabled until the decided enable
-  path's public wiring and macOS conformance corpus are complete.
+  must account for. These launcher profiles apply to the backend-private
+  deployer-helper machinery, not to the public direct-spawn constructor path.
 - **macOS mechanism caveat.** The unprivileged containment relies on
   `sandbox_init` (deprecated) and SBPL (undocumented). It is an empirical property
   of the current OS, verified by measurement, not a supported API contract.
@@ -133,7 +136,7 @@ one API and one contract; only the underlying primitive changes:
 | --- | --- | --- | --- |
 | Shared memory | sealed anonymous `memfd` + `SCM_RIGHTS` | Mach memory-entry send rights | least-rights unnamed section handles |
 | Peer identity | per-record `SCM_CREDENTIALS` bound to the exact child | Mach audit-token PID (+ deployer signing policy in the private launcher) | both named-pipe endpoint PIDs |
-| Runner lifecycle | `pidfd` + owned helper cleanup | ptrace exec-trap + sandbox + exact reap (design; not yet public) | suspended spawn + kill-on-close Job |
+| Runner lifecycle | `pidfd` + owned helper cleanup | audit-token-authenticated direct spawn + exact reap (public); ptrace exec-trap + sandbox launcher (private deployer machinery) | suspended spawn + kill-on-close Job |
 
 The common promise is exact configured-image bootstrap, bounded IPC authority,
 and honest direct-child cleanup facts without elevated privilege. Descendant and
@@ -150,11 +153,10 @@ in [`public-api.md`](public-api.md). This is source compatibility, not a stable
 ABI or equal private type layout.
 
 `session::backend_status()` makes lifecycle availability explicit through the
-same `BackendStatus` type on every supported target. Linux and Windows report
-`Available`; macOS Arm64 reports `Unavailable`, and valid construction attempts
-return `SessionError::BackendUnavailable`. This does not compile out any
-consumer declaration, disable macOS shared memory, or enable the private macOS
-supervisor.
+same `BackendStatus` type on every supported target. Linux, macOS Arm64, and
+Windows all report `Available`; `Unavailable` remains reserved for targets
+whose adapter is not composed. The query does not compile out any consumer
+declaration or vary the declared surface by target.
 
 ## Reference proofs
 

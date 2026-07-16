@@ -1,11 +1,11 @@
 # macOS exact-lifecycle supervisor boundary
 
-Status: backend-private same-user launcher lifecycle implemented and natively
-tested; public macOS session construction remains `BackendUnavailable` pending
-the decided enable path — public session wiring plus a green macOS run of the
-cross-platform public session conformance corpus.
-The common `session::backend_status()` query therefore reports
-`BackendStatus::Unavailable` on macOS Arm64.
+Status: public macOS session construction is composed and enabled
+(2026-07-16) over the audit-token-authenticated direct-spawn path, with the
+cross-platform public session conformance corpus green on macOS Arm64. The
+common `session::backend_status()` query reports `BackendStatus::Available`.
+The backend-private same-user launcher lifecycle documented here remains
+deployer-helper machinery outside the public constructor path.
 
 This document is subordinate to
 [`integration-model.md`](integration-model.md) and the normative
@@ -79,9 +79,9 @@ The backend-private implementation now composes the following source path:
    `RLIMIT_NPROC=1`, closes those staging descriptors as defense in depth, and
    immediately calls `execve`. A rare explicit-close failure therefore cannot
    leak either descriptor into the target.
-6. Public `Session::spawn` and `Session::from_bootstrap` on macOS still return
-   `BackendUnavailable`; none of these private owners can be reached through the
-   ordinary safe session API.
+6. Public `Session::spawn` and `Session::from_bootstrap` on macOS compose the
+   direct-spawn session path; none of these private launcher owners can be
+   reached through the ordinary safe session API.
 
 Security.framework and CoreFoundation are never statically linked into the
 shared library/test image. The fixed authentication worker loads both frameworks
@@ -248,6 +248,10 @@ public Negotiating/Ready session wiring is complete and the same public
 session conformance corpus that Linux and Windows pass runs green on macOS.
 Installed/signed/notarized artifact proof is the deploying application's
 responsibility (section above) and is documented as an evidence-level caveat,
-not a flip precondition. Until the wiring and corpus land, public macOS
-remains `BackendUnavailable`; no agent may infer enablement from the existence
-of private source code or from this decision record alone.
+not a flip precondition.
+
+**Enabled (2026-07-16):** the wiring landed, the corpus runs green on macOS
+Arm64, and `backend_status()` reports `Available`. The public path is the
+audit-token-authenticated direct spawn with exact own-child cleanup; the
+hardened launcher machinery above remains backend-private for deployer-built
+helpers and confers no installed/signed/notarized claim.
