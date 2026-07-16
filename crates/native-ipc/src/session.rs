@@ -251,7 +251,9 @@ pub struct Ready;
 pub enum BackendStatus {
     /// Public spawn and inherited-bootstrap session construction are composed.
     Available,
-    /// The target is supported, but public session construction is fail-closed.
+    /// Reserved for a supported target whose lifecycle adapter is not composed.
+    /// Every target the crate currently compiles for reports [`Self::Available`];
+    /// no supported target returns this today.
     Unavailable,
 }
 
@@ -561,6 +563,13 @@ pub fn __take_receiver_bootstrap() -> Result<ReceiverBootstrap, SessionFailure> 
                 SessionError::InvalidInput,
             ));
         }
+        // Scrub the one-shot routing marker so descendants of this receiver
+        // cannot reinterpret its bootstrap designation, matching the Linux
+        // pre-init and Windows connect scrubs. The Mach nonce and parent PID are
+        // scrubbed where they are consumed, in `ChildChannel::connect_from_environment`.
+        // SAFETY: the bootstrap environment is process-local startup state
+        // consumed exactly once here before any application or descendant code.
+        unsafe { std::env::remove_var("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP") };
         Ok(ReceiverBootstrap {
             not_sync: PhantomData,
         })
@@ -922,7 +931,10 @@ pub enum SessionTransactionState {
     Negotiating,
     /// The accepted control reducer was idle and ready.
     Ready,
-    /// A native capability transaction had begun.
+    /// A native capability transaction had begun. Only backends whose batch
+    /// activation is non-atomic report this state (Linux); macOS and Windows
+    /// activate atomically and expose no partially-open transaction, so a
+    /// portable consumer must not depend on observing it on every target.
     TransactionOpen,
     /// The session reducer was terminally poisoned.
     Poisoned,

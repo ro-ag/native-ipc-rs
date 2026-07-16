@@ -1367,6 +1367,15 @@ impl ChildChannel {
             .map_err(|_| BootstrapError::InvalidEnvironment)?
             .parse()
             .map_err(|_| BootstrapError::InvalidEnvironment)?;
+        // Scrub the inherited bootstrap identity so descendants of this receiver
+        // cannot reuse the nonce or parent designation, matching the Windows
+        // connect scrub and the Linux pre-init scrub.
+        // SAFETY: process-local startup state consumed exactly once here before
+        // any application or descendant code runs.
+        unsafe {
+            std::env::remove_var(ENV_NONCE);
+            std::env::remove_var(ENV_PARENT_PID);
+        }
         let mut parent = MACH_PORT_NULL;
         // SAFETY: output pointer is valid for the current task.
         mach("task_get_special_port", unsafe {

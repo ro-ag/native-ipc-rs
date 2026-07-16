@@ -197,7 +197,6 @@ Current source/native tests do not prove:
   replacement resistance for deployer-supplied helper paths;
 - a complete filesystem/network/service capability allowlist;
 - constructor/dyld behavior of the eventual minimal signed helpers;
-- public `Session<Negotiating>`/`Session<Ready>` composition on macOS;
 - 10,000-cycle installed lifecycle/port baselines; or
 - exact-release packaged and physical-host conformance.
 

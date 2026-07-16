@@ -79,8 +79,8 @@ Both the const status query and backend-unavailable result are behavior of the
 common API, not missing macOS declarations or target-specific compile features.
 Unsupported OS/architecture combinations still fail compilation at the crate
 boundary. The status concerns only vNext lifecycle/session construction; it
-does not disable the published macOS memory API. This inventory neither chooses
-nor authorizes the separate macOS enablement decision.
+does not disable the published macOS memory API. This inventory does not itself
+constitute the macOS enablement decision, which was made separately (2026-07-16).
 
 ## Non-consumer hooks
 
