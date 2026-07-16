@@ -357,6 +357,15 @@ fn public_receiver_helper() {
     .require_atomic_u32()
     .require_atomic_u64();
     let negotiating = ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, options).unwrap();
+    // The one-shot bootstrap designation must not survive into this receiver's
+    // descendants. The public marker and every target-specific bootstrap value
+    // are scrubbed by the time construction completes.
+    assert!(std::env::var_os("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP").is_none());
+    #[cfg(target_os = "macos")]
+    {
+        assert!(std::env::var_os("NATIVE_IPC_MACH_NONCE").is_none());
+        assert!(std::env::var_os("NATIVE_IPC_PARENT_PID").is_none());
+    }
     assert_eq!(
         negotiating.peer_application_payload(),
         b"public-coordinator"
