@@ -8,7 +8,7 @@
 //! separate fixed report channel can return only the exact plan binding after
 //! a future native broker loop consumes both trusted-launcher stops.
 
-use std::ffi::{OsStr, c_int, c_void};
+use std::ffi::{CStr, OsStr, c_int, c_void};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -17,7 +17,6 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-use super::SupervisorWireError;
 use super::auth_adapter::broker_plan::{
     AcknowledgedBrokerLaunchPlan, BROKER_ACK_BYTES, BROKER_PLAN_PREFIX_BYTES,
     ExactParentBrokerLaunchPlan, MAX_BROKER_PLAN_BYTES, ReceivedBrokerLaunchPlan, broker_plan_ack,
@@ -28,9 +27,9 @@ use super::auth_adapter::broker_report::finish_broker_trace_report;
 use super::auth_adapter::broker_report::{BROKER_RESUME_BYTE, encode_broker_trace_report};
 use super::auth_adapter::broker_spawn::{
     BROKER_CONTROL_FD, BROKER_GATE_FD, BROKER_TRACE_FD, INSTALLED_BROKER_MODE,
-    INSTALLED_BROKER_PATH, INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT,
-    INSTALLED_TRACE_ARGUMENT, START_BYTE,
+    INSTALLED_CONTROL_ARGUMENT, INSTALLED_GATE_ARGUMENT, INSTALLED_TRACE_ARGUMENT, START_BYTE,
 };
+use super::{SupervisorWireError, is_deployer_helper_path};
 
 #[path = "supervisor_broker_launcher.rs"]
 pub(super) mod broker_launcher;
@@ -172,8 +171,10 @@ impl DormantBrokerGate {
     /// Descriptor 3 must have no other Rust owner. A fixture may perform only
     /// read-only dispatch over its process vector before calling; the signed
     /// artifact must enter directly without effect-bearing preprocessing.
-    pub(super) unsafe fn adopt_fixed_process() -> Result<DormantBrokerProcess, BrokerEntryError> {
-        validate_fixed_arguments(std::env::args_os())?;
+    pub(super) unsafe fn adopt_fixed_process(
+        installed_path: &CStr,
+    ) -> Result<DormantBrokerProcess, BrokerEntryError> {
+        validate_fixed_arguments(installed_path, std::env::args_os())?;
         // SAFETY: the caller promises exclusive ownership of fixed descriptors
         // 3 and 4 in this just-execed process.
         let gate = unsafe { Self::adopt_fixed_gate() }?;
@@ -886,9 +887,9 @@ impl ActiveBrokerGate {
 /// policy, or effect-bearing endpoints. Its exact process vector and
 /// descriptors 3 and 4 must come from the fixed spawner, and no Rust value may
 /// already own either descriptor.
-pub(in crate::backend::macos) unsafe fn run_fixed_gate_process() -> ! {
+pub(in crate::backend::macos) unsafe fn run_fixed_gate_process(installed_path: &CStr) -> ! {
     // SAFETY: the caller promises the complete process-entry contract.
-    let adopted = unsafe { DormantBrokerGate::adopt_fixed_process() };
+    let adopted = unsafe { DormantBrokerGate::adopt_fixed_process(installed_path) };
     let status = match adopted {
         Err(_) => 64,
         Ok(dormant) => match dormant.stage_plan() {
@@ -919,11 +920,15 @@ pub(in crate::backend::macos) unsafe fn run_fixed_gate_process() -> ! {
 }
 
 fn validate_fixed_arguments(
+    installed_path: &CStr,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Result<(), BrokerEntryError> {
+    if !is_deployer_helper_path(installed_path) {
+        return Err(BrokerEntryError::InvalidArguments);
+    }
     let mut arguments = arguments.into_iter();
     let expected = [
-        INSTALLED_BROKER_PATH.as_bytes(),
+        installed_path.to_bytes(),
         INSTALLED_BROKER_MODE.as_bytes(),
         INSTALLED_GATE_ARGUMENT.as_bytes(),
         INSTALLED_CONTROL_ARGUMENT.as_bytes(),

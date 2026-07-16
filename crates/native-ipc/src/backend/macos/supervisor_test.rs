@@ -97,7 +97,7 @@ fn policy_definition() -> TargetPolicyDefinition {
         b"com.example.receiver".to_vec(),
         CLIENT_IDENTITY,
         TARGET_IDENTITY,
-        b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
+        b"/example/NativeIPC.app/Contents/Helpers/receiver".to_vec(),
         b"receiver".to_vec(),
         4,
         vec![b"LANG".to_vec()],
@@ -106,7 +106,7 @@ fn policy_definition() -> TargetPolicyDefinition {
 }
 
 fn catalog() -> InstalledPolicyCatalog {
-    // SAFETY: tests model one immutable root-owned installed policy resource.
+    // SAFETY: tests model one immutable deployer-owned installed policy resource.
     unsafe { InstalledPolicyCatalog::from_verified_installation(vec![policy_definition()]) }
         .unwrap()
 }
@@ -549,7 +549,7 @@ fn installed_catalog_is_unique_and_enforces_client_argv_and_environment() {
         b"com.example.receiver".to_vec(),
         [0x99; 32],
         TARGET_IDENTITY,
-        b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
+        b"/example/NativeIPC.app/Contents/Helpers/receiver".to_vec(),
         b"receiver".to_vec(),
         4,
         vec![b"LANG".to_vec()],

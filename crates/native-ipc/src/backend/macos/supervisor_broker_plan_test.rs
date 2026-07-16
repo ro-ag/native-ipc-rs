@@ -17,7 +17,7 @@ fn plan() -> BrokerLaunchPlan {
         client_nonce: [5; 32],
         service_nonce: [6; 32],
         policy_id: b"org.example.private-policy".to_vec(),
-        installed_executable: b"/Library/PrivilegedHelperTools/com.example.receiver".to_vec(),
+        installed_executable: b"/example/NativeIPC.app/Contents/Helpers/receiver".to_vec(),
         arguments: vec![b"receiver".to_vec(), b"--mode=test".to_vec()],
         environment: vec![TargetEnvironmentEntry::new(b"LANG".to_vec(), b"C".to_vec()).unwrap()],
     }

@@ -1,20 +1,26 @@
 use super::*;
 
+const DEPLOYER_LAUNCHER_PATH: &std::ffi::CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
+
 #[test]
 fn fixed_arguments_accept_only_the_installed_launcher_vector() {
     let good = [
-        INSTALLED_LAUNCHER_PATH,
+        DEPLOYER_LAUNCHER_PATH.to_str().unwrap(),
         INSTALLED_LAUNCHER_MODE,
         INSTALLED_LAUNCHER_DEATH_ARGUMENT,
         INSTALLED_LAUNCHER_PLAN_ARGUMENT,
     ];
-    assert_eq!(validate_fixed_arguments(good), Ok(()));
+    assert_eq!(
+        validate_fixed_arguments(DEPLOYER_LAUNCHER_PATH, good),
+        Ok(())
+    );
 
     // No request value may reach this vector, so every deviation is refused
     // rather than interpreted.
     let cases: [&[&str]; 6] = [
         &[],
-        &[INSTALLED_LAUNCHER_PATH],
+        &[DEPLOYER_LAUNCHER_PATH.to_str().unwrap()],
         &[
             "/usr/bin/true",
             INSTALLED_LAUNCHER_MODE,
@@ -22,19 +28,19 @@ fn fixed_arguments_accept_only_the_installed_launcher_vector() {
             INSTALLED_LAUNCHER_PLAN_ARGUMENT,
         ],
         &[
-            INSTALLED_LAUNCHER_PATH,
+            DEPLOYER_LAUNCHER_PATH.to_str().unwrap(),
             "--other-mode",
             INSTALLED_LAUNCHER_DEATH_ARGUMENT,
             INSTALLED_LAUNCHER_PLAN_ARGUMENT,
         ],
         &[
-            INSTALLED_LAUNCHER_PATH,
+            DEPLOYER_LAUNCHER_PATH.to_str().unwrap(),
             INSTALLED_LAUNCHER_MODE,
             "--broker-death-fd=9",
             INSTALLED_LAUNCHER_PLAN_ARGUMENT,
         ],
         &[
-            INSTALLED_LAUNCHER_PATH,
+            DEPLOYER_LAUNCHER_PATH.to_str().unwrap(),
             INSTALLED_LAUNCHER_MODE,
             INSTALLED_LAUNCHER_DEATH_ARGUMENT,
             INSTALLED_LAUNCHER_PLAN_ARGUMENT,
@@ -43,11 +49,23 @@ fn fixed_arguments_accept_only_the_installed_launcher_vector() {
     ];
     for case in cases {
         assert_eq!(
-            validate_fixed_arguments(case.iter().copied()),
+            validate_fixed_arguments(DEPLOYER_LAUNCHER_PATH, case.iter().copied()),
             Err(LauncherEntryError::InvalidArguments),
             "vector {case:?} must be refused",
         );
     }
+    assert_eq!(
+        validate_fixed_arguments(
+            c"relative-launcher",
+            [
+                "relative-launcher",
+                INSTALLED_LAUNCHER_MODE,
+                INSTALLED_LAUNCHER_DEATH_ARGUMENT,
+                INSTALLED_LAUNCHER_PLAN_ARGUMENT,
+            ],
+        ),
+        Err(LauncherEntryError::InvalidArguments),
+    );
 }
 
 #[test]

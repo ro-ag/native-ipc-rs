@@ -33,16 +33,17 @@
 //! FD4 writer, so a blocking plan read cannot hang past it.
 
 use std::convert::Infallible;
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 use super::auth_adapter::broker_plan::{
     LAUNCHER_PLAN_PREFIX_BYTES, LauncherExecParts, MAX_BROKER_PLAN_BYTES, ReceivedLauncherExecPlan,
     parse_launcher_plan_prefix,
 };
 use super::broker_entry::broker_launcher::{
-    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PATH,
-    INSTALLED_LAUNCHER_PLAN_ARGUMENT, LAUNCHER_DEATH_FD, LAUNCHER_PLAN_FD,
+    INSTALLED_LAUNCHER_DEATH_ARGUMENT, INSTALLED_LAUNCHER_MODE, INSTALLED_LAUNCHER_PLAN_ARGUMENT,
+    LAUNCHER_DEATH_FD, LAUNCHER_PLAN_FD,
 };
+use super::is_deployer_helper_path;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -162,9 +163,9 @@ impl LauncherEntryError {
 /// process vector, fixed descriptor 3 (broker death) and descriptor 4 (plan)
 /// must come from this library's launcher spawner, and no other Rust value may
 /// own either descriptor.
-pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process() -> ! {
+pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process(installed_path: &CStr) -> ! {
     // SAFETY: the caller promises the complete fixed process-entry contract.
-    let status = match unsafe { run_launcher() } {
+    let status = match unsafe { run_launcher(installed_path) } {
         Ok(infallible) => match infallible {},
         Err(error) => error.status(),
     };
@@ -174,8 +175,8 @@ pub(in crate::backend::macos) unsafe fn run_fixed_launcher_process() -> ! {
     unsafe { _exit(status) }
 }
 
-unsafe fn run_launcher() -> Result<Infallible, LauncherEntryError> {
-    validate_fixed_arguments(std::env::args_os())?;
+unsafe fn run_launcher(installed_path: &CStr) -> Result<Infallible, LauncherEntryError> {
+    validate_fixed_arguments(installed_path, std::env::args_os())?;
     // SAFETY: read-only liveness queries before either fixed descriptor is
     // used; the entry contract transfers sole ownership of both.
     unsafe {
@@ -462,11 +463,15 @@ unsafe fn require_live(fd: c_int) -> Result<(), LauncherEntryError> {
 }
 
 fn validate_fixed_arguments(
+    installed_path: &CStr,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Result<(), LauncherEntryError> {
+    if !is_deployer_helper_path(installed_path) {
+        return Err(LauncherEntryError::InvalidArguments);
+    }
     let mut arguments = arguments.into_iter();
     let expected = [
-        INSTALLED_LAUNCHER_PATH.as_bytes(),
+        installed_path.to_bytes(),
         INSTALLED_LAUNCHER_MODE.as_bytes(),
         INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes(),
         INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes(),

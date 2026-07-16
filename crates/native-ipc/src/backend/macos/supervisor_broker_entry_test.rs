@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString, c_int};
+use std::ffi::{CStr, OsStr, OsString, c_int};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -15,6 +15,7 @@ use super::*;
 const HELPER_ENV: &str = "NATIVE_IPC_TEST_BROKER_GATE_ENTRY";
 const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::tests::fixed_gate_entry_subprocess";
+const DEPLOYER_BROKER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-broker";
 
 unsafe extern "C" {
     fn close(fd: c_int) -> c_int;
@@ -95,13 +96,16 @@ fn finish(mut child: Child) -> std::process::Output {
 #[test]
 fn fixed_arguments_accept_only_the_installed_vector() {
     let exact = [
-        OsStr::new(INSTALLED_BROKER_PATH),
+        OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes()),
         OsStr::new(INSTALLED_BROKER_MODE),
         OsStr::new(INSTALLED_GATE_ARGUMENT),
         OsStr::new(INSTALLED_CONTROL_ARGUMENT),
         OsStr::new(INSTALLED_TRACE_ARGUMENT),
     ];
-    assert_eq!(validate_fixed_arguments(exact), Ok(()));
+    assert_eq!(
+        validate_fixed_arguments(DEPLOYER_BROKER_PATH, exact),
+        Ok(())
+    );
 
     let mutations = [
         vec![
@@ -112,27 +116,27 @@ fn fixed_arguments_accept_only_the_installed_vector() {
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from("--other-mode"),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from("--gate-fd=4"),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
             OsString::from(INSTALLED_TRACE_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
         ],
         vec![
-            OsString::from(INSTALLED_BROKER_PATH),
+            OsString::from(OsStr::from_bytes(DEPLOYER_BROKER_PATH.to_bytes())),
             OsString::from(INSTALLED_BROKER_MODE),
             OsString::from(INSTALLED_GATE_ARGUMENT),
             OsString::from(INSTALLED_CONTROL_ARGUMENT),
@@ -142,10 +146,34 @@ fn fixed_arguments_accept_only_the_installed_vector() {
     ];
     for mutation in mutations {
         assert_eq!(
-            validate_fixed_arguments(mutation),
+            validate_fixed_arguments(DEPLOYER_BROKER_PATH, mutation),
             Err(BrokerEntryError::InvalidArguments)
         );
     }
+
+    let substituted_path = [
+        OsStr::new("/other/NativeIPC.app/Contents/Helpers/native-ipc-broker"),
+        OsStr::new(INSTALLED_BROKER_MODE),
+        OsStr::new(INSTALLED_GATE_ARGUMENT),
+        OsStr::new(INSTALLED_CONTROL_ARGUMENT),
+        OsStr::new(INSTALLED_TRACE_ARGUMENT),
+    ];
+    assert_eq!(
+        validate_fixed_arguments(DEPLOYER_BROKER_PATH, substituted_path),
+        Err(BrokerEntryError::InvalidArguments)
+    );
+
+    let relative_configuration = [
+        OsStr::new("relative-broker"),
+        OsStr::new(INSTALLED_BROKER_MODE),
+        OsStr::new(INSTALLED_GATE_ARGUMENT),
+        OsStr::new(INSTALLED_CONTROL_ARGUMENT),
+        OsStr::new(INSTALLED_TRACE_ARGUMENT),
+    ];
+    assert_eq!(
+        validate_fixed_arguments(c"relative-broker", relative_configuration),
+        Err(BrokerEntryError::InvalidArguments)
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -14,6 +14,8 @@ const WORKER_TEST: &str =
     "backend::macos::supervisor::auth_adapter::auth_worker_spawn::tests::fixed_worker_fixture";
 const CODE_IDENTITY: [u8; 32] = [0x5a; 32];
 const PREMAIN_ENV: &[u8] = b"NATIVE_IPC_TEST_AUTH_WORKER_ENTRY\0";
+const DEPLOYER_AUTH_WORKER_PATH: &CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-auth-worker";
 
 unsafe extern "C" {
     static mach_task_self_: u32;
@@ -36,7 +38,11 @@ extern "C" fn premain_auth_worker_hook() {
     // SAFETY: this pre-main child was created only by the production-shaped
     // fixed spawner below and carries the exact FD3/FD4 process ABI.
     unsafe {
-        super::super::auth_worker_entry::run_fixed_auth_worker_process(c"always", CODE_IDENTITY)
+        super::super::auth_worker_entry::run_fixed_auth_worker_process(
+            DEPLOYER_AUTH_WORKER_PATH,
+            c"always",
+            CODE_IDENTITY,
+        )
     }
 }
 
@@ -65,7 +71,7 @@ fn real_entry_image() -> InstalledAuthWorkerImage {
     let executable = std::env::current_exe().unwrap();
     InstalledAuthWorkerImage {
         spawn_path: CString::new(executable.as_os_str().as_bytes()).unwrap(),
-        argument0: CString::new(INSTALLED_AUTH_WORKER_PATH).unwrap(),
+        argument0: DEPLOYER_AUTH_WORKER_PATH.to_owned(),
         mode: CString::new(INSTALLED_AUTH_WORKER_MODE).unwrap(),
         request_argument: CString::new(INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT).unwrap(),
         result_argument: CString::new(INSTALLED_AUTH_WORKER_RESULT_ARGUMENT).unwrap(),
@@ -93,15 +99,17 @@ fn deadline_after(duration: Duration) -> SupervisorDeadline {
 
 #[test]
 fn installed_worker_vectors_are_fixed_and_canonical() {
-    // SAFETY: this test inspects only the source-level fixed vector.
-    let image = unsafe { InstalledAuthWorkerImage::from_verified_installation() }.unwrap();
+    // SAFETY: this test inspects only the source-level deployer-bound vector.
+    let image =
+        unsafe { InstalledAuthWorkerImage::from_verified_installation(DEPLOYER_AUTH_WORKER_PATH) }
+            .unwrap();
     assert_eq!(
         image.spawn_path.to_bytes(),
-        INSTALLED_AUTH_WORKER_PATH.as_bytes()
+        DEPLOYER_AUTH_WORKER_PATH.to_bytes()
     );
     assert_eq!(
         image.argument0.to_bytes(),
-        INSTALLED_AUTH_WORKER_PATH.as_bytes()
+        DEPLOYER_AUTH_WORKER_PATH.to_bytes()
     );
     assert_eq!(image.mode.to_bytes(), INSTALLED_AUTH_WORKER_MODE.as_bytes());
     assert_eq!(
@@ -118,6 +126,11 @@ fn installed_worker_vectors_are_fixed_and_canonical() {
         image.environment_locale.to_bytes(),
         CANONICAL_LOCALE.as_bytes()
     );
+    // SAFETY: the invalid test value is rejected before any spawn vector exists.
+    assert!(matches!(
+        unsafe { InstalledAuthWorkerImage::from_verified_installation(c"relative-worker") },
+        Err(AuthWorkerSpawnError::InvalidFixedImage)
+    ));
 }
 
 #[test]

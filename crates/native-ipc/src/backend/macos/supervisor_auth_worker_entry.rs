@@ -10,11 +10,11 @@ use std::os::unix::fs::FileTypeExt;
 
 use super::auth_worker_spawn::{
     AUTH_WORKER_REQUEST_FD, AUTH_WORKER_RESULT_FD, INSTALLED_AUTH_WORKER_MODE,
-    INSTALLED_AUTH_WORKER_PATH, INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT,
-    INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
+    INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT, INSTALLED_AUTH_WORKER_RESULT_ARGUMENT,
 };
 use super::{AUTH_WORKER_JOB_BYTES, AuditToken, AuthWorkerJob, AuthWorkerResult};
 use crate::backend::macos::supervisor::SupervisorDeadline;
+use crate::backend::macos::supervisor::is_deployer_helper_path;
 
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
@@ -69,10 +69,11 @@ unsafe extern "C" {
 /// The fixed spawner must exclusively transfer the request FIFO reader at FD3
 /// and result FIFO writer at FD4 with the exact process vector.
 pub(in crate::backend::macos) unsafe fn run_fixed_auth_worker_process(
+    installed_path: &CStr,
     requirement: &CStr,
     code_identity: [u8; 32],
 ) -> ! {
-    let status = match prepare_worker(code_identity) {
+    let status = match prepare_worker(installed_path, code_identity) {
         Ok((mut request, result)) => {
             let outcome = run_worker(requirement, code_identity, &mut request, &result);
             // `result` deliberately has no close-on-drop path. It remains owned
@@ -87,8 +88,11 @@ pub(in crate::backend::macos) unsafe fn run_fixed_auth_worker_process(
     unsafe { _exit(status.max(0)) }
 }
 
-fn prepare_worker(code_identity: [u8; 32]) -> Result<(File, ExitOwnedResultFd), c_int> {
-    validate_fixed_arguments(std::env::args_os())?;
+fn prepare_worker(
+    installed_path: &CStr,
+    code_identity: [u8; 32],
+) -> Result<(File, ExitOwnedResultFd), c_int> {
+    validate_fixed_arguments(installed_path, std::env::args_os())?;
     if code_identity == [0; 32] {
         return Err(71);
     }
@@ -157,14 +161,18 @@ impl ExitOwnedResultFd {
 }
 
 fn validate_fixed_arguments(
+    installed_path: &CStr,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Result<(), c_int> {
+    if !is_deployer_helper_path(installed_path) {
+        return Err(79);
+    }
     let actual = arguments
         .into_iter()
         .map(|argument| argument.as_ref().as_bytes().to_vec())
         .collect::<Vec<_>>();
     let expected = [
-        INSTALLED_AUTH_WORKER_PATH.as_bytes(),
+        installed_path.to_bytes(),
         INSTALLED_AUTH_WORKER_MODE.as_bytes(),
         INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT.as_bytes(),
         INSTALLED_AUTH_WORKER_RESULT_ARGUMENT.as_bytes(),

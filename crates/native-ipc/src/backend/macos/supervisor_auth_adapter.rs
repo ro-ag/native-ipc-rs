@@ -1,4 +1,4 @@
-//! Fused exact-message authentication state for the privileged supervisor.
+//! Fused exact-message authentication state for the same-user supervisor.
 //!
 //! This is a source-level raw receive and ownership boundary, not an installed
 //! Mach service. Fixed clean-exec Security.framework workers and exact worker

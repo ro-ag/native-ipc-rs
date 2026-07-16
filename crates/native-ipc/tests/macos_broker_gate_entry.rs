@@ -2,7 +2,7 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos {
-    use std::ffi::{c_int, c_long};
+    use std::ffi::{CStr, c_int, c_long};
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -13,7 +13,7 @@ mod macos {
     use std::thread;
     use std::time::Duration;
 
-    const INSTALLED_PATH: &str = "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.broker";
+    const DEPLOYER_PATH: &CStr = c"/example/NativeIPC.app/Contents/Helpers/native-ipc-broker";
     const MODE: &str = "--supervisor-broker";
     const GATE: &str = "--gate-fd=3";
     const CONTROL: &str = "--control-fd=4";
@@ -40,7 +40,7 @@ mod macos {
     fn is_fixed_child_invocation() -> bool {
         std::env::args_os()
             .next()
-            .is_some_and(|argument| argument.as_bytes() == INSTALLED_PATH.as_bytes())
+            .is_some_and(|argument| argument.as_bytes() == DEPLOYER_PATH.to_bytes())
     }
 
     fn spawn(mode: &str, gate: &str, control_argument: &str) -> Spawned {
@@ -61,7 +61,7 @@ mod macos {
         let child_trace_fd = stable_trace.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .arg0(INSTALLED_PATH)
+            .arg0(std::ffi::OsStr::from_bytes(DEPLOYER_PATH.to_bytes()))
             .arg(mode)
             .arg(gate)
             .arg(control_argument)
@@ -107,7 +107,7 @@ mod macos {
 
     fn plan_frame() -> Vec<u8> {
         let policy = b"com.example.receiver";
-        let executable = b"/Library/PrivilegedHelperTools/com.example.receiver";
+        let executable = b"/example/NativeIPC.app/Contents/Helpers/receiver";
         let argument = b"receiver";
         let mut bytes = vec![0_u8; 256];
         bytes[..8].copy_from_slice(b"NIPCBP01");
@@ -175,7 +175,7 @@ mod macos {
         if is_fixed_child_invocation() {
             // SAFETY: the fixture's pre-exec hook transferred sole FD 3
             // ownership and arg0/args reproduce the installed process vector.
-            unsafe { native_ipc::__private_macos_broker_gate_main() }
+            unsafe { native_ipc::__private_macos_broker_gate_main(DEPLOYER_PATH) }
         }
 
         let mut active = spawn(MODE, GATE, CONTROL);

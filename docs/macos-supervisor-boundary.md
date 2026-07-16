@@ -44,10 +44,13 @@ The backend-private implementation and adversarial corpus now exercise this
 chain.
 
 The source model now also contains the production-shaped broker creation
-boundary that was previously missing. An installation-only value prepares one
-fixed absolute broker path, fixed `argv` with matching `argv[0]`, and a
-canonical environment before exact-path `posix_spawn`. The child receives only
-one collision-normalized start/death pipe reader. Darwin
+boundary that was previously missing. An installation-only value copies one
+absolute broker path supplied as a compile-time constant by the deployer's
+helper artifact, fixes `argv` with matching `argv[0]`, and prepares a canonical
+environment before exact-path `posix_spawn`. The launcher and clean-exec auth
+worker use the same deployer-supplied path contract. Relative configuration and
+entry-vector substitution fail closed; no request field selects any helper
+path. The child receives only one collision-normalized start/death pipe reader. Darwin
 `POSIX_SPAWN_CLOEXEC_DEFAULT`, `POSIX_SPAWN_SETSIGDEF`, and
 `POSIX_SPAWN_SETSIGMASK` close unrelated descriptors, restore explicit signal
 defaults, and install an empty child mask without changing the parent mask.
@@ -115,8 +118,8 @@ the library test build and is not a minimal signed/package artifact or pre-main
 constructor audit. These tests also cannot distinguish an anonymous pipe from
 a named FIFO using public descriptor metadata; FIFO shape and START are
 explicitly non-authoritative until an exact-child/session/control-plan binding
-is authenticated. Nor do they prove that the hard-coded production path is
-installed, root-owned, signed, packaged, or replacement-resistant. The
+is authenticated. Nor do they prove that any deployer-supplied production path
+is installed, signed, packaged, or replacement-resistant. The
 packaged executable and clean-exec launcher artifact,
 installed service loop,
 permanent credential drop, real client-death authority, and launchd/XPC

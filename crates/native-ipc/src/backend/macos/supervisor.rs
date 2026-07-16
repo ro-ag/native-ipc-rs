@@ -1,4 +1,4 @@
-//! Bounded, effect-ordered wire contract for the future privileged supervisor.
+//! Bounded, effect-ordered wire contract for the future same-user supervisor.
 //!
 //! This module deliberately contains no Mach transport, process, filesystem,
 //! or signal operations. Platform adapters must authenticate each received
@@ -7,7 +7,7 @@
 //! [`ValidatedSpawn`] may reach the fixed-policy launcher path.
 
 use std::collections::HashSet;
-use std::ffi::{c_int, c_long};
+use std::ffi::{CStr, CString, c_int, c_long};
 use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 8] = *b"NIPCSUP1";
@@ -25,6 +25,17 @@ pub(super) const MAX_ARGUMENTS: usize = 64;
 pub(super) const MAX_ENVIRONMENT: usize = 64;
 pub(super) const MAX_COMPONENT_BYTES: usize = 4096;
 pub(super) const MAX_SUPERVISOR_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Copies one deployer-owned absolute helper path into an installation-bound
+/// value. Request data never reaches this boundary.
+pub(in crate::backend::macos::supervisor) fn deployer_helper_path(path: &CStr) -> Option<CString> {
+    is_deployer_helper_path(path).then(|| path.to_owned())
+}
+
+pub(in crate::backend::macos::supervisor) fn is_deployer_helper_path(path: &CStr) -> bool {
+    let bytes = path.to_bytes();
+    bytes.len() > 1 && bytes.first() == Some(&b'/')
+}
 
 #[repr(C)]
 struct TimeSpec {
@@ -67,7 +78,7 @@ struct Header {
     service_nonce: [u8; 32],
 }
 
-/// Failure while validating the bounded privileged-supervisor protocol.
+/// Failure while validating the bounded same-user supervisor protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SupervisorWireError {
     /// The message was truncated, noncanonical, or used an unknown kind.
@@ -574,20 +585,20 @@ impl TargetPolicyDefinition {
     }
 }
 
-/// Immutable root-owned catalog that uniquely maps IDs to installed targets.
+/// Immutable deployer-owned catalog that uniquely maps IDs to installed targets.
 pub(super) struct InstalledPolicyCatalog {
     policies: Vec<InstalledTargetPolicy>,
 }
 
 impl InstalledPolicyCatalog {
     /// Builds the effect-authorizing catalog after verifying its signed,
-    /// root-owned installation source.
+    /// deployer-owned installation source.
     ///
     /// # Safety
     ///
     /// `definitions` must come from the authenticated immutable installed
     /// policy resource for this exact signed service generation. Every target
-    /// path and identity must name the same root-owned, replacement-resistant
+    /// path and identity must name the same deployer-owned, replacement-resistant
     /// installed image that the trusted launcher will pass directly to
     /// `execve`; no caller-writable path component or symlink is permitted.
     pub(super) unsafe fn from_verified_installation(

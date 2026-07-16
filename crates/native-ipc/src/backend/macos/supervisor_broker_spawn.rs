@@ -1,6 +1,6 @@
 //! Fixed-image broker spawn and exact direct-child lifecycle authority.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::Shutdown;
@@ -20,6 +20,7 @@ use super::broker_plan::trace_report_binding_from_frame;
 use super::broker_plan::{BROKER_ACK_BYTES, StagedBrokerSpawn, broker_plan_ack};
 use super::broker_report::BrokerTraceReportReceiver;
 use super::{DedicatedChildWaitDomain, PendingSpawnReply};
+use crate::backend::macos::supervisor::deployer_helper_path;
 
 pub(super) type FixedImageAtomicBroker =
     AtomicallySpawnedBroker<ValidatedSpawn, DirectChildBrokerAuthority, BrokerTraceReportReceiver>;
@@ -30,8 +31,6 @@ type FixedImageSpawnResult =
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
 
-pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_PATH: &str =
-    "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_BROKER_MODE: &str = "--supervisor-broker";
 pub(in crate::backend::macos::supervisor) const INSTALLED_GATE_ARGUMENT: &str = "--gate-fd=3";
 pub(in crate::backend::macos::supervisor) const INSTALLED_CONTROL_ARGUMENT: &str = "--control-fd=4";
@@ -134,8 +133,8 @@ pub(in crate::backend::macos) enum BrokerSpawnError {
 /// Installation-only fixed broker image and its canonical process vectors.
 ///
 /// This value contains no request-selected path, PID, signal, filesystem
-/// operation, requirement, or descriptor. The installed runtime must verify
-/// the root-owned replacement-resistant signed image before constructing it.
+/// operation, requirement, or descriptor. The same-user runtime must verify
+/// the deployer-supplied replacement-resistant signed image before constructing it.
 pub(in crate::backend::macos::supervisor) struct InstalledBrokerImage {
     path: CString,
     mode: CString,
@@ -150,14 +149,16 @@ pub(in crate::backend::macos::supervisor) struct InstalledBrokerImage {
 impl InstalledBrokerImage {
     /// # Safety
     ///
-    /// The caller must be the installed supervisor after it has verified the
-    /// fixed path as the immutable root-owned signed broker image. This source
-    /// boundary does not itself claim installed, root, signing, or packaging
-    /// evidence.
-    pub(in crate::backend::macos::supervisor) unsafe fn from_verified_installation()
-    -> Result<Self, BrokerSpawnError> {
+    /// `path` must be an absolute compile-time constant supplied by the
+    /// deployer's helper artifact, not request data. The caller must have
+    /// verified that exact path as its replacement-resistant signed broker.
+    /// This source boundary does not itself claim installation, signing, or
+    /// packaging evidence.
+    pub(in crate::backend::macos::supervisor) unsafe fn from_verified_installation(
+        path: &CStr,
+    ) -> Result<Self, BrokerSpawnError> {
         Ok(Self {
-            path: fixed_cstring(INSTALLED_BROKER_PATH)?,
+            path: deployer_helper_path(path).ok_or(BrokerSpawnError::InvalidFixedImage)?,
             mode: fixed_cstring(INSTALLED_BROKER_MODE)?,
             gate_argument: fixed_cstring(INSTALLED_GATE_ARGUMENT)?,
             control_argument: fixed_cstring(INSTALLED_CONTROL_ARGUMENT)?,

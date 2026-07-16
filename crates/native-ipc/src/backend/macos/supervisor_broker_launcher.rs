@@ -33,7 +33,7 @@
 //!
 //! FD3 carries no data. Its only signal is EOF, which means the broker died.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 use std::time::Instant;
@@ -51,6 +51,7 @@ use super::{
     require_resume_commit_eof, set_nonblocking, write_control_while_dormant,
 };
 use crate::backend::macos::bootstrap::{TaskAuditIdentity, capture_task_audit_identity};
+use crate::backend::macos::supervisor::deployer_helper_path;
 
 const SIGKILL: c_int = 9;
 const SIGSTOP: c_int = 17;
@@ -65,8 +66,6 @@ const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const EPIPE: c_int = 32;
 
-pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_PATH: &str =
-    "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.launcher";
 pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_MODE: &str =
     "--supervisor-launcher";
 pub(in crate::backend::macos::supervisor) const INSTALLED_LAUNCHER_DEATH_ARGUMENT: &str =
@@ -221,7 +220,7 @@ pub(super) enum LauncherSignatureError<WorkerFailure> {
 ///
 /// No request data selects its path, arguments, environment, credentials, PID,
 /// signal, or descriptors. Construction alone does not claim installed-image
-/// verification; that obligation remains with the privileged runtime.
+/// verification; that obligation remains with the same-user runtime.
 pub(super) struct InstalledLauncherImage {
     path: CString,
     mode: CString,
@@ -236,11 +235,15 @@ pub(super) struct InstalledLauncherImage {
 impl InstalledLauncherImage {
     /// # Safety
     ///
-    /// The installed supervisor must first verify the fixed path is the
-    /// immutable root-owned signed launcher image for this service.
-    pub(super) unsafe fn from_verified_installation() -> Result<Self, LauncherSpawnFailure> {
+    /// `path` must be an absolute compile-time constant supplied by the
+    /// deployer's helper artifact, not request data. The installed supervisor
+    /// must first verify that exact path as its replacement-resistant signed
+    /// launcher image.
+    pub(super) unsafe fn from_verified_installation(
+        path: &CStr,
+    ) -> Result<Self, LauncherSpawnFailure> {
         Ok(Self {
-            path: fixed_launcher_cstring(INSTALLED_LAUNCHER_PATH)?,
+            path: deployer_helper_path(path).ok_or(LauncherSpawnFailure::InvalidFixedImage)?,
             mode: fixed_launcher_cstring(INSTALLED_LAUNCHER_MODE)?,
             death_argument: fixed_launcher_cstring(INSTALLED_LAUNCHER_DEATH_ARGUMENT)?,
             plan_argument: fixed_launcher_cstring(INSTALLED_LAUNCHER_PLAN_ARGUMENT)?,
@@ -518,7 +521,7 @@ impl PreparedLauncherSpawn<'_> {
                 },
         } = self;
         // Last veto while no child exists. Service death and the original
-        // absolute deadline both outrank creating a new privileged process.
+        // absolute deadline both outrank creating a new process.
         if let Err(failure) = ensure_spawn_admissible(&active) {
             return Err(Box::new(LauncherSpawnError { active, failure }));
         }

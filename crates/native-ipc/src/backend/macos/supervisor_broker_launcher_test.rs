@@ -28,6 +28,8 @@ const UNTRACED_STOP: &[u8] = b"untraced-stop";
 const SUBSTITUTE_EXEC: &[u8] = b"substitute-exec";
 const EXACT_TEST: &str =
     "backend::macos::supervisor::broker_entry::broker_launcher::tests::fixture_target";
+const DEPLOYER_LAUNCHER_PATH: &CStr =
+    c"/example/NativeIPC.app/Contents/Helpers/native-ipc-launcher";
 const PT_TRACE_ME: c_int = 0;
 const ENOENT: c_int = 2;
 const ECHILD: c_int = 10;
@@ -139,7 +141,9 @@ fn signature_worker_pool(
 fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
     // SAFETY: this source-level vector test does not claim the fixed image is
     // installed or verified; it inspects only the installation-bound values.
-    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let image =
+        unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }
+            .unwrap();
     let argv = image.argv();
     let environment = image.environment();
     let argv = argv[..argv.len() - 1]
@@ -153,7 +157,7 @@ fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
     assert_eq!(
         argv,
         [
-            INSTALLED_LAUNCHER_PATH.as_bytes(),
+            DEPLOYER_LAUNCHER_PATH.to_bytes(),
             INSTALLED_LAUNCHER_MODE.as_bytes(),
             INSTALLED_LAUNCHER_DEATH_ARGUMENT.as_bytes(),
             INSTALLED_LAUNCHER_PLAN_ARGUMENT.as_bytes(),
@@ -173,7 +177,12 @@ fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
         assert_eq!(identity.real_gid, getgid());
         assert_eq!(identity.effective_gid, getegid());
     }
-    assert_eq!(identity.executable, INSTALLED_LAUNCHER_PATH.as_bytes());
+    assert_eq!(identity.executable, DEPLOYER_LAUNCHER_PATH.to_bytes());
+    // SAFETY: the invalid test value is rejected before any child can exist.
+    assert!(matches!(
+        unsafe { InstalledLauncherImage::from_verified_installation(c"relative-launcher") },
+        Err(LauncherSpawnFailure::InvalidFixedImage)
+    ));
 }
 
 #[test]
@@ -187,7 +196,9 @@ fn launcher_identity_never_expects_or_requires_root() {
         "the unprivileged supervisor's tests must not run as root",
     );
     // SAFETY: source-level vector construction only; see above.
-    let image = unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap();
+    let image =
+        unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }
+            .unwrap();
     let identity = image.fixed_identity();
     assert_ne!(identity.real_uid, 0);
     assert_ne!(identity.effective_uid, 0);
@@ -264,17 +275,20 @@ fn test_pipe() -> (OwnedFd, OwnedFd) {
 }
 
 /// Source-level vectors only. No test claims the fixed image is installed,
-/// root-owned, signed, or verified.
+/// signed, installed, or verified.
 fn uninstalled_fixed_image() -> InstalledLauncherImage {
     // SAFETY: this inspects installation-bound values and deliberately drives
     // the spawn against an absent path; it asserts no installation evidence.
-    unsafe { InstalledLauncherImage::from_verified_installation() }.unwrap()
+    unsafe { InstalledLauncherImage::from_verified_installation(DEPLOYER_LAUNCHER_PATH) }.unwrap()
 }
 
 #[test]
 fn uninstalled_fixed_launcher_image_fails_only_at_the_exact_spawn() {
     assert!(
-        !std::path::Path::new(INSTALLED_LAUNCHER_PATH).exists(),
+        !std::path::Path::new(std::ffi::OsStr::from_bytes(
+            DEPLOYER_LAUNCHER_PATH.to_bytes()
+        ))
+        .exists(),
         "this boundary test is only meaningful while the fixed image is absent",
     );
     let mut boundary = SpawnBoundary::new(Instant::now() + Duration::from_secs(5));
@@ -305,7 +319,7 @@ fn service_death_preempts_the_fixed_launcher_spawn() {
             .err()
             .expect("service death must preempt the spawn")
             .into_parts();
-    // Service loss outranks creating a privileged child. This must never reach
+    // Service loss outranks creating a child. This must never reach
     // posix_spawn, so it cannot report the absent image instead.
     assert_eq!(failure, LauncherSpawnFailure::ServiceGone);
 }

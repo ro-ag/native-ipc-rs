@@ -1,4 +1,4 @@
-//! One-shot client state for the future privileged supervisor transport.
+//! One-shot client state for the future same-user supervisor transport.
 
 use super::supervisor::{
     DecodedSpawnResult, OpaqueSessionHandle, SpawnRequest, SupervisorWireError,

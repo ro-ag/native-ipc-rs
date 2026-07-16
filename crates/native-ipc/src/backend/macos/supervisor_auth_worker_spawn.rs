@@ -1,6 +1,6 @@
 //! Fixed-image clean-exec authentication-worker spawn boundary.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use super::{
@@ -8,12 +8,11 @@ use super::{
     DirectChildAuthWorkerAuthority, DirectChildAuthWorkerError, DirectChildState, ExactAuthWorker,
     FreshAuthWorkerGeneration,
 };
+use crate::backend::macos::supervisor::deployer_helper_path;
 
 type PosixSpawnAttr = *mut c_void;
 type PosixSpawnFileActions = *mut c_void;
 
-pub(super) const INSTALLED_AUTH_WORKER_PATH: &str =
-    "/Library/PrivilegedHelperTools/com.ro-ag.native-ipc.auth-worker";
 pub(super) const INSTALLED_AUTH_WORKER_MODE: &str = "--supervisor-auth-worker";
 pub(super) const INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT: &str = "--request-fd=3";
 pub(super) const INSTALLED_AUTH_WORKER_RESULT_ARGUMENT: &str = "--result-fd=4";
@@ -101,8 +100,8 @@ pub(super) enum AuthWorkerSpawnError {
 /// Installation-only fixed authentication-worker image and process vectors.
 ///
 /// The worker path, mode, descriptors, and environment are never selected by
-/// a request. The installed runtime must verify the root-owned signed image
-/// before constructing this value.
+/// a request. The installed runtime must verify the deployer-supplied signed
+/// image before constructing this value.
 pub(super) struct InstalledAuthWorkerImage {
     spawn_path: CString,
     argument0: CString,
@@ -119,12 +118,18 @@ impl InstalledAuthWorkerImage {
     ///
     /// # Safety
     ///
-    /// The caller must have verified that the fixed path is a root-owned,
-    /// replacement-resistant, signed clean-exec worker for this service.
-    pub(super) unsafe fn from_verified_installation() -> Result<Self, AuthWorkerSpawnError> {
+    /// `path` must be an absolute compile-time constant supplied by the
+    /// deployer's helper artifact, not request data. The caller must have
+    /// verified that exact path as a replacement-resistant signed clean-exec
+    /// worker for this service.
+    pub(super) unsafe fn from_verified_installation(
+        path: &CStr,
+    ) -> Result<Self, AuthWorkerSpawnError> {
+        let spawn_path =
+            deployer_helper_path(path).ok_or(AuthWorkerSpawnError::InvalidFixedImage)?;
         Ok(Self {
-            spawn_path: fixed_cstring(INSTALLED_AUTH_WORKER_PATH)?,
-            argument0: fixed_cstring(INSTALLED_AUTH_WORKER_PATH)?,
+            argument0: spawn_path.clone(),
+            spawn_path,
             mode: fixed_cstring(INSTALLED_AUTH_WORKER_MODE)?,
             request_argument: fixed_cstring(INSTALLED_AUTH_WORKER_REQUEST_ARGUMENT)?,
             result_argument: fixed_cstring(INSTALLED_AUTH_WORKER_RESULT_ARGUMENT)?,
