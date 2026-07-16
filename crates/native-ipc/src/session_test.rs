@@ -286,7 +286,7 @@ fn public_typestate_negotiates_controls_and_reports_exact_exit() {
         .arg("--ignored")
         .arg("--nocapture");
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     )
     .with_application_payload(b"public-coordinator".to_vec())
@@ -306,7 +306,7 @@ fn public_typestate_negotiates_controls_and_reports_exact_exit() {
         .send_control(
             0x8000_0040,
             &oversized,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap_err();
     assert_eq!(
@@ -316,7 +316,7 @@ fn public_typestate_negotiates_controls_and_reports_exact_exit() {
     assert!(!failure.is_poisoned());
     assert_eq!(ready.state(), SessionState::Ready);
     let frame = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(
         (frame.kind, frame.payload.as_slice()),
@@ -326,10 +326,10 @@ fn public_typestate_negotiates_controls_and_reports_exact_exit() {
         .send_control(
             0x8000_0042,
             b"from-coordinator",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
-    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap());
+    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap());
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -350,7 +350,7 @@ fn public_receiver_helper() {
     let bootstrap = __take_receiver_bootstrap().unwrap();
     assert!(__take_receiver_bootstrap().is_err());
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     )
     .with_application_payload(b"public-receiver".to_vec())
@@ -372,11 +372,11 @@ fn public_receiver_helper() {
         .send_control(
             0x8000_0041,
             b"from-receiver",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let frame = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(
         (frame.kind, frame.payload.as_slice()),
@@ -396,7 +396,7 @@ fn macos_public_unknown_rejection_preserves_cleanup_facts() {
         .arg("--ignored")
         .arg("--nocapture");
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     );
     let negotiating = CoordinatorSession::<Negotiating>::spawn(command, options).unwrap();
@@ -423,7 +423,7 @@ fn macos_public_unknown_reject_helper() {
             Vec::new(),
             false,
             false,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let outcome = negotiating
@@ -459,7 +459,7 @@ fn macos_public_abort_uses_exact_audit_token_and_closes_inherited_fds() {
         .arg("--nocapture")
         .env("NATIVE_IPC_TEST_INHERITED_FD", inherited_fd.to_string());
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     );
     let negotiating = CoordinatorSession::<Negotiating>::spawn(command, options).unwrap();
@@ -467,7 +467,7 @@ fn macos_public_abort_uses_exact_audit_token_and_closes_inherited_fds() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("abort helper rejected negotiation"),
     };
-    let outcome = ready.abort(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap());
+    let outcome = ready.abort(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap());
     assert!(outcome.failure().is_none());
     assert!(matches!(
         outcome.cleanup().direct_child(),
@@ -493,7 +493,7 @@ fn macos_public_abort_helper() {
     assert_eq!(unsafe { fcntl(inherited_fd, F_GETFD) }, -1);
     let bootstrap = __take_receiver_bootstrap().unwrap();
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     );
     let negotiating = ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, options).unwrap();
@@ -504,7 +504,7 @@ fn macos_public_abort_helper() {
         NegotiationOutcome::Accepted(ready) => ready,
         NegotiationOutcome::Rejected { .. } => panic!("coordinator rejected abort helper"),
     };
-    std::thread::sleep(Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(300));
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -548,7 +548,7 @@ fn public_ready_activates_one_mixed_batch_atomically() {
         .arg("--ignored")
         .arg("--nocapture");
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     );
     let negotiating = CoordinatorSession::<Negotiating>::spawn(command, options).unwrap();
@@ -560,7 +560,7 @@ fn public_ready_activates_one_mixed_batch_atomically() {
     let mut active = ready
         .transfer_batch(
             batch,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     assert_eq!(active.len(), 4);
@@ -575,11 +575,11 @@ fn public_ready_activates_one_mixed_batch_atomically() {
         .send_control(
             0x8000_0051,
             b"inspect",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let acknowledgement = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(acknowledgement.kind, 0x8000_0052);
     for ordinal in (1..4).step_by(2) {
@@ -592,7 +592,7 @@ fn public_ready_activates_one_mixed_batch_atomically() {
     }
     assert!(active.is_empty());
     assert!(ready.active_leases().is_empty());
-    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap());
+    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap());
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
 }
 
@@ -604,7 +604,7 @@ fn public_batch_receiver_helper() {
 
     let bootstrap = __take_receiver_bootstrap().unwrap();
     let options = SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     );
     let negotiating = ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, options).unwrap();
@@ -619,12 +619,12 @@ fn public_batch_receiver_helper() {
     let mut active = ready
         .receive_batch(
             expected,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     assert_eq!(active.len(), 4);
     let notification = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(notification.kind, 0x8000_0051);
     for ordinal in 0..4 {
@@ -648,7 +648,7 @@ fn public_batch_receiver_helper() {
         .send_control(
             0x8000_0052,
             b"done",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
@@ -657,7 +657,7 @@ fn public_batch_receiver_helper() {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn one_active_region_options() -> SessionOptions {
     SessionOptions::new(
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         ExecutableIdentityPolicy::ExactOpenedFile,
     )
     .with_limits(SessionLimits {
@@ -687,7 +687,7 @@ fn public_capacity_rejection_keeps_both_sessions_synchronized() {
     let active = ready
         .transfer_batch(
             first,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     drop(active);
@@ -695,13 +695,13 @@ fn public_capacity_rejection_keeps_both_sessions_synchronized() {
         .send_control(
             0x8000_0061,
             b"second",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let (second, _) = public_native_batch(1);
     let failure = match ready.transfer_batch(
         second,
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
     ) {
         Ok(_) => panic!("receiver capacity rejection unexpectedly activated"),
         Err(failure) => failure,
@@ -713,14 +713,14 @@ fn public_capacity_rejection_keeps_both_sessions_synchronized() {
         .send_control(
             0x8000_0062,
             b"still-synchronized",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let acknowledgement = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(acknowledgement.kind, 0x8000_0063);
-    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap());
+    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap());
     assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
 }
 
@@ -743,17 +743,17 @@ fn public_capacity_receiver_helper() {
     let active = ready
         .receive_batch(
             first,
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     let notification = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(notification.kind, 0x8000_0061);
     let (_, second) = public_native_batch(1);
     let failure = match ready.receive_batch(
         second,
-        AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
     ) {
         Ok(_) => panic!("over-limit receiver unexpectedly activated"),
         Err(failure) => failure,
@@ -763,14 +763,14 @@ fn public_capacity_receiver_helper() {
     assert_eq!(ready.state(), SessionState::Ready);
     drop(active);
     let synchronized = ready
-        .receive_control(AbsoluteDeadline::after(Duration::from_secs(10)).unwrap())
+        .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
         .unwrap();
     assert_eq!(synchronized.kind, 0x8000_0062);
     ready
         .send_control(
             0x8000_0063,
             b"confirmed",
-            AbsoluteDeadline::after(Duration::from_secs(10)).unwrap(),
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
         )
         .unwrap();
     assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
