@@ -214,6 +214,13 @@ Versioning once a stable API is released.
   sole-waiter lifecycle confirms the exact child's reap, live re-exec still
   fails closed as an identity mismatch, and only an `ESRCH` process lookup is
   reported as peer exit.
+- Scrub the inherited bootstrap environment in the public macOS receiver so a
+  receiver's descendants no longer inherit the live Mach nonce, parent PID, or
+  one-shot public-bootstrap marker, matching the Linux pre-init and Windows
+  connect scrubs.
+- Stabilize the macOS CI job: widen a transport-delay fixture deadline that
+  flaked on slow shared runners, and run the macOS test legs single-threaded so
+  concurrent ptrace lifecycle fixtures cannot race on `wait()` and hang the job.
 
 ### Changed
 
@@ -228,6 +235,15 @@ Versioning once a stable API is released.
   transfer backend after confirming it had no production consumer. Preserve
   the quiescent memfd allocator shared by the public memory facade and private
   vNext preparation, and make that retained module reject dead code locally.
+- Enable public macOS Arm64 session construction. `session::backend_status()`
+  now reports `Available` on every supported target, and `Session::spawn` /
+  `Session::from_bootstrap` compose the audit-token/nonce-authenticated
+  direct-spawn path with exact own-child termination and reaping. The same
+  cross-platform public session conformance corpus runs green on macOS. The
+  hardened ptrace/sandbox launcher remains backend-private machinery for
+  deployer-built helper artifacts; no installed, signed, notarized, or
+  packaged-release evidence is claimed, and descendant cleanup stays
+  `FreshGroupUnverified`.
 
 ## [0.4.0] - 2026-07-11
 
