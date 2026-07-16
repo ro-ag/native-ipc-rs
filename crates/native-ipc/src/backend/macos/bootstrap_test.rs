@@ -270,10 +270,16 @@ fn process_marker(label: &str) -> std::path::PathBuf {
 }
 
 fn wait_for_marker(path: &std::path::Path) -> Pid {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            return contents.trim().parse().unwrap();
+        // The child creates the marker file and then writes the PID in a second
+        // step, so a read can observe the file after creation but before the
+        // digits land. Retry until the contents parse rather than unwrapping an
+        // empty string, and keep the deadline generous for slow shared runners.
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse()
+        {
+            return pid;
         }
         assert!(
             Instant::now() < deadline,
@@ -635,10 +641,14 @@ fn traced_launcher_handshake_precedes_rlimit_and_target_exec() {
         .start_traced_launcher(&lifecycle, test_deadline())
         .unwrap();
 
-    let marker_deadline = Instant::now() + Duration::from_secs(5);
+    let marker_deadline = Instant::now() + Duration::from_secs(120);
     let denied_errno = loop {
-        if let Ok(contents) = std::fs::read_to_string(&marker) {
-            break contents.trim().parse::<Pid>().unwrap();
+        // Tolerate the create-before-write window: parse only once the digits
+        // have landed, and keep the deadline generous for slow shared runners.
+        if let Ok(contents) = std::fs::read_to_string(&marker)
+            && let Ok(value) = contents.trim().parse::<Pid>()
+        {
+            break value;
         }
         if lifecycle.try_poll() == Ok(PeerState::ExitedUnknown) {
             panic!(
