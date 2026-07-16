@@ -419,6 +419,64 @@ fn public_receiver_helper() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn parallel_public_macos_sessions_negotiate_control_and_exit_independently() {
+    fn spawn_one() -> CoordinatorSession<Negotiating> {
+        let executable = std::env::current_exe().unwrap();
+        let command = SessionCommand::new(&executable)
+            .arg0("native-ipc-parallel-helper")
+            .arg("--exact")
+            .arg("session::tests::public_receiver_helper")
+            .arg("--ignored")
+            .arg("--nocapture");
+        let options = SessionOptions::new(
+            AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
+            ExecutableIdentityPolicy::ExactOpenedFile,
+        )
+        .with_application_payload(b"public-coordinator".to_vec())
+        .require_atomic_u32()
+        .require_atomic_u64();
+        CoordinatorSession::<Negotiating>::spawn(command, options).unwrap()
+    }
+    fn drive_to_exit(mut ready: CoordinatorSession<Ready>) {
+        let frame = ready
+            .receive_control(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap())
+            .unwrap();
+        assert_eq!(
+            (frame.kind, frame.payload.as_slice()),
+            (0x8000_0041, b"from-receiver".as_slice())
+        );
+        ready
+            .send_control(
+                0x8000_0042,
+                b"from-coordinator",
+                AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
+            )
+            .unwrap();
+        let cleanup =
+            ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(120)).unwrap());
+        assert_eq!(cleanup.direct_child(), Some(ChildExitStatus::Exited(0)));
+    }
+    // Two independent public sessions are live in this process at once, each
+    // owning its own exact child in the shared macOS wait domain. Both must
+    // negotiate to Ready and exchange control before either is driven to exit.
+    let first = spawn_one();
+    let second = spawn_one();
+    assert_eq!(first.peer_application_payload(), b"public-receiver");
+    assert_eq!(second.peer_application_payload(), b"public-receiver");
+    let first = match first.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("first parallel helper rejected"),
+    };
+    let second = match second.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        NegotiationOutcome::Rejected { .. } => panic!("second parallel helper rejected"),
+    };
+    drive_to_exit(first);
+    drive_to_exit(second);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_public_unknown_rejection_preserves_cleanup_facts() {
     let executable = std::env::current_exe().unwrap();
     let command = SessionCommand::new(&executable)
