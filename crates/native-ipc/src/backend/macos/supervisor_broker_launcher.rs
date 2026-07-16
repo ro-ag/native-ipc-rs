@@ -40,6 +40,10 @@ use std::time::Instant;
 
 use super::super::SupervisorWireError;
 use super::super::auth_adapter::broker_report::{BROKER_RESUME_BYTE, encode_broker_trace_report};
+use super::super::auth_adapter::{
+    AuthAdapterError, AuthWorkerPipeFailure, AuthWorkerPool, AuthWorkerResultPoll,
+    ExactAuthWorkerAuthority, FreshAuthJobId,
+};
 use super::{
     ActiveBrokerGate, ActiveBrokerProcess, BrokerEntryError, BrokerGateExit, EAGAIN, EINTR,
     F_GETFL, F_SETFL, O_NONBLOCK, ensure_deadline_live, fcntl,
@@ -203,6 +207,14 @@ pub(super) enum LauncherWaitError {
     UnexpectedStatus,
     IdentityTransition,
     Native(c_int),
+}
+
+#[derive(Debug)]
+pub(super) enum LauncherSignatureError<WorkerFailure> {
+    Launcher(LauncherWaitError),
+    Pipe(AuthWorkerPipeFailure),
+    Auth(AuthAdapterError<WorkerFailure>),
+    BindingMismatch,
 }
 
 /// Installation-only fixed launcher image and canonical clean-exec vectors.
@@ -804,6 +816,13 @@ pub(super) struct ExecTrapHeld {
     _after_exec: TaskAuditIdentity,
 }
 
+/// Exact exec-trap authority after the target's fixed signing requirement and
+/// installed policy identity were verified by a cleanly reaped auth worker.
+#[must_use = "the signature-verified target must report, resume, or exact-clean"]
+pub(super) struct SignatureVerifiedExecTrap {
+    inner: Option<ExactLauncher>,
+}
+
 /// Exact exec-trap authority after its canonical FD5 report reached service.
 #[must_use = "the reported target must receive Ready-bound resume or exact-clean"]
 pub(super) struct ReportedExecTrapHeld {
@@ -1017,6 +1036,148 @@ impl AwaitingExecTrap {
 }
 
 impl ExecTrapHeld {
+    /// Authenticates the stopped post-exec image before any report or resume
+    /// authority can exist.
+    ///
+    /// The job contains only the exact audit token, same-user credentials,
+    /// canonical plan digest, and original deadline. The signed clean-exec
+    /// worker owns the designated requirement and returns its compiled
+    /// nonzero identity only on success. The pool must also reap that exact
+    /// worker with status zero before this transition completes.
+    pub(super) fn verify_signature<Authority: ExactAuthWorkerAuthority>(
+        mut self,
+        pool: &mut AuthWorkerPool<Authority>,
+        job_id: FreshAuthJobId,
+    ) -> Result<SignatureVerifiedExecTrap, LauncherSignatureError<Authority::Failure>> {
+        let inner = self.inner.as_ref().unwrap_or_else(|| std::process::abort());
+        let audit_identity = self._after_exec.audit_identity();
+        let effective_uid = inner.expected_euid();
+        let effective_gid = inner.expected_egid();
+        let frame_digest = inner.active.plan.plan_digest();
+        let expected_code_identity = inner.active.plan.target_identity();
+        let wire_deadline = inner.active.plan.deadline().wire();
+        let deadline = inner.deadline();
+        let dispatched = pool
+            .dispatch_exec_trap(
+                audit_identity,
+                effective_uid,
+                effective_gid,
+                frame_digest,
+                expected_code_identity,
+                job_id,
+                wire_deadline,
+            )
+            .map_err(LauncherSignatureError::Auth)?;
+        let worker = dispatched.worker();
+        let mut receipt = match dispatched.submit() {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(cancel_signature_worker(
+                    pool,
+                    worker,
+                    LauncherSignatureError::Pipe(error),
+                ));
+            }
+        };
+        let received = loop {
+            if let Err(error) = probe_gate(inner.gate()).and_then(|()| ensure_deadline(deadline)) {
+                return Err(cancel_signature_worker(
+                    pool,
+                    worker,
+                    LauncherSignatureError::Launcher(error),
+                ));
+            }
+            match receipt.poll() {
+                Ok(AuthWorkerResultPoll::Complete(received)) => break received,
+                Ok(AuthWorkerResultPoll::Pending(next)) => {
+                    let result_fd = next.result_fd();
+                    receipt = next;
+                    if let Err(error) = poll_signature_slice(inner.gate(), result_fd) {
+                        return Err(cancel_signature_worker(
+                            pool,
+                            worker,
+                            LauncherSignatureError::Launcher(error),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(cancel_signature_worker(
+                        pool,
+                        worker,
+                        LauncherSignatureError::Pipe(error),
+                    ));
+                }
+            }
+        };
+
+        let mut completion = pool.complete_exec_trap(received);
+        let authenticated = loop {
+            match completion {
+                Ok(authenticated) => break authenticated,
+                Err(AuthAdapterError::WorkerRetirementPending(pending)) if pending == worker => {
+                    if let Err(error) =
+                        probe_gate(inner.gate()).and_then(|()| ensure_deadline(deadline))
+                    {
+                        return Err(cancel_signature_worker(
+                            pool,
+                            worker,
+                            LauncherSignatureError::Launcher(error),
+                        ));
+                    }
+                    if let Err(error) = poll_gate_slice(inner.gate()) {
+                        return Err(cancel_signature_worker(
+                            pool,
+                            worker,
+                            LauncherSignatureError::Launcher(error),
+                        ));
+                    }
+                    completion = pool.poll_completed_exec_trap(worker);
+                }
+                Err(error) => return Err(LauncherSignatureError::Auth(error)),
+            }
+        };
+        if authenticated.audit_identity() != audit_identity
+            || authenticated.effective_uid() != effective_uid
+            || authenticated.effective_gid() != effective_gid
+            || authenticated.frame_digest() != frame_digest
+            || authenticated.code_identity() != expected_code_identity
+            || authenticated.deadline() != wire_deadline
+        {
+            return Err(LauncherSignatureError::BindingMismatch);
+        }
+        let inner = self.inner.take().unwrap_or_else(|| std::process::abort());
+        Ok(SignatureVerifiedExecTrap { inner: Some(inner) })
+    }
+
+    #[cfg(test)]
+    unsafe fn assume_signature_verified_for_test(mut self) -> SignatureVerifiedExecTrap {
+        SignatureVerifiedExecTrap {
+            inner: self.inner.take(),
+        }
+    }
+
+    #[cfg(test)]
+    fn exact_pid_for_test(&self) -> c_int {
+        self.inner
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .pid
+    }
+
+    #[cfg(test)]
+    fn wait_for_gate_eof_for_test(&self) {
+        let inner = self.inner.as_ref().unwrap_or_else(|| std::process::abort());
+        loop {
+            match probe_gate(inner.gate()) {
+                Err(LauncherWaitError::ServiceGone) => return,
+                Ok(()) => poll_gate_slice(inner.gate()).unwrap(),
+                Err(error) => panic!("unexpected gate probe failure: {error:?}"),
+            }
+        }
+    }
+}
+
+impl SignatureVerifiedExecTrap {
     pub(super) fn report_trace_stops(
         mut self,
     ) -> Result<Result<ReportedExecTrapHeld, BrokerGateExit>, BrokerEntryError> {
@@ -1330,6 +1491,41 @@ fn poll_plan_slice(gate: &ActiveBrokerGate, writer: c_int) -> Result<(), Launche
         }
     }
     Ok(())
+}
+
+fn poll_signature_slice(gate: &ActiveBrokerGate, result: c_int) -> Result<(), LauncherWaitError> {
+    let mut descriptors = [
+        PollFd {
+            fd: gate.reader.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: result,
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: descriptors contains two initialized writable pollfd values.
+    let polled = unsafe { poll(descriptors.as_mut_ptr(), 2, 1) };
+    if polled < 0 {
+        let error = last_errno();
+        if error != EINTR {
+            return Err(LauncherWaitError::Native(error));
+        }
+    }
+    Ok(())
+}
+
+fn cancel_signature_worker<Authority: ExactAuthWorkerAuthority>(
+    pool: &mut AuthWorkerPool<Authority>,
+    worker: super::super::auth_adapter::AuthWorkerIdentity,
+    original: LauncherSignatureError<Authority::Failure>,
+) -> LauncherSignatureError<Authority::Failure> {
+    match pool.cancel(worker) {
+        Ok(()) => original,
+        Err(error) => LauncherSignatureError::Auth(error),
+    }
 }
 
 fn poll_gate_slice(gate: &ActiveBrokerGate) -> Result<(), LauncherWaitError> {

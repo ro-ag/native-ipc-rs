@@ -297,6 +297,16 @@ impl ExactParentBrokerLaunchPlan {
         &self.plan.installed_executable
     }
 
+    /// Installed-policy identity the target's fixed Security worker must echo.
+    pub(in crate::backend::macos::supervisor) const fn target_identity(&self) -> [u8; 32] {
+        self.plan.target_identity
+    }
+
+    /// Full canonical plan binding used to domain-separate target validation.
+    pub(in crate::backend::macos::supervisor) const fn plan_digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
     #[cfg(test)]
     pub(in crate::backend::macos::supervisor) fn for_launcher_test(
         deadline: Instant,

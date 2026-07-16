@@ -309,7 +309,7 @@ pub(super) struct AuthWorkerJob {
 }
 
 /// One pre-created worker's parent-side one-job pipe capability.
-struct AuthWorkerEndpoint {
+pub(super) struct AuthWorkerEndpoint {
     request: OwnedFd,
     result: OwnedFd,
 }
@@ -321,7 +321,7 @@ impl AuthWorkerEndpoint {
     /// fresh worker's private job pipe, with `F_SETNOSIGPIPE` enabled. `result`
     /// must be that same worker's sole nonblocking, CLOEXEC parent reader. The
     /// worker endpoints must never be shared with another slot or generation.
-    unsafe fn from_private_parent_pipe_ends(request: OwnedFd, result: OwnedFd) -> Self {
+    pub(super) unsafe fn from_private_parent_pipe_ends(request: OwnedFd, result: OwnedFd) -> Self {
         Self { request, result }
     }
 }
@@ -440,6 +440,10 @@ impl AuthWorkerReplyReceipt {
         self.worker
     }
 
+    pub(super) fn result_fd(&self) -> c_int {
+        self.result.as_raw_fd()
+    }
+
     pub(super) fn poll(mut self) -> Result<AuthWorkerResultPoll, AuthWorkerPipeFailure> {
         while self.filled < self.bytes.len() {
             self.ensure_deadline()?;
@@ -551,6 +555,16 @@ impl AuthWorkerJob {
     /// inherited pipe.
     pub(super) fn decode_pipe_frame(bytes: &[u8]) -> Result<Self, AuthWorkerWireError> {
         decode_auth_worker_job(bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn encode_test_result(self, code_identity: [u8; 32]) -> Vec<u8> {
+        // SAFETY: this is fixture-only modeling of the assigned worker's
+        // Security decision on its private endpoint.
+        unsafe { AuthWorkerResult::from_test_security_validation(self, code_identity) }
+            .encode_pipe_frame()
+            .unwrap()
+            .to_vec()
     }
 }
 
@@ -1030,6 +1044,11 @@ pub(super) struct ReapedAuthWorker {
 }
 
 impl ReapedAuthWorker {
+    #[cfg(test)]
+    pub(super) const fn from_test_clean_exit() -> Self {
+        Self { clean_exit: true }
+    }
+
     /// # Safety
     ///
     /// The exact worker owned by the calling authority must already be reaped,
@@ -1449,7 +1468,7 @@ enum AuthWorkerRetirement {
     Rejected,
 }
 
-struct ExactAuthWorker<Authority: ExactAuthWorkerAuthority> {
+pub(super) struct ExactAuthWorker<Authority: ExactAuthWorkerAuthority> {
     authority: Authority,
     armed: bool,
 }
@@ -1467,7 +1486,7 @@ impl<Authority: ExactAuthWorkerAuthority> ExactAuthWorker<Authority> {
     }
 
     #[cfg(test)]
-    unsafe fn from_test_unreaped_direct_child(authority: Authority) -> Self {
+    pub(super) unsafe fn from_test_unreaped_direct_child(authority: Authority) -> Self {
         // SAFETY: the test authority models one exact unreaped direct child.
         unsafe { Self::from_unreaped_direct_child(authority) }
     }
@@ -1522,8 +1541,58 @@ impl<Authority: ExactAuthWorkerAuthority> Drop for ExactAuthWorker<Authority> {
     }
 }
 
+struct PendingExecTrap {
+    audit_identity: [u8; 32],
+    effective_uid: u32,
+    effective_gid: u32,
+    frame_digest: [u8; 32],
+    expected_code_identity: [u8; 32],
+}
+
+enum PendingAuthInput {
+    Mach(RawMachRecord),
+    ExecTrap(PendingExecTrap),
+}
+
+impl PendingAuthInput {
+    fn audit_identity(&self) -> [u8; 32] {
+        match self {
+            Self::Mach(raw) => raw.audit_identity,
+            Self::ExecTrap(target) => target.audit_identity,
+        }
+    }
+
+    fn effective_uid(&self) -> u32 {
+        match self {
+            Self::Mach(raw) => raw.effective_uid,
+            Self::ExecTrap(target) => target.effective_uid,
+        }
+    }
+
+    fn effective_gid(&self) -> u32 {
+        match self {
+            Self::Mach(raw) => raw.effective_gid,
+            Self::ExecTrap(target) => target.effective_gid,
+        }
+    }
+
+    fn frame_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Mach(raw) => frame_digest(raw),
+            Self::ExecTrap(target) => target.frame_digest,
+        }
+    }
+
+    fn expected_code_identity(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Mach(_) => None,
+            Self::ExecTrap(target) => Some(target.expected_code_identity),
+        }
+    }
+}
+
 struct PendingRecord {
-    raw: RawMachRecord,
+    input: PendingAuthInput,
     job: AuthWorkerJob,
     deadline: SupervisorDeadline,
     outcome: PendingOutcome,
@@ -1548,6 +1617,47 @@ pub(super) struct AuthenticatedMachRecord {
     raw: RawMachRecord,
     code_identity: [u8; 32],
     deadline: SupervisorDeadline,
+}
+
+/// Exact exec-trap audit token accepted by a cleanly reaped fixed worker.
+pub(super) struct AuthenticatedExecTrap {
+    audit_identity: [u8; 32],
+    effective_uid: u32,
+    effective_gid: u32,
+    frame_digest: [u8; 32],
+    code_identity: [u8; 32],
+    deadline: SupervisorDeadline,
+}
+
+impl AuthenticatedExecTrap {
+    pub(super) const fn audit_identity(&self) -> [u8; 32] {
+        self.audit_identity
+    }
+
+    pub(super) const fn effective_uid(&self) -> u32 {
+        self.effective_uid
+    }
+
+    pub(super) const fn effective_gid(&self) -> u32 {
+        self.effective_gid
+    }
+
+    pub(super) const fn frame_digest(&self) -> [u8; 32] {
+        self.frame_digest
+    }
+
+    pub(super) const fn code_identity(&self) -> [u8; 32] {
+        self.code_identity
+    }
+
+    pub(super) const fn deadline(&self) -> SupervisorDeadline {
+        self.deadline
+    }
+}
+
+enum CompletedAuthentication {
+    Mach(AuthenticatedMachRecord),
+    ExecTrap(AuthenticatedExecTrap),
 }
 
 /// Authenticated, exact-reaped request shape ready for service-state routing.
@@ -2273,7 +2383,7 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
     }
 
     #[cfg(test)]
-    fn from_test_precreated_workers(
+    pub(super) fn from_test_precreated_workers(
         workers: Vec<(
             FreshAuthWorkerGeneration,
             ExactAuthWorker<Authority>,
@@ -2291,15 +2401,61 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
         job_id: FreshAuthJobId,
         deadline: SupervisorDeadline,
     ) -> Result<DispatchedAuthJob, AuthAdapterError<Authority::Failure>> {
+        if raw.bytes.len() > MAX_SUPERVISOR_RECORD_BYTES {
+            return Err(AuthAdapterError::CapacityExceeded);
+        }
+        self.dispatch_input(PendingAuthInput::Mach(raw), job_id, deadline)
+    }
+
+    /// Assigns the exact stopped target execution to one fixed-requirement
+    /// worker. The worker receives no path, requirement, or expected identity;
+    /// those remain installed broker policy and are compared only after the
+    /// result endpoint reaches EOF and the exact worker is cleanly reaped.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_exec_trap(
+        &mut self,
+        audit_identity: [u8; 32],
+        effective_uid: u32,
+        effective_gid: u32,
+        frame_digest: [u8; 32],
+        expected_code_identity: [u8; 32],
+        job_id: FreshAuthJobId,
+        deadline: SupervisorDeadline,
+    ) -> Result<DispatchedAuthJob, AuthAdapterError<Authority::Failure>> {
+        if frame_digest == [0; 32] || expected_code_identity == [0; 32] {
+            return Err(AuthAdapterError::CapacityExceeded);
+        }
+        self.dispatch_input(
+            PendingAuthInput::ExecTrap(PendingExecTrap {
+                audit_identity,
+                effective_uid,
+                effective_gid,
+                frame_digest,
+                expected_code_identity,
+            }),
+            job_id,
+            deadline,
+        )
+    }
+
+    fn dispatch_input(
+        &mut self,
+        input: PendingAuthInput,
+        job_id: FreshAuthJobId,
+        deadline: SupervisorDeadline,
+    ) -> Result<DispatchedAuthJob, AuthAdapterError<Authority::Failure>> {
         deadline
             .to_local_instant()
             .map_err(AuthAdapterError::Protocol)?;
-        if raw.bytes.len() > MAX_SUPERVISOR_RECORD_BYTES
-            || raw.audit_identity == [0; 32]
-            || raw.effective_uid == 0
-            || raw.effective_gid == 0
-            || raw.effective_uid == u32::MAX
-            || raw.effective_gid == u32::MAX
+        let audit_identity = input.audit_identity();
+        let effective_uid = input.effective_uid();
+        let effective_gid = input.effective_gid();
+        let frame_digest = input.frame_digest();
+        if audit_identity == [0; 32]
+            || effective_uid == 0
+            || effective_gid == 0
+            || effective_uid == u32::MAX
+            || effective_gid == u32::MAX
         {
             return Err(AuthAdapterError::CapacityExceeded);
         }
@@ -2311,7 +2467,7 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
             .iter()
             .flatten()
             .filter_map(|slot| slot.pending.as_ref())
-            .filter(|pending| pending.raw.effective_uid == raw.effective_uid)
+            .filter(|pending| pending.input.effective_uid() == effective_uid)
             .count();
         if uid_pending >= MAX_PENDING_PER_UID {
             return Err(AuthAdapterError::CapacityExceeded);
@@ -2322,13 +2478,12 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
             .flatten()
             .find(|slot| slot.pending.is_none() && slot.endpoint.is_some())
             .ok_or(AuthAdapterError::Saturated)?;
-        let frame_digest = frame_digest(&raw);
         let job = AuthWorkerJob {
             worker: slot.identity,
             job_id: job_id.0,
-            audit_identity: raw.audit_identity,
-            effective_uid: raw.effective_uid,
-            effective_gid: raw.effective_gid,
+            audit_identity,
+            effective_uid,
+            effective_gid,
             frame_digest,
             deadline: deadline.wire_value(),
         };
@@ -2338,7 +2493,7 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
             .take()
             .expect("idle worker retains one private endpoint");
         slot.pending = Some(PendingRecord {
-            raw,
+            input,
             job,
             deadline,
             outcome: PendingOutcome::AwaitingResult,
@@ -2364,6 +2519,25 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
         &mut self,
         received: ReceivedAuthWorkerResult,
     ) -> Result<AuthenticatedMachRecord, AuthAdapterError<Authority::Failure>> {
+        let worker = self.accept_result(received, false)?;
+        self.poll_completed(worker)
+    }
+
+    /// Accepts an exec-trap result only for the exact dispatched audit token,
+    /// canonical-plan binding, and installed expected target identity.
+    pub(super) fn complete_exec_trap(
+        &mut self,
+        received: ReceivedAuthWorkerResult,
+    ) -> Result<AuthenticatedExecTrap, AuthAdapterError<Authority::Failure>> {
+        let worker = self.accept_result(received, true)?;
+        self.poll_completed_exec_trap(worker)
+    }
+
+    fn accept_result(
+        &mut self,
+        received: ReceivedAuthWorkerResult,
+        expect_exec_trap: bool,
+    ) -> Result<AuthWorkerIdentity, AuthAdapterError<Authority::Failure>> {
         let ReceivedAuthWorkerResult { receipt, result } = received;
         let slot_index = usize::from(receipt.worker.slot);
         let mismatch = match self.slots.get(slot_index).and_then(Option::as_ref) {
@@ -2372,6 +2546,8 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
                     receipt.job_id != pending.job.job_id
                         || !matches!(pending.outcome, PendingOutcome::AwaitingResult)
                         || pending.job != result.job
+                        || matches!(pending.input, PendingAuthInput::ExecTrap(_))
+                            != expect_exec_trap
                 }
                 None => true,
             },
@@ -2396,7 +2572,13 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
                 Err(error) => Err(error),
             };
         }
-        if result.code_identity == [0; 32] {
+        let expected_code_identity = self.slots[slot_index]
+            .as_ref()
+            .and_then(|slot| slot.pending.as_ref())
+            .and_then(|pending| pending.input.expected_code_identity());
+        if result.code_identity == [0; 32]
+            || expected_code_identity.is_some_and(|expected| expected != result.code_identity)
+        {
             self.mark_rejected(slot_index);
             return match self.terminate_slot(slot_index) {
                 Ok(()) => Err(AuthAdapterError::AuthenticationRejected),
@@ -2408,7 +2590,7 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
             .and_then(|slot| slot.pending.as_mut())
             .expect("matched pending job");
         pending.outcome = PendingOutcome::Validated(result.code_identity);
-        self.poll_completed(receipt.worker)
+        Ok(receipt.worker)
     }
 
     /// Makes one bounded nonblocking exact-reap observation for a previously
@@ -2417,6 +2599,26 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
         &mut self,
         worker: AuthWorkerIdentity,
     ) -> Result<AuthenticatedMachRecord, AuthAdapterError<Authority::Failure>> {
+        match self.poll_completed_authentication(worker)? {
+            CompletedAuthentication::Mach(record) => Ok(record),
+            CompletedAuthentication::ExecTrap(_) => Err(AuthAdapterError::ResultMismatch),
+        }
+    }
+
+    pub(super) fn poll_completed_exec_trap(
+        &mut self,
+        worker: AuthWorkerIdentity,
+    ) -> Result<AuthenticatedExecTrap, AuthAdapterError<Authority::Failure>> {
+        match self.poll_completed_authentication(worker)? {
+            CompletedAuthentication::ExecTrap(record) => Ok(record),
+            CompletedAuthentication::Mach(_) => Err(AuthAdapterError::ResultMismatch),
+        }
+    }
+
+    fn poll_completed_authentication(
+        &mut self,
+        worker: AuthWorkerIdentity,
+    ) -> Result<CompletedAuthentication, AuthAdapterError<Authority::Failure>> {
         let slot_index = usize::from(worker.slot);
         let slot = self
             .slots
@@ -2459,13 +2661,38 @@ impl<Authority: ExactAuthWorkerAuthority> AuthWorkerPool<Authority> {
             }
             AuthWorkerRetirement::Clean => {}
         }
+        if slot
+            .pending
+            .as_ref()
+            .expect("validated pending job")
+            .deadline
+            .to_local_instant()
+            .is_err()
+        {
+            let pending = slot.pending.take().expect("validated pending job");
+            self.live_jobs.remove(&pending.job.job_id);
+            self.slots[slot_index] = None;
+            return Err(AuthAdapterError::DeadlineExpired);
+        }
         let pending = slot.pending.take().expect("validated pending job");
         self.live_jobs.remove(&pending.job.job_id);
         self.slots[slot_index] = None;
-        Ok(AuthenticatedMachRecord {
-            raw: pending.raw,
-            code_identity,
-            deadline: pending.deadline,
+        Ok(match pending.input {
+            PendingAuthInput::Mach(raw) => CompletedAuthentication::Mach(AuthenticatedMachRecord {
+                raw,
+                code_identity,
+                deadline: pending.deadline,
+            }),
+            PendingAuthInput::ExecTrap(target) => {
+                CompletedAuthentication::ExecTrap(AuthenticatedExecTrap {
+                    audit_identity: target.audit_identity,
+                    effective_uid: target.effective_uid,
+                    effective_gid: target.effective_gid,
+                    frame_digest: target.frame_digest,
+                    code_identity,
+                    deadline: pending.deadline,
+                })
+            }
         })
     }
 

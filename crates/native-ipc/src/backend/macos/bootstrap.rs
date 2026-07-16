@@ -357,6 +357,18 @@ pub(super) struct TaskAuditIdentity {
 }
 
 impl TaskAuditIdentity {
+    /// Exact native audit token bytes for a clean-exec Security guest lookup.
+    ///
+    /// The caller must continue to pin the corresponding stopped execution;
+    /// these bytes are identity evidence, never lifecycle authority.
+    pub(super) fn audit_identity(&self) -> [u8; 32] {
+        let mut encoded = [0_u8; 32];
+        for (destination, value) in encoded.chunks_exact_mut(4).zip(self.audit.values) {
+            destination.copy_from_slice(&value.to_ne_bytes());
+        }
+        encoded
+    }
+
     /// Requires one exact PID, executable, and complete real/effective
     /// credential tuple while the caller pins the stopped process.
     pub(super) fn proves_exact_process_image(

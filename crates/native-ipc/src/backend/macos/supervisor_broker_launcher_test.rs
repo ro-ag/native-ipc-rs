@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use static_assertions::assert_not_impl_any;
@@ -48,6 +49,91 @@ assert_not_impl_any!(SpawnedLauncher: Clone, Copy, Send, Sync);
 assert_not_impl_any!(InitialStopObserved: Clone, Copy, Send, Sync);
 assert_not_impl_any!(AwaitingExecTrap: Clone, Copy, Send, Sync);
 assert_not_impl_any!(ExecTrapHeld: Clone, Copy, Send, Sync);
+assert_not_impl_any!(SignatureVerifiedExecTrap: Clone, Copy, Send, Sync);
+
+struct FakeSignatureWorkerAuthority;
+
+unsafe impl super::super::super::auth_adapter::ExactAuthWorkerAuthority
+    for FakeSignatureWorkerAuthority
+{
+    type Failure = ();
+
+    fn try_reap_after_result(
+        &mut self,
+    ) -> Result<Option<super::super::super::auth_adapter::ReapedAuthWorker>, Self::Failure> {
+        Ok(Some(
+            super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit(),
+        ))
+    }
+
+    fn try_terminate_and_reap(
+        &mut self,
+    ) -> Result<Option<super::super::super::auth_adapter::ReapedAuthWorker>, Self::Failure> {
+        Ok(Some(
+            super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit(),
+        ))
+    }
+
+    fn emergency_terminate_and_reap(
+        &mut self,
+    ) -> super::super::super::auth_adapter::ReapedAuthWorker {
+        super::super::super::auth_adapter::ReapedAuthWorker::from_test_clean_exit()
+    }
+}
+
+fn signature_job_id(byte: u8) -> super::super::super::auth_adapter::FreshAuthJobId {
+    // SAFETY: each test uses one fresh nonzero value for its one-job pool.
+    unsafe {
+        super::super::super::auth_adapter::FreshAuthJobId::from_fresh_random([byte; 32]).unwrap()
+    }
+}
+
+fn signature_worker_pool(
+    code_identity: [u8; 32],
+    expected_audit_identity: [u8; 32],
+) -> (
+    super::super::super::auth_adapter::AuthWorkerPool<FakeSignatureWorkerAuthority>,
+    JoinHandle<()>,
+) {
+    use super::super::super::auth_adapter::{
+        AuthWorkerEndpoint, AuthWorkerJob, AuthWorkerPool, ExactAuthWorker,
+        FreshAuthWorkerGeneration,
+    };
+
+    let (request_reader, request_writer) = test_pipe();
+    let (result_reader, result_writer) = test_pipe();
+    super::set_nonblocking(request_writer.as_raw_fd(), true).unwrap();
+    super::set_nonblocking(result_reader.as_raw_fd(), true).unwrap();
+    // SAFETY: the request writer is a live pipe descriptor retained by the
+    // parent endpoint; Darwin applies this setting without consuming it.
+    assert_eq!(
+        unsafe { fcntl(request_writer.as_raw_fd(), F_SETNOSIGPIPE, 1) },
+        0
+    );
+    // SAFETY: these are the sole parent ends for one fresh private worker.
+    let endpoint =
+        unsafe { AuthWorkerEndpoint::from_private_parent_pipe_ends(request_writer, result_reader) };
+    // SAFETY: this fake models one exact unreaped worker owned by the pool.
+    let worker =
+        unsafe { ExactAuthWorker::from_test_unreaped_direct_child(FakeSignatureWorkerAuthority) };
+    // SAFETY: this generation is nonzero and unique within this one-worker pool.
+    let generation = unsafe { FreshAuthWorkerGeneration::from_unique_service_value(1).unwrap() };
+    let pool =
+        AuthWorkerPool::from_test_precreated_workers(vec![(generation, worker, endpoint)]).unwrap();
+    let worker_thread = std::thread::spawn(move || {
+        let mut request = Vec::new();
+        std::fs::File::from(request_reader)
+            .read_to_end(&mut request)
+            .unwrap();
+        let job = AuthWorkerJob::decode_pipe_frame(&request).unwrap();
+        assert_eq!(job.audit_identity(), expected_audit_identity);
+        let result = job.encode_test_result(code_identity);
+        std::fs::File::from(result_writer)
+            .write_all(&result)
+            .unwrap();
+    });
+    (pool, worker_thread)
+}
 
 #[test]
 fn installed_launcher_vectors_and_same_user_identity_are_fixed() {
@@ -506,11 +592,23 @@ impl Fixture {
         drop(self.gate_writer.take());
     }
 
-    fn held_exec(&mut self) -> (c_int, ExecTrapHeld) {
+    fn held_exec(&mut self) -> (c_int, SignatureVerifiedExecTrap) {
         self.held_exec_until(self.deadline())
     }
 
-    fn held_exec_until(&mut self, deadline: Instant) -> (c_int, ExecTrapHeld) {
+    fn held_exec_until(&mut self, deadline: Instant) -> (c_int, SignatureVerifiedExecTrap) {
+        let (pid, held) = self.held_exec_unverified_until(deadline);
+        // SAFETY: legacy launcher lifecycle tests isolate properties after the
+        // new signature boundary. Dedicated tests above exercise the real
+        // auth-worker accept/reject transition.
+        (pid, unsafe { held.assume_signature_verified_for_test() })
+    }
+
+    fn held_exec_unverified(&mut self) -> (c_int, ExecTrapHeld) {
+        self.held_exec_unverified_until(self.deadline())
+    }
+
+    fn held_exec_unverified_until(&mut self, deadline: Instant) -> (c_int, ExecTrapHeld) {
         let pid = c_int::try_from(self.child.id()).unwrap();
         let initial = self.spawned_launcher(deadline).wait_initial_stop().unwrap();
         let running = initial.prove_trace_and_continue_to_exec().unwrap();
@@ -543,6 +641,45 @@ fn real_exec_changes_audit_pid_version_at_exact_trap() {
     assert_eq!(held.exact_pid_for_test(), pid);
     drop(held);
     fixture.close_gate();
+}
+
+#[test]
+fn exec_trap_signature_gate_accepts_the_installed_target_identity() {
+    let mut fixture = Fixture::spawn("valid-exec");
+    let (pid, held) = fixture.held_exec_unverified();
+    let expected_audit_identity = held._after_exec.audit_identity();
+    let (mut pool, worker) = signature_worker_pool([4; 32], expected_audit_identity);
+
+    let verified = held
+        .verify_signature(&mut pool, signature_job_id(0x71))
+        .unwrap();
+
+    assert_eq!(verified.exact_pid_for_test(), pid);
+    worker.join().unwrap();
+    drop(verified);
+    assert_no_reapable_status(pid);
+    fixture.close_gate();
+}
+
+#[test]
+fn exec_trap_signature_gate_rejects_zero_or_substituted_identity_and_exact_cleans() {
+    for (job_byte, code_identity) in [(0x72, [0; 32]), (0x73, [9; 32])] {
+        let mut fixture = Fixture::spawn("valid-exec");
+        let (pid, held) = fixture.held_exec_unverified();
+        let expected_audit_identity = held._after_exec.audit_identity();
+        let (mut pool, worker) = signature_worker_pool(code_identity, expected_audit_identity);
+
+        assert!(matches!(
+            held.verify_signature(&mut pool, signature_job_id(job_byte)),
+            Err(LauncherSignatureError::Auth(
+                super::super::super::auth_adapter::AuthAdapterError::AuthenticationRejected
+            ))
+        ));
+
+        worker.join().unwrap();
+        assert_no_reapable_status(pid);
+        fixture.close_gate();
+    }
 }
 
 #[test]

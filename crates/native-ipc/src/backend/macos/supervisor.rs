@@ -529,6 +529,9 @@ pub(super) struct TargetPolicyDefinition {
 }
 
 impl TargetPolicyDefinition {
+    /// `target_identity` must be the nonzero code identity compiled into the
+    /// fixed auth worker that evaluates this target's designated requirement.
+    /// It is installed policy, never request-selected data.
     pub(super) fn new(
         policy_id: Vec<u8>,
         authorized_client_code_identity: [u8; 32],
