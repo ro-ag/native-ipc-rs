@@ -46,6 +46,10 @@ jobs:
 
   test:
     name: test / ${{ matrix.name }} / Rust 1.97
+    # A hung fixture must fail fast, not consume the full runner budget. The
+    # whole suite runs in well under this bound on every target, including the
+    # single-threaded macOS leg.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +63,12 @@ jobs:
           - name: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
+            # macOS exercises ptrace lifecycle fixtures that stop and reap exact
+            # child processes. Run its tests single-threaded so concurrent
+            # fixtures cannot race on wait(); the suite is small enough that
+            # serial execution stays well within the job timeout even on a
+            # shared, heavily loaded runner.
+            test_threads_flag: "--test-threads=1"
           - name: windows-amd64
             os: windows-2025
             target: x86_64-pc-windows-msvc
@@ -95,9 +105,9 @@ jobs:
         with:
           shared-key: tests-rust-1.97-${{ matrix.target }}
       - name: Run workspace and native permission tests
-        run: cargo test --workspace --all-features --all-targets --locked --target ${{ matrix.target }}
+        run: cargo test --workspace --all-features --all-targets --locked --target ${{ matrix.target }} -- ${{ matrix.test_threads_flag }}
       - name: Test without default features
-        run: cargo test --workspace --no-default-features --all-targets --locked --target ${{ matrix.target }}
+        run: cargo test --workspace --no-default-features --all-targets --locked --target ${{ matrix.target }} -- ${{ matrix.test_threads_flag }}
       - name: Check no-default-feature target surface
         run: cargo check --workspace --no-default-features --all-targets --locked --target ${{ matrix.target }}
 
