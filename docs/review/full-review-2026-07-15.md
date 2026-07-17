@@ -1,5 +1,11 @@
 # Full repository review — 2026-07-15
 
+> Point-in-time review evidence from 2026-07-15, before the macOS public
+> enablement decision (2026-07-16). Statements below about macOS being
+> `BackendUnavailable` describe the reviewed head, not the current state;
+> [`macos-supervisor-boundary.md`](../macos-supervisor-boundary.md) is the
+> current authority.
+
 Scope: task 55 on Plan 8b. Reviewed the public vNext surface, Linux, macOS, and
 Windows backends, integration/threat-model documentation, traceability, and the
 macOS fixed broker/launcher spawn, entry, and FD4 delivery path through branch

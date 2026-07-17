@@ -87,9 +87,11 @@ the preinstalled signed launchd/XPC service contract.
 The service must own the sole-waiter child entry before resume, expose only an
 opaque session identifier, reject audit PID-version changes, and complete exact
 reap before terminal acknowledgement. A client-spawned broker is nonconforming.
-Public macOS remains fail-closed until an OS-enforced containment design
-survives service crash without helper escape and the signed deployment and
-complete native fault/baseline corpus pass.
+This subphase described the deployer-helper lifecycle track; the separate
+public audit-token direct-spawn path was enabled on 2026-07-16 (see
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md)), while the
+signed helper deployment and its complete native fault/baseline corpus remain
+outstanding.
 
 ## Phase 7 — Windows AMD64/Arm64 backend
 
