@@ -372,10 +372,20 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features --all-targets
 cargo test --workspace --no-default-features --all-targets --locked
 cargo check --workspace --no-default-features --all-targets
+RUSTFLAGS="--cfg loom" cargo test -p native-ipc --lib --locked \
+  backend::reaper_ownership_tests::concurrent_final_owner_drops_latch_reaper_termination \
+  -- --exact
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo deny check
 git diff --check
 ```
+
+The Loom model is intentionally limited to syscall-free in-process lifecycle
+synchronization. Kernel eventual-consistency tests retain bounded retries; see
+[`docs/concurrency-testing.md`](docs/concurrency-testing.md) for the tool
+comparison and coverage boundary. Keep the Loom invocation filtered to that
+exact model: a broad cfg-Loom test run would execute ordinary unit tests with
+Loom synchronization primitives outside a `loom::model` closure.
 
 The Linux AMD64 sanitizer job uses nightly Rust because sanitizers and
 instrumented standard-library builds are not stable compiler features:

@@ -10,6 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{KERN_SUCCESS, MachPort, current_task, deallocate_port};
+use crate::backend::reaper_ownership::{ReaperOwnership, ReaperTermination};
 use crate::backend::{PeerState, SessionTransportError};
 use crate::protocol::{
     CONTROL_FRAME_LEN, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
@@ -830,7 +831,7 @@ struct MacChildLifecycleState {
 
 struct MacChildLifecycleShared {
     pid: AtomicI32,
-    terminate: AtomicBool,
+    termination: ReaperTermination,
     traced: AtomicBool,
     fresh_group_verified: AtomicBool,
     reaper_gate: Mutex<()>,
@@ -845,13 +846,16 @@ struct MacChildLifecycleShared {
 /// Durable exact-child owner whose destructor never waits on the caller.
 pub(super) struct MacChildLifecycle {
     shared: Arc<MacChildLifecycleShared>,
+    ownership: ReaperOwnership,
 }
 
 impl MacChildLifecycle {
     fn prepare() -> Result<Self, SessionTransportError> {
+        let ownership = ReaperOwnership::new();
+        let termination = ownership.termination();
         let shared = Arc::new(MacChildLifecycleShared {
             pid: AtomicI32::new(0),
-            terminate: AtomicBool::new(false),
+            termination,
             traced: AtomicBool::new(false),
             fresh_group_verified: AtomicBool::new(false),
             reaper_gate: Mutex::new(()),
@@ -874,7 +878,7 @@ impl MacChildLifecycle {
             .name("native-ipc-macos-child-reaper".into())
             .spawn(move || mac_child_reaper(worker_shared))
             .map_err(|error| SessionTransportError::Native(error.raw_os_error()))?;
-        Ok(Self { shared })
+        Ok(Self { shared, ownership })
     }
 
     fn start(pid: Pid) -> Result<Self, SessionTransportError> {
@@ -1049,7 +1053,7 @@ impl MacChildLifecycle {
     }
 
     fn request_termination(&self) {
-        self.shared.terminate.store(true, Ordering::Release);
+        self.shared.termination.request();
         self.shared.changed.notify_all();
     }
 
@@ -1105,8 +1109,8 @@ impl Drop for MacChildLifecycle {
     fn drop(&mut self) {
         // The worker retains one Arc until exact wait completion. Request
         // cancellation/cleanup when this is the final external owner.
-        if Arc::strong_count(&self.shared) <= 2 {
-            self.request_termination();
+        if self.ownership.release() {
+            self.shared.changed.notify_all();
         }
     }
 }
@@ -1115,6 +1119,7 @@ impl Clone for MacChildLifecycle {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
+            ownership: self.ownership.clone(),
         }
     }
 }
@@ -2424,7 +2429,7 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
     loop {
         let pid = shared.pid.load(Ordering::Acquire);
         if pid == 0 {
-            if shared.terminate.load(Ordering::Acquire) {
+            if shared.termination.requested() {
                 return;
             }
             let state = lock_lifecycle(&shared.state);
@@ -2443,7 +2448,7 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if shared.terminate.load(Ordering::Acquire) && !termination_attempted {
+        if shared.termination.requested() && !termination_attempted {
             if shared.traced.load(Ordering::Acquire) {
                 termination_attempted = true;
                 // The sole waiter has not reaped this direct child, so a live
