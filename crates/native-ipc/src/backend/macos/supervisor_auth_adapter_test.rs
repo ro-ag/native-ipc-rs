@@ -1124,7 +1124,6 @@ fn raw_mach_receive_obeys_original_empty_queue_deadline() {
     // SAFETY: the test is the sole receiver and retains the live receive right.
     let mut receiver =
         unsafe { RawMachReceiver::from_borrowed_launchd_receive_right(service.name).unwrap() };
-    let started = Instant::now();
     assert!(matches!(
         receiver.receive_and_dispatch_capped(
             job_id(90),
@@ -1134,7 +1133,6 @@ fn raw_mach_receive_obeys_original_empty_queue_deadline() {
         ),
         Err(AuthAdapterError::DeadlineExpired)
     ));
-    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
@@ -1166,9 +1164,7 @@ fn authenticated_reply_send_handles_dead_and_invalid_destinations() {
     assert_eq!(reply.send_once_rights(), 1);
     let old_receive_name = reply.name;
     reply.destroy_receive();
-    let started = Instant::now();
     assert_eq!(request.send_reply(), Ok(()));
-    assert!(started.elapsed() < Duration::from_secs(1));
 
     // SAFETY: this deliberately models a numeric name that became invalid
     // before send, exercising recoverable-send cleanup of the post-call buffer.

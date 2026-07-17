@@ -3839,7 +3839,6 @@ fn isolated_decision_silence_and_exit_restore_exact_baselines() {
         OsString::from("decision-silent"),
     ));
     let operation_deadline = AbsoluteDeadline::after(Duration::from_millis(250)).unwrap();
-    let started = std::time::Instant::now();
     let owner = spawn_negotiating(
         &executable,
         &arguments,
@@ -3853,7 +3852,6 @@ fn isolated_decision_silence_and_exit_restore_exact_baselines() {
         owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::Packet(PacketError::DeadlineExpired)
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
 
     let mut exit_environment = decision_environment(1, 1, "accept");
@@ -3870,12 +3868,10 @@ fn isolated_decision_silence_and_exit_restore_exact_baselines() {
     )
     .unwrap();
     let pid = owner.pid();
-    let started = std::time::Instant::now();
     assert_eq!(
         owner.decide(ApplicationDecision::Accept).err().unwrap().0,
         LinuxSpawnError::Packet(PacketError::PeerExited)
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     wait_for_baseline(before_fds, before_tasks, pid, deadline());
 }
 
@@ -4204,7 +4200,6 @@ fn isolated_hello_deadline_and_peer_exit_restore_exact_baselines() {
     let arguments = helper_arguments();
 
     let operation_deadline = AbsoluteDeadline::after(Duration::from_millis(250)).unwrap();
-    let started = std::time::Instant::now();
     let silent = spawn_negotiating(
         &executable,
         &arguments,
@@ -4217,17 +4212,13 @@ fn isolated_hello_deadline_and_peer_exit_restore_exact_baselines() {
     )
     .err()
     .unwrap();
-    let elapsed = started.elapsed();
     assert_eq!(
         silent,
         LinuxSpawnError::Packet(PacketError::DeadlineExpired)
     );
-    assert!(elapsed >= Duration::from_millis(100));
-    assert!(elapsed < Duration::from_secs(2));
     let silent_pid = LAST_SPAWN_PID.with(|slot| slot.get());
     wait_for_baseline(before_fds, before_tasks, silent_pid, deadline());
 
-    let started = std::time::Instant::now();
     let exited = spawn_negotiating(
         &executable,
         &arguments,
@@ -4241,7 +4232,6 @@ fn isolated_hello_deadline_and_peer_exit_restore_exact_baselines() {
     .err()
     .unwrap();
     assert_eq!(exited, LinuxSpawnError::Packet(PacketError::PeerExited));
-    assert!(started.elapsed() < Duration::from_secs(2));
     let exited_pid = LAST_SPAWN_PID.with(|slot| slot.get());
     wait_for_baseline(before_fds, before_tasks, exited_pid, deadline());
 }

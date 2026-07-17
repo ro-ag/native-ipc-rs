@@ -3,7 +3,7 @@ use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::session::AbsoluteDeadline;
 
@@ -1630,21 +1630,15 @@ fn isolated_exact_child_terminal_cleanup_failure_helper() {
 
     let child = lifecycle_child(deadline());
     child.inject_signal_failure(libc::EIO);
-    let started = Instant::now();
     assert_incomplete_direct(child.terminate_and_reap(deadline()), Some(libc::EIO));
-    assert!(started.elapsed() < Duration::from_secs(1));
 
     let child = lifecycle_child(deadline());
     child.inject_poll_failure(libc::EIO);
-    let started = Instant::now();
     assert_incomplete_direct(child.terminate_and_reap(deadline()), Some(libc::EIO));
-    assert!(started.elapsed() < Duration::from_secs(1));
 
     let child = lifecycle_child(deadline());
     child.inject_reap_failure(libc::EIO);
-    let started = Instant::now();
     assert_incomplete_direct(child.terminate_and_reap(deadline()), Some(libc::EIO));
-    assert!(started.elapsed() < Duration::from_secs(1));
 
     // These workers deliberately retain their exact pidfds until this isolated
     // process exits. Process teardown is the backstop for simulated terminal

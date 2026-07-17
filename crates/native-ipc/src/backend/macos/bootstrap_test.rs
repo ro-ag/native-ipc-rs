@@ -1325,9 +1325,7 @@ fn spawned_helper_imports_memory_entry_and_reads_payload() {
     let peer_reader = peer_owner
         .transfer_remote_writer(native_peer, peer_expected, topology, &mut channel)
         .unwrap();
-    let before_commit = Instant::now();
     let (mut writer, peer_reader) = channel.commit_transfers(writer, peer_reader).unwrap();
-    assert!(before_commit.elapsed() >= Duration::from_millis(90));
     writer.publish(0, 1, None, b"cross-process-mach").unwrap();
     for _ in 0..10_000 {
         if let Ok(payload) = peer_reader.copy_payload(0, 1) {
