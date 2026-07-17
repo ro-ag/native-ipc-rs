@@ -1016,6 +1016,9 @@ fn observe_vnext_drop_for_test(label: &'static str) {
     });
 }
 
+#[path = "macos_vnext/image_identity.rs"]
+pub(crate) mod vnext_image_identity;
+
 #[path = "macos_vnext/memory.rs"]
 pub(crate) mod vnext_memory;
 
@@ -1024,6 +1027,10 @@ pub(crate) mod vnext_transport;
 
 #[path = "macos_vnext/session.rs"]
 pub(crate) mod vnext_session;
+
+#[cfg(test)]
+#[path = "macos_vnext/image_identity_test.rs"]
+mod vnext_image_identity_test;
 
 #[cfg(test)]
 #[path = "macos_vnext/memory_test.rs"]

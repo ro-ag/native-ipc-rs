@@ -57,6 +57,15 @@ pub(super) const MAX_VNEXT_RECORD_BYTES: usize = 64 * 1024;
 const MAX_VNEXT_CAPABILITIES: usize = 16;
 const WNOHANG: c_int = 1;
 const WUNTRACED: c_int = 2;
+const WEXITED: c_int = 0x0000_0004;
+const WNOWAIT: c_int = 0x0000_0020;
+const P_PID: c_int = 1;
+// Transient-glitch tolerance for the pinned-witness re-observation. Kernel
+// artifacts of back-to-back nonblocking queries last microseconds, so a few
+// retried milliseconds cover them; the bound keeps a persistent refusal from
+// stalling cleanup, which then honestly reports the unverified status.
+const GROUP_ATTEMPT_LIMIT: usize = 50;
+const EPERM: c_int = 1;
 const ESRCH: c_int = 3;
 const SIGSTOP: c_int = 17;
 const SIGCONT: c_int = 19;
@@ -118,6 +127,25 @@ unsafe extern "C" {
     ) -> c_int;
     fn kill(pid: Pid, signal: c_int) -> c_int;
     fn waitpid(pid: Pid, status: *mut c_int, options: c_int) -> Pid;
+    fn waitid(idtype: c_int, id: u32, information: *mut DarwinSigInfo, options: c_int) -> c_int;
+    fn killpg(process_group: Pid, signal: c_int) -> c_int;
+    fn getpgid(pid: Pid) -> Pid;
+    fn getsid(pid: Pid) -> Pid;
+}
+
+/// Darwin `siginfo_t` transcribed from the macOS SDK's `sys/signal.h`.
+#[repr(C)]
+struct DarwinSigInfo {
+    si_signo: c_int,
+    si_errno: c_int,
+    si_code: c_int,
+    si_pid: Pid,
+    si_uid: u32,
+    si_status: c_int,
+    si_addr: *mut c_void,
+    si_value: *mut c_void,
+    si_band: isize,
+    __pad: [u64; 7],
 }
 
 #[link(name = "proc")]
@@ -631,6 +659,7 @@ impl SpawnedHelper {
             };
             owner.install_task_identity(task_name, audit_token);
             owner.activate(pid);
+            owner.verify_fresh_group_while_suspended(pid);
             // Resume the exact captured execution rather than addressing the
             // reusable PID with a numeric SIGCONT.
             if let Err(error) = signal_with_audit_token(&mut audit_token, SIGCONT) {
@@ -750,6 +779,14 @@ impl SpawnedHelper {
     pub const fn pid(&self) -> u32 {
         self.pid as u32
     }
+
+    /// Audit-token words captured while the fresh child was still suspended,
+    /// pinning the exact pre-resume execution for kernel identity queries.
+    pub(super) fn suspended_audit_token_values(&self) -> Option<[u32; 8]> {
+        self.lifecycle
+            .as_ref()
+            .and_then(MacChildLifecycle::audit_token_values)
+    }
 }
 
 impl Drop for SpawnedHelper {
@@ -788,12 +825,14 @@ struct MacChildLifecycleState {
     exit_status: Option<i32>,
     task_name: Option<TaskNameRight>,
     audit_token: Option<AuditToken>,
+    descendants: DescendantCleanupStatus,
 }
 
 struct MacChildLifecycleShared {
     pid: AtomicI32,
     terminate: AtomicBool,
     traced: AtomicBool,
+    fresh_group_verified: AtomicBool,
     reaper_gate: Mutex<()>,
     state: Mutex<MacChildLifecycleState>,
     changed: Condvar,
@@ -814,6 +853,7 @@ impl MacChildLifecycle {
             pid: AtomicI32::new(0),
             terminate: AtomicBool::new(false),
             traced: AtomicBool::new(false),
+            fresh_group_verified: AtomicBool::new(false),
             reaper_gate: Mutex::new(()),
             state: Mutex::new(MacChildLifecycleState {
                 reaped: false,
@@ -821,6 +861,7 @@ impl MacChildLifecycle {
                 exit_status: None,
                 task_name: None,
                 audit_token: None,
+                descendants: DescendantCleanupStatus::FreshGroupUnverified,
             }),
             changed: Condvar::new(),
             #[cfg(test)]
@@ -885,6 +926,27 @@ impl MacChildLifecycle {
         self.shared.changed.notify_all();
     }
 
+    pub(super) fn audit_token_values(&self) -> Option<[u32; 8]> {
+        lock_lifecycle(&self.shared.state)
+            .audit_token
+            .map(|token| token.values)
+    }
+
+    /// Kernel-verifies the fresh session while the suspended child cannot run.
+    ///
+    /// Session leadership is irrevocable — a leader can never change its own
+    /// process group or session — so this one pre-resume observation remains
+    /// true for the child's whole lifetime, including its unreaped zombie,
+    /// even though Darwin refuses these queries once the process is a zombie.
+    fn verify_fresh_group_while_suspended(&self, pid: Pid) {
+        // SAFETY: scalar identity queries about the suspended pinned child.
+        if unsafe { getpgid(pid) == pid && getsid(pid) == pid } {
+            self.shared
+                .fresh_group_verified
+                .store(true, Ordering::Release);
+        }
+    }
+
     fn pause_reaping(&self) -> MacReapingPause<'_> {
         MacReapingPause {
             _guard: match self.shared.reaper_gate.lock() {
@@ -927,7 +989,12 @@ impl MacChildLifecycle {
     }
 
     pub(super) fn wait_and_reap_facts(&self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
-        mac_child_cleanup_facts(self.wait_and_reap_status(deadline))
+        let status = self.wait_and_reap_status(deadline);
+        mac_child_cleanup_facts(status, self.descendant_status())
+    }
+
+    fn descendant_status(&self) -> DescendantCleanupStatus {
+        lock_lifecycle(&self.shared.state).descendants
     }
 
     pub(super) fn terminate_and_reap_status(
@@ -938,7 +1005,8 @@ impl MacChildLifecycle {
     }
 
     pub(super) fn terminate_and_reap_facts(&self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
-        mac_child_cleanup_facts(self.terminate_and_reap_status(deadline))
+        let status = self.terminate_and_reap_status(deadline);
+        mac_child_cleanup_facts(status, self.descendant_status())
     }
 
     pub(super) fn terminate_and_reap(
@@ -1002,8 +1070,10 @@ struct MacReapingPause<'a> {
     _guard: std::sync::MutexGuard<'a, ()>,
 }
 
-fn mac_child_cleanup_facts(result: Result<i32, SessionTransportError>) -> ChildCleanupFacts {
-    let descendants = DescendantCleanupStatus::FreshGroupUnverified;
+fn mac_child_cleanup_facts(
+    result: Result<i32, SessionTransportError>,
+    descendants: DescendantCleanupStatus,
+) -> ChildCleanupFacts {
     match result {
         Ok(status) if status & 0x7f == 0 => ChildCleanupFacts::new(
             Some(ChildExitStatus::Exited((status >> 8) & 0xff)),
@@ -1052,6 +1122,11 @@ impl Clone for MacChildLifecycle {
 impl ParentChannel {
     pub(super) const fn vnext_nonce(&self) -> [u8; 32] {
         self.nonce
+    }
+
+    /// Authenticated peer audit-token words for exact kernel identity queries.
+    pub(super) fn peer_audit_values(&self) -> Option<[u32; 8]> {
+        self.peer_audit.map(|token| token.values)
     }
 
     pub(super) fn send_vnext_zero_rights(
@@ -2344,6 +2419,8 @@ fn signal_with_audit_token(token: &mut AuditToken, signal: c_int) -> Result<(), 
 
 fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
     let mut termination_attempted = false;
+    let mut group_termination_attempted = false;
+    let mut unavailable_probes = 0_usize;
     let mut pending_signal_error = None;
     loop {
         let pid = shared.pid.load(Ordering::Acquire);
@@ -2416,9 +2493,64 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             continue;
         }
 
+        let traced = shared.traced.load(Ordering::Acquire);
+        // Non-traced public children can lead a fresh session whose ordinary
+        // descendants must be group-terminated before this sole waiter reaps
+        // the pinning direct-child status. The reap is therefore gated on a
+        // cheap `WNOWAIT` probe that leaves the status queued: the group
+        // signal always precedes the reap that would release the identity pin.
+        // A traced child (backend-private launcher, never a fresh public
+        // group) uses the exact original `waitpid` path below, untouched.
+        if !traced && !group_termination_attempted {
+            match queued_exit_probe(pid) {
+                QueuedExit::Pinned => {
+                    unavailable_probes = 0;
+                    group_termination_attempted = true;
+                    if shared.fresh_group_verified.load(Ordering::Acquire)
+                        && terminate_descendant_group_under_pin(pid)
+                    {
+                        lock_lifecycle(&shared.state).descendants =
+                            DescendantCleanupStatus::FreshGroupTerminated;
+                    }
+                    // Fall through to the reaping waitpid; the pin is released
+                    // only by that reap.
+                }
+                QueuedExit::NotExited => {
+                    // Not exited: nothing to reap or group-terminate yet.
+                    unavailable_probes = 0;
+                    drop(reaper_gate);
+                    if let Some(error) = pending_signal_error.take() {
+                        let mut state = lock_lifecycle(&shared.state);
+                        state.last_error = Some(error);
+                        shared.changed.notify_all();
+                    }
+                    let state = lock_lifecycle(&shared.state);
+                    let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
+                        Ok(result) => result,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    continue;
+                }
+                QueuedExit::Unavailable if unavailable_probes < GROUP_ATTEMPT_LIMIT => {
+                    // A transient probe failure must not skip the pre-reap
+                    // group step; retry a bounded number of times before
+                    // letting the reap proceed on a persistent refusal.
+                    unavailable_probes += 1;
+                    drop(reaper_gate);
+                    let state = lock_lifecycle(&shared.state);
+                    let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
+                        Ok(result) => result,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    continue;
+                }
+                QueuedExit::Unavailable => group_termination_attempted = true,
+            }
+        }
+
         let mut status = 0;
         // SAFETY: this worker is the sole waiter for the exact spawned PID.
-        let wait_options = if termination_attempted && shared.traced.load(Ordering::Acquire) {
+        let wait_options = if termination_attempted && traced {
             WNOHANG | WUNTRACED
         } else {
             WNOHANG
@@ -2473,6 +2605,91 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
             Err(poisoned) => poisoned.into_inner(),
         };
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueuedExit {
+    /// The exact child's exit status is queued and unconsumed, which pins its
+    /// PID and process-group identity against reuse until this owner reaps.
+    Pinned,
+    /// The exact child has not exited.
+    NotExited,
+    /// The queued-exit question could not be answered; reaping proceeds
+    /// without any numeric group operation.
+    Unavailable,
+}
+
+fn queued_exit_probe(pid: Pid) -> QueuedExit {
+    if pid <= 0 {
+        return QueuedExit::Unavailable;
+    }
+    loop {
+        // SAFETY: zero is valid initialization for waitid output storage.
+        let mut information: DarwinSigInfo = unsafe { core::mem::zeroed() };
+        // SAFETY: P_PID targets this owner's exact unreaped child and WNOWAIT
+        // leaves the reported status queued rather than consuming it.
+        let result = unsafe {
+            waitid(
+                P_PID,
+                pid as u32,
+                &mut information,
+                WEXITED | WNOHANG | WNOWAIT,
+            )
+        };
+        if result != 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return QueuedExit::Unavailable;
+        }
+        return if information.si_pid == pid {
+            QueuedExit::Pinned
+        } else {
+            QueuedExit::NotExited
+        };
+    }
+}
+
+/// Bounded ordinary-descendant group termination after the caller observed
+/// the queued-exit pin on a birth-verified fresh session leader. Returns true
+/// only when the pin is observed again afterwards, proving the numeric group
+/// identity held throughout because only the sole waiter's own reap can
+/// release it.
+///
+/// `killpg`'s own return distinguishes the outcomes without any system-wide
+/// process scan: `0` signaled at least one live in-group descendant, while
+/// Darwin reports `EPERM`/`ESRCH` for a group whose only member is the pinned
+/// zombie leader — a vacuously terminated group. Any other errno is a real
+/// failure.
+fn terminate_descendant_group_under_pin(pid: Pid) -> bool {
+    // SAFETY: the pinned zombie leader plus the irrevocable pre-resume session
+    // verification prove this numeric group is still the fresh session created
+    // for the exact child, so SIGKILL to it cannot reach any process outside
+    // that owned session.
+    let terminated = unsafe { killpg(pid, 9) } == 0
+        || matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(EPERM) | Some(ESRCH)
+        );
+    terminated && witnessed_pin(pid)
+}
+
+/// Confirms the queued-exit pin again after the group operation. An exit is
+/// permanent, so a not-exited or unanswerable probe after the caller already
+/// observed the queued exit can only be a transient kernel artifact of
+/// back-to-back nonblocking `WNOWAIT` queries under load; retry it. Only a
+/// persistent refusal (the status actually consumed by a waiter this design
+/// excludes) refutes the witness.
+fn witnessed_pin(pid: Pid) -> bool {
+    for _ in 0..GROUP_ATTEMPT_LIMIT {
+        match queued_exit_probe(pid) {
+            QueuedExit::Pinned => return true,
+            QueuedExit::Unavailable | QueuedExit::NotExited => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    false
 }
 
 fn port_peer_state(name: MachPort) -> Result<PeerState, SessionTransportError> {

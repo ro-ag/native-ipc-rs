@@ -1144,18 +1144,31 @@ apparent tensions resolve as follows:
    not dual RW/RX aliases or the outside-tree receiver-writer delegation case.
 4. Windows remote cleanup is containment/process teardown, not unsafe numeric
    remote-handle closure after resume.
-5. Linux process-group creation does not make numeric PGID termination
-   race-resistant. The section 9 MUST for bounded ordinary-descendant group
-   termination conflicts with the malicious-receiver plus broad-waiter model
-   unless stronger trusted containment is added. The private checkpoint fails
-   closed by omitting numeric group signals and blocks release pending a
-   normative amendment or mandatory stronger containment.
+5. Linux process-group creation alone does not make numeric PGID termination
+   race-resistant: under the original SIGCHLD-visible clone, a broad waiter or
+   an ignored-SIGCHLD auto-reap could consume the direct child and free its
+   numeric group identity for reuse. This is resolved without a normative
+   amendment by making the identity pin kernel-durable and gating the group
+   signal on it. The production child is cloned with a zero exit signal, so no
+   default process-global wait selects it and no SIGCHLD disposition can
+   auto-reap it; only the sole pidfd owner's `__WALL` wait can release the
+   unreaped zombie that pins the PID and fresh-group identity. Group SIGKILL
+   is issued only after a `WNOWAIT` observation of the queued exit, only for a
+   kernel-verified `pid == pgid == sid` leader, and is reported as performed
+   only when the pin is observed again afterwards. macOS reaches the same
+   shape by verifying the `POSIX_SPAWN_SETSID` session while the suspended
+   child cannot yet run (leadership is irrevocable, surviving Darwin's refusal
+   to answer group queries about zombies) and by gating the sole waiter's reap
+   on the same `WNOWAIT` queued-exit observation. An in-process `__WALL`
+   waiter (Linux) or a violated sole-waiter discipline (macOS) degrades the
+   report to the unverified status rather than signaling a reusable identity.
 6. A bounded termination/reap attempt does not guarantee successful bounded
    reap when a task is stuck in an uninterruptible kernel wait; the cleanup
    ledger retains ownership and reports this exact incomplete state.
 
 The memory-authority mechanism design is feasible under the explicit Linux
-kernel limit above. Phase 0's execute-authority contradiction is resolved, but
-the newly proven Linux process-group identity contradiction blocks release
-pending a normative amendment or mandatory stronger containment. Exact
-five-target implementation evidence also remains outstanding.
+kernel limit above. Phase 0's execute-authority contradiction is resolved, and
+the Linux process-group identity contradiction is resolved by the zero-exit-
+signal zombie pin and pinned group termination described in item 5, keeping
+the section 9 MUST implementable without a normative amendment. Exact
+five-target release evidence remains outstanding.

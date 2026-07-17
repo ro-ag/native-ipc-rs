@@ -7,7 +7,7 @@
 use core::cell::Cell;
 use core::marker::PhantomData;
 use std::ffi::{CStr, CString, OsStr, OsString, c_char, c_int, c_void};
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -16,6 +16,8 @@ use std::path::Path;
 use super::bootstrap::{
     self, BootstrapError, ChildChannel, MacChildLifecycle, ParentChannel, SpawnedHelper,
 };
+use super::vnext_image_identity as image_identity;
+use super::vnext_image_identity::ImageIdentityError;
 use super::vnext_memory::{MacBatchError, MacMixedDirectionBatch};
 use super::vnext_transport::{CoordinatorMacControlTransport, ReceiverMacControlTransport};
 use crate::backend::accepted_control::{
@@ -44,7 +46,6 @@ const NONCE_LEN: usize = 32;
 const ESRCH: c_int = 3;
 const O_CLOEXEC: c_int = 0x0100_0000;
 const O_NOFOLLOW_ANY: c_int = 0x2000_0000;
-const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 const MAX_MAC_HELLO_PAYLOAD: usize = bootstrap::MAX_VNEXT_RECORD_BYTES - HEADER_LEN;
 const MAX_MAC_CONTROL_PAYLOAD: u32 =
     (bootstrap::MAX_VNEXT_RECORD_BYTES - CONTROL_HEADER_LEN) as u32;
@@ -57,7 +58,6 @@ const RESERVED_ENVIRONMENT: [&[u8]; 4] = [
 ];
 
 unsafe extern "C" {
-    fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffer_size: u32) -> c_int;
     fn sysctlbyname(
         name: *const c_char,
         old_value: *mut c_void,
@@ -152,17 +152,9 @@ struct MacHelloOffer {
     application_payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-    mode: u32,
-}
-
 pub(super) struct HeldExecutable {
     _file: File,
-    identity: FileIdentity,
+    cdhashes: Vec<[u8; image_identity::CDHASH_LEN]>,
 }
 
 pub(crate) struct MacCoordinatorNegotiatingSession {
@@ -212,34 +204,39 @@ impl HeldExecutable {
         if !metadata.file_type().is_file() || metadata.mode() & 0o6000 != 0 {
             return Err(MacPublicSessionError::InvalidInput);
         }
+        // The content identity is read through the retained descriptor, never
+        // the pathname, so later pathname swaps cannot move this baseline. A
+        // file with no computable code directory (unsigned or script input)
+        // can never be bound to a running image and fails closed here.
+        let cdhashes = image_identity::held_image_cdhashes(&file).map_err(|error| match error {
+            ImageIdentityError::UnsupportedImage | ImageIdentityError::MalformedImage => {
+                MacPublicSessionError::InvalidInput
+            }
+            ImageIdentityError::Native(code) => MacPublicSessionError::Native(code),
+        })?;
         Ok(Self {
-            identity: file_identity(&metadata),
+            cdhashes,
             _file: file,
         })
     }
 
-    fn matches_process_image(&self, pid: u32) -> Result<bool, MacPublicSessionError> {
-        let mut path = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE];
-        // SAFETY: `path` is a live writable buffer of the supplied exact size.
-        let length =
-            unsafe { proc_pidpath(pid as c_int, path.as_mut_ptr().cast(), path.len() as u32) };
-        if length <= 0 {
-            // Only "no such process" means the peer is gone; every other
-            // failure names a live process whose image could not be read and
-            // must not be reported as an exit.
-            return Err(match std::io::Error::last_os_error().raw_os_error() {
-                Some(ESRCH) => MacPublicSessionError::PeerExited,
-                code => MacPublicSessionError::Native(code),
-            });
+    /// Compares the kernel-registered code-directory hash of the exact
+    /// execution named by `token_values` against the held file's hashes.
+    ///
+    /// The kernel refuses the query once the PID no longer carries that exact
+    /// audit token, so a reused PID or a post-capture `exec` reports as an
+    /// exit rather than as another process's identity.
+    fn matches_running_image(
+        &self,
+        pid: u32,
+        token_values: Option<[u32; 8]>,
+    ) -> Result<bool, MacPublicSessionError> {
+        let token_values = token_values.ok_or(MacPublicSessionError::Ambiguous)?;
+        match image_identity::process_cdhash_with_token(pid, token_values) {
+            Ok(hash) => Ok(self.cdhashes.contains(&hash)),
+            Err(Some(ESRCH)) => Err(MacPublicSessionError::PeerExited),
+            Err(code) => Err(MacPublicSessionError::Native(code)),
         }
-        path.truncate(length as usize);
-        let process_path = OsStr::from_bytes(&path);
-        let image = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_CLOEXEC | O_NOFOLLOW_ANY)
-            .open(process_path)
-            .map_err(native_io)?;
-        Ok(file_identity(&image.metadata().map_err(native_io)?) == self.identity)
     }
 }
 
@@ -247,6 +244,33 @@ impl MacCoordinatorNegotiatingSession {
     pub(crate) fn spawn(
         command: &SessionCommand,
         options: &SessionOptions,
+    ) -> Result<Self, MacCoordinatorSessionFailure> {
+        Self::spawn_with_hooks(command, options, || (), || ())
+    }
+
+    /// Runs the production spawn with injection points around the launch so a
+    /// test can replace the configured file after the identity baseline is
+    /// retained and restore it before any recheck could observe the swap.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_image_hooks_for_test(
+        command: &SessionCommand,
+        options: &SessionOptions,
+        after_open_before_spawn: impl FnOnce(),
+        after_spawn_before_check: impl FnOnce(),
+    ) -> Result<Self, MacCoordinatorSessionFailure> {
+        Self::spawn_with_hooks(
+            command,
+            options,
+            after_open_before_spawn,
+            after_spawn_before_check,
+        )
+    }
+
+    fn spawn_with_hooks(
+        command: &SessionCommand,
+        options: &SessionOptions,
+        after_open_before_spawn: impl FnOnce(),
+        after_spawn_before_check: impl FnOnce(),
     ) -> Result<Self, MacCoordinatorSessionFailure> {
         if options.deadline().is_expired() || command.arguments().is_empty() {
             return Err(MacCoordinatorSessionFailure::before_child(
@@ -277,6 +301,7 @@ impl MacCoordinatorNegotiatingSession {
                 .expect("fixed public bootstrap environment"),
         );
 
+        after_open_before_spawn();
         let helper = match SpawnedHelper::spawn_explicit(&path, &arguments, &environment) {
             Ok(helper) => helper,
             Err(BootstrapError::ExactAuthorityUnavailable { native_error }) => {
@@ -296,19 +321,40 @@ impl MacCoordinatorNegotiatingSession {
             }
         };
         let child_pid = helper.pid();
+        after_spawn_before_check();
+        // Bind the exec'd incarnation to the held content before waiting on
+        // any child cooperation. The token was captured while the fresh child
+        // was still suspended, so a pathname swapped between the identity
+        // baseline and `posix_spawn` is caught here even if the path is
+        // restored immediately after launch.
+        match executable.matches_running_image(child_pid, helper.suspended_audit_token_values()) {
+            Ok(true) => {}
+            Ok(false) => {
+                let cleanup = helper.cleanup_vnext_until(options.deadline());
+                return Err(MacCoordinatorSessionFailure::after_spawn(
+                    MacPublicSessionError::IdentityMismatch,
+                    cleanup,
+                ));
+            }
+            Err(error) => {
+                let cleanup = helper.cleanup_vnext_until(options.deadline());
+                return Err(MacCoordinatorSessionFailure::after_spawn(error, cleanup));
+            }
+        }
         let (mut channel, lifecycle) = helper
             .authenticate_vnext_until(options.deadline())
             .map_err(|(error, cleanup)| {
                 MacCoordinatorSessionFailure::after_spawn(map_bootstrap_error(error), cleanup)
             })?;
-        let image_matches = match executable.matches_process_image(child_pid) {
-            Ok(matches) => matches,
-            Err(error) => {
-                drop(channel);
-                let cleanup = lifecycle.terminate_and_reap_facts(options.deadline());
-                return Err(MacCoordinatorSessionFailure::after_spawn(error, cleanup));
-            }
-        };
+        let image_matches =
+            match executable.matches_running_image(child_pid, channel.peer_audit_values()) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    drop(channel);
+                    let cleanup = lifecycle.terminate_and_reap_facts(options.deadline());
+                    return Err(MacCoordinatorSessionFailure::after_spawn(error, cleanup));
+                }
+            };
         if !image_matches {
             drop(channel);
             let cleanup = lifecycle.terminate_and_reap_facts(options.deadline());
@@ -489,33 +535,36 @@ impl MacCoordinatorNegotiatingSession {
         // received record was bound to the authenticated child execution by
         // the pinned kernel audit trailer and nonce. A child that exited
         // after sending its decision therefore completed negotiation, and the
-        // queued decision must win over any exit observation. The live-image
-        // verdict below is only meaningful while the exact child is still the
-        // process behind `peer_pid`; once its sole waiter has reaped it, the
-        // numeric PID may name an unrelated process. Anything but a live
-        // match or a confirmed exact exit stays fail-closed.
+        // queued decision must win over any exit observation. The image
+        // verdict below is audit-token bound: the kernel answers only while
+        // the exact authenticated execution is still behind `peer_pid`, and a
+        // reused PID or a post-authentication `exec` reports `ESRCH` instead
+        // of another image's identity. Anything but a token-bound match or a
+        // confirmed exact exit stays fail-closed.
         let lifecycle = self
             .lifecycle
             .as_ref()
             .ok_or(MacPublicSessionError::PeerExited)?;
         match self
             .executable
-            .matches_process_image(self.channel.peer_pid())
+            .matches_running_image(self.channel.peer_pid(), self.channel.peer_audit_values())
         {
             Ok(true) => {}
             Err(MacPublicSessionError::PeerExited) => {
-                // No live process behind the PID: the exact child exited as a
-                // zombie or was already reaped. Confirm the exact reap under
-                // the caller deadline before treating negotiation as won.
+                // The authenticated execution is gone: it exited (possibly
+                // still a zombie), was reaped, or replaced itself with a
+                // different image. Confirm the exact reap under the caller
+                // deadline before treating negotiation as won; a live
+                // replaced child never reaps and therefore fails closed here.
                 lifecycle
                     .wait_and_reap_status(self.deadline)
                     .map_err(map_transport_error)?;
             }
             Ok(false) => {
-                // A live process with a different image is either a re-exec
-                // of the still-running child (terminal) or an unrelated
-                // process that received the reused PID after the exact child
-                // was reaped (negotiation already complete).
+                // The authenticated execution is alive and still reports a
+                // code-directory hash the held file does not carry. This can
+                // only be the launch-time swap that the spawn-side check
+                // exists to reject, so it is terminal.
                 if !matches!(
                     lifecycle.try_poll().map_err(map_transport_error)?,
                     crate::backend::PeerState::ExitedUnknown
@@ -553,9 +602,10 @@ impl MacCoordinatorNegotiatingSession {
         // PID and nonce before this owner could exchange either HELLO.
         let channel_receipt =
             unsafe { CoordinatorChildChannelReceipt::from_verified_native(facts) };
-        // SAFETY: the retained pre-spawn file identity matched the live process
-        // image after spawn and after channel authentication. After ACCEPT it
-        // either matched the still-live image, or the exact child was
+        // SAFETY: the running image's kernel-registered code-directory hash
+        // matched a hash computed from the retained descriptor at spawn and
+        // after channel authentication, both bound to the authenticated audit
+        // token. After ACCEPT it either matched again, or the exact child was
         // confirmed reaped by its sole waiter, in which case no execution
         // remains that could carry a different image.
         let image_receipt = unsafe { CoordinatorChildImageReceipt::from_verified_native(facts) };
@@ -1112,15 +1162,6 @@ fn encode_environment(
 
 fn cstring(value: &OsStr) -> Result<CString, MacPublicSessionError> {
     CString::new(value.as_bytes()).map_err(|_| MacPublicSessionError::InvalidInput)
-}
-
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        size: metadata.size(),
-        mode: metadata.mode(),
-    }
 }
 
 fn native_io(error: std::io::Error) -> MacPublicSessionError {

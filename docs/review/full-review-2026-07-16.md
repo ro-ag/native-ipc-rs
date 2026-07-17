@@ -242,8 +242,17 @@ the review branch:
 
 The full local gate, Miri, and Linux/Windows cross-target compilation pass with
 those corrections. The macOS opened-file launch guarantee and the Unix
-ordinary-descendant cleanup guarantee remain unresolved P1 blockers. The P3
-batch API proposal remains report-only.
+ordinary-descendant cleanup guarantee remained unresolved P1 blockers at the
+time of this review. The P3 batch API proposal remains report-only.
+
+Resolution follow-up (2026-07-17): both remaining P1 findings were resolved by
+stronger retained mechanisms with no normative specification change. The macOS
+launch now binds the started image to the retained descriptor by comparing the
+kernel's audit-token-bound code-directory hash against hashes computed from
+the held file, and both Unix backends perform bounded ordinary-descendant
+group termination under the unreaped direct child's kernel-witnessed identity
+pin. Decisions, evidence, and rows `p1-16`/`p1-17` are recorded in
+[`../vnext-traceability.md`](../vnext-traceability.md).
 
 ## Six-pass disposition
 

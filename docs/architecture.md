@@ -331,9 +331,10 @@ disposable clean-exec authentication worker.
 This design uses no root, set-ID transition, root-owned path, privileged
 service, or request-selected executable. Applications own signing, packaging,
 notarization, and any additional filesystem/network policy. Exact direct-child
-termination/reap is implemented; race-resistant ordinary-descendant group
-termination is not claimed. A separate malicious same-user process is outside
-the host/runner integration model. The authoritative current description and
+termination/reap is implemented, and bounded ordinary-descendant group
+termination runs under the unreaped direct child's kernel-witnessed identity
+pin before the reap releases it. A separate malicious same-user process is
+outside the host/runner integration model. The authoritative current description and
 enablement gate are in
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
 
@@ -468,11 +469,17 @@ destroys malformed/complex/oversized input, retains a linear send-once reply,
 constructions, the primary-source evidence, and the enable decision history
 are recorded in
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md). In the
-post-authentication prototype the
-coordinator retains an opened regular non-setid
-executable and compares its stable path identity with `proc_pidpath` after
-authentication and again through ACCEPT. This is not fd-exec, immutable
-running-vnode proof, or replacement denial. Spawn launches the helper in a
+post-authentication prototype the coordinator retains an opened regular
+non-setid executable and binds every launch to its content identity: opening
+computes the code-directory hash set of the held descriptor across all slices
+and alternate code directories, and the running image must report one of those
+hashes through the kernel's audit-token-bound code-signing query immediately
+after the suspended spawn resumes, after channel authentication, and again
+through ACCEPT. A reused PID or a post-capture `exec` fails the token binding
+instead of answering with another image's identity, and files with no
+computable code directory (unsigned images, scripts) fail construction closed.
+This is content-identity binding, not fd-exec or replacement denial of the
+pathname. Spawn launches the helper in a
 fresh POSIX session with close-on-exec default and transfers wait ownership to
 a durable nonblocking reaper before the deadline-bound Mach bootstrap receive.
 The private channel validates exact audit PID and nonce;
@@ -480,8 +487,14 @@ only canonical bilateral HELLO and challenged ACCEPT mint role-scoped evidence.
 Prototype Ready control and mixed transfers reuse the common dispatcher, including a
 bilateral capacity preflight that returns both endpoints cleanly to Ready on an
 asymmetric active limit. Direct-child status is reported only after the sole
-waiter reaps it; descendant cleanup is `FreshGroupUnverified` because macOS has
-no retained race-resistant process-group handle in the public session path.
+waiter reaps it. Descendant cleanup performs bounded group termination under
+the direct child's identity pin: the fresh session is kernel-verified while
+the suspended child cannot yet run (leadership is irrevocable), the reap is
+gated on a `WNOWAIT` queued-exit observation so the unreaped child still pins
+the numeric group identity when `SIGKILL` reaches its members, and the pin is
+re-observed afterwards before the facts report `FreshGroupTerminated`; any
+unwitnessed path keeps reporting `FreshGroupUnverified`. Descendants that left
+the fresh session are out of the sweep by design.
 The private traced-launcher proof prevents direct fork/spawn by the nonroot
 target but is not wired into public sessions until its privileged broker and
 delegation boundary exist. The macOS lifecycle

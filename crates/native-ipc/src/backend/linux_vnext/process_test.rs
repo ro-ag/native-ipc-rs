@@ -1378,8 +1378,10 @@ fn isolated_fresh_session_containment_helper() {
     let deadline = || AbsoluteDeadline::after(Duration::from_secs(5)).unwrap();
 
     // The ordinary descendant inherits the fresh group. Exact-child cleanup
-    // deliberately leaves it alive because Linux has no race-resistant group
-    // handle and a numeric PGID could be reused.
+    // terminates the kernel-verified group while the unreaped direct child
+    // still pins its numeric identity, so the ordinary descendant must die
+    // without any test-side signal. The kernel exit event on its pidfd is the
+    // deterministic observation; the deadline is only a harness escape bound.
     let (ordinary, descendant, descendant_pidfd, pid_file) =
         containment_child("ordinary", deadline());
     assert_eq!(
@@ -1395,22 +1397,15 @@ fn isolated_fresh_session_containment_helper() {
             ..
         })
     ));
-    assert_eq!(cleanup.descendants, DescendantCleanup::FreshGroupUnverified);
-    let mut event = libc::pollfd {
-        fd: descendant_pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: the pidfd remains live for this nonblocking containment-limit check.
-    assert_eq!(unsafe { libc::poll(&mut event, 1, 0) }, 0);
-    signal_exact_child(descendant_pidfd.as_raw_fd(), libc::SIGKILL).unwrap();
+    assert_eq!(cleanup.descendants, DescendantCleanup::FreshGroupTerminated);
     wait_for_pidfd_ready(descendant_pidfd.as_raw_fd(), deadline());
     drop(descendant_pidfd);
     std::fs::remove_file(pid_file).unwrap();
 
-    // A malicious descendant can leave the fresh session. Group teardown must
-    // not be described as containment of that process; a test-only pidfd is the
-    // disposable-helper cleanup backstop.
+    // A malicious descendant can leave the fresh session. The witnessed group
+    // termination is still performed and reported, but it must not touch the
+    // escaped process; a test-only pidfd is the disposable-helper cleanup
+    // backstop.
     let (escaping, descendant, descendant_pidfd, pid_file) =
         containment_child("escape", deadline());
     wait_for_descendant_session(descendant, descendant_pidfd.as_raw_fd(), deadline());
@@ -1427,7 +1422,7 @@ fn isolated_fresh_session_containment_helper() {
             ..
         })
     ));
-    assert_eq!(cleanup.descendants, DescendantCleanup::FreshGroupUnverified);
+    assert_eq!(cleanup.descendants, DescendantCleanup::FreshGroupTerminated);
     let mut event = libc::pollfd {
         fd: descendant_pidfd.as_raw_fd(),
         events: libc::POLLIN,
@@ -1866,6 +1861,168 @@ fn clone3_pidfd_survives_ignored_sigchld() {
         .args([
             "--exact",
             "backend::linux_vnext::process::tests::isolated_clone3_pidfd_sigchld_ignored_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "spawned alone by zero_exit_signal_zombie_pin_survives_hostile_reaping"]
+fn isolated_zero_exit_signal_zombie_pin_helper() {
+    let deadline = AbsoluteDeadline::after(Duration::from_secs(10)).unwrap();
+
+    // The production spawn premise under one roof: an ignored SIGCHLD
+    // disposition, a concurrent process-global broad waiter, and hostile
+    // numeric signals must all fail to release a zero-exit-signal child's
+    // identity pin before the sole pidfd owner consumes its status.
+    install_sigchld_disposition(libc::SIG_IGN, 0);
+
+    let mut lifecycle_pipe = [-1; 2];
+    // SAFETY: output has room for two descriptors.
+    assert_eq!(
+        unsafe {
+            libc::pipe2(
+                lifecycle_pipe.as_mut_ptr(),
+                libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        },
+        0
+    );
+    // SAFETY: successful pipe2 returned two uniquely owned descriptors.
+    let grandchild_alive = unsafe { OwnedFd::from_raw_fd(lifecycle_pipe[0]) };
+    // SAFETY: successful pipe2 returned two uniquely owned descriptors.
+    let grandchild_writer = unsafe { OwnedFd::from_raw_fd(lifecycle_pipe[1]) };
+    let alive_raw = grandchild_alive.as_raw_fd();
+    let writer_raw = grandchild_writer.as_raw_fd();
+
+    let mut raw_pidfd: libc::c_int = -1;
+    let arguments = CloneArgs {
+        flags: CLONE_PIDFD,
+        pidfd: (&mut raw_pidfd as *mut libc::c_int) as u64,
+        exit_signal: 0,
+        ..CloneArgs::default()
+    };
+    // SAFETY: fork-like clone3 with an 88-byte zero-extended clone_args.
+    let child = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &arguments,
+            core::mem::size_of::<CloneArgs>(),
+        ) as libc::pid_t
+    };
+    if child == 0 {
+        // Child: raw async-signal-safe syscalls only. It becomes a fresh
+        // session leader, plants one ordinary grandchild that holds the
+        // inherited pipe writer open forever, then exits so its zombie is the
+        // only thing pinning the fresh group identity.
+        // SAFETY: descriptors were inherited and scalar arguments are valid.
+        unsafe {
+            libc::close(alive_raw);
+            if libc::setsid() < 0 {
+                libc::_exit(101);
+            }
+            let grandchild = libc::fork();
+            if grandchild < 0 {
+                libc::_exit(102);
+            }
+            if grandchild == 0 {
+                loop {
+                    libc::pause();
+                }
+            }
+            libc::close(writer_raw);
+            libc::_exit(0);
+        }
+    }
+    assert!(child > 0, "clone3 failed: {}", io::Error::last_os_error());
+    assert!(raw_pidfd >= 0);
+    // SAFETY: successful CLONE_PIDFD atomically installed one owned pidfd.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    drop(grandchild_writer);
+
+    // A broad waiter races the child's exit from the start and must never
+    // select a zero-exit-signal child; it observes ECHILD once no other
+    // waitable children exist.
+    let broad_waiter = std::thread::spawn(|| {
+        let mut status = 0;
+        // SAFETY: status output is valid; this isolated helper owns exactly
+        // one direct child, which carries no exit signal.
+        let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
+        (waited, io::Error::last_os_error().raw_os_error())
+    });
+    let (waited, errno) = broad_waiter.join().unwrap();
+    assert_eq!(waited, -1);
+    assert_eq!(errno, Some(libc::ECHILD));
+
+    // The child has exited by now or shortly after; the pidfd exit event is
+    // the deterministic observation and the deadline only an escape bound.
+    wait_for_pidfd_ready(pidfd.as_raw_fd(), deadline);
+
+    // Ignored SIGCHLD did not auto-reap: the zombie still answers queued-exit
+    // and group-identity queries.
+    let pinned = zombie_pinned_child(pidfd.as_raw_fd()).expect("zombie must stay queued");
+    assert_eq!(pinned, child);
+    // SAFETY: scalar identity queries about the pinned zombie leader.
+    assert_eq!(unsafe { libc::getpgid(child) }, child);
+    // SAFETY: scalar identity queries about the pinned zombie leader.
+    assert_eq!(unsafe { libc::getsid(child) }, child);
+
+    // Hostile numeric signals cannot dislodge a zombie's identity pin.
+    // SAFETY: SIGKILL/SIGCONT to an owned zombie mutate nothing.
+    unsafe {
+        let _ = libc::kill(child, libc::SIGKILL);
+        let _ = libc::kill(child, libc::SIGCONT);
+    }
+    assert_eq!(zombie_pinned_child(pidfd.as_raw_fd()), Some(child));
+
+    // Group termination under the pin reaches the planted ordinary
+    // grandchild: the inherited pipe writer closes only when it dies.
+    // SAFETY: the pinned zombie leader proves the numeric group identity.
+    assert_eq!(unsafe { libc::killpg(child, libc::SIGKILL) }, 0);
+    let mut byte = 0_u8;
+    loop {
+        // SAFETY: one-byte output buffer is live for this nonblocking read.
+        let read = unsafe {
+            libc::read(
+                grandchild_alive.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        let errno = io::Error::last_os_error().raw_os_error();
+        assert!(
+            read < 0 && matches!(errno, Some(libc::EINTR | libc::EAGAIN)),
+            "unexpected grandchild pipe state: read {read}, errno {errno:?}"
+        );
+        assert!(
+            !deadline.is_expired(),
+            "ordinary grandchild survived group termination"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // The pin held across the group signal and only the sole owner's __WALL
+    // reap releases it.
+    assert_eq!(zombie_pinned_child(pidfd.as_raw_fd()), Some(child));
+    match reap_exact_child(pidfd.as_raw_fd()) {
+        Ok(Some(ExactChildExit::Exited(0))) => {}
+        other => panic!("exact reap failed after pinned group termination: {other:?}"),
+    }
+}
+
+#[test]
+fn zero_exit_signal_zombie_pin_survives_hostile_reaping() {
+    let executable = std::env::current_exe().unwrap();
+    let status = Command::new(executable)
+        .args([
+            "--exact",
+            "backend::linux_vnext::process::tests::isolated_zero_exit_signal_zombie_pin_helper",
             "--ignored",
             "--nocapture",
         ])
