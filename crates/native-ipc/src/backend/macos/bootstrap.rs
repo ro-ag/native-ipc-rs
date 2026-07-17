@@ -2650,8 +2650,10 @@ fn queued_exit_probe(pid: Pid) -> QueuedExit {
 fn terminate_descendant_group_under_pin(pid: Pid) -> bool {
     // Confirm the queued-exit pin before signaling: while it holds, this sole
     // waiter has not reaped the leader, so the numeric group `pid` cannot have
-    // been reused by another session.
-    if queued_exit_probe(pid) != QueuedExit::Pinned {
+    // been reused by another session. `getpgid` already reported the leader an
+    // unreaped zombie, so the exit is queued; a non-`Pinned` `waitid` answer
+    // here is a transient nonblocking-probe glitch and is retried.
+    if !witnessed_pin(pid) {
         return false;
     }
     // SAFETY: the pinned zombie leader plus the irrevocable pre-resume session
@@ -2666,12 +2668,12 @@ fn terminate_descendant_group_under_pin(pid: Pid) -> bool {
     terminated && witnessed_pin(pid)
 }
 
-/// Confirms the queued-exit pin again after the group operation. An exit is
-/// permanent, so a not-exited or unanswerable probe after the caller already
-/// observed the queued exit can only be a transient kernel artifact of
-/// back-to-back nonblocking `WNOWAIT` queries under load; retry it. Only a
+/// Confirms the queued-exit pin. An exit is permanent, so once `getpgid` has
+/// reported the leader an unreaped zombie, a not-exited or unanswerable
+/// `waitid` answer can only be a transient kernel artifact of back-to-back
+/// nonblocking `WNOWAIT` queries under load; retry it within the bound. Only a
 /// persistent refusal (the status actually consumed by a waiter this design
-/// excludes) refutes the witness.
+/// excludes) refutes the pin.
 fn witnessed_pin(pid: Pid) -> bool {
     for _ in 0..GROUP_ATTEMPT_LIMIT {
         match queued_exit_probe(pid) {
