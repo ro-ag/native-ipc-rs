@@ -35,6 +35,15 @@ jobs:
         run: git diff --check
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: Model-check the in-process reaper ownership handshake
+        env:
+          RUSTFLAGS: --cfg loom
+        run: |
+          model_log="$(mktemp)"
+          cargo test -p native-ipc --lib --locked \
+            backend::reaper_ownership_tests::concurrent_final_owner_drops_latch_reaper_termination \
+            -- --exact | tee "${model_log}"
+          grep -F "test result: ok. 1 passed; 0 failed;" "${model_log}"
       - name: Build all features
         run: cargo check --workspace --all-features --all-targets --locked
       - name: Build without default features

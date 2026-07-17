@@ -319,6 +319,7 @@ pub(crate) trait OwnedChildLifecycle: sealed::Sealed {
 }
 
 mod accepted_control;
+mod reaper_ownership;
 
 #[cfg(target_os = "linux")]
 #[deny(dead_code)]
@@ -397,3 +398,7 @@ mod receipt_tests;
 #[cfg(test)]
 #[path = "accepted_control_test.rs"]
 mod accepted_control_tests;
+
+#[cfg(all(test, loom))]
+#[path = "reaper_ownership_test.rs"]
+mod reaper_ownership_tests;

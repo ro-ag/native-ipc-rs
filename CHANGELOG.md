@@ -223,6 +223,10 @@ Versioning once a stable API is released.
 
 ### Fixed
 
+- Replace the macOS detached-reaper's `Arc::strong_count` last-owner heuristic
+  with an explicit atomic external-owner count. A Loom model now exhaustively
+  verifies that concurrent final owner drops cannot lose the latched termination
+  request; this in-process check does not model kernel reaping or CI timing.
 - Fix a macOS private-prototype negotiation race where a receiver that sent
   its validated ACCEPT and exited before the coordinator's live-image recheck
   poisoned the completed negotiation with `PeerExited`. The queued bilateral
