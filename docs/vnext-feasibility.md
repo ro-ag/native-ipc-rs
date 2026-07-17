@@ -981,10 +981,12 @@ diff review and local tests; R5.13 remains release-unverified until native
 hostile mutation, Miri-covered portable range code, and exact-target
 conformance pass.
 
-## Blocked macOS 6d public-session prototype
+## macOS 6d public-session prototype (historical; enabled 2026-07-16)
 
 Current decision: the backend-private lifecycle is a same-user, unprivileged
-fixed broker/launcher construction, while public macOS remains fail-closed.
+fixed broker/launcher construction, and public macOS sessions are enabled
+(2026-07-16) through the audit-token direct-spawn path; see
+[`macos-supervisor-boundary.md`](macos-supervisor-boundary.md).
 There is no root helper, set-ID transition, root-owned catalog, privileged
 watchdog, or requirement to restore general launchd reachability in the
 selected model. The inherited launcher profile instead denies signals and Mach
@@ -998,8 +1000,9 @@ superseded privileged-service proposals. They are not the current architecture;
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) is authoritative.
 
 The private macOS memory, transport, evidence, reducer, and activation owners
-now compose into a public-API-shaped prototype on Apple Silicon, but actual
-public spawn/bootstrap remain fail-closed. The private prototype now starts the
+composed into a public-API-shaped prototype on Apple Silicon while actual
+public spawn/bootstrap remained fail-closed (a state superseded by the
+2026-07-16 enable). The private prototype starts the
 direct child suspended, captures a task-name right and `TASK_AUDIT_TOKEN` before
 resume, and uses private `proc_signal_with_audittoken` for exact silent-child
 termination. Native probes also establish the limits: ordinary `exec`
@@ -1055,8 +1058,9 @@ clients fail that requirement, while unsigned and post-signing-mutated clients
 are killed before service authorization. This is per-user mechanism evidence:
 no root privileged-service installation, UID
 separation, immutable downstream policy, or delegation evidence exists. The
-standing 2026-07-13 decision keeps public
-macOS fail-closed rather than weakening the contract. See
+2026-07-13 decision kept public macOS fail-closed rather than weakening the
+contract; the 2026-07-16 decision superseded it and enabled the public
+audit-token direct-spawn path. See
 [`macos-supervisor-boundary.md`](macos-supervisor-boundary.md) for the
 evidence and native gate.
 The prototype coordinator opens an absolute

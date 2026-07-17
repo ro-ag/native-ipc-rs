@@ -32,8 +32,8 @@ index each new dependency before its dependents can be packaged.
 ## Publish
 
 ```sh
-git tag -a v0.1.0 -m "native-ipc 0.1.0"
-git push origin v0.1.0
+git tag -a v0.5.0 -m "native-ipc 0.5.0"
+git push origin v0.5.0
 ```
 
 Pushing the tag runs `.github/workflows/release.yml`. The workflow verifies the

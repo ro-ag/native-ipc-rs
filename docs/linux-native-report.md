@@ -1,5 +1,12 @@
 # Linux native handoff report
 
+> Historical implementation checkpoint (2026-07-12). The hardware facts,
+> commits, and native evidence below remain valid for that date, but the
+> conclusions about what "remains blocked" are superseded: the public
+> session and batch state machine exists and public macOS sessions were
+> enabled on 2026-07-16. [`vnext-traceability.md`](vnext-traceability.md)
+> is the current status authority.
+
 This report closes the source-tree work requested by
 [`linux-agent.md`](linux-agent.md). It is an implementation checkpoint, not a
 vNext release-conformance record. The release ledger in

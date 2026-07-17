@@ -275,8 +275,8 @@ defines the platform-neutral opaque region API, true 1..=16 mixed-direction
 atomic batches, session lifecycle, native security rules, VST3-oriented generic
 acceptance profile, adversarial test matrix, and release gates.
 
-A fresh implementation session can start from
-[`docs/vnext-implementation-prompt.md`](docs/vnext-implementation-prompt.md).
+The dependency-ordered implementation phases are recorded in
+[`docs/vnext-implementation-plan.md`](docs/vnext-implementation-plan.md).
 
 ## Current status
 
