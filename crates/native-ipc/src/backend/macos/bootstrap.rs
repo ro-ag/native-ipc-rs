@@ -2420,7 +2420,6 @@ fn signal_with_audit_token(token: &mut AuditToken, signal: c_int) -> Result<(), 
 fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
     let mut termination_attempted = false;
     let mut group_termination_attempted = false;
-    let mut unavailable_probes = 0_usize;
     let mut pending_signal_error = None;
     loop {
         let pid = shared.pid.load(Ordering::Acquire);
@@ -2496,55 +2495,42 @@ fn mac_child_reaper(shared: Arc<MacChildLifecycleShared>) {
         let traced = shared.traced.load(Ordering::Acquire);
         // Non-traced public children can lead a fresh session whose ordinary
         // descendants must be group-terminated before this sole waiter reaps
-        // the pinning direct-child status. The reap is therefore gated on a
-        // cheap `WNOWAIT` probe that leaves the status queued: the group
-        // signal always precedes the reap that would release the identity pin.
-        // A traced child (backend-private launcher, never a fresh public
-        // group) uses the exact original `waitpid` path below, untouched.
+        // the pinning direct-child status. Liveness is polled with the
+        // lightweight `getpgid`: it answers while the fresh-session leader
+        // lives and ESRCHes once it is an unreaped zombie (Darwin refuses
+        // group queries on zombies). This avoids a per-iteration wait-queue
+        // scan on the live child, whose concurrent Mach negotiation must not
+        // be perturbed; the heavier `WNOWAIT` pin confirmation and the group
+        // signal run only at that running->zombie transition, so the group
+        // kill still precedes the reap that releases the identity pin. A
+        // traced child (backend-private launcher, never a fresh public group)
+        // uses the exact original `waitpid` path below, untouched.
         if !traced && !group_termination_attempted {
-            match queued_exit_probe(pid) {
-                QueuedExit::Pinned => {
-                    unavailable_probes = 0;
-                    group_termination_attempted = true;
-                    if shared.fresh_group_verified.load(Ordering::Acquire)
-                        && terminate_descendant_group_under_pin(pid)
-                    {
-                        lock_lifecycle(&shared.state).descendants =
-                            DescendantCleanupStatus::FreshGroupTerminated;
-                    }
-                    // Fall through to the reaping waitpid; the pin is released
-                    // only by that reap.
+            // SAFETY: a scalar identity query about this worker's exact child.
+            if unsafe { getpgid(pid) } > 0 {
+                // Still running: nothing to reap or group-terminate yet.
+                drop(reaper_gate);
+                if let Some(error) = pending_signal_error.take() {
+                    let mut state = lock_lifecycle(&shared.state);
+                    state.last_error = Some(error);
+                    shared.changed.notify_all();
                 }
-                QueuedExit::NotExited => {
-                    // Not exited: nothing to reap or group-terminate yet.
-                    unavailable_probes = 0;
-                    drop(reaper_gate);
-                    if let Some(error) = pending_signal_error.take() {
-                        let mut state = lock_lifecycle(&shared.state);
-                        state.last_error = Some(error);
-                        shared.changed.notify_all();
-                    }
-                    let state = lock_lifecycle(&shared.state);
-                    let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
-                        Ok(result) => result,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    continue;
-                }
-                QueuedExit::Unavailable if unavailable_probes < GROUP_ATTEMPT_LIMIT => {
-                    // A transient probe failure must not skip the pre-reap
-                    // group step; retry a bounded number of times before
-                    // letting the reap proceed on a persistent refusal.
-                    unavailable_probes += 1;
-                    drop(reaper_gate);
-                    let state = lock_lifecycle(&shared.state);
-                    let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
-                        Ok(result) => result,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    continue;
-                }
-                QueuedExit::Unavailable => group_termination_attempted = true,
+                let state = lock_lifecycle(&shared.state);
+                let _ = match shared.changed.wait_timeout(state, Duration::from_millis(1)) {
+                    Ok(result) => result,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                continue;
+            }
+            // The leader is an unreaped zombie (this worker is the sole
+            // waiter). Perform bounded group termination under its identity
+            // pin before the reaping waitpid below.
+            group_termination_attempted = true;
+            if shared.fresh_group_verified.load(Ordering::Acquire)
+                && terminate_descendant_group_under_pin(pid)
+            {
+                lock_lifecycle(&shared.state).descendants =
+                    DescendantCleanupStatus::FreshGroupTerminated;
             }
         }
 
@@ -2662,6 +2648,12 @@ fn queued_exit_probe(pid: Pid) -> QueuedExit {
 /// zombie leader — a vacuously terminated group. Any other errno is a real
 /// failure.
 fn terminate_descendant_group_under_pin(pid: Pid) -> bool {
+    // Confirm the queued-exit pin before signaling: while it holds, this sole
+    // waiter has not reaped the leader, so the numeric group `pid` cannot have
+    // been reused by another session.
+    if queued_exit_probe(pid) != QueuedExit::Pinned {
+        return false;
+    }
     // SAFETY: the pinned zombie leader plus the irrevocable pre-resume session
     // verification prove this numeric group is still the fresh session created
     // for the exact child, so SIGKILL to it cannot reach any process outside
