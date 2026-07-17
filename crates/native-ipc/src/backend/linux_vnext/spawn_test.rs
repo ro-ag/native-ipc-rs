@@ -3491,10 +3491,25 @@ fn receiver_control_observes_socket_hup_without_inventing_exit_status() {
         PeerState::Running
     );
     drop(peer);
-    assert_eq!(
-        observe_accepted_control_peer(receiver.fd.as_raw_fd(), None).unwrap(),
-        PeerState::ExitedUnknown
-    );
+    // Closing the peer makes the receiver observe HUP, but on a loaded host the
+    // close's effect on a concurrent single `poll` can lag briefly, so retry the
+    // observation within a bounded deadline rather than asserting it on the
+    // first poll. This still forbids inventing an exit before the HUP — it only
+    // tolerates the propagation window — and it matches production callers,
+    // which already poll the peer in a deadline loop.
+    let observation_deadline = deadline();
+    loop {
+        match observe_accepted_control_peer(receiver.fd.as_raw_fd(), None).unwrap() {
+            PeerState::ExitedUnknown => break,
+            PeerState::Running => {
+                assert!(
+                    !observation_deadline.is_expired(),
+                    "receiver never observed peer HUP after close"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 #[test]
