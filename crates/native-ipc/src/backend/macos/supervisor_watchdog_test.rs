@@ -295,12 +295,9 @@ fn near_future_deadline() -> Instant {
 }
 
 fn wait_past(deadline: Instant) {
-    std::thread::sleep(
-        deadline
-            .saturating_duration_since(Instant::now())
-            .saturating_add(Duration::from_millis(1)),
-    );
-    assert!(Instant::now() >= deadline);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn launch(connection: ConnectionIdentity, deadline: Instant) -> TestLaunch {

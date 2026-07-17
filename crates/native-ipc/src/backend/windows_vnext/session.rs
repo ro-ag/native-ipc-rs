@@ -9,7 +9,10 @@ use super::vnext_transport::{
     CoordinatorWindowsControlTransport, ReceiverWindowsControlTransport, read_message,
     write_message,
 };
-use super::{ChildChannel, ChildSession, MAX_VNEXT_RECORD_BYTES, WindowsError, session_nonce};
+use super::{
+    ChildChannel, ChildSession, ChildSpawnFailure, MAX_VNEXT_RECORD_BYTES, WindowsError,
+    public_command_strings_are_valid, session_nonce,
+};
 use crate::backend::accepted_control::{
     AcceptedControlDispatcher, AcceptedControlError, WindowsActivationError,
     WindowsCapabilityBatchError,
@@ -150,6 +153,11 @@ impl WindowsCoordinatorNegotiatingSession {
         if options.deadline().is_expired()
             || command.arguments().is_empty()
             || !command.executable().is_absolute()
+            || !public_command_strings_are_valid(
+                command.executable(),
+                command.arguments(),
+                command.environment(),
+            )
         {
             return Err(WindowsCoordinatorSessionFailure::before_child(
                 WindowsPublicSessionError::InvalidInput,
@@ -165,11 +173,16 @@ impl WindowsCoordinatorNegotiatingSession {
             command.environment(),
             options.deadline(),
         )
-        .map_err(|error| {
-            WindowsCoordinatorSessionFailure::after_child(
-                map_windows_error(error),
-                WindowsCoordinatorFailureState::Spawned,
-            )
+        .map_err(|failure: ChildSpawnFailure| {
+            let error = map_windows_error(failure.error);
+            if failure.child_was_created {
+                WindowsCoordinatorSessionFailure::after_child(
+                    error,
+                    WindowsCoordinatorFailureState::Spawned,
+                )
+            } else {
+                WindowsCoordinatorSessionFailure::before_child(error)
+            }
         })?;
         let nonce = session.vnext_nonce();
         let coordinator =

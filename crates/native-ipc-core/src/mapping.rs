@@ -147,19 +147,23 @@ impl<M: ReadOnlyMapping> ReaderRegion<M> {
         let range = self
             .layout
             .slot_payload_range(slot, observation.payload_len())?;
-        let mut owned = Vec::new();
+        let mut owned = Vec::<u8>::new();
         owned
             .try_reserve_exact(range.len())
             .map_err(|_| BindingError::AllocationFailed)?;
         // SAFETY: the read-only witness keeps this validated range mapped and
-        // readable; the reserved owned destination is disjoint shared memory.
+        // readable. Each volatile byte load crosses the externally mutable
+        // memory boundary without forming a shared Rust reference, and each
+        // destination byte is initialized exactly once in disjoint owned memory.
         unsafe {
             owned.set_len(range.len());
-            core::ptr::copy_nonoverlapping(
-                self.mapping.base().as_ptr().add(range.start),
-                owned.as_mut_ptr(),
-                range.len(),
-            );
+            let source = self.mapping.base().as_ptr().add(range.start);
+            let destination = owned.as_mut_ptr();
+            for index in 0..range.len() {
+                destination
+                    .add(index)
+                    .write(core::ptr::read_volatile(source.add(index)));
+            }
         }
         self.slot(slot)?.recheck(observation)?;
         Ok(owned)

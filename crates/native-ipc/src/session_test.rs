@@ -141,6 +141,66 @@ fn macos_public_pre_spawn_failure_is_not_misreported_as_negotiating() {
     assert!(!failure.is_poisoned());
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_public_command_rejects_interior_nul_before_spawn() {
+    use std::os::windows::ffi::OsStringExt;
+
+    let executable = OsString::from_wide(&[
+        b'C' as u16,
+        b':' as u16,
+        b'\\' as u16,
+        b'h' as u16,
+        b'e' as u16,
+        b'l' as u16,
+        b'p' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        0,
+        b'x' as u16,
+    ]);
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        SessionCommand::new(executable),
+        SessionOptions::new(
+            AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+            ExecutableIdentityPolicy::ExactOpenedFile,
+        ),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(failure.reason(), SessionError::InvalidInput);
+    assert_eq!(
+        failure.transaction_state(),
+        SessionTransactionState::NotEstablished
+    );
+    assert!(!failure.is_poisoned());
+    assert!(failure.cleanup().is_none());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_public_pre_spawn_failure_remains_not_established() {
+    let missing = std::env::current_exe()
+        .unwrap()
+        .with_extension("native-ipc-intentionally-missing");
+    assert!(!missing.exists());
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        SessionCommand::new(missing),
+        SessionOptions::new(
+            AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+            ExecutableIdentityPolicy::ExactOpenedFile,
+        ),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        failure.transaction_state(),
+        SessionTransactionState::NotEstablished
+    );
+    assert!(!failure.is_poisoned());
+    assert!(failure.cleanup().is_none());
+}
+
 #[test]
 fn limits_are_finite_validated_and_negotiated_by_minimum() {
     let local = SessionLimits::default();

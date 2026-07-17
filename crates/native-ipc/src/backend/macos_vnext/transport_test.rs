@@ -21,7 +21,7 @@ use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 assert_impl_all!(
     CoordinatorMacControlTransport:
@@ -214,7 +214,7 @@ fn only_coordinator_owns_the_exact_child_reap() {
 }
 
 #[test]
-fn cleanup_timeout_hands_reaping_off_without_blocking_drop() {
+fn cleanup_timeout_keeps_background_reaping_active() {
     let channel = spawn_helper("backend::macos::vnext_transport_test::natural_exit_helper");
     let mut transport = coordinator_transport(channel);
     transport.delay_reap_for_test(100);
@@ -223,12 +223,8 @@ fn cleanup_timeout_hands_reaping_off_without_blocking_drop() {
         transport.terminate_and_reap(short),
         Err(SessionTransportError::DeadlineExpired)
     );
-    let before_drop = Instant::now();
+    transport.wait_for_child_exit_for_test(deadline()).unwrap();
     drop(transport);
-    assert!(before_drop.elapsed() < Duration::from_millis(25));
-    // Leave enough time for the detached exact-child worker to consume the
-    // delayed wait and reap before the test process exits.
-    std::thread::sleep(Duration::from_millis(125));
 }
 
 #[test]

@@ -568,6 +568,27 @@ pub struct ChildSession {
     _executable: Option<HeldExecutable>,
 }
 
+pub(crate) struct ChildSpawnFailure {
+    pub(crate) error: WindowsError,
+    pub(crate) child_was_created: bool,
+}
+
+impl ChildSpawnFailure {
+    fn before_child(error: WindowsError) -> Self {
+        Self {
+            error,
+            child_was_created: false,
+        }
+    }
+
+    fn after_child(error: WindowsError) -> Self {
+        Self {
+            error,
+            child_was_created: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ExecutableIdentity {
     volume_serial: u32,
@@ -658,7 +679,7 @@ impl ChildSession {
         let arguments = std::iter::once(path.as_os_str().to_owned())
             .chain(arguments.iter().cloned())
             .collect::<Vec<_>>();
-        Self::spawn_until(path, &arguments, &[], deadline)
+        Self::spawn_until(path, &arguments, &[], deadline).map_err(|failure| failure.error)
     }
 
     /// Creates a public-session child under one caller-owned absolute deadline
@@ -668,15 +689,18 @@ impl ChildSession {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         deadline: AbsoluteDeadline,
-    ) -> Result<Self, WindowsError> {
+    ) -> Result<Self, ChildSpawnFailure> {
         if deadline.is_expired() || arguments.is_empty() || !path.is_absolute() {
-            return Err(WindowsError::TimedOut("public spawn"));
+            return Err(ChildSpawnFailure::before_child(WindowsError::TimedOut(
+                "public spawn",
+            )));
         }
-        let executable = HeldExecutable::open(path)?;
-        let nonce = session_nonce()?;
+        let executable = HeldExecutable::open(path).map_err(ChildSpawnFailure::before_child)?;
+        let nonce = session_nonce().map_err(ChildSpawnFailure::before_child)?;
         let name = format!(r"\\.\pipe\native-ipc-{}", hex(&nonce));
         let pipe_name = wide_null(OsStr::new(&name));
-        let pipe_security = PipeSecurity::for_current_logon()?;
+        let pipe_security =
+            PipeSecurity::for_current_logon().map_err(ChildSpawnFailure::before_child)?;
         // SAFETY: name and explicit logon-SID-only security attributes remain live.
         let pipe = unsafe {
             CreateNamedPipeW(
@@ -693,8 +717,8 @@ impl ChildSession {
                 &raw const pipe_security.attributes,
             )
         };
-        let pipe = OwnedHandle::new(pipe)?;
-        let job = ChildJob::new()?;
+        let pipe = OwnedHandle::new(pipe).map_err(ChildSpawnFailure::before_child)?;
+        let job = ChildJob::new().map_err(ChildSpawnFailure::before_child)?;
 
         let application = wide_null(path.as_os_str());
         let mut command = command_line_exact(arguments);
@@ -707,7 +731,8 @@ impl ChildSession {
                 (PARENT_ENV, parent_pid.to_string()),
                 (PUBLIC_BOOTSTRAP_ENV, "1".to_owned()),
             ],
-        )?;
+        )
+        .map_err(ChildSpawnFailure::before_child)?;
         let mut startup: STARTUPINFOW = unsafe { zeroed() };
         startup.cb = size_of::<STARTUPINFOW>() as u32;
         let mut information: PROCESS_INFORMATION = unsafe { zeroed() };
@@ -727,26 +752,28 @@ impl ChildSession {
             )
         } == 0
         {
-            return Err(last_os("CreateProcessW"));
+            return Err(ChildSpawnFailure::before_child(last_os("CreateProcessW")));
         }
-        let process = OwnedHandle::new(information.hProcess)?;
-        let thread = OwnedHandle::new(information.hThread)?;
+        let process =
+            OwnedHandle::new(information.hProcess).map_err(ChildSpawnFailure::after_child)?;
+        let thread =
+            OwnedHandle::new(information.hThread).map_err(ChildSpawnFailure::after_child)?;
         // SAFETY: CreateProcessW returned this exact child still suspended.
         if let Err(error) = unsafe { job.assign_suspended(process.0) } {
             // SAFETY: exact held child is still suspended.
             let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(error);
+            return Err(ChildSpawnFailure::after_child(error));
         }
         if let Err(error) = executable.verify_process_image(process.0) {
             // SAFETY: exact held child is still suspended and contained by the Job.
             let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(error);
+            return Err(ChildSpawnFailure::after_child(error));
         }
         // SAFETY: thread is the exact suspended primary thread.
         if unsafe { ResumeThread(thread.0) } == u32::MAX {
             let error = last_os("ResumeThread");
             let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(error);
+            return Err(ChildSpawnFailure::after_child(error));
         }
         drop(thread);
         let bootstrap_deadline = Instant::now() + deadline.remaining();
@@ -755,22 +782,27 @@ impl ChildSession {
             process.0,
             information.dwProcessId,
             bootstrap_deadline,
-        )?;
+        )
+        .map_err(ChildSpawnFailure::after_child)?;
         let hello = BootstrapFrame {
             magic: BOOTSTRAP_MAGIC,
             nonce,
             parent_pid,
             child_pid: information.dwProcessId,
         };
-        write_frame_until(pipe.0, &hello, bootstrap_deadline)?;
-        let ready = read_frame_until(pipe.0, bootstrap_deadline)?;
+        write_frame_until(pipe.0, &hello, bootstrap_deadline)
+            .map_err(ChildSpawnFailure::after_child)?;
+        let ready =
+            read_frame_until(pipe.0, bootstrap_deadline).map_err(ChildSpawnFailure::after_child)?;
         if ready.magic != AUTH_MAGIC
             || ready.nonce != nonce
             || ready.parent_pid != parent_pid
             || ready.child_pid != information.dwProcessId
         {
             let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(WindowsError::InvalidBootstrap);
+            return Err(ChildSpawnFailure::after_child(
+                WindowsError::InvalidBootstrap,
+            ));
         }
         Ok(Self {
             pipe,
@@ -1394,6 +1426,35 @@ fn command_line_exact(arguments: &[OsString]) -> Vec<u16> {
     }
     result.push(0);
     result
+}
+
+pub(super) fn public_command_strings_are_valid(
+    path: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+) -> bool {
+    let has_nul = |value: &OsStr| value.encode_wide().any(|unit| unit == 0);
+    if has_nul(path.as_os_str()) || arguments.iter().any(|argument| has_nul(argument)) {
+        return false;
+    }
+    let reserved = [PIPE_ENV, NONCE_ENV, PARENT_ENV, PUBLIC_BOOTSTRAP_ENV];
+    for (index, (key, value)) in environment.iter().enumerate() {
+        let key_text = key.to_string_lossy();
+        if key.is_empty()
+            || has_nul(key)
+            || key_text.contains('=')
+            || has_nul(value)
+            || reserved
+                .iter()
+                .any(|name| key_text.eq_ignore_ascii_case(name))
+            || environment[..index]
+                .iter()
+                .any(|(existing, _)| existing.to_string_lossy().eq_ignore_ascii_case(&key_text))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn environment_block_exact(
