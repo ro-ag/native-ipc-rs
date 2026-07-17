@@ -205,6 +205,22 @@ Versioning once a stable API is released.
   decision 6d state) and the README/architecture/feasibility macOS status
   text with the standing fail-closed decision.
 
+### Added
+
+- Prove the section 10 real-time contract dynamically on the public macOS
+  active path. A dedicated `tests/rt` binary carries its own counting global
+  allocator and task-level syscall/context-switch/fault deltas: after an
+  explicit prefault, a 10,000-iteration `write_from`/`read_into`/`fill` hot
+  window makes exactly zero measured-thread allocator entries and cannot
+  contain a per-operation syscall, wait, or fault; prefault reports exact
+  touched coverage and observes faults on freshly imported mappings without
+  promising residency; every access after abrupt peer death returns bounded
+  success or `SessionInactive`, before and after the exact reap; and one full
+  session close plus one fresh replacement session execute without a single
+  allocator entry on the measured active thread. Deliberate allocation and
+  unix/Mach syscall tripwires prove each instrument detects the violation it
+  guards against.
+
 ### Fixed
 
 - Fix a macOS private-prototype negotiation race where a receiver that sent
