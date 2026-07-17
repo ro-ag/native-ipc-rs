@@ -100,6 +100,19 @@ jobs:
           systemd-detect-virt --container || true
           systemd-detect-virt --vm || true
           findmnt -no SOURCE,FSTYPE,OPTIONS /
+      - name: Serialize cargo jobs on the constrained macOS runner
+        # `--test-threads=1` bounds threads *within* a test binary, but cargo
+        # otherwise runs several test binaries at once — each spawning child
+        # processes with a polling reaper thread. On the weak hosted macOS
+        # runner that oversubscribes the host and starves the timing-sensitive
+        # Mach/IPC negotiations into spurious deadline expiries. Serializing
+        # build and test-binary execution keeps at most one child-spawning
+        # binary live at a time. Only this step runs on macOS, so the other
+        # targets leave CARGO_BUILD_JOBS genuinely unset (an empty value would
+        # make cargo reject the invocation).
+        if: matrix.name == 'macos-arm64'
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
