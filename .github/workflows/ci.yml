@@ -69,6 +69,15 @@ jobs:
             # serial execution stays well within the job timeout even on a
             # shared, heavily loaded runner.
             test_threads_flag: "--test-threads=1"
+            # `--test-threads=1` bounds threads *within* a test binary, but the
+            # hosted macOS runner is weak and cargo otherwise runs several test
+            # binaries at once — each spawning child processes with a polling
+            # reaper thread. That oversubscribes the runner and starves the
+            # timing-sensitive Mach/IPC negotiations into spurious deadline
+            # expiries. `CARGO_BUILD_JOBS=1` serializes build and test-binary
+            # execution so only one child-spawning binary runs at a time. Other
+            # targets leave it empty (treated as unset).
+            build_jobs: "1"
           - name: windows-amd64
             os: windows-2025
             target: x86_64-pc-windows-msvc
@@ -76,6 +85,10 @@ jobs:
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      # Empty on every target except macOS, where it is "1"; cargo treats an
+      # empty value as unset, so only the macOS leg serializes its jobs.
+      CARGO_BUILD_JOBS: ${{ matrix.build_jobs }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
