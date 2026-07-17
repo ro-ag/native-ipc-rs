@@ -330,8 +330,13 @@ pub enum ChildExitStatus {
 pub enum DescendantCleanupStatus {
     /// The trusted fresh-session checkpoint was not established.
     NotEstablished,
-    /// A fresh process group existed, but this target cannot verify descendant cleanup race-free.
+    /// A fresh process group existed, but bounded group termination could not
+    /// be performed under a kernel-witnessed direct-child identity pin.
     FreshGroupUnverified,
+    /// SIGKILL was delivered to the kernel-verified fresh process group while
+    /// the unreaped direct child pinned its numeric identity, terminating
+    /// every ordinary descendant that had not left the group.
+    FreshGroupTerminated,
     /// A target-owned containment object proved the complete spawned process tree empty.
     ContainedProcessTreeComplete,
     /// A target-owned containment object exists, but bounded cleanup did not prove it empty.
@@ -614,9 +619,14 @@ enum SessionInner {
 pub enum ExecutableIdentityPolicy {
     /// Open and retain one absolute regular executable without any symlink
     /// traversal and apply the target's documented image-identity checks.
-    /// Linux executes the held object; macOS currently performs repeated
-    /// stable-path identity comparisons and does not claim fd-exec or
-    /// replacement denial.
+    /// Linux executes the held object directly. macOS authenticates the
+    /// running image against the retained file by content: the kernel-
+    /// registered code-directory hash of the exact audit-token-bound child
+    /// execution must match a hash computed from the held descriptor, at
+    /// launch and again through ACCEPT, independent of pathnames and of the
+    /// signing identity (an ad-hoc linker signature suffices). A macOS
+    /// executable that carries no code directory — an unsigned image or a
+    /// script — cannot be bound and fails construction closed.
     ExactOpenedFile,
 }
 

@@ -902,12 +902,26 @@ fn direct_child_termination_does_not_contain_setsid_descendant() {
     );
     let descendant_pid = wait_for_marker(&marker);
     let descendant = ExactProcessGuard::capture(descendant_pid);
+    // The escape must be observed before cleanup runs, or the pinned group
+    // termination could legitimately reach a descendant that has not yet
+    // left the fresh session. The deadline is only a harness escape bound.
+    let escape_deadline = Instant::now() + Duration::from_secs(120);
+    // SAFETY: getsid is a scalar query about the live guarded descendant.
+    while unsafe { getsid(descendant_pid) } != descendant_pid {
+        assert!(
+            Instant::now() < escape_deadline,
+            "descendant did not escape the fresh session"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     let cleanup = helper.cleanup_vnext_until(test_deadline());
     assert!(cleanup.direct_child_complete());
+    // The witnessed group termination ran, but it must not touch a descendant
+    // that left the fresh session.
     assert_eq!(
         cleanup.descendants(),
-        DescendantCleanupStatus::FreshGroupUnverified
+        DescendantCleanupStatus::FreshGroupTerminated
     );
     // The exact descendant task remains live after direct-child cleanup.
     assert!(descendant.task_name.audit_token().is_ok());
@@ -1263,6 +1277,61 @@ fn setsid_descendant_helper() {
     // SAFETY: this process is not a process-group leader and intentionally
     // creates a new session to prove process-group escape.
     assert!(unsafe { setsid() } > 0);
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+fn direct_child_termination_kills_ordinary_descendant_under_group_pin() {
+    let marker = process_marker("ordinary-descendant");
+    let environment = [CString::new(format!("{PROCESS_MARKER_ENV}={}", marker.display())).unwrap()];
+    let helper = vnext_helper_with_environment(
+        "backend::macos::bootstrap::tests::ordinary_descendant_parent_helper",
+        &environment,
+    );
+    let descendant_pid = wait_for_marker(&marker);
+    let descendant = ExactProcessGuard::capture(descendant_pid);
+
+    let cleanup = helper.cleanup_vnext_until(test_deadline());
+    assert!(cleanup.direct_child_complete());
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::FreshGroupTerminated
+    );
+    // The exact descendant task's kernel death is the deterministic
+    // observation that the pinned group SIGKILL reached the ordinary
+    // in-group descendant; the deadline is only a harness escape bound.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while descendant.task_name.audit_token().is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "ordinary descendant survived pinned group termination"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::remove_file(marker).unwrap();
+}
+
+#[test]
+#[ignore = "spawned only as the ordinary in-group descendant's parent"]
+#[allow(clippy::zombie_processes)]
+fn ordinary_descendant_parent_helper() {
+    // Intentionally do not wait: the descendant stays in the inherited fresh
+    // group so the test can prove pinned group termination reaches it.
+    let marker = std::env::var_os(PROCESS_MARKER_ENV).unwrap();
+    let descendant = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("backend::macos::bootstrap::tests::ordinary_descendant_helper")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .spawn()
+        .unwrap();
+    std::fs::write(marker, descendant.id().to_string()).unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+#[ignore = "spawned only as the ordinary in-group descendant"]
+fn ordinary_descendant_helper() {
     std::thread::sleep(Duration::from_secs(30));
 }
 

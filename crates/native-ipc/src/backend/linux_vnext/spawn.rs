@@ -1521,6 +1521,7 @@ fn map_child_cleanup(cleanup: ExactChildCleanup) -> ChildCleanupFacts {
     let descendants = match cleanup.descendants() {
         DescendantCleanup::NotEstablished => DescendantCleanupStatus::NotEstablished,
         DescendantCleanup::FreshGroupUnverified => DescendantCleanupStatus::FreshGroupUnverified,
+        DescendantCleanup::FreshGroupTerminated => DescendantCleanupStatus::FreshGroupTerminated,
     };
     ChildCleanupFacts::new(direct_child, descendants, cleanup.last_native_error())
 }
@@ -2462,10 +2463,17 @@ fn spawn_held_with_fault_diagnostic(
     }
 
     let mut raw_pidfd = -1;
+    // A zero exit signal keeps this child out of every default process-global
+    // wait: `wait`/`waitpid(-1)`/`waitid(P_ALL)` without `__WALL` never select
+    // it, and an ignored or `SA_NOCLDWAIT` SIGCHLD disposition cannot
+    // auto-reap it. The unreaped zombie therefore durably pins its PID and
+    // fresh process-group identity until the sole pidfd waiter consumes it,
+    // which is what makes the bounded group termination before that reap
+    // race-resistant.
     let clone_arguments = CloneArgs {
         flags: CLONE_PIDFD,
         pidfd: (&mut raw_pidfd as *mut libc::c_int) as u64,
-        exit_signal: libc::SIGCHLD as u64,
+        exit_signal: 0,
         ..CloneArgs::default()
     };
     // SAFETY: fork-like clone3 receives a complete zero-extended clone_args.

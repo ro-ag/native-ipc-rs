@@ -77,6 +77,57 @@ fn production_spawn_rejects_relative_and_symlink_images() {
 }
 
 #[test]
+fn launch_binds_the_retained_file_to_the_started_image_across_swap_and_restore() {
+    let unique = format!(
+        "native-ipc-macos-image-swap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let directory = std::env::temp_dir().canonicalize().unwrap().join(unique);
+    std::fs::create_dir(&directory).unwrap();
+    let helper = directory.join("helper");
+    let backup = directory.join("backup");
+    let evil = directory.join("evil");
+    std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), &backup).unwrap();
+    // A differently-signed, different-content, long-lived platform binary
+    // stands in for the replacement a normal installer or updater performs.
+    std::fs::copy("/bin/sleep", &evil).unwrap();
+
+    let command = SessionCommand::new(&helper).arg("1000");
+    let options = SessionOptions::new(deadline(), ExecutableIdentityPolicy::ExactOpenedFile);
+    let failure = MacCoordinatorNegotiatingSession::spawn_with_image_hooks_for_test(
+        &command,
+        &options,
+        || std::fs::rename(&evil, &helper).unwrap(),
+        || std::fs::rename(&backup, &helper).unwrap(),
+    )
+    .err()
+    .expect("a swapped launch image must never negotiate");
+
+    // The pathname holds the original file again, so any pathname-derived
+    // recheck would pass; only the running-image binding can reject this.
+    assert_eq!(
+        failure.error,
+        super::vnext_session::MacPublicSessionError::IdentityMismatch
+    );
+    assert_eq!(
+        failure.state,
+        super::vnext_session::MacCoordinatorFailureState::Spawned
+    );
+    assert!(failure.poisoned);
+    let cleanup = failure
+        .cleanup
+        .expect("spawned child retains cleanup facts");
+    assert!(cleanup.direct_child_complete());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn production_spawn_binds_image_hellos_and_bilateral_accept() {
     let command = helper_command("backend::macos::vnext_session_test::production_receiver_helper")
         .env("NATIVE_IPC_VNEXT_TEST_DECISION", "accept");
@@ -130,7 +181,7 @@ fn coordinator_rejection_is_canonical_and_bounded() {
             assert!(cleanup.direct_child_complete());
             assert_eq!(
                 cleanup.descendants(),
-                crate::session::DescendantCleanupStatus::FreshGroupUnverified
+                crate::session::DescendantCleanupStatus::FreshGroupTerminated
             );
         }
         _ => panic!("coordinator rejection did not retain cleanup facts"),

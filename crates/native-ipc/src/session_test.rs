@@ -417,7 +417,7 @@ fn public_typestate_negotiates_controls_and_reports_exact_exit() {
     #[cfg(target_os = "macos")]
     assert_eq!(
         cleanup.descendants(),
-        DescendantCleanupStatus::FreshGroupUnverified
+        DescendantCleanupStatus::FreshGroupTerminated
     );
     #[cfg(target_os = "windows")]
     assert_eq!(

@@ -740,7 +740,7 @@ fn assert_clean_public_child_exit(facts: ChildCleanupFacts) {
     assert_eq!(facts.direct_child(), Some(ChildExitStatus::Exited(0)));
     assert_eq!(
         facts.descendants(),
-        DescendantCleanupStatus::FreshGroupUnverified
+        DescendantCleanupStatus::FreshGroupTerminated
     );
     assert_eq!(facts.native_error(), None);
 }

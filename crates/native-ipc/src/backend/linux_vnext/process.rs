@@ -289,9 +289,13 @@ pub(super) enum ExactChildExit {
 pub(super) enum DescendantCleanup {
     /// The child never reached the trusted post-`setsid` checkpoint.
     NotEstablished,
-    /// A fresh session/group exists, but Linux has no race-resistant
-    /// process-group handle. Numeric PGID signaling is deliberately omitted.
+    /// A fresh session/group exists, but bounded group termination could not
+    /// be performed under a kernel-witnessed direct-child identity pin.
     FreshGroupUnverified,
+    /// SIGKILL was delivered to the kernel-verified fresh process group while
+    /// the unreaped direct child pinned its identity, and the pin was
+    /// re-observed after the signal.
+    FreshGroupTerminated,
 }
 
 /// Bounded explicit cleanup result. An incomplete direct-child result leaves
@@ -561,6 +565,7 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
 
     let mut signal_attempted = false;
     let mut descendant_cleanup_attempted = false;
+    let mut group_termination_attempted = false;
     loop {
         let request = shared.request.load(Ordering::Acquire);
         if request == LIFECYCLE_IDLE {
@@ -626,6 +631,10 @@ fn exact_child_reaper(shared: Arc<LifecycleShared>) {
             *lock_unpoisoned(&shared.descendant_cleanup) = cleanup;
             descendant_cleanup_attempted = true;
         }
+        if !group_termination_attempted {
+            group_termination_attempted = true;
+            terminate_descendant_group_before_reap(&shared, task.pidfd.as_raw_fd());
+        }
         #[cfg(test)]
         let injected_reap_failure = shared.reap_failure.swap(0, Ordering::AcqRel);
         #[cfg(not(test))]
@@ -658,6 +667,70 @@ fn descendant_cleanup_limit(shared: &LifecycleShared) -> DescendantCleanup {
         DescendantCleanup::FreshGroupUnverified
     } else {
         DescendantCleanup::NotEstablished
+    }
+}
+
+/// Bounded ordinary-descendant termination under the direct child's identity
+/// pin, immediately before this sole waiter consumes the exit status.
+///
+/// The child was cloned with no exit signal, so no default process-global
+/// wait and no ignored-SIGCHLD auto-reap can consume it: the unreaped zombie
+/// durably pins its PID and therefore the numeric identity of the fresh
+/// process group it leads. Every step is kernel-verified under that pin, and
+/// the successful outcome is recorded only after the pin is observed again,
+/// which proves it held across the group signal because the pin can end only
+/// through this worker's own reap.
+fn terminate_descendant_group_before_reap(shared: &LifecycleShared, pidfd: RawFd) {
+    if !shared.fresh_session.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(pid) = zombie_pinned_child(pidfd) else {
+        return;
+    };
+    // SAFETY: scalar queries about the pinned PID with no memory arguments.
+    let fresh_group_leader = unsafe { libc::getpgid(pid) == pid && libc::getsid(pid) == pid };
+    if !fresh_group_leader {
+        return;
+    }
+    // SAFETY: the pinned zombie leader proves this numeric group is still the
+    // fresh session created for the exact child; SIGKILL to it cannot reach
+    // any process outside that owned session.
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+        return;
+    }
+    if zombie_pinned_child(pidfd) == Some(pid) {
+        *lock_unpoisoned(&shared.descendant_cleanup) = DescendantCleanup::FreshGroupTerminated;
+    }
+}
+
+/// Exact child PID while its exit status remains queued for this pidfd owner.
+fn zombie_pinned_child(pidfd: RawFd) -> Option<libc::pid_t> {
+    loop {
+        // SAFETY: zero is valid initialization for waitid output.
+        let mut information: libc::siginfo_t = unsafe { core::mem::zeroed() };
+        // SAFETY: P_PIDFD binds the query to this exact owned child; WNOWAIT
+        // leaves the status queued so the PID stays pinned; __WALL is
+        // mandatory because the child carries no exit signal.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd as libc::id_t,
+                &mut information,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            )
+        };
+        if result != 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return None;
+        }
+        // SAFETY: waitid initialized the exit fields it reports.
+        let pid = unsafe { information.si_pid() };
+        if pid <= 0 {
+            return None;
+        }
+        return Some(pid);
     }
 }
 
@@ -724,13 +797,14 @@ fn reap_exact_child(pidfd: RawFd) -> Result<Option<ExactChildExit>, i32> {
     // SAFETY: zero is valid initialization for waitid output.
     let mut information: libc::siginfo_t = unsafe { core::mem::zeroed() };
     // SAFETY: P_PIDFD binds the wait to this exact owned child; WNOHANG prevents
-    // an unexpected kernel wait even after pidfd readiness was observed.
+    // an unexpected kernel wait even after pidfd readiness was observed, and
+    // __WALL is mandatory because the child carries no exit signal.
     let result = unsafe {
         libc::waitid(
             libc::P_PIDFD,
             pidfd as libc::id_t,
             &mut information,
-            libc::WEXITED | libc::WNOHANG,
+            libc::WEXITED | libc::WNOHANG | libc::__WALL,
         )
     };
     if result != 0 {
