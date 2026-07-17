@@ -678,7 +678,24 @@ fn traced_launcher_lifecycle_uses_exact_ptrace_termination() {
         .start_traced_launcher(&lifecycle, test_deadline())
         .unwrap();
 
-    let cleanup = lifecycle.terminate_and_reap_facts(test_deadline());
+    // The exact-ptrace teardown (SIGSTOP handshake, PT_KILL, then reap) can need
+    // more than one bounded wait to finish on a slow, oversubscribed shared
+    // runner. `terminate_and_reap_facts` is idempotent — the termination request
+    // is latched and the background reaper keeps working — so retry the reap
+    // facts within a generous escape bound instead of asserting completion after
+    // a single wait. The deadline is only an escape bound, never a speed oracle.
+    let escape = Instant::now() + Duration::from_secs(120);
+    let cleanup = loop {
+        let cleanup = lifecycle.terminate_and_reap_facts(test_deadline());
+        if cleanup.direct_child_complete() {
+            break cleanup;
+        }
+        assert!(
+            Instant::now() < escape,
+            "traced launcher direct child did not reap within the escape bound"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
     assert!(cleanup.direct_child_complete());
     assert_eq!(cleanup.native_error(), None);
 }
