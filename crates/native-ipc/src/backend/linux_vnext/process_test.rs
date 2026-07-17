@@ -406,6 +406,35 @@ fn wait_for_child_baseline(
     );
 }
 
+/// Waits until the process's descriptor and thread counts return to a captured
+/// baseline, retrying within the deadline.
+///
+/// Use at sites with no single owned child PID to check (`wait_for_child_baseline`
+/// covers those). A worker thread that has already returned can still hold a
+/// `/proc/self/task` entry for a brief window before the kernel clears it, so an
+/// immediate `assert_eq!(open_task_count(), ..)` reads one thread too many under
+/// load. This does not weaken the invariant — it still requires the baseline to
+/// be restored, just not on the first read — and locally the counts settle
+/// instantly so the loop returns on its first iteration.
+fn wait_for_fd_task_baseline(
+    expected_fds: usize,
+    expected_tasks: usize,
+    deadline: AbsoluteDeadline,
+) {
+    loop {
+        let (fds, tasks) = (open_fd_count(), open_task_count());
+        if fds == expected_fds && tasks == expected_tasks {
+            return;
+        }
+        assert!(
+            !deadline.is_expired(),
+            "fd/task baseline not restored within deadline: \
+             fds {fds} (want {expected_fds}), tasks {tasks} (want {expected_tasks})"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn pidfd_reported_pid(pidfd: RawFd) -> i64 {
     let contents = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")).unwrap();
     contents
@@ -1435,8 +1464,7 @@ fn isolated_fresh_session_containment_helper() {
     drop(descendant_pidfd);
     std::fs::remove_file(pid_file).unwrap();
 
-    assert_eq!(open_fd_count(), before_fds);
-    assert_eq!(open_task_count(), before_tasks);
+    wait_for_fd_task_baseline(before_fds, before_tasks, deadline());
 }
 
 #[test]
@@ -1481,8 +1509,7 @@ fn isolated_exact_child_lifecycle_drop_and_reap_helper() {
         registration,
         Err(SpawnPolicyError::Native(libc::EAGAIN))
     ));
-    assert_eq!(open_fd_count(), expected_fds);
-    assert_eq!(open_task_count(), expected_tasks);
+    wait_for_fd_task_baseline(expected_fds, expected_tasks, deadline());
     // SAFETY: this isolated helper has not cloned a child yet; WNOHANG cannot
     // block and ECHILD proves registration failure acquired no child.
     assert_eq!(
