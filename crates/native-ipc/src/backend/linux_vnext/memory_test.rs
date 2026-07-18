@@ -255,9 +255,18 @@ fn mapping_fails(fd: RawFd, protection: libc::c_int, len: usize) -> bool {
 }
 
 fn portable_batch(regions: &[(u128, WriterEndpoint, usize)]) -> TransferBatch {
+    portable_batch_with_policy(regions, GuardPolicy::BestEffort)
+}
+
+fn portable_batch_with_policy(
+    regions: &[(u128, WriterEndpoint, usize)],
+    guard: GuardPolicy,
+) -> TransferBatch {
     let mut batch = TransferBatch::new(16, 16 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
     for &(id, writer, logical_len) in regions {
-        let mut region = PrivateRegion::allocate(RegionOptions::fixed(logical_len)).unwrap();
+        let mut region =
+            PrivateRegion::allocate(RegionOptions::fixed(logical_len).with_guard_policy(guard))
+                .unwrap();
         region.initialize(|bytes| bytes.fill(id as u8));
         batch
             .add(
@@ -985,6 +994,7 @@ fn mixed_direction_revalidation_rejects_a_retained_coordinator_writable_view() {
             entry.fd.as_raw_fd(),
             entry.key.mapped_len,
             libc::PROT_READ | libc::PROT_WRITE,
+            false,
             false,
         )
         .unwrap(),
@@ -1898,4 +1908,232 @@ fn receiver_import_nth_failure_restores_resources() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+/// Returns the `/proc/self/maps` permission field for the range containing
+/// `address`, or `None` when no mapping covers it.
+fn maps_permissions_of(address: usize) -> Option<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    for line in maps.lines() {
+        let (range, rest) = line.split_once(' ')?;
+        let (start, end) = range.split_once('-').unwrap();
+        let start = usize::from_str_radix(start, 16).unwrap();
+        let end = usize::from_str_radix(end, 16).unwrap();
+        if (start..end).contains(&address) {
+            return Some(rest.split(' ').next().unwrap().to_string());
+        }
+    }
+    None
+}
+
+/// A guard band page must be inaccessible: mapped without any permission.
+fn assert_band_inaccessible(address: usize) {
+    let permissions = maps_permissions_of(address)
+        .unwrap_or_else(|| panic!("guard band at {address:#x} is not mapped"));
+    assert!(
+        permissions.starts_with("---"),
+        "guard band at {address:#x} is accessible: {permissions}"
+    );
+}
+
+fn assert_owner_view_guarded(owner: &LinuxActiveRegionOwner, page: usize, installed: bool) {
+    let (base, len, reported) = match owner {
+        LinuxActiveRegionOwner::Reader { owner, .. } => (
+            owner.as_ptr() as usize,
+            owner.len(),
+            owner.guard_installed(),
+        ),
+        LinuxActiveRegionOwner::Writer { owner, .. } => (
+            owner.as_ptr() as usize,
+            owner.len(),
+            owner.guard_installed(),
+        ),
+    };
+    assert_eq!(reported, installed, "owner guard reporting is dishonest");
+    if installed {
+        assert_band_inaccessible(base - page);
+        assert_band_inaccessible(base + len);
+        assert!(!maps_permissions_of(base).unwrap().starts_with("---"));
+    }
+}
+
+#[test]
+fn guarded_view_mapping_places_inaccessible_bands_inside_one_reservation() {
+    let private = PrivateMemfd::new(37).unwrap();
+    let mapped_len = page_align(37).unwrap();
+    let page = native_page_size().unwrap();
+    let mapping = VmMapping::map(private.fd.as_raw_fd(), mapped_len, libc::PROT_READ).unwrap();
+    assert!(mapping.guarded);
+    let base = mapping.base.as_ptr() as usize;
+    assert_eq!(mapping.len, mapped_len);
+    assert_eq!(mapping.reservation_base as usize + page, base);
+    assert_eq!(mapping.reservation_len, mapped_len + 2 * page);
+    assert_band_inaccessible(base - page);
+    assert_band_inaccessible(base + mapped_len);
+    assert_eq!(maps_permissions_of(base).unwrap(), "r--s");
+    mapping.unmap().unwrap();
+
+    let plain = VmMapping::map_with_clear(
+        private.fd.as_raw_fd(),
+        mapped_len,
+        libc::PROT_READ,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(!plain.guarded);
+    assert_eq!(
+        plain.reservation_base as usize,
+        plain.base.as_ptr() as usize
+    );
+    assert_eq!(plain.reservation_len, plain.len);
+    plain.unmap().unwrap();
+}
+
+#[test]
+fn mixed_active_owners_install_guard_bands_on_both_endpoints() {
+    let regions = [
+        (1, WriterEndpoint::Receiver, 17),
+        (2, WriterEndpoint::Coordinator, 34),
+    ];
+    let deadline = batch_deadline();
+    let mut coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch(&regions),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    coordinator.revalidate_before_send().unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x7b; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let descriptors = duplicate_mixed_descriptors(&coordinator);
+    let mut imported = expected.import(&manifest, descriptors).unwrap();
+    coordinator.seal_after_import().unwrap();
+    imported.verify_final_seals(deadline).unwrap();
+
+    let page = native_page_size().unwrap();
+    let creator_specs = coordinator.activation_specs().unwrap();
+    assert!(
+        creator_specs
+            .iter()
+            .all(|spec| spec.guard_requested == GuardPolicy::BestEffort)
+    );
+    for owner in coordinator.into_active_region_owners(page) {
+        assert_owner_view_guarded(&owner, page, true);
+    }
+    let imported_specs = imported.activation_specs(deadline).unwrap();
+    assert!(
+        imported_specs
+            .iter()
+            .all(|spec| spec.guard_requested == GuardPolicy::BestEffort)
+    );
+    for owner in imported.into_active_region_owners(page) {
+        assert_owner_view_guarded(&owner, page, true);
+    }
+}
+
+#[test]
+fn required_guard_policy_commits_with_installed_bands() {
+    let regions = [
+        (1, WriterEndpoint::Receiver, 17),
+        (2, WriterEndpoint::Coordinator, 34),
+    ];
+    let deadline = batch_deadline();
+    let mut coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch_with_policy(&regions, GuardPolicy::Require),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x7c; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let descriptors = duplicate_mixed_descriptors(&coordinator);
+    let imported = expected.import(&manifest, descriptors).unwrap();
+    coordinator.seal_after_import().unwrap();
+    let page = native_page_size().unwrap();
+    let specs = coordinator.activation_specs().unwrap();
+    assert!(
+        specs
+            .iter()
+            .all(|spec| spec.guard_requested == GuardPolicy::Require)
+    );
+    for owner in coordinator.into_active_region_owners(page) {
+        assert_owner_view_guarded(&owner, page, true);
+    }
+    drop(imported);
+}
+
+#[test]
+fn disabled_guard_policy_keeps_creator_views_unguarded_and_honest() {
+    let regions = [
+        (1, WriterEndpoint::Receiver, 17),
+        (2, WriterEndpoint::Coordinator, 34),
+    ];
+    let deadline = batch_deadline();
+    let mut coordinator = LinuxMixedDirectionBatch::prepare(
+        portable_batch_with_policy(&regions, GuardPolicy::Disable),
+        NativeAuthorityProfile::LinuxMdweV1,
+        deadline,
+    )
+    .unwrap();
+    let manifest = TransferManifest::new_with_authority(
+        [0x7d; 32],
+        10,
+        11,
+        1,
+        NativeAuthorityProfile::LinuxMdweV1,
+        coordinator.manifest_entries(),
+    )
+    .unwrap();
+    let expected = LinuxExpectedMixedDirectionBatch::prepare(
+        expected_batch(&regions),
+        SessionLimits::default(),
+        deadline,
+    )
+    .unwrap();
+    let descriptors = duplicate_mixed_descriptors(&coordinator);
+    let mut imported = expected.import(&manifest, descriptors).unwrap();
+    coordinator.seal_after_import().unwrap();
+    imported.verify_final_seals(deadline).unwrap();
+    let page = native_page_size().unwrap();
+    let specs = coordinator.activation_specs().unwrap();
+    assert!(
+        specs
+            .iter()
+            .all(|spec| spec.guard_requested == GuardPolicy::Disable)
+    );
+    for owner in coordinator.into_active_region_owners(page) {
+        assert_owner_view_guarded(&owner, page, false);
+    }
+    // The importing endpoint cannot see the creator's policy and still
+    // applies best-effort placement to its own views.
+    for owner in imported.into_active_region_owners(page) {
+        assert_owner_view_guarded(&owner, page, true);
+    }
 }

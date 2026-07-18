@@ -2245,7 +2245,7 @@ fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
                     owner,
                     expected_spec.logical_len,
                     reservation,
-                    crate::region::GuardPolicy::BestEffort,
+                    expected_spec.guard_requested,
                 ) {
                     Ok(reader) => CommittedRegion::Reader(reader),
                     Err(error) => {
@@ -2259,7 +2259,7 @@ fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
                     owner,
                     expected_spec.logical_len,
                     reservation,
-                    crate::region::GuardPolicy::BestEffort,
+                    expected_spec.guard_requested,
                 ) {
                     Ok(writer) => CommittedRegion::Writer(writer),
                     Err(error) => {
