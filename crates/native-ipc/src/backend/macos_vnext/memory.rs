@@ -13,7 +13,7 @@ use crate::batch::{ExpectedBatch, LocalRegionAuthority, TransferBatch};
 use crate::protocol::{
     ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess, TransferManifest,
 };
-use crate::region::{RegionId, WriterEndpoint};
+use crate::region::{GuardPolicy, RegionId, WriterEndpoint};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const KERN_INVALID_ARGUMENT: super::KernReturn = 4;
@@ -27,6 +27,7 @@ pub(crate) enum MacBatchError {
     DeadlineExpired,
     WrongProvenance,
     WrongObject,
+    GuardUnavailable,
     Mach(super::MachError),
 }
 
@@ -42,6 +43,7 @@ pub(crate) struct MacActiveRegionSpec {
     pub(crate) logical_len: usize,
     pub(crate) mapped_len: usize,
     pub(crate) authority: LocalRegionAuthority,
+    pub(crate) guard_requested: GuardPolicy,
 }
 
 pub(crate) enum MacActiveRegionOwner {
@@ -106,6 +108,10 @@ unsafe impl ActiveReadOwner for MacActiveReadMapping {
     fn page_size(&self) -> usize {
         self.page_size
     }
+
+    fn guard_installed(&self) -> bool {
+        self.mapping.guarded
+    }
 }
 
 // SAFETY: this wrapper uniquely owns the endpoint's only writable local view.
@@ -126,18 +132,24 @@ unsafe impl ActiveWriteOwner for MacActiveWriteMapping {
     fn page_size(&self) -> usize {
         self.page_size
     }
+
+    fn guard_installed(&self) -> bool {
+        self.mapping.guarded
+    }
 }
 
 struct CoordinatorWriterEntry {
     native: NativeRegionSpec,
     mapping: Mapping,
     peer_entry: MemoryEntry<ReadOnlyCapability>,
+    guard_requested: GuardPolicy,
 }
 
 struct ReceiverWriterEntry {
     native: NativeRegionSpec,
     mapping: Mapping,
     peer_entry: MemoryEntry<ReadWriteCapability>,
+    guard_requested: GuardPolicy,
 }
 
 enum PreparedEntry {
@@ -179,7 +191,7 @@ impl MacMixedDirectionBatch {
         let mut entries = Vec::with_capacity(pending.regions.len());
         for (ordinal, region) in pending.regions.into_iter().enumerate() {
             check_deadline(deadline)?;
-            let (request, spec, _) = region.into_macos_transfer_parts();
+            let (request, spec, guard) = region.into_macos_transfer_parts();
             let native = request
                 .native_spec(spec.id.get())
                 .ok_or(MacBatchError::InvalidBatch)?;
@@ -192,10 +204,15 @@ impl MacMixedDirectionBatch {
                         peer_entry,
                         len: _,
                     } = region.into_local_writer(mapped_len)?;
+                    let (mapping, installed) = guard_local_writer_view(mapping, guard.requested);
+                    if guard.requested == GuardPolicy::Require && !installed {
+                        return Err(MacBatchError::GuardUnavailable);
+                    }
                     PreparedEntry::CoordinatorWriter(CoordinatorWriterEntry {
                         native,
                         mapping,
                         peer_entry,
+                        guard_requested: guard.requested,
                     })
                 }
                 WriterEndpoint::Receiver => {
@@ -204,10 +221,16 @@ impl MacMixedDirectionBatch {
                         peer_entry,
                         len: _,
                     } = region.into_remote_writer(mapped_len)?;
+                    let (mapping, installed) =
+                        guard_remote_writer_view(mapping, &peer_entry, guard.requested);
+                    if guard.requested == GuardPolicy::Require && !installed {
+                        return Err(MacBatchError::GuardUnavailable);
+                    }
                     PreparedEntry::ReceiverWriter(ReceiverWriterEntry {
                         native,
                         mapping,
                         peer_entry,
+                        guard_requested: guard.requested,
                     })
                 }
             };
@@ -268,12 +291,18 @@ impl MacMixedDirectionBatch {
             .entries
             .iter()
             .map(|entry| match entry {
-                PreparedEntry::CoordinatorWriter(entry) => {
-                    active_spec(entry.native, LocalRegionAuthority::Writer, &entry.mapping)
-                }
-                PreparedEntry::ReceiverWriter(entry) => {
-                    active_spec(entry.native, LocalRegionAuthority::Reader, &entry.mapping)
-                }
+                PreparedEntry::CoordinatorWriter(entry) => active_spec(
+                    entry.native,
+                    LocalRegionAuthority::Writer,
+                    &entry.mapping,
+                    entry.guard_requested,
+                ),
+                PreparedEntry::ReceiverWriter(entry) => active_spec(
+                    entry.native,
+                    LocalRegionAuthority::Reader,
+                    &entry.mapping,
+                    entry.guard_requested,
+                ),
             })
             .collect::<Result<Vec<_>, _>>()?;
         validate_active_specs(&specs)?;
@@ -286,9 +315,13 @@ impl MacMixedDirectionBatch {
             .into_iter()
             .map(|entry| match entry {
                 PreparedEntry::CoordinatorWriter(entry) => {
-                    let spec =
-                        active_spec(entry.native, LocalRegionAuthority::Writer, &entry.mapping)
-                            .expect("activation preflight validated coordinator mapping");
+                    let spec = active_spec(
+                        entry.native,
+                        LocalRegionAuthority::Writer,
+                        &entry.mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated coordinator mapping");
                     drop(entry.peer_entry);
                     MacActiveRegionOwner::Writer {
                         spec,
@@ -300,9 +333,13 @@ impl MacMixedDirectionBatch {
                     }
                 }
                 PreparedEntry::ReceiverWriter(entry) => {
-                    let spec =
-                        active_spec(entry.native, LocalRegionAuthority::Reader, &entry.mapping)
-                            .expect("activation preflight validated receiver-writer mapping");
+                    let spec = active_spec(
+                        entry.native,
+                        LocalRegionAuthority::Reader,
+                        &entry.mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated receiver-writer mapping");
                     drop(entry.peer_entry);
                     MacActiveRegionOwner::Reader {
                         spec,
@@ -663,6 +700,72 @@ fn validate_prepared_entries(
     Ok(())
 }
 
+/// Replaces the creator's own writable view with a guarded view of the same
+/// underlying memory object, established through a transient read-write self
+/// entry that never leaves this function. On any failure the original
+/// unguarded view is kept and reported honestly.
+fn guard_local_writer_view(original: Mapping, policy: GuardPolicy) -> (Mapping, bool) {
+    if policy == GuardPolicy::Disable {
+        return (original, false);
+    }
+    let task = original.task;
+    let Ok(self_entry) = MemoryEntry::<ReadWriteCapability>::new(task, &original) else {
+        return (original, false);
+    };
+    match Mapping::map_port(
+        task,
+        original.mapped_len,
+        self_entry.name,
+        VM_PROT_READ | VM_PROT_WRITE,
+    ) {
+        Ok(replacement) if replacement.guarded => {
+            drop(self_entry);
+            drop(original);
+            (replacement, true)
+        }
+        Ok(replacement) => {
+            // The guarded carve fell back to a plain view; keep the original
+            // view instead of the redundant replacement.
+            drop(replacement);
+            drop(self_entry);
+            (original, false)
+        }
+        Err(_) => {
+            drop(self_entry);
+            (original, false)
+        }
+    }
+}
+
+/// Replaces the creator's own read-only view of a receiver-writer region with
+/// a guarded read-only view mapped from the peer entry it already holds. On
+/// any failure the original unguarded view is kept and reported honestly.
+fn guard_remote_writer_view(
+    original: Mapping,
+    peer_entry: &MemoryEntry<ReadWriteCapability>,
+    policy: GuardPolicy,
+) -> (Mapping, bool) {
+    if policy == GuardPolicy::Disable {
+        return (original, false);
+    }
+    match Mapping::map_port(
+        original.task,
+        original.mapped_len,
+        peer_entry.name,
+        VM_PROT_READ,
+    ) {
+        Ok(replacement) if replacement.guarded => {
+            drop(original);
+            (replacement, true)
+        }
+        Ok(replacement) => {
+            drop(replacement);
+            (original, false)
+        }
+        Err(_) => (original, false),
+    }
+}
+
 fn map_exact_memory_entry(
     name: super::MachPort,
     mapped_len: usize,
@@ -748,6 +851,7 @@ fn active_spec(
     native: NativeRegionSpec,
     authority: LocalRegionAuthority,
     mapping: &Mapping,
+    guard_requested: GuardPolicy,
 ) -> Result<MacActiveRegionSpec, MacBatchError> {
     let id = RegionId::new(native.region_id).ok_or(MacBatchError::WrongProvenance)?;
     let logical_len =
@@ -761,6 +865,7 @@ fn active_spec(
         logical_len,
         mapped_len,
         authority,
+        guard_requested,
     })
 }
 
@@ -777,7 +882,9 @@ fn active_spec_from_manifest(
         usize::try_from(manifest.mapped_len).map_err(|_| MacBatchError::InvalidSize)?,
     )
     .ok_or(MacBatchError::WrongProvenance)?;
-    active_spec(native, authority, mapping)
+    // Imported regions apply best-effort guard placement: the wire manifest
+    // does not carry the creator's requested policy.
+    active_spec(native, authority, mapping, GuardPolicy::BestEffort)
 }
 
 fn validate_imported_manifest(

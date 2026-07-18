@@ -1225,7 +1225,9 @@ fn map_memory_error(error: MacBatchError) -> MacPublicSessionError {
         | MacBatchError::InvalidSize
         | MacBatchError::WrongProvenance => MacPublicSessionError::InvalidInput,
         MacBatchError::WrongObject => MacPublicSessionError::MalformedPeer,
-        MacBatchError::Mach(_) => MacPublicSessionError::Native(None),
+        MacBatchError::GuardUnavailable | MacBatchError::Mach(_) => {
+            MacPublicSessionError::Native(None)
+        }
     }
 }
 

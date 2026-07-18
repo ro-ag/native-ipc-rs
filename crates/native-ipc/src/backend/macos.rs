@@ -100,7 +100,10 @@ type VmProt = c_int;
 
 const KERN_SUCCESS: KernReturn = 0;
 const MACH_PORT_NULL: MachPort = 0;
+const VM_FLAGS_FIXED: c_int = 0;
 const VM_FLAGS_ANYWHERE: c_int = 1;
+const VM_FLAGS_OVERWRITE: c_int = 0x4000;
+const VM_PROT_NONE: VmProt = 0;
 const VM_PROT_READ: VmProt = 1;
 const VM_PROT_WRITE: VmProt = 2;
 const VM_PROT_EXECUTE: VmProt = 4;
@@ -745,11 +748,18 @@ impl RemoteWriterRegion {
     }
 }
 
+/// One owned Mach VM range. When `guarded` is true the interior view sits one
+/// page inside an owned reservation whose first and last pages are
+/// inaccessible bands; when false the reservation and the interior are the
+/// exact same range.
 #[derive(Debug)]
 struct Mapping {
     task: MachPort,
     address: NonNull<u8>,
     mapped_len: usize,
+    reservation_address: MachVmAddress,
+    reservation_len: usize,
+    guarded: bool,
 }
 
 // SAFETY: `Mapping` uniquely owns one Mach VM range. Moving that owner between
@@ -779,6 +789,9 @@ impl Mapping {
         protection: VmProt,
     ) -> Result<Self, MachError> {
         debug_assert_eq!(protection & VM_PROT_EXECUTE, 0);
+        if let Some(guarded) = Self::map_port_guarded(task, mapped_len, port, protection) {
+            return Ok(guarded);
+        }
         let mut address = 0;
         // SAFETY: entry is live; current/maximum protections exclude execute.
         let result = unsafe {
@@ -798,6 +811,88 @@ impl Mapping {
         };
         check_kernel("mach_vm_map", result)?;
         Self::from_allocated(task, address, mapped_len)
+    }
+
+    /// Best-effort guarded placement: an owned anywhere reservation of one
+    /// page, the view, and one page, whose outer pages become inaccessible
+    /// bands before the entry view overwrites the middle at a fixed address.
+    /// Any failure deallocates the reservation and returns `None`, so the
+    /// plain path preserves the original error semantics.
+    fn map_port_guarded(
+        task: MachPort,
+        mapped_len: usize,
+        port: MachPort,
+        protection: VmProt,
+    ) -> Option<Self> {
+        let page = page_size().ok()?;
+        if mapped_len == 0 || !mapped_len.is_multiple_of(page) {
+            return None;
+        }
+        let total = mapped_len.checked_add(page.checked_mul(2)?)?;
+        if total > isize::MAX as usize {
+            return None;
+        }
+        let mut reservation: MachVmAddress = 0;
+        // SAFETY: output pointer is valid and the total size was checked.
+        let result = unsafe {
+            mach_vm_allocate(
+                task,
+                &mut reservation,
+                total as MachVmSize,
+                VM_FLAGS_ANYWHERE,
+            )
+        };
+        if result != KERN_SUCCESS {
+            return None;
+        }
+        let interior_target = reservation + page as MachVmAddress;
+        for band in [reservation, interior_target + mapped_len as MachVmAddress] {
+            // SAFETY: each one-page band lies wholly inside the reservation
+            // this function owns until it returns.
+            let result =
+                unsafe { mach_vm_protect(task, band, page as MachVmSize, 0, VM_PROT_NONE) };
+            if result != KERN_SUCCESS {
+                deallocate_mapping(task, reservation, total);
+                return None;
+            }
+        }
+        let mut interior = interior_target;
+        // SAFETY: the fixed overwrite target lies wholly inside the owned
+        // reservation; current/maximum protections exclude execute.
+        let result = unsafe {
+            mach_vm_map(
+                task,
+                &mut interior,
+                mapped_len as MachVmSize,
+                0,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                port,
+                0,
+                0,
+                protection,
+                protection,
+                VM_INHERIT_NONE,
+            )
+        };
+        if result != KERN_SUCCESS || interior != interior_target {
+            deallocate_mapping(task, reservation, total);
+            return None;
+        }
+        let Some(address) = usize::try_from(interior)
+            .ok()
+            .and_then(|address| NonNull::new(address as *mut u8))
+        else {
+            deallocate_mapping(task, reservation, total);
+            return None;
+        };
+        Some(Self {
+            task,
+            address,
+            mapped_len,
+            reservation_address: reservation,
+            reservation_len: total,
+            guarded: true,
+        })
     }
 
     fn protect(&mut self, protection: VmProt, set_maximum: bool) -> Result<(), MachError> {
@@ -827,6 +922,7 @@ impl Mapping {
                 return Err(MachError::InvalidAddress(address));
             }
         };
+        let reservation_address = address;
         let Some(address) = NonNull::new(address_usize as *mut u8) else {
             // VM_FLAGS_ANYWHERE never returns address zero; refuse the value
             // without speculatively deallocating the page-zero range this code
@@ -837,6 +933,9 @@ impl Mapping {
             task,
             address,
             mapped_len,
+            reservation_address,
+            reservation_len: mapped_len,
+            guarded: false,
         })
     }
 
@@ -863,7 +962,9 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        deallocate_mapping(self.task, self.address(), self.mapped_len);
+        // The reservation is exactly the interior view when unguarded and
+        // additionally covers both bands when guarded.
+        deallocate_mapping(self.task, self.reservation_address, self.reservation_len);
         #[cfg(test)]
         observe_vnext_drop_for_test("mapping");
     }
