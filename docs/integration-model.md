@@ -12,7 +12,8 @@ this one wins.
 1. **Shared-memory core (shipping).** Least-authority, pointer-free, sealed
    shared memory with a single allocation/preparation API across every supported
    platform: private regions, direction-specific reader/writer capabilities,
-   and a bounded wire/layout codec. The unreleased vNext session layer adds
+   and a bounded wire/layout codec. The vNext session layer (released in
+   `0.5.0` as an experimental API) adds
    authenticated capability transfer; it is publicly composed on Linux,
    macOS Arm64, and Windows (macOS enabled 2026-07-16 after the cross-platform
    public session conformance corpus ran green there).
