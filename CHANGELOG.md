@@ -7,6 +7,19 @@ Versioning once a stable API is released.
 
 ### Added
 
+- Inaccessible guard bands around every vnext active view mapping on Linux
+  (`PROT_NONE` reservation carve), macOS (Mach fixed-overwrite placement
+  inside a protected reservation), and Windows (reserved placeholders around
+  a `MapViewOfFile3` view), with honest reporting:
+  `ActiveReader::guard_capability` and `ActiveWriter::guard_capability`
+  return the requested policy and whether bands actually installed. The
+  creating endpoint honors the region's `GuardPolicy` (`Require` fails batch
+  preparation or commit when a band cannot install; `Disable` skips bands);
+  the receiving endpoint always applies best-effort placement because the
+  wire manifest is unchanged. Bands contain in-process linear overruns past
+  a view; they do not constrain the peer's address space or hostile
+  native-capability aliases.
+
 - `binding` module: safe audited conversion from committed active mappings to
   core read/write capabilities (`ActiveReader::bind`, `ActiveWriter::bind`,
   recoverable `BindRejected`, reversible witnesses). Downstream no longer
@@ -22,6 +35,12 @@ Versioning once a stable API is released.
 
 ### Changed
 
+- `PrivateRegion::allocate` accepts `GuardPolicy::Require` instead of
+  rejecting it with `GuardUnavailable`: guard bands install at view-mapping
+  time, so a `Require` region now fails at batch preparation or commit when
+  bands cannot install. `PreparedRegion::guard_capability` keeps reporting
+  `installed: false` and documents that the active reporters carry the
+  post-commit outcome.
 - `core::mapping::{ReaderRegion, WriterRegion}::new` return the rejected
   mapping witness alongside the binding error, so callers recover the
   consumed witness instead of losing it.
