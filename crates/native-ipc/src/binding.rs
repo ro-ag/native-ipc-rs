@@ -25,6 +25,14 @@
 //! write witnesses simply publish to nobody. Liveness re-checking is
 //! deliberately not part of the witness contract; a consumer that needs it
 //! keeps the owning session handle and quiesces before dropping the witness.
+//!
+//! [`ActiveReader`]: crate::active::ActiveReader
+//! [`ActiveReader::len`]: crate::active::ActiveReader::len
+//! [`ActiveWriter`]: crate::active::ActiveWriter
+//! [`ActiveWriter::len`]: crate::active::ActiveWriter::len
+//! [`ReaderRegion`]: crate::core::mapping::ReaderRegion
+//! [`WriterRegion`]: crate::core::mapping::WriterRegion
+//! [`ValidatedRegionLayout`]: crate::core::layout::ValidatedRegionLayout
 
 use crate::active::{ActiveReader, ActiveWriter};
 use crate::core::layout::{RegionSetLayout, ValidatedRegionLayout};
