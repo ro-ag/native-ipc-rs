@@ -35,6 +35,13 @@ Versioning once a stable API is released.
 
 ### Changed
 
+- Docs: retitle the crate README's vNext session section from "Unreleased" to
+  "Experimental" and correct the workspace and crate READMEs to reflect that
+  guard bands ship on every vnext active view mapping (reported through
+  `ActiveReader`/`ActiveWriter::guard_capability`), that native Windows Arm64
+  and Linux Arm64 full-suite evidence now exists, and that `region.rs`'s
+  `with_guard_policy` doc uses "guard-band" rather than the stale
+  "guard-page" wording.
 - `PrivateRegion::allocate` accepts `GuardPolicy::Require` instead of
   rejecting it with `GuardUnavailable`: guard bands install at view-mapping
   time, so a `Require` region now fails at batch preparation or commit when

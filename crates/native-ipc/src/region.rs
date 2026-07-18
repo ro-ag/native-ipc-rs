@@ -97,7 +97,7 @@ impl RegionOptions {
         self
     }
 
-    /// Selects guard-page behavior.
+    /// Selects guard-band behavior.
     pub const fn with_guard_policy(mut self, guard: GuardPolicy) -> Self {
         self.guard = guard;
         self

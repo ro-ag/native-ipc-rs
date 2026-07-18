@@ -38,9 +38,10 @@ Cargo feature. Today only the unsafe raw pointer methods are gated by the
 | --- | --- | --- |
 | `native_ipc::core` re-export | Published in 0.4 | Existing pre-1.0 surface; normal semver rules apply. |
 | `native_ipc::memory` | Published in 0.4 | Existing pre-1.0 allocation/lifecycle surface; normal semver rules apply. |
-| `native_ipc::{region,batch,control,active,binding,session}` | Unreleased vNext | Experimental source API. Names and details may change until the vNext contract and release gates are complete. |
-| `native_ipc::receiver_main!` | Unreleased vNext | Experimental helper-entry macro coupled to the vNext session bootstrap contract. |
-| `raw-pointer` methods | Unreleased vNext advanced API | Feature-gated unsafe escape; never part of the ordinary safe API. |
+| `native_ipc::{region,batch,control,active,session}` | Experimental vNext (released in 0.5) | Experimental source API. Names and details may change between 0.x releases per vNext spec §16. |
+| `native_ipc::binding` | Experimental vNext (unreleased; ships in the next release) | Experimental source API. Names and details may change between 0.x releases per vNext spec §16. |
+| `native_ipc::receiver_main!` | Experimental vNext (released in 0.5) | Experimental helper-entry macro coupled to the vNext session bootstrap contract. |
+| `raw-pointer` methods | Experimental vNext advanced API (released in 0.5) | Feature-gated unsafe escape; never part of the ordinary safe API. |
 | `#[doc(hidden)]` entry hooks | Deployment/test plumbing | Not consumer API and no compatibility promise. |
 
 The `native-ipc-platform` re-export present in the published 0.4 facade is

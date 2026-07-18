@@ -1,4 +1,11 @@
 //! Runtime mappings exposed only after complete batch commit.
+//!
+//! Raw-pointer consumers must quiesce every thread that dereferences an
+//! acquired pointer before aborting, closing, or dropping the owning session
+//! or mapping: a successful acquisition proves liveness only at its own call
+//! boundary, never for any later use. The [`crate::binding`] module is the
+//! safe alternative for consumers who do not need raw pointers at all; it
+//! needs no `raw-pointer` feature.
 
 use core::cell::Cell;
 use core::fmt;
