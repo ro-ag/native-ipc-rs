@@ -5,6 +5,8 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-18
+
 ### Added
 
 - Inaccessible guard bands around every vnext active view mapping on Linux
@@ -30,6 +32,9 @@ Versioning once a stable API is released.
   metadata recheck discipline as `copy_payload`, performing no allocation, for
   consumers that cannot allocate on their read path. Short destinations report
   the new `BindingError::DestinationTooSmall` without touching shared bytes.
+- **Breaking:** `BindingError` gains the `DestinationTooSmall` variant
+  documented above. `BindingError` is not `non_exhaustive`, so any downstream
+  exhaustive match over the enum must add an arm for it.
 - `core::mapping::{ReaderRegion, WriterRegion}::into_mapping` release a
   binding and return the owned mapping witness.
 
@@ -42,14 +47,19 @@ Versioning once a stable API is released.
   and Linux Arm64 full-suite evidence now exists, and that `region.rs`'s
   `with_guard_policy` doc uses "guard-band" rather than the stale
   "guard-page" wording.
+- Docs: record the raw-pointer quiescence invariant in `active.rs`'s module
+  doc (every thread that dereferences an acquired pointer must quiesce before
+  the owning session or mapping aborts, closes, or drops) and the
+  threat-model paragraph describing what installed guard bands contain and
+  what they do not constrain.
 - `PrivateRegion::allocate` accepts `GuardPolicy::Require` instead of
   rejecting it with `GuardUnavailable`: guard bands install at view-mapping
   time, so a `Require` region now fails at batch preparation or commit when
   bands cannot install. `PreparedRegion::guard_capability` keeps reporting
   `installed: false` and documents that the active reporters carry the
   post-commit outcome.
-- `core::mapping::{ReaderRegion, WriterRegion}::new` return the rejected
-  mapping witness alongside the binding error, so callers recover the
+- **Breaking:** `core::mapping::{ReaderRegion, WriterRegion}::new` return the
+  rejected mapping witness alongside the binding error, so callers recover the
   consumed witness instead of losing it.
 - Unify the cross-platform public-API failure semantics recorded as known
   limitations in 0.5.0. Every target now rejects the same reserved bootstrap
@@ -434,7 +444,8 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.2.0...v0.3.0

@@ -120,7 +120,7 @@ platform; only the underlying kernel mechanism differs (see
 [supported targets](#supported-targets)). The shared-memory allocation core
 ships on all platforms. The vNext session composition is public on
 Linux, macOS Arm64, and Windows (macOS enabled 2026-07-16 after the shared
-public session conformance corpus ran green there) and ships in the `0.5`
+public session conformance corpus ran green there) and ships in the `0.6`
 release line as an experimental API. The exact module inventory,
 cross-target enforcement, and stable-core versus
 experimental-vNext boundary are recorded in
@@ -312,7 +312,7 @@ rerun is enforced by the tag-gated release workflow. Physical (non-virtualized)
 Linux Arm64 evidence, non-macOS packaged-crate conformance, and the
 installed/signed macOS helper (launcher) architecture remain outstanding.
 
-Implemented in the current source tree (`0.5.0`):
+Implemented in the current source tree (`0.6.0`):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -357,7 +357,7 @@ stack-use-after-return detection are enabled, and the standard library is
 rebuilt with instrumentation so the check covers allocation boundaries beyond
 this workspace's crates.
 
-The `0.5` release line ships the vNext session API as an experimental surface;
+The `0.6` release line ships the vNext session API as an experimental surface;
 per the vNext specification §16 its shapes may still change between 0.x
 releases. Guard bands now ship on every vnext active view mapping, with their
 actual installed/requested outcome reported through
