@@ -68,6 +68,13 @@ pub enum BindingError {
     AllocationFailed,
     /// Caller payload length cannot be represented by the fixed protocol field.
     PayloadLengthOverflow,
+    /// Caller destination is shorter than the observed payload.
+    DestinationTooSmall {
+        /// Bytes the observed payload occupies.
+        required: usize,
+        /// Bytes the caller supplied.
+        provided: usize,
+    },
     /// Validated mapping does not belong to the supplied composed topology.
     TopologyMismatch,
     /// Composed topology has no exact route for the requested target slot.
@@ -100,6 +107,23 @@ impl From<SlotError> for BindingError {
     }
 }
 
+/// Copies `len` externally mutable bytes without forming shared references.
+///
+/// # Safety
+///
+/// `source..source+len` must stay mapped and readable for the call; the
+/// destination must be valid for `len` disjoint writes.
+unsafe fn volatile_copy(source: *const u8, destination: *mut u8, len: usize) {
+    for index in 0..len {
+        // SAFETY: caller supplies bounds, liveness, and disjointness.
+        unsafe {
+            destination
+                .add(index)
+                .write(core::ptr::read_volatile(source.add(index)));
+        }
+    }
+}
+
 /// Mapping-lifetime owner that can mint acquire-only capabilities.
 pub struct ReaderRegion<M> {
     mapping: M,
@@ -109,13 +133,20 @@ pub struct ReaderRegion<M> {
 
 impl<M: ReadOnlyMapping> ReaderRegion<M> {
     /// Consumes a platform-minted read-only witness.
+    ///
+    /// On rejection, returns the witness alongside the error so the caller
+    /// recovers the mapping instead of losing it.
     pub fn new(
         mapping: M,
         layout: ValidatedRegionLayout,
         topology: RegionSetLayout,
-    ) -> Result<Self, BindingError> {
-        validate_mapping_size(mapping.len(), &layout)?;
-        validate_topology(&layout, &topology)?;
+    ) -> Result<Self, (M, BindingError)> {
+        if let Err(error) = validate_mapping_size(mapping.len(), &layout) {
+            return Err((mapping, error));
+        }
+        if let Err(error) = validate_topology(&layout, &topology) {
+            return Err((mapping, error));
+        }
         Ok(Self {
             mapping,
             layout,
@@ -157,16 +188,54 @@ impl<M: ReadOnlyMapping> ReaderRegion<M> {
         // destination byte is initialized exactly once in disjoint owned memory.
         unsafe {
             owned.set_len(range.len());
-            let source = self.mapping.base().as_ptr().add(range.start);
-            let destination = owned.as_mut_ptr();
-            for index in 0..range.len() {
-                destination
-                    .add(index)
-                    .write(core::ptr::read_volatile(source.add(index)));
-            }
+            volatile_copy(
+                self.mapping.base().as_ptr().add(range.start),
+                owned.as_mut_ptr(),
+                range.len(),
+            );
         }
         self.slot(slot)?.recheck(observation)?;
         Ok(owned)
+    }
+
+    /// Copies one bounded hostile payload into caller storage and rechecks
+    /// its publication metadata, performing no allocation.
+    ///
+    /// Returns the copied payload length. Same-sequence malicious mutation
+    /// can still produce torn bytes; the destination prefix must be decoded
+    /// as hostile input. Bytes past the returned length are untouched.
+    pub fn copy_payload_into(
+        &self,
+        slot: u32,
+        expected_sequence: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, BindingError> {
+        let observation = self.slot(slot)?.observe(expected_sequence)?;
+        let range = self
+            .layout
+            .slot_payload_range(slot, observation.payload_len())?;
+        if destination.len() < range.len() {
+            return Err(BindingError::DestinationTooSmall {
+                required: range.len(),
+                provided: destination.len(),
+            });
+        }
+        // SAFETY: the read-only witness keeps this validated range mapped and
+        // readable; the destination is caller-owned disjoint memory.
+        unsafe {
+            volatile_copy(
+                self.mapping.base().as_ptr().add(range.start),
+                destination.as_mut_ptr(),
+                range.len(),
+            );
+        }
+        self.slot(slot)?.recheck(observation)?;
+        Ok(range.len())
+    }
+
+    /// Releases the binding and returns the owned mapping witness.
+    pub fn into_mapping(self) -> M {
+        self.mapping
     }
 
     /// Binds one checked acknowledgement route without exposing shared bytes.
@@ -201,18 +270,30 @@ pub struct WriterRegion<M> {
 
 impl<M: SoleWriterMapping> WriterRegion<M> {
     /// Consumes a platform-minted unique writer witness.
+    ///
+    /// On rejection, returns the witness alongside the error so the caller
+    /// recovers the mapping instead of losing it.
     pub fn new(
         mapping: M,
         layout: ValidatedRegionLayout,
         topology: RegionSetLayout,
-    ) -> Result<Self, BindingError> {
-        validate_mapping_size(mapping.len(), &layout)?;
-        validate_topology(&layout, &topology)?;
+    ) -> Result<Self, (M, BindingError)> {
+        if let Err(error) = validate_mapping_size(mapping.len(), &layout) {
+            return Err((mapping, error));
+        }
+        if let Err(error) = validate_topology(&layout, &topology) {
+            return Err((mapping, error));
+        }
         Ok(Self {
             mapping,
             layout,
             topology,
         })
+    }
+
+    /// Releases the binding and returns the owned mapping witness.
+    pub fn into_mapping(self) -> M {
+        self.mapping
     }
 
     /// Exclusively binds one checked producer slot.

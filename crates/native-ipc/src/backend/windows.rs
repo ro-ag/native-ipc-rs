@@ -246,7 +246,8 @@ impl QuiescentRegion {
         let entry = ManifestEntry::from_native(native, PeerAccess::ReadOnly);
         Ok(PreparedLocalWriter {
             section: self.section,
-            runtime: WriterRegion::new(WindowsWriterMapping { view: self.view }, layout, topology)?,
+            runtime: WriterRegion::new(WindowsWriterMapping { view: self.view }, layout, topology)
+                .map_err(|(_, error)| error)?,
             entry,
             len,
             reader_duplicated: false,
@@ -272,7 +273,8 @@ impl QuiescentRegion {
         let entry = ManifestEntry::from_native(native, PeerAccess::SoleWriter);
         Ok(PreparedRemoteWriter {
             section: self.section,
-            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
+            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)
+                .map_err(|(_, error)| error)?,
             entry,
             len,
             writer_duplicated: false,
@@ -1149,7 +1151,8 @@ impl ChildChannel {
         let entry = ManifestEntry::from_native(native, PeerAccess::ReadOnly);
         drop(section);
         Ok(PendingImportedReader {
-            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)?,
+            runtime: ReaderRegion::new(WindowsReaderMapping { view }, layout, topology)
+                .map_err(|(_, error)| error)?,
             entry,
             provenance: self.pending_provenance(),
         })
@@ -1181,7 +1184,8 @@ impl ChildChannel {
         let entry = ManifestEntry::from_native(native, PeerAccess::SoleWriter);
         drop(section);
         Ok(PendingImportedWriter {
-            runtime: WriterRegion::new(WindowsWriterMapping { view }, layout, topology)?,
+            runtime: WriterRegion::new(WindowsWriterMapping { view }, layout, topology)
+                .map_err(|(_, error)| error)?,
             entry,
             provenance: self.pending_provenance(),
         })

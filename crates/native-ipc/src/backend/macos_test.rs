@@ -336,6 +336,7 @@ fn mach_mapping_completes_core_publish_observe_and_ack_path() {
             producer_validated.clone(),
             topology.clone(),
         )
+        .map_err(|(_, error)| error)
         .unwrap();
         writer.publish(0, 1, None, b"mach").unwrap();
     }
@@ -344,6 +345,7 @@ fn mach_mapping_completes_core_publish_observe_and_ack_path() {
         producer_validated,
         topology.clone(),
     )
+    .map_err(|(_, error)| error)
     .unwrap();
     let observation = reader.slot(0).unwrap().observe(1).unwrap();
     reader.slot(0).unwrap().recheck(observation).unwrap();
@@ -355,6 +357,7 @@ fn mach_mapping_completes_core_publish_observe_and_ack_path() {
             ack_validated.clone(),
             topology.clone(),
         )
+        .map_err(|(_, error)| error)
         .unwrap();
         writer
             .acknowledgement(producer, 0)
@@ -362,7 +365,9 @@ fn mach_mapping_completes_core_publish_observe_and_ack_path() {
             .acknowledge(observation)
             .unwrap();
     }
-    let reader = ReaderRegion::new(TestReaderWitness(&ack_peer), ack_validated, topology).unwrap();
+    let reader = ReaderRegion::new(TestReaderWitness(&ack_peer), ack_validated, topology)
+        .map_err(|(_, error)| error)
+        .unwrap();
     let acknowledged = reader.acknowledgement(producer, 0).unwrap().observe();
     assert_eq!(acknowledged.sequence(), 1);
     assert_eq!(acknowledged.slot_index(), 0);
