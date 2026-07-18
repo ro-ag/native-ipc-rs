@@ -374,17 +374,29 @@ impl ReceiverCapabilityTransport for ReceiverWindowsControlTransport {
     }
 }
 
-impl OwnedChildLifecycle for CoordinatorWindowsControlTransport {
-    fn terminate_and_reap(
+impl CoordinatorWindowsControlTransport {
+    /// Terminates and reaps the held child, returning the exact exit code
+    /// the kernel recorded (the termination constant only when the forced
+    /// termination actually landed first).
+    pub(crate) fn terminate_and_reap_code(
         &mut self,
         deadline: AbsoluteDeadline,
-    ) -> Result<(), SessionTransportError> {
+    ) -> Result<u32, SessionTransportError> {
         self.poisoned = true;
         let result = terminate_session(&mut self.session, deadline);
         if result.is_ok() {
             self.remote_ledger.clear();
         }
         result
+    }
+}
+
+impl OwnedChildLifecycle for CoordinatorWindowsControlTransport {
+    fn terminate_and_reap(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<(), SessionTransportError> {
+        self.terminate_and_reap_code(deadline).map(|_| ())
     }
 }
 
@@ -604,15 +616,15 @@ fn poll_pipe(pipe: HANDLE) -> Result<PeerState, SessionTransportError> {
 fn terminate_session(
     session: &mut ChildSession,
     deadline: AbsoluteDeadline,
-) -> Result<(), SessionTransportError> {
+) -> Result<u32, SessionTransportError> {
     if session.reaped {
-        return Ok(());
+        return reaped_exit_code(session);
     }
     if job_is_empty(session._job.0.0)?
         && poll_process(session.process.0)? == PeerState::ExitedUnknown
     {
         session.reaped = true;
-        return Ok(());
+        return reaped_exit_code(session);
     }
     // SAFETY: this session uniquely retains the kill-on-close Job containing
     // the exact still-live child and every descendant.
@@ -624,10 +636,22 @@ fn terminate_session(
             && poll_process(session.process.0)? == PeerState::ExitedUnknown
         {
             session.reaped = true;
-            return Ok(());
+            return reaped_exit_code(session);
         }
         wait_retry(deadline)?;
     }
+}
+
+/// Reads the exact exit code the kernel recorded for the reaped child, so
+/// termination facts report the real code instead of assuming the
+/// termination constant landed first.
+fn reaped_exit_code(session: &ChildSession) -> Result<u32, SessionTransportError> {
+    let mut code = 0;
+    // SAFETY: the exact held process has exited and the output is writable.
+    if unsafe { GetExitCodeProcess(session.process.0, &mut code) } == 0 {
+        return Err(native_error(unsafe { GetLastError() }));
+    }
+    Ok(code)
 }
 
 fn job_is_empty(job: HANDLE) -> Result<bool, SessionTransportError> {

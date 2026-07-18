@@ -310,11 +310,11 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsCoordinatorFailureState::Negotiating,
                 )
             })?;
-            session.abort_child();
+            let exit_code = session.abort_child();
             return Ok(WindowsNegotiationOutcome::Rejected {
                 by: WindowsNegotiationRole::Coordinator,
                 reason,
-                cleanup: Some(terminated_cleanup()),
+                cleanup: Some(terminated_cleanup(exit_code)),
             });
         }
         let accept = self
@@ -394,11 +394,11 @@ impl WindowsCoordinatorNegotiatingSession {
                             WindowsCoordinatorFailureState::Negotiating,
                         )
                     })?;
-                session.abort_child();
+                let exit_code = session.abort_child();
                 return Ok(WindowsNegotiationOutcome::Rejected {
                     by: WindowsNegotiationRole::Receiver,
                     reason,
-                    cleanup: Some(terminated_cleanup()),
+                    cleanup: Some(terminated_cleanup(exit_code)),
                 });
             }
             NegotiationFrame::Hello(_) => {
@@ -670,8 +670,8 @@ impl WindowsCoordinatorReadySession {
         }
     }
     pub(crate) fn abort(&mut self, deadline: AbsoluteDeadline) -> ChildCleanupFacts {
-        match self.dispatcher.terminate_and_reap(deadline) {
-            Ok(()) => terminated_cleanup(),
+        match self.dispatcher.terminate_windows_child(deadline) {
+            Ok(code) => terminated_cleanup(Some(code)),
             Err(error) => cleanup_from_transport(error),
         }
     }
@@ -881,7 +881,8 @@ fn map_windows_error(error: WindowsError) -> WindowsPublicSessionError {
         | WindowsError::ForeignPending
         | WindowsError::InvalidHandle => WindowsPublicSessionError::MalformedPeer,
         WindowsError::Os { code, .. } => WindowsPublicSessionError::Native(Some(code as i32)),
-        WindowsError::InvalidSize(_)
+        WindowsError::MissingBootstrap
+        | WindowsError::InvalidSize(_)
         | WindowsError::Layout(_)
         | WindowsError::Binding(_)
         | WindowsError::CapabilityAlreadyTransferred => WindowsPublicSessionError::InvalidInput,
@@ -894,6 +895,7 @@ fn map_transport_error(error: SessionTransportError) -> WindowsPublicSessionErro
         SessionTransportError::PeerExited => WindowsPublicSessionError::PeerExited,
         SessionTransportError::IdentityMismatch => WindowsPublicSessionError::IdentityMismatch,
         SessionTransportError::Ambiguous => WindowsPublicSessionError::Ambiguous,
+        SessionTransportError::Poisoned => WindowsPublicSessionError::Poisoned,
         SessionTransportError::MalformedRecord | SessionTransportError::RecordTooLarge => {
             WindowsPublicSessionError::MalformedPeer
         }
@@ -969,9 +971,9 @@ fn incomplete_cleanup() -> ChildCleanupFacts {
         None,
     )
 }
-fn terminated_cleanup() -> ChildCleanupFacts {
+fn terminated_cleanup(code: Option<u32>) -> ChildCleanupFacts {
     ChildCleanupFacts::new(
-        Some(ChildExitStatus::Exited(127)),
+        code.map(|code| ChildExitStatus::Exited(code as i32)),
         DescendantCleanupStatus::ContainedProcessTreeComplete,
         None,
     )

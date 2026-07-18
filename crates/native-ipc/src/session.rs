@@ -22,8 +22,6 @@ pub use crate::liveness::{ActiveLeaseFacts, LeaseFactsConsistency};
 #[cfg(target_os = "linux")]
 const RECEIVER_BOOTSTRAP_ENV_PREFIX: &[u8] = b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD=";
 #[cfg(target_os = "linux")]
-const RECEIVER_PUBLIC_BOOTSTRAP_ENV: &[u8] = b"NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP";
-#[cfg(target_os = "linux")]
 const RECEIVER_PUBLIC_BOOTSTRAP_ENV_ENTRY: &[u8] = b"NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP=1";
 #[cfg(target_os = "linux")]
 const PR_GET_MDWE: libc::c_int = 66;
@@ -487,8 +485,11 @@ pub struct ReceiverBootstrap {
 /// The supplied closure receives `Result<ReceiverBootstrap, SessionFailure>` and
 /// runs only after the library has attempted the one-shot reservation take.
 /// Linux validates and reserves its inherited descriptor in an ELF
-/// pre-initializer; macOS takes its private Mach bootstrap reservation from
-/// Rust main before invoking the supplied closure.
+/// pre-initializer. macOS consumes its one-shot bootstrap designation from
+/// Rust main and scrubs the public marker there; the Mach nonce and parent
+/// identity are taken and scrubbed when the receiver session connects.
+/// Windows takes and scrubs its pipe, nonce, and parent designation when the
+/// receiver session connects from the environment.
 #[macro_export]
 macro_rules! receiver_main {
     ($entry:expr) => {
@@ -626,7 +627,10 @@ pub enum ExecutableIdentityPolicy {
     /// launch and again through ACCEPT, independent of pathnames and of the
     /// signing identity (an ad-hoc linker signature suffices). A macOS
     /// executable that carries no code directory — an unsigned image or a
-    /// script — cannot be bound and fails construction closed.
+    /// script — cannot be bound and fails construction closed. Windows
+    /// retains the opened file, spawns from the retained image, binds the
+    /// session transport to the exact spawned process identity, and holds
+    /// the child and its descendants in a kill-on-close Job.
     ExactOpenedFile,
 }
 
@@ -677,16 +681,22 @@ impl SessionCommand {
         self
     }
 
-    #[cfg(target_os = "linux")]
+    /// The cross-platform union of reserved bootstrap environment names.
+    /// Every target rejects the full union so a command that spawns on one
+    /// platform is not silently accepted with a reserved key on another.
     fn has_reserved_environment(&self) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-
+        const RESERVED: [&str; 6] = [
+            "NATIVE_IPC_VNEXT_BOOTSTRAP_FD",
+            "NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP",
+            "NATIVE_IPC_MACH_NONCE",
+            "NATIVE_IPC_PARENT_PID",
+            "NATIVE_IPC_WINDOWS_PIPE",
+            "NATIVE_IPC_WINDOWS_NONCE",
+        ];
         self.environment.iter().any(|(key, _)| {
-            let key = key.as_os_str().as_bytes();
-            key == b"NATIVE_IPC_VNEXT_BOOTSTRAP_FD"
-                || key == RECEIVER_PUBLIC_BOOTSTRAP_ENV
-                || key == b"NATIVE_IPC_MACH_NONCE"
-                || key == b"NATIVE_IPC_PARENT_PID"
+            RESERVED
+                .iter()
+                .any(|name| key.as_os_str() == std::ffi::OsStr::new(name))
         })
     }
 
@@ -1320,15 +1330,15 @@ impl Session<Coordinator, Negotiating> {
                 reason,
             )
         })?;
+        if command.has_reserved_environment() {
+            return Err(SessionFailure::new(
+                SessionOperation::Spawn,
+                SessionTransactionState::NotEstablished,
+                SessionError::InvalidInput,
+            ));
+        }
         #[cfg(target_os = "linux")]
         {
-            if command.has_reserved_environment() {
-                return Err(SessionFailure::new(
-                    SessionOperation::Spawn,
-                    SessionTransactionState::NotEstablished,
-                    SessionError::InvalidInput,
-                ));
-            }
             let inner =
                 crate::backend::linux_vnext::spawn::LinuxCoordinatorNegotiatingSession::spawn(
                     &command, &options,
@@ -1561,11 +1571,23 @@ impl Session<Receiver, Negotiating> {
                     options.deadline,
                 )
                 .map_err(|error| {
+                    // Parity: an absent bootstrap designation or invalid
+                    // caller input means no peer exists and nothing was
+                    // negotiated, matching the Linux mapping.
+                    let invalid_input = matches!(
+                        error,
+                        crate::backend::macos::vnext_session::MacPublicSessionError::InvalidInput
+                    );
+                    let state = if invalid_input {
+                        SessionTransactionState::NotEstablished
+                    } else {
+                        SessionTransactionState::Negotiating
+                    };
                     mac_session_failure(
                         SessionOperation::Bootstrap,
-                        SessionTransactionState::Negotiating,
+                        state,
                         error,
-                        true,
+                        !invalid_input,
                     )
                 })?;
             Ok(Self::from_inner(SessionInner::ReceiverNegotiating(inner)))
@@ -1575,11 +1597,23 @@ impl Session<Receiver, Negotiating> {
             let _bootstrap = bootstrap;
             let inner = crate::backend::windows::vnext_session::WindowsReceiverNegotiatingSession::from_environment(&options)
             .map_err(|error| {
+                // Parity: an absent bootstrap designation or invalid caller
+                // input means no peer exists and nothing was negotiated,
+                // matching the Linux mapping.
+                let invalid_input = matches!(
+                    error,
+                    crate::backend::windows::vnext_session::WindowsPublicSessionError::InvalidInput
+                );
+                let state = if invalid_input {
+                    SessionTransactionState::NotEstablished
+                } else {
+                    SessionTransactionState::Negotiating
+                };
                 windows_session_failure(
                     SessionOperation::Bootstrap,
-                    SessionTransactionState::Negotiating,
+                    state,
                     error,
-                    true,
+                    !invalid_input,
                 )
             })?;
             Ok(Self::from_inner(SessionInner::ReceiverNegotiating(

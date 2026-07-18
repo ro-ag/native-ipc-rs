@@ -72,18 +72,29 @@ fn public_session_inputs_are_explicit_bounded_and_role_typed() {
         0x8000_0042
     );
 
+    for reserved in [
+        "NATIVE_IPC_VNEXT_BOOTSTRAP_FD",
+        "NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP",
+        "NATIVE_IPC_MACH_NONCE",
+        "NATIVE_IPC_PARENT_PID",
+        "NATIVE_IPC_WINDOWS_PIPE",
+        "NATIVE_IPC_WINDOWS_NONCE",
+    ] {
+        assert!(
+            SessionCommand::new("/absolute/helper")
+                .env(reserved, "forged")
+                .has_reserved_environment(),
+            "{reserved} must be reserved on every target"
+        );
+    }
+    assert!(
+        !SessionCommand::new("/absolute/helper")
+            .env("ORDINARY_KEY", "1")
+            .has_reserved_environment()
+    );
+
     #[cfg(target_os = "linux")]
     {
-        assert!(
-            SessionCommand::new("/absolute/helper")
-                .env("NATIVE_IPC_VNEXT_BOOTSTRAP_FD", "7")
-                .has_reserved_environment()
-        );
-        assert!(
-            SessionCommand::new("/absolute/helper")
-                .env("NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP", "1")
-                .has_reserved_environment()
-        );
         assert_eq!(
             RejectionReason::from_wire(NonZeroU32::new(3).unwrap()),
             Some(RejectionReason::APPLICATION_POLICY)
@@ -96,6 +107,36 @@ fn public_session_inputs_are_explicit_bounded_and_role_typed() {
             RejectionReason::from_wire(NonZeroU32::new(0x8000_0042).unwrap()),
             RejectionReason::application_specific(0x8000_0042)
         );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn public_spawn_rejects_the_reserved_environment_union_identically() {
+    for reserved in [
+        "NATIVE_IPC_VNEXT_BOOTSTRAP_FD",
+        "NATIVE_IPC_VNEXT_PUBLIC_BOOTSTRAP",
+        "NATIVE_IPC_MACH_NONCE",
+        "NATIVE_IPC_PARENT_PID",
+        "NATIVE_IPC_WINDOWS_PIPE",
+        "NATIVE_IPC_WINDOWS_NONCE",
+    ] {
+        let command = SessionCommand::new(std::env::current_exe().unwrap()).env(reserved, "forged");
+        let options = SessionOptions::new(
+            AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+            ExecutableIdentityPolicy::ExactOpenedFile,
+        );
+        let failure = CoordinatorSession::<Negotiating>::spawn(command, options)
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason(), SessionError::InvalidInput, "{reserved}");
+        assert_eq!(
+            failure.transaction_state(),
+            SessionTransactionState::NotEstablished,
+            "{reserved}"
+        );
+        assert!(!failure.is_poisoned(), "{reserved}");
+        assert!(failure.cleanup().is_none(), "{reserved}");
     }
 }
 

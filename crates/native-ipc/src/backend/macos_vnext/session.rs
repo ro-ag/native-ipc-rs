@@ -1176,6 +1176,7 @@ fn map_bootstrap_error(error: BootstrapError) -> MacPublicSessionError {
         BootstrapError::InvalidMessage | BootstrapError::InvalidEnvironment => {
             MacPublicSessionError::MalformedPeer
         }
+        BootstrapError::MissingEnvironment => MacPublicSessionError::InvalidInput,
         BootstrapError::Spawn(code) => MacPublicSessionError::Native(Some(code)),
         BootstrapError::Mach { code, .. } => MacPublicSessionError::Native(Some(code)),
         BootstrapError::ExactAuthorityUnavailable { native_error } => {
@@ -1193,6 +1194,7 @@ fn map_transport_error(error: SessionTransportError) -> MacPublicSessionError {
         SessionTransportError::MalformedRecord | SessionTransportError::RecordTooLarge => {
             MacPublicSessionError::MalformedPeer
         }
+        SessionTransportError::Poisoned => MacPublicSessionError::Poisoned,
         SessionTransportError::Native(code) => MacPublicSessionError::Native(code),
     }
 }

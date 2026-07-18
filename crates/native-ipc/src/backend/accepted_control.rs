@@ -903,8 +903,22 @@ impl AcceptedControlDispatcher<CoordinatorWindowsControlTransport> {
         deadline: AbsoluteDeadline,
     ) -> Result<u32, SessionTransportError> {
         let result = self.transport.wait_for_child_exit(deadline);
-        self.poison_both();
+        // Parity with the Linux/macOS dispatchers: an expired deadline with
+        // the child still running leaves the session usable for a later
+        // wait; completion or a native failure poisons both directions.
+        if !matches!(result, Err(SessionTransportError::DeadlineExpired)) {
+            self.poison_both();
+        }
         result
+    }
+
+    pub(crate) fn terminate_windows_child(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<u32, SessionTransportError> {
+        self.transport.poison();
+        self.state.poison();
+        self.transport.terminate_and_reap_code(deadline)
     }
 
     pub(crate) fn begin_public_windows_transfer_capacity(
