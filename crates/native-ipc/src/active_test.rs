@@ -1,5 +1,6 @@
 use super::*;
 use crate::liveness::{LivenessState, ResourceError, ResourceOwner};
+use crate::region::{GuardCapability, GuardPolicy};
 use crate::session::SessionLimits;
 use std::sync::{Arc, Barrier};
 
@@ -192,6 +193,7 @@ fn active_mapping_retains_shared_liveness_until_mapping_drop_finishes() {
         }),
         4,
         resources.reserve(4).unwrap(),
+        GuardPolicy::BestEffort,
     )
     .unwrap();
     assert_eq!(reader.liveness_state(), Some(LivenessState::Active));
@@ -232,6 +234,7 @@ fn rejected_mapping_is_destroyed_and_its_charge_rolls_back() {
         }),
         3,
         resources.reserve(4).unwrap(),
+        GuardPolicy::BestEffort,
     );
     assert!(matches!(
         result,
@@ -253,6 +256,7 @@ fn active_writer_retains_the_same_exact_resource_lease() {
         Box::new(WriterOwner(vec![0; 5].into())),
         5,
         resources.reserve(5).unwrap(),
+        GuardPolicy::BestEffort,
     )
     .unwrap();
     assert_eq!(writer.liveness_state(), Some(LivenessState::Active));
@@ -287,10 +291,73 @@ fn owner_destructor_panic_cannot_leak_the_resource_charge() {
         Box::new(PanickingReaderOwner(vec![0; 4].into())),
         4,
         resources.reserve(4).unwrap(),
+        GuardPolicy::BestEffort,
     )
     .unwrap();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(reader)));
     assert!(panic.is_err());
     assert_eq!(resources.active_lease_facts().regions, 0);
     resources.try_close().unwrap();
+}
+
+struct GuardedReaderOwner(Box<[u8]>);
+
+// SAFETY: test storage is uniquely owned, stable, and destroyed on drop.
+unsafe impl ActiveReadOwner for GuardedReaderOwner {
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn page_size(&self) -> usize {
+        1
+    }
+
+    fn guard_installed(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn guard_reporting_defaults_to_uninstalled_best_effort() {
+    let reader =
+        ActiveReader::new_unleased_for_test(Box::new(ReaderOwner(vec![0; 4].into())), 4).unwrap();
+    assert_eq!(
+        reader.guard_capability(),
+        GuardCapability {
+            requested: GuardPolicy::BestEffort,
+            installed: false,
+        }
+    );
+    let writer =
+        ActiveWriter::new_unleased_for_test(Box::new(WriterOwner(vec![0; 4].into())), 4).unwrap();
+    assert_eq!(
+        writer.guard_capability(),
+        GuardCapability {
+            requested: GuardPolicy::BestEffort,
+            installed: false,
+        }
+    );
+}
+
+#[test]
+fn guard_reporting_reflects_owner_installation_through_a_lease() {
+    let mut resources = ResourceOwner::new(lease_limits()).unwrap();
+    let reader = ActiveReader::new_leased(
+        Box::new(GuardedReaderOwner(vec![0; 4].into())),
+        4,
+        resources.reserve(4).unwrap(),
+        GuardPolicy::Require,
+    )
+    .unwrap();
+    assert_eq!(
+        reader.guard_capability(),
+        GuardCapability {
+            requested: GuardPolicy::Require,
+            installed: true,
+        }
+    );
 }
