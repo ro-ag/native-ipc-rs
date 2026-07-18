@@ -7,6 +7,11 @@ Versioning once a stable API is released.
 
 ### Added
 
+- `binding` module: safe audited conversion from committed active mappings to
+  core read/write capabilities (`ActiveReader::bind`, `ActiveWriter::bind`,
+  recoverable `BindRejected`, reversible witnesses). Downstream no longer
+  needs the `raw-pointer` feature or a hand-written unsafe adapter to run the
+  audited core protocol over session-transferred regions.
 - `core::mapping::ReaderRegion::copy_payload_into` copies one observed hostile
   payload into caller-owned storage with the same observe → volatile copy →
   metadata recheck discipline as `copy_payload`, performing no allocation, for

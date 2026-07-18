@@ -3,13 +3,14 @@ use crate::session::SessionLimits;
 
 #[test]
 fn public_memory_transport_vocabulary_remains_application_neutral() {
-    const PUBLIC_MODULES: [(&str, &str); 6] = [
+    const PUBLIC_MODULES: [(&str, &str); 7] = [
         ("memory", include_str!("memory.rs")),
         ("session", include_str!("session.rs")),
         ("region", include_str!("region.rs")),
         ("batch", include_str!("batch.rs")),
         ("control", include_str!("control.rs")),
         ("active", include_str!("active.rs")),
+        ("binding", include_str!("binding.rs")),
     ];
     const FORBIDDEN: [&str; 9] = [
         "vst3",
@@ -54,13 +55,14 @@ fn public_memory_transport_vocabulary_remains_application_neutral() {
 
 #[test]
 fn consumer_modules_have_no_target_gated_public_items() {
-    const PUBLIC_MODULES: [(&str, &str); 6] = [
+    const PUBLIC_MODULES: [(&str, &str); 7] = [
         ("memory", include_str!("memory.rs")),
         ("session", include_str!("session.rs")),
         ("region", include_str!("region.rs")),
         ("batch", include_str!("batch.rs")),
         ("control", include_str!("control.rs")),
         ("active", include_str!("active.rs")),
+        ("binding", include_str!("binding.rs")),
     ];
 
     for (module, source) in PUBLIC_MODULES {

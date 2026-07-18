@@ -8,10 +8,10 @@ It is an API inventory, not a 1.0 compatibility promise.
 ## Cross-target invariant
 
 For a fixed Cargo feature set, the public declarations in `memory`, `session`,
-`region`, `batch`, `control`, and `active` are the same on every supported
-target. A consumer does not select an OS module or use `cfg(target_os)` to name
-a type or method. Backend selection changes private representation and runtime
-behavior, not the consumer-visible Rust signatures.
+`region`, `batch`, `control`, `active`, and `binding` are the same on every
+supported target. A consumer does not select an OS module or use
+`cfg(target_os)` to name a type or method. Backend selection changes private
+representation and runtime behavior, not the consumer-visible Rust signatures.
 
 This is a Rust source-compatibility contract. It does not promise a stable C
 ABI, stable type layout, equal `size_of` values, or interchangeable serialized
@@ -21,7 +21,7 @@ contract says so.
 The invariant is enforced in two complementary ways:
 
 - `protocol::tests::consumer_modules_have_no_target_gated_public_items` rejects
-  a `target_os` or `target_arch` gate on a public item in any of the six
+  a `target_os` or `target_arch` gate on a public item in any of the seven
   consumer modules; and
 - `tests/public_consumer_surface.rs` names the complete public type inventory
   from one unchanged downstream source file. The existing five-target CI
@@ -38,7 +38,7 @@ Cargo feature. Today only the unsafe raw pointer methods are gated by the
 | --- | --- | --- |
 | `native_ipc::core` re-export | Published in 0.4 | Existing pre-1.0 surface; normal semver rules apply. |
 | `native_ipc::memory` | Published in 0.4 | Existing pre-1.0 allocation/lifecycle surface; normal semver rules apply. |
-| `native_ipc::{region,batch,control,active,session}` | Unreleased vNext | Experimental source API. Names and details may change until the vNext contract and release gates are complete. |
+| `native_ipc::{region,batch,control,active,binding,session}` | Unreleased vNext | Experimental source API. Names and details may change until the vNext contract and release gates are complete. |
 | `native_ipc::receiver_main!` | Unreleased vNext | Experimental helper-entry macro coupled to the vNext session bootstrap contract. |
 | `raw-pointer` methods | Unreleased vNext advanced API | Feature-gated unsafe escape; never part of the ordinary safe API. |
 | `#[doc(hidden)]` entry hooks | Deployment/test plumbing | Not consumer API and no compatibility promise. |
@@ -58,12 +58,41 @@ artifact can be changed retroactively.
 | `batch` | `TransferBatch`, `ExpectedRegion`, `ExpectedBatch`, `ActiveRegionSet`, `BatchError` | vNext bounded 1..=16 mixed-direction transaction and committed keyed result. |
 | `control` | `ControlFrame`, `ControlError`, `APPLICATION_CONTROL_KIND_MIN` | vNext bounded opaque application-control record. |
 | `active` | `ActiveReader`, `ActiveWriter`, `AccessError`, `PrefaultResult` | vNext checked runtime copy/fill/prefault access; raw pointers only with the explicit feature. |
+| `binding` | `BoundReadMapping`, `BoundWriteMapping`, `BindRejected`, `ActiveReader::bind`, `ActiveWriter::bind` | vNext safe, audited conversion from a committed active mapping to a `core` read/write capability without the `raw-pointer` feature. |
 | `session` | role/state markers and `Session<Role, State>` aliases; `BackendStatus`/`backend_status`; bootstrap/command/options/limits/deadline; negotiation/control/batch operations; lifecycle, failure, peer, exit, cleanup, atomic, and lease facts | vNext authenticated exact-child session, negotiation, transfer, control, and lifecycle ownership. |
 
 The two `RegionOptions` types are intentionally distinct during the migration:
 `memory::RegionOptions` belongs to the published 0.4 private-memory lifecycle;
 `region::RegionOptions` configures a vNext consuming region. Consumers should
 import them through their module paths or explicit aliases.
+
+### Safe core binding
+
+The `binding` module is the safe, fully audited path from a committed active
+mapping to the `native_ipc::core` read/write protocol. It exposes five items:
+
+- `BoundReadMapping` — a read-only witness that owns a consumed `ActiveReader`
+  and implements `core::mapping::ReadOnlyMapping`; `into_active` returns the
+  reader unchanged.
+- `BoundWriteMapping` — a sole-writer witness that owns a consumed
+  `ActiveWriter` and implements `core::mapping::SoleWriterMapping`;
+  `into_active` returns the writer unchanged.
+- `BindRejected<T>` — a rejection carrier whose public `error` reports the
+  `BindingError` and whose `into_inner` returns the consumed active mapping
+  unchanged, so a rejected bind never loses the committed mapping.
+- `ActiveReader::bind(layout, topology)` — consumes the reader into a
+  `ReaderRegion<BoundReadMapping>` or returns `Box<BindRejected<ActiveReader>>`.
+- `ActiveWriter::bind(layout, topology)` — consumes the writer into a
+  `WriterRegion<BoundWriteMapping>` or returns `Box<BindRejected<ActiveWriter>>`.
+
+This path needs no consumer-authored unsafe and the `raw-pointer` feature
+remains unnecessary for it. Consuming an active mapping into a witness keeps its
+native view mapped for the witness lifetime; the witness `len` is the mapping's
+validated logical extent. The witness contract carries no liveness guarantee:
+after the peer session ends, a read witness observes only frozen or stale
+hostile bytes (memory-safe) and a write witness publishes to nobody. A consumer
+that needs liveness keeps its owning session handle and quiesces before dropping
+the witness.
 
 ## Runtime availability
 
