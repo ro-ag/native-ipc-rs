@@ -13,7 +13,8 @@ limit, exec trap, and exact ptrace lifecycle used by its native proof corpus.
 
 ## Dead-code suppression inventory
 
-There are 63 explicit `dead_code` allowances after the legacy Linux retirement.
+There are 64 explicit `dead_code` allowances (counting each `dead_code` token
+inside an `allow`/`cfg_attr` attribute, including multi-line attribute lists).
 The table accounts for every site; counts include `cfg_attr` allowances that
 exist only on targets where the corresponding private implementation is not
 yet reachable.
