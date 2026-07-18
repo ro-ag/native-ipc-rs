@@ -359,11 +359,14 @@ this workspace's crates.
 
 The `0.5` release line ships the vNext session API as an experimental surface;
 per the vNext specification §16 its shapes may still change between 0.x
-releases. Still intentionally outside the published line are payload
-authenticity or encryption, automatic guard-page policy, and a stable `1.0`
-compatibility promise. The published crates remain low-level building blocks
-for applications that explicitly own protocol negotiation, resource budgets,
-compatibility policy, and guard-page decisions.
+releases. Guard bands now ship on every vnext active view mapping, with their
+actual installed/requested outcome reported through
+`ActiveReader::guard_capability` and `ActiveWriter::guard_capability`; private
+quiescent mappings that never reach an active view remain unguarded. Still
+intentionally outside the published line are payload authenticity or
+encryption and a stable `1.0` compatibility promise. The published crates
+remain low-level building blocks for applications that explicitly own
+protocol negotiation, resource budgets, and compatibility policy.
 
 ## Toolchain and validation
 

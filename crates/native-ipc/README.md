@@ -50,9 +50,11 @@ Run the complete portable lifecycle example with:
 cargo run -p native-ipc --example common_memory
 ```
 
-## Unreleased vNext session API
+## Experimental vNext session API
 
-The current source tree exposes the Linux, macOS Arm64, and Windows vNext compositions through role- and
+Since 0.5.0 the Linux, macOS Arm64, and Windows vNext compositions ship as an
+experimental surface: per the vNext specification §16, its shapes may still
+change between 0.x releases. It is exposed through role- and
 state-typed `CoordinatorSession<Negotiating>` and
 `ReceiverSession<Negotiating>` owners. `receiver_main!` adopts the inherited
 bootstrap exactly once before ordinary receiver code, bilateral application
@@ -112,9 +114,11 @@ unnamed-section memory owner, PID-authenticated message transport, held image,
 whole-Job lifecycle, full-manifest reducer, bilateral capacity recovery, and
 post-COMMIT active ledger. Native Windows AMD64 source-tree and extracted-package
 all-feature/no-default suites pass at the recorded checkpoint. Native Windows
-Arm64 runtime, exact-release packaged conformance, the installed/signed
-macOS helper (launcher) architecture, and release evidence remain pending. The existing cross-platform
-native-memory lifecycle API remains available independently.
+Arm64 and Linux Arm64 full-suite runs also pass with zero failures, recorded
+at both the 0.5.0 parity checkpoint and the guard-band head. Exact-release
+packaged conformance and the installed/signed macOS helper (launcher)
+architecture remain pending. The existing cross-platform native-memory
+lifecycle API remains available independently.
 
 Payload bytes received through shared memory remain hostile input. Readers copy
 them into owned storage and recheck bounded metadata, but the library does not

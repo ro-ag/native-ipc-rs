@@ -1,4 +1,10 @@
 //! Common lifecycle and policy interface for the best native shared-memory backend.
+//!
+//! The region-to-prepared-to-batch path composed by [`crate::region`],
+//! [`crate::batch`], and [`crate::session`] is the supported transfer route;
+//! [`crate::memory::NativeRegion::prepare_for_sharing`] exists for the documented
+//! lower-level boundary directly on this module's own types and has no
+//! public transfer consumer.
 
 use core::fmt;
 use core::sync::atomic::{Ordering, compiler_fence};
