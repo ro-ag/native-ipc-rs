@@ -21,6 +21,8 @@ pub mod active;
 #[allow(dead_code)]
 /// Atomic transfer-batch construction, expectations, and committed active sets.
 pub mod batch;
+/// Safe audited binding from committed active mappings to core capabilities.
+pub mod binding;
 /// Common native shared-memory allocation, policy, and cleanup interface.
 pub mod memory;
 /// Platform-neutral consuming region ownership states.

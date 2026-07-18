@@ -4,7 +4,10 @@ use native_ipc::active::{AccessError, ActiveReader, ActiveWriter, PrefaultResult
 use native_ipc::batch::{
     ActiveRegionSet, BatchError, ExpectedBatch, ExpectedRegion, TransferBatch,
 };
+use native_ipc::binding::{BindRejected, BoundReadMapping, BoundWriteMapping};
 use native_ipc::control::{APPLICATION_CONTROL_KIND_MIN, ControlError, ControlFrame};
+use native_ipc::core::layout::{RegionSetLayout, ValidatedRegionLayout};
+use native_ipc::core::mapping::{BindingError, ReaderRegion, WriterRegion};
 use native_ipc::memory::{
     AuthorityMechanism, CleanupPolicy, GrowthPolicy, MemoryAccess, MemoryError, NativeArchitecture,
     NativeMemoryCapabilities, NativePlatform, NativeRegion, NativeShareRequest, PermissionPlan,
@@ -41,6 +44,9 @@ fn consumer_type_surface_is_available_on_every_supported_target() {
     assert_public_type::<ExpectedBatch>();
     assert_public_type::<ExpectedRegion>();
     assert_public_type::<TransferBatch>();
+    assert_public_type::<BoundReadMapping>();
+    assert_public_type::<BoundWriteMapping>();
+    assert_public_type::<BindRejected<ActiveReader>>();
     assert_public_type::<ControlError>();
     assert_public_type::<ControlFrame>();
     assert_public_type::<AuthorityMechanism>();
@@ -104,6 +110,19 @@ fn consumer_type_surface_is_available_on_every_supported_target() {
     assert_public_type::<SessionState>();
     assert_public_type::<SessionTransactionState>();
 
+    let _: fn(
+        ActiveReader,
+        ValidatedRegionLayout,
+        RegionSetLayout,
+        &mut [u8],
+    ) -> Result<ActiveReader, BindingError> = safe_read_binding_chain;
+    let _: fn(
+        ActiveWriter,
+        ValidatedRegionLayout,
+        RegionSetLayout,
+        &[u8],
+    ) -> Result<ActiveWriter, BindingError> = safe_write_binding_chain;
+
     let _: fn() -> NativeMemoryCapabilities = native_memory_capabilities;
     let _: fn() -> BackendStatus = backend_status;
     let _ = (
@@ -117,4 +136,38 @@ fn consumer_type_surface_is_available_on_every_supported_target() {
         HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
         HARD_MAX_CONTROL_PAYLOAD_BYTES,
     );
+}
+
+// Compile-only proof that the safe binding chain (bind -> copy/publish ->
+// into_mapping().into_active()) is expressible with the public API alone: no
+// `raw-pointer` feature and no consumer-authored unsafe. An `ActiveReader`/
+// `ActiveWriter` has no public constructor, so this is exercised at compile
+// time only, matching this fixture's cross-target compile contract.
+fn safe_read_binding_chain(
+    reader: ActiveReader,
+    layout: ValidatedRegionLayout,
+    topology: RegionSetLayout,
+    destination: &mut [u8],
+) -> Result<ActiveReader, BindingError> {
+    let bound: ReaderRegion<BoundReadMapping> = match reader.bind(layout, topology) {
+        Ok(region) => region,
+        // The consumed reader is recovered from the boxed rejection.
+        Err(rejected) => return Ok(rejected.into_inner()),
+    };
+    let _copied: usize = bound.copy_payload_into(0, 1, destination)?;
+    Ok(bound.into_mapping().into_active())
+}
+
+fn safe_write_binding_chain(
+    writer: ActiveWriter,
+    layout: ValidatedRegionLayout,
+    topology: RegionSetLayout,
+    payload: &[u8],
+) -> Result<ActiveWriter, BindingError> {
+    let mut bound: WriterRegion<BoundWriteMapping> = match writer.bind(layout, topology) {
+        Ok(region) => region,
+        Err(rejected) => return Ok(rejected.into_inner()),
+    };
+    bound.publish(0, 1, None, payload)?;
+    Ok(bound.into_mapping().into_active())
 }

@@ -196,6 +196,12 @@ impl ActiveReader {
         self.logical_len == 0
     }
 
+    pub(crate) fn payload_base(&self) -> core::ptr::NonNull<u8> {
+        // Owners validate a non-null page-aligned base at construction.
+        core::ptr::NonNull::new(self.owner.as_ptr().cast_mut())
+            .expect("active mapping base is never null")
+    }
+
     /// Copies hostile externally mutable bytes into caller-owned storage.
     ///
     /// The copy is byte-volatile and may be torn or internally inconsistent.
@@ -319,6 +325,10 @@ impl ActiveWriter {
     /// Whether the logical payload is empty (always false for valid regions).
     pub const fn is_empty(&self) -> bool {
         self.logical_len == 0
+    }
+
+    pub(crate) fn payload_base_mut(&mut self) -> core::ptr::NonNull<u8> {
+        core::ptr::NonNull::new(self.owner.as_mut_ptr()).expect("active mapping base is never null")
     }
 
     /// Copies caller bytes into the sole writable mapping.
