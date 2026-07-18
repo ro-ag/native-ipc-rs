@@ -26,7 +26,10 @@ fn public_memory_transport_vocabulary_remains_application_neutral() {
     for (module, source) in PUBLIC_MODULES {
         for (line_number, line) in source.lines().enumerate() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") && !trimmed.starts_with("///") {
+            if trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+                && !trimmed.starts_with("//!")
+            {
                 continue;
             }
             let lowercase = trimmed.to_ascii_lowercase();
