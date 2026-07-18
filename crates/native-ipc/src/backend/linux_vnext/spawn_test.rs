@@ -10,7 +10,10 @@ use crate::backend::accepted_control::{
 use crate::batch::{ExpectedBatch, ExpectedRegion, TransferBatch};
 use crate::control::{APPLICATION_CONTROL_KIND_MIN, ControlError, ControlFrame, ControlState};
 use crate::protocol::{ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest};
-use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
+use crate::region::{
+    GuardCapability, GuardPolicy, PrivateRegion, RegionId, RegionOptions, RegionSpec,
+    WriterEndpoint,
+};
 use crate::session::{
     ChildCleanupFacts, ChildExitStatus, CoordinatorCloseOutcome, CoordinatorSession,
     DescendantCleanupStatus, ExecutableIdentityPolicy, Negotiating, NegotiationDecision,
@@ -791,6 +794,22 @@ fn run_public_session_receiver(mode: &str) {
             let mut active = ready.receive_batch(expected, operation_deadline).unwrap();
             let reader = active.take_reader(RegionId::new(1).unwrap()).unwrap();
             let mut writer = active.take_writer(RegionId::new(2).unwrap()).unwrap();
+            // The receiving endpoint always applies best-effort placement to
+            // its own imported views and reports the installed bands.
+            assert_eq!(
+                reader.guard_capability(),
+                GuardCapability {
+                    requested: GuardPolicy::BestEffort,
+                    installed: true,
+                }
+            );
+            assert_eq!(
+                writer.guard_capability(),
+                GuardCapability {
+                    requested: GuardPolicy::BestEffort,
+                    installed: true,
+                }
+            );
             writer.fill(0..writer.len(), 4).unwrap();
             let coordinator_ready = ready.receive_control(public_flow_deadline()).unwrap();
             assert_eq!(coordinator_ready.kind(), APPLICATION_CONTROL_KIND_MIN + 5);
@@ -4484,7 +4503,14 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
     );
     let mut batch = ready.new_transfer_batch().unwrap();
     for id in (1..=2).rev() {
-        let mut region = PrivateRegion::allocate(RegionOptions::fixed(id * 17)).unwrap();
+        // Region 1 requires guard bands, proving a GuardPolicy::Require
+        // region commits through the public session path.
+        let options = if id == 1 {
+            RegionOptions::fixed(id * 17).with_guard_policy(GuardPolicy::Require)
+        } else {
+            RegionOptions::fixed(id * 17)
+        };
+        let mut region = PrivateRegion::allocate(options).unwrap();
         region.initialize(|bytes| bytes.fill(id as u8));
         batch
             .add(
@@ -4505,6 +4531,20 @@ fn isolated_public_ready_session_control_is_real_bounded_and_typed() {
     let mut active = ready.transfer_batch(batch, operation_deadline).unwrap();
     let mut writer = active.take_writer(RegionId::new(1).unwrap()).unwrap();
     let reader = active.take_reader(RegionId::new(2).unwrap()).unwrap();
+    assert_eq!(
+        writer.guard_capability(),
+        GuardCapability {
+            requested: GuardPolicy::Require,
+            installed: true,
+        }
+    );
+    assert_eq!(
+        reader.guard_capability(),
+        GuardCapability {
+            requested: GuardPolicy::BestEffort,
+            installed: true,
+        }
+    );
     writer.fill(0..writer.len(), 3).unwrap();
     ready
         .send_control(

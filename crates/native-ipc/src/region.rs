@@ -40,23 +40,36 @@ pub struct RegionSpec {
     pub writer: WriterEndpoint,
 }
 
-/// Requested guard-page behavior around a payload mapping.
+/// Requested guard-band behavior around an endpoint's own active view mapping.
+///
+/// Guard bands are inaccessible address ranges installed immediately before
+/// and after each endpoint's own active view mapping when a committed batch
+/// maps its views. They contain in-process linear overruns past a view. They
+/// do not constrain the peer's own address space, and they do not constrain
+/// aliases created by a hostile holder of delegated native capability.
+///
+/// The creating endpoint honors the policy requested for the region. The
+/// receiving endpoint always applies best-effort installation, because the
+/// wire manifest does not carry the policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardPolicy {
-    /// Install guards where reliable placement is available.
+    /// Install guard bands where reliable placement is available and report
+    /// the outcome honestly instead of failing.
     BestEffort,
-    /// Fail preparation unless guards can be installed.
+    /// Fail batch preparation or commit on the creating endpoint unless its
+    /// own view mappings receive guard bands.
     Require,
-    /// Do not request guard pages.
+    /// Do not request guard bands on the creating endpoint.
     Disable,
 }
 
-/// Guard-page request and the backend result established during preparation.
+/// Guard-band request and the reporting endpoint's installation outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardCapability {
     /// Policy requested by the caller.
     pub requested: GuardPolicy,
-    /// Whether inaccessible guard pages were actually installed.
+    /// Whether inaccessible guard bands are actually installed around the
+    /// reporting endpoint's own view mapping.
     pub installed: bool,
 }
 
@@ -96,7 +109,9 @@ impl RegionOptions {
 pub enum RegionError {
     /// Portable or native allocation/preparation failed.
     Memory(memory::MemoryError),
-    /// Required reliable guard-page placement is not implemented.
+    /// Required reliable guard-band placement is unavailable. Batch and
+    /// session operations report the equivalent commit-time failure through
+    /// their own error surfaces.
     GuardUnavailable,
 }
 
@@ -104,7 +119,7 @@ impl fmt::Display for RegionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Memory(error) => error.fmt(formatter),
-            Self::GuardUnavailable => formatter.write_str("required guard pages are unavailable"),
+            Self::GuardUnavailable => formatter.write_str("required guard bands are unavailable"),
         }
     }
 }
@@ -133,10 +148,12 @@ impl PrivateRegion {
     ///
     /// Delegated native authority follows the documented target policy; on
     /// Linux, a malicious memfd holder may create a separate executable alias.
+    ///
+    /// Every [`GuardPolicy`] is accepted here: guard bands are installed when
+    /// a committed batch maps each endpoint's own active views, so a
+    /// [`GuardPolicy::Require`] region fails at batch preparation or commit,
+    /// not at allocation, when bands cannot install.
     pub fn allocate(options: RegionOptions) -> Result<Self, RegionError> {
-        if options.guard == GuardPolicy::Require {
-            return Err(RegionError::GuardUnavailable);
-        }
         let native = if options.maximum_len == options.logical_len {
             memory::RegionOptions::fixed(options.logical_len, memory::WriterOwner::Creator)
         } else {
@@ -215,7 +232,14 @@ impl Drop for PreparedDropObserver {
 unsafe impl Send for PreparedRegion {}
 
 impl PreparedRegion {
-    /// Reports requested and actually installed guard-page behavior.
+    /// Reports the requested guard policy for this prepared region.
+    ///
+    /// Preparation never installs guard bands, so `installed` is always
+    /// `false` here: bands are installed when a committed batch maps each
+    /// endpoint's own active views. After commit,
+    /// [`crate::active::ActiveReader::guard_capability`] and
+    /// [`crate::active::ActiveWriter::guard_capability`] report the actual
+    /// installation outcome.
     pub const fn guard_capability(&self) -> GuardCapability {
         self.guard
     }

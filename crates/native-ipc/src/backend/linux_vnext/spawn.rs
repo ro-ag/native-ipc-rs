@@ -1290,7 +1290,8 @@ fn map_public_local_memory_error(error: MemfdError) -> LinuxPublicSessionError {
         MemfdError::InvalidObject
         | MemfdError::WrongObject
         | MemfdError::WrongProvenance
-        | MemfdError::ExecutableAuthorityUnsupported => LinuxPublicSessionError::Native(None),
+        | MemfdError::ExecutableAuthorityUnsupported
+        | MemfdError::GuardUnavailable => LinuxPublicSessionError::Native(None),
         MemfdError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
     }
 }
@@ -1332,7 +1333,8 @@ fn map_public_receiver_transaction_error(
             | MemfdError::InvalidObject
             | MemfdError::WrongObject
             | MemfdError::WrongProvenance
-            | MemfdError::ExecutableAuthorityUnsupported => LinuxPublicSessionError::MalformedPeer,
+            | MemfdError::ExecutableAuthorityUnsupported
+            | MemfdError::GuardUnavailable => LinuxPublicSessionError::MalformedPeer,
             MemfdError::Native(code) => LinuxPublicSessionError::Native(Some(code)),
         },
         LinuxCapabilityBatchError::Control(error) => map_public_control_error(error),

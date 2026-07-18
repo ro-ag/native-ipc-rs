@@ -6,6 +6,7 @@ use core::marker::PhantomData;
 use core::ops::Range;
 
 use crate::liveness::{LivenessState, RegionLease, ResourceError};
+use crate::region::{GuardCapability, GuardPolicy};
 
 /// Checked active-memory access failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +70,11 @@ pub(crate) unsafe trait ActiveReadOwner: Send + Sync {
     fn as_ptr(&self) -> *const u8;
     fn len(&self) -> usize;
     fn page_size(&self) -> usize;
+    /// Whether inaccessible guard bands are installed immediately before and
+    /// after this owner's exact local mapping. The honest default is `false`.
+    fn guard_installed(&self) -> bool {
+        false
+    }
     #[allow(dead_code)]
     fn liveness_state(&self) -> Option<LivenessState> {
         None
@@ -90,6 +96,11 @@ pub(crate) unsafe trait ActiveWriteOwner: Send {
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
     fn page_size(&self) -> usize;
+    /// Whether inaccessible guard bands are installed immediately before and
+    /// after this owner's exact local mapping. The honest default is `false`.
+    fn guard_installed(&self) -> bool {
+        false
+    }
     #[allow(dead_code)]
     fn liveness_state(&self) -> Option<LivenessState> {
         None
@@ -111,6 +122,7 @@ pub(crate) unsafe trait ActiveWriteOwner: Send {
 pub struct ActiveReader {
     owner: Box<dyn ActiveReadOwner>,
     logical_len: usize,
+    guard_requested: GuardPolicy,
 }
 
 #[allow(dead_code)]
@@ -159,7 +171,11 @@ impl ActiveReader {
         {
             return Err(AccessError::OutOfBounds);
         }
-        Ok(Self { owner, logical_len })
+        Ok(Self {
+            owner,
+            logical_len,
+            guard_requested: GuardPolicy::BestEffort,
+        })
     }
 
     #[allow(dead_code)]
@@ -167,8 +183,10 @@ impl ActiveReader {
         owner: Box<dyn ActiveReadOwner>,
         logical_len: usize,
         reservation: LeaseReservation,
+        guard_requested: GuardPolicy,
     ) -> Result<Self, ActivationError> {
         let mut active = Self::from_owner(owner, logical_len).map_err(ActivationError::Access)?;
+        active.guard_requested = guard_requested;
         let mapped_len = u64::try_from(active.owner.len())
             .map_err(|_| ActivationError::MappingLengthOverflow)?;
         let lease = reservation
@@ -194,6 +212,21 @@ impl ActiveReader {
     /// Whether the logical payload is empty (always false for valid regions).
     pub const fn is_empty(&self) -> bool {
         self.logical_len == 0
+    }
+
+    /// Reports the guard policy applied to this endpoint's own view mapping
+    /// and whether inaccessible guard bands are actually installed around it.
+    ///
+    /// Guard bands contain in-process linear overruns past this view. They do
+    /// not constrain the peer's own address space, and they do not constrain
+    /// aliases created by a hostile holder of delegated native capability.
+    /// The receiving endpoint always applies best-effort installation; the
+    /// creating endpoint applies the policy requested for the region.
+    pub fn guard_capability(&self) -> GuardCapability {
+        GuardCapability {
+            requested: self.guard_requested,
+            installed: self.owner.guard_installed(),
+        }
     }
 
     pub(crate) fn payload_base(&self) -> core::ptr::NonNull<u8> {
@@ -261,6 +294,7 @@ impl ActiveReader {
 pub struct ActiveWriter {
     owner: Box<dyn ActiveWriteOwner>,
     logical_len: usize,
+    guard_requested: GuardPolicy,
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -289,6 +323,7 @@ impl ActiveWriter {
         Ok(Self {
             owner,
             logical_len,
+            guard_requested: GuardPolicy::BestEffort,
             _not_sync: PhantomData,
         })
     }
@@ -298,8 +333,10 @@ impl ActiveWriter {
         owner: Box<dyn ActiveWriteOwner>,
         logical_len: usize,
         reservation: LeaseReservation,
+        guard_requested: GuardPolicy,
     ) -> Result<Self, ActivationError> {
         let mut active = Self::from_owner(owner, logical_len).map_err(ActivationError::Access)?;
+        active.guard_requested = guard_requested;
         let mapped_len = u64::try_from(active.owner.len())
             .map_err(|_| ActivationError::MappingLengthOverflow)?;
         let lease = reservation
@@ -325,6 +362,21 @@ impl ActiveWriter {
     /// Whether the logical payload is empty (always false for valid regions).
     pub const fn is_empty(&self) -> bool {
         self.logical_len == 0
+    }
+
+    /// Reports the guard policy applied to this endpoint's own view mapping
+    /// and whether inaccessible guard bands are actually installed around it.
+    ///
+    /// Guard bands contain in-process linear overruns past this view. They do
+    /// not constrain the peer's own address space, and they do not constrain
+    /// aliases created by a hostile holder of delegated native capability.
+    /// The receiving endpoint always applies best-effort installation; the
+    /// creating endpoint applies the policy requested for the region.
+    pub fn guard_capability(&self) -> GuardCapability {
+        GuardCapability {
+            requested: self.guard_requested,
+            installed: self.owner.guard_installed(),
+        }
     }
 
     pub(crate) fn payload_base_mut(&mut self) -> core::ptr::NonNull<u8> {
@@ -435,6 +487,10 @@ unsafe impl ActiveReadOwner for LeasedReadOwner {
         self.owner().page_size()
     }
 
+    fn guard_installed(&self) -> bool {
+        self.owner().guard_installed()
+    }
+
     fn liveness_state(&self) -> Option<LivenessState> {
         Some(self.lease().state())
     }
@@ -455,6 +511,10 @@ unsafe impl ActiveWriteOwner for LeasedWriteOwner {
 
     fn page_size(&self) -> usize {
         self.owner().page_size()
+    }
+
+    fn guard_installed(&self) -> bool {
+        self.owner().guard_installed()
     }
 
     fn liveness_state(&self) -> Option<LivenessState> {

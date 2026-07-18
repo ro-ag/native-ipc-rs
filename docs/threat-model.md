@@ -80,6 +80,17 @@ not establish payload integrity. Protocol decoders must reject inconsistent
 owned payloads. A malicious sole writer can forge any unkeyed checksum or
 seqlock state, so neither is described as integrity here.
 
+Inaccessible guard bands are installed around each endpoint's own active view
+mapping at commit time, honoring the region's requested policy on the creating
+endpoint (`Require` fails batch preparation or commit when a band cannot
+install; `BestEffort` falls back to an unguarded view and reports
+`installed: false`) and applying best-effort placement on the receiving
+endpoint, whose wire manifest carries no policy. The bands contain in-process
+linear overruns past a view. They do not constrain the peer's own address
+space, and they do not constrain aliases created by a hostile holder of
+delegated native capability; `ActiveReader::guard_capability` and
+`ActiveWriter::guard_capability` report the actual installation outcome.
+
 Linux requires per-record `SCM_CREDENTIALS` and binds those credentials to its
 clone-time pidfd child identity; cached `SO_PEERCRED` is explicitly insufficient.
 The private macOS path authenticates Mach audit trailers and may apply a

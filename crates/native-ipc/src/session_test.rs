@@ -701,7 +701,9 @@ fn macos_public_abort_helper() {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn public_native_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
     use crate::batch::{ExpectedBatch, ExpectedRegion};
-    use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
+    use crate::region::{
+        GuardPolicy, PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint,
+    };
 
     let mut batch = TransferBatch::new(16, 1 << 20, 16 << 20).unwrap();
     let mut expected = Vec::with_capacity(count);
@@ -713,7 +715,14 @@ fn public_native_batch(count: usize) -> (TransferBatch, ExpectedBatch) {
             WriterEndpoint::Receiver
         };
         let logical_len = 31 + index;
-        let mut region = PrivateRegion::allocate(RegionOptions::fixed(logical_len)).unwrap();
+        // The first region requires guard bands, proving a
+        // GuardPolicy::Require region commits through the public session.
+        let options = if index == 0 {
+            RegionOptions::fixed(logical_len).with_guard_policy(GuardPolicy::Require)
+        } else {
+            RegionOptions::fixed(logical_len)
+        };
+        let mut region = PrivateRegion::allocate(options).unwrap();
         region.initialize(|bytes| {
             bytes.fill(0);
             bytes[0] = (index + 1) as u8;
@@ -756,11 +765,23 @@ fn public_ready_activates_one_mixed_batch_atomically() {
         .unwrap();
     assert_eq!(active.len(), 4);
     for ordinal in (0..4).step_by(2) {
-        active
+        let mut writer = active
             .take_writer(RegionId::new((ordinal + 1) as u128).unwrap())
-            .unwrap()
-            .write_from(1, &[0xa0 + ordinal as u8])
             .unwrap();
+        // The creating endpoint installs guard bands around its own active
+        // views and honors the requested policy: region 1 required them.
+        assert_eq!(
+            writer.guard_capability(),
+            crate::region::GuardCapability {
+                requested: if ordinal == 0 {
+                    crate::region::GuardPolicy::Require
+                } else {
+                    crate::region::GuardPolicy::BestEffort
+                },
+                installed: true,
+            }
+        );
+        writer.write_from(1, &[0xa0 + ordinal as u8]).unwrap();
     }
     ready
         .send_control(
@@ -777,6 +798,13 @@ fn public_ready_activates_one_mixed_batch_atomically() {
         let reader = active
             .take_reader(RegionId::new((ordinal + 1) as u128).unwrap())
             .unwrap();
+        assert_eq!(
+            reader.guard_capability(),
+            crate::region::GuardCapability {
+                requested: crate::region::GuardPolicy::BestEffort,
+                installed: true,
+            }
+        );
         let mut byte = [0];
         reader.read_into(1, &mut byte).unwrap();
         assert_eq!(byte, [0xc0 + ordinal as u8]);
@@ -851,17 +879,22 @@ fn public_batch_receiver_helper() {
     assert_eq!(notification.kind, 0x8000_0051);
     for ordinal in 0..4 {
         let id = RegionId::new((ordinal + 1) as u128).unwrap();
+        // The receiving endpoint always applies best-effort placement to its
+        // own imported views and reports the installed bands honestly.
+        let expected_guard = crate::region::GuardCapability {
+            requested: crate::region::GuardPolicy::BestEffort,
+            installed: true,
+        };
         if ordinal % 2 == 0 {
             let reader = active.take_reader(id).unwrap();
+            assert_eq!(reader.guard_capability(), expected_guard);
             let mut bytes = [0; 2];
             reader.read_into(0, &mut bytes).unwrap();
             assert_eq!(bytes, [(ordinal + 1) as u8, 0xa0 + ordinal as u8]);
         } else {
-            active
-                .take_writer(id)
-                .unwrap()
-                .write_from(1, &[0xc0 + ordinal as u8])
-                .unwrap();
+            let mut writer = active.take_writer(id).unwrap();
+            assert_eq!(writer.guard_capability(), expected_guard);
+            writer.write_from(1, &[0xc0 + ordinal as u8]).unwrap();
         }
     }
     assert!(active.is_empty());

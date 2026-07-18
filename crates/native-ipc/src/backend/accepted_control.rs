@@ -2086,7 +2086,12 @@ fn activate_windows_regions<T: AuthenticatedZeroRightsTransport>(
         }
         let region = match (expected_spec.authority, owner) {
             (LocalRegionAuthority::Reader, WindowsActiveRegionOwner::Reader { owner, .. }) => {
-                match ActiveReader::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveReader::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(reader) => CommittedRegion::Reader(reader),
                     Err(error) => {
                         dispatcher.poison_both();
@@ -2095,7 +2100,12 @@ fn activate_windows_regions<T: AuthenticatedZeroRightsTransport>(
                 }
             }
             (LocalRegionAuthority::Writer, WindowsActiveRegionOwner::Writer { owner, .. }) => {
-                match ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveWriter::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(writer) => CommittedRegion::Writer(writer),
                     Err(error) => {
                         dispatcher.poison_both();
@@ -2149,7 +2159,12 @@ fn activate_mac_regions<T: AuthenticatedZeroRightsTransport>(
         }
         let region = match (expected_spec.authority, owner) {
             (LocalRegionAuthority::Reader, MacActiveRegionOwner::Reader { owner, .. }) => {
-                match ActiveReader::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveReader::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(reader) => CommittedRegion::Reader(reader),
                     Err(error) => {
                         dispatcher.poison_both();
@@ -2158,7 +2173,12 @@ fn activate_mac_regions<T: AuthenticatedZeroRightsTransport>(
                 }
             }
             (LocalRegionAuthority::Writer, MacActiveRegionOwner::Writer { owner, .. }) => {
-                match ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveWriter::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(writer) => CommittedRegion::Writer(writer),
                     Err(error) => {
                         dispatcher.poison_both();
@@ -2221,7 +2241,12 @@ fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
         }
         let region = match (expected_spec.authority, owner) {
             (LocalRegionAuthority::Reader, LinuxActiveRegionOwner::Reader { owner, .. }) => {
-                match ActiveReader::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveReader::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(reader) => CommittedRegion::Reader(reader),
                     Err(error) => {
                         dispatcher.poison_both();
@@ -2230,7 +2255,12 @@ fn activate_linux_regions<T: AuthenticatedZeroRightsTransport>(
                 }
             }
             (LocalRegionAuthority::Writer, LinuxActiveRegionOwner::Writer { owner, .. }) => {
-                match ActiveWriter::new_leased(owner, expected_spec.logical_len, reservation) {
+                match ActiveWriter::new_leased(
+                    owner,
+                    expected_spec.logical_len,
+                    reservation,
+                    expected_spec.guard_requested,
+                ) {
                     Ok(writer) => CommittedRegion::Writer(writer),
                     Err(error) => {
                         dispatcher.poison_both();

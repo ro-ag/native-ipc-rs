@@ -17,7 +17,7 @@ use crate::memory::CleanupPolicy;
 use crate::protocol::{
     ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess, TransferManifest,
 };
-use crate::region::{RegionId, WriterEndpoint};
+use crate::region::{GuardPolicy, RegionId, WriterEndpoint};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const MFD_NOEXEC_SEAL: libc::c_uint = 0x0008;
@@ -37,6 +37,7 @@ pub(crate) enum MemfdError {
     WrongObject,
     WrongProvenance,
     ExecutableAuthorityUnsupported,
+    GuardUnavailable,
     Native(i32),
 }
 
@@ -108,10 +109,17 @@ struct CoordinatorReaderPrepared {
     not_sync: PhantomData<Cell<()>>,
 }
 
+/// One owned view mapping. When `guarded` is true the interior view sits one
+/// page inside an inaccessible anonymous reservation whose bands contain
+/// in-process linear overruns; when false the reservation and the interior
+/// are the exact same range.
 struct VmMapping {
     base: NonNull<u8>,
     len: usize,
     clear_on_drop: bool,
+    reservation_base: *mut libc::c_void,
+    reservation_len: usize,
+    guarded: bool,
 }
 
 /// Owns a successful `mmap` before the address has been validated and the
@@ -120,6 +128,9 @@ struct PendingVmMapping {
     base: *mut libc::c_void,
     len: usize,
     clear_on_drop: bool,
+    reservation_base: *mut libc::c_void,
+    reservation_len: usize,
+    guarded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +139,7 @@ pub(crate) struct LinuxActiveRegionSpec {
     pub(crate) authority: LocalRegionAuthority,
     pub(crate) logical_len: usize,
     pub(crate) mapped_len: u64,
+    pub(crate) guard_requested: GuardPolicy,
 }
 
 pub(crate) enum LinuxActiveRegionOwner {
@@ -325,6 +337,7 @@ struct LinuxImportedReceiverWriterEntry {
 struct LinuxCoordinatorWriterEntry {
     native: NativeRegionSpec,
     prepared: CoordinatorWriterPrepared,
+    guard_requested: GuardPolicy,
 }
 
 struct LinuxReceiverWriterEntry {
@@ -333,6 +346,7 @@ struct LinuxReceiverWriterEntry {
     key: ObjectKey,
     mapping: Option<VmMapping>,
     pending_mapping: Option<PendingVmMapping>,
+    guard_requested: GuardPolicy,
     #[cfg(test)]
     capability_override: Option<OwnedFd>,
 }
@@ -365,6 +379,10 @@ unsafe impl ActiveReadOwner for LinuxActiveReadMapping {
     fn page_size(&self) -> usize {
         self.page_size
     }
+
+    fn guard_installed(&self) -> bool {
+        self.mapping().guarded
+    }
 }
 
 // SAFETY: this wrapper uniquely owns the sole local writable mmap range. Its
@@ -385,6 +403,10 @@ unsafe impl ActiveWriteOwner for LinuxActiveWriteMapping {
 
     fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    fn guard_installed(&self) -> bool {
+        self.mapping().guarded
     }
 }
 
@@ -499,6 +521,7 @@ impl PrivateMemfd {
         mut region: QuiescentRegion,
         cleanup: CleanupPolicy,
         deadline: AbsoluteDeadline,
+        guard: bool,
     ) -> Result<Self, MemfdError> {
         check_deadline(deadline)?;
         let logical_len = region.logical_len();
@@ -508,6 +531,7 @@ impl PrivateMemfd {
             mapped_len,
             libc::PROT_READ | libc::PROT_WRITE,
             cleanup == CleanupPolicy::ClearThenRelease,
+            guard,
         ) {
             Ok(mapping) => mapping,
             Err(error) => {
@@ -695,7 +719,7 @@ impl LinuxCoordinatorWriterBatch {
         let mut entries = Vec::with_capacity(pending.regions.len());
         for region in pending.regions {
             check_deadline(deadline)?;
-            let (request, spec, _) = region.into_linux_transfer_parts();
+            let (request, spec, guard) = region.into_linux_transfer_parts();
             if spec.writer != WriterEndpoint::Coordinator {
                 return Err(MemfdError::UnsupportedDirection);
             }
@@ -703,9 +727,23 @@ impl LinuxCoordinatorWriterBatch {
                 .native_spec(spec.id.get())
                 .ok_or(MemfdError::InvalidBatch)?;
             let (region, cleanup) = request.into_linux_quiescent();
-            let prepared = PrivateMemfd::from_quiescent(region, cleanup, deadline)?
-                .prepare_coordinator_writer_for_batch(deadline)?;
-            entries.push(LinuxCoordinatorWriterEntry { native, prepared });
+            // This writable view is the coordinator's own active view after
+            // commit, so it receives the region's requested guard policy.
+            let prepared = PrivateMemfd::from_quiescent(
+                region,
+                cleanup,
+                deadline,
+                guard.requested != GuardPolicy::Disable,
+            )?
+            .prepare_coordinator_writer_for_batch(deadline)?;
+            if guard.requested == GuardPolicy::Require && !prepared.mapping.guarded {
+                return Err(MemfdError::GuardUnavailable);
+            }
+            entries.push(LinuxCoordinatorWriterEntry {
+                native,
+                prepared,
+                guard_requested: guard.requested,
+            });
         }
         check_deadline(deadline)?;
         Ok(Self {
@@ -782,7 +820,7 @@ impl LinuxReceiverWriterBatch {
         let mut entries = Vec::with_capacity(pending.regions.len());
         for region in pending.regions {
             check_deadline(deadline)?;
-            let (request, spec, _) = region.into_linux_transfer_parts();
+            let (request, spec, guard) = region.into_linux_transfer_parts();
             if spec.writer != WriterEndpoint::Receiver {
                 return Err(MemfdError::UnsupportedDirection);
             }
@@ -790,7 +828,10 @@ impl LinuxReceiverWriterBatch {
                 .native_spec(spec.id.get())
                 .ok_or(MemfdError::InvalidBatch)?;
             let (region, cleanup) = request.into_linux_quiescent();
-            let (fd, key) = PrivateMemfd::from_quiescent(region, cleanup, deadline)?
+            // This transitional writable view is destroyed before any
+            // capability escapes; only the read-only view established at
+            // seal time is active, so the policy applies there instead.
+            let (fd, key) = PrivateMemfd::from_quiescent(region, cleanup, deadline, false)?
                 .prepare_receiver_writer_for_batch(deadline)?;
             entries.push(LinuxReceiverWriterEntry {
                 native,
@@ -798,6 +839,7 @@ impl LinuxReceiverWriterBatch {
                 key,
                 mapping: None,
                 pending_mapping: None,
+                guard_requested: guard.requested,
                 #[cfg(test)]
                 capability_override: None,
             });
@@ -926,12 +968,18 @@ impl LinuxReceiverWriterBatch {
         let mut advice_operation = 0_usize;
         for entry in &mut self.entries {
             check_deadline(self.deadline)?;
+            // This read-only view is the coordinator's own active view after
+            // commit, so it receives the region's requested guard policy.
             let pending = PendingVmMapping::map(
                 entry.fd.as_raw_fd(),
                 entry.key.mapped_len,
                 libc::PROT_READ,
                 false,
+                entry.guard_requested != GuardPolicy::Disable,
             )?;
+            if entry.guard_requested == GuardPolicy::Require && !pending.guarded {
+                return Err(MemfdError::GuardUnavailable);
+            }
             entry.pending_mapping = Some(pending);
             check_deadline(self.deadline)?;
             for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
@@ -1224,12 +1272,18 @@ impl LinuxMixedDirectionBatch {
             };
             for entry in &mut batch.entries {
                 check_deadline(self.deadline)?;
+                // This read-only view is the coordinator's own active view
+                // after commit; it receives the region's requested policy.
                 let pending = PendingVmMapping::map(
                     entry.fd.as_raw_fd(),
                     entry.key.mapped_len,
                     libc::PROT_READ,
                     false,
+                    entry.guard_requested != GuardPolicy::Disable,
                 )?;
+                if entry.guard_requested == GuardPolicy::Require && !pending.guarded {
+                    return Err(MemfdError::GuardUnavailable);
+                }
                 entry.pending_mapping = Some(pending);
                 check_deadline(self.deadline)?;
                 for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
@@ -1454,11 +1508,18 @@ impl LinuxExpectedCoordinatorWriterBatch {
             if let Err(error) = check_deadline(self.deadline) {
                 fail!(error, Some(fd), None);
             }
-            let pending =
-                match PendingVmMapping::map(fd.as_raw_fd(), mapped_len, libc::PROT_READ, false) {
-                    Ok(mapping) => mapping,
-                    Err(error) => fail!(error, Some(fd), None),
-                };
+            // Imported views always take best-effort guard placement: the
+            // wire manifest does not carry the creator's policy.
+            let pending = match PendingVmMapping::map(
+                fd.as_raw_fd(),
+                mapped_len,
+                libc::PROT_READ,
+                false,
+                true,
+            ) {
+                Ok(mapping) => mapping,
+                Err(error) => fail!(error, Some(fd), None),
+            };
             if let Err(error) = check_deadline(self.deadline) {
                 fail!(error, Some(fd), Some(pending));
             }
@@ -1632,11 +1693,14 @@ impl LinuxExpectedReceiverWriterBatch {
             if let Err(error) = check_deadline(self.deadline) {
                 fail!(error, Some(fd), None);
             }
+            // Imported views always take best-effort guard placement: the
+            // wire manifest does not carry the creator's policy.
             let pending = match PendingVmMapping::map(
                 fd.as_raw_fd(),
                 mapped_len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 false,
+                true,
             ) {
                 Ok(mapping) => mapping,
                 Err(error) => fail!(error, Some(fd), None),
@@ -1833,11 +1897,13 @@ impl LinuxExpectedMixedDirectionBatch {
             if let Err(error) = check_deadline(self.deadline) {
                 fail!(error, Some(fd), None);
             }
-            let pending = match PendingVmMapping::map(fd.as_raw_fd(), mapped_len, protection, false)
-            {
-                Ok(mapping) => mapping,
-                Err(error) => fail!(error, Some(fd), None),
-            };
+            // Imported views always take best-effort guard placement: the
+            // wire manifest does not carry the creator's policy.
+            let pending =
+                match PendingVmMapping::map(fd.as_raw_fd(), mapped_len, protection, false, true) {
+                    Ok(mapping) => mapping,
+                    Err(error) => fail!(error, Some(fd), None),
+                };
             if let Err(error) = check_deadline(self.deadline) {
                 fail!(error, Some(fd), Some(pending));
             }
@@ -2173,6 +2239,7 @@ impl LinuxMixedDirectionBatch {
                         0,
                         LocalRegionAuthority::Writer,
                         &entry.prepared.mapping,
+                        entry.guard_requested,
                     )?
                 }
                 LinuxMixedDirectionEntry::ReceiverWriter(batch) => {
@@ -2187,7 +2254,13 @@ impl LinuxMixedDirectionBatch {
                         return Err(MemfdError::WrongObject);
                     }
                     let mapping = entry.mapping.as_ref().ok_or(MemfdError::WrongObject)?;
-                    native_active_spec(entry.native, 1, LocalRegionAuthority::Reader, mapping)?
+                    native_active_spec(
+                        entry.native,
+                        1,
+                        LocalRegionAuthority::Reader,
+                        mapping,
+                        entry.guard_requested,
+                    )?
                 }
             };
             specs.push(spec);
@@ -2222,9 +2295,14 @@ impl LinuxMixedDirectionBatch {
                         not_sync: _,
                     } = entry.prepared;
                     drop(reader_capability);
-                    let spec =
-                        native_active_spec(entry.native, 0, LocalRegionAuthority::Writer, &mapping)
-                            .expect("activation preflight validated coordinator-writer metadata");
+                    let spec = native_active_spec(
+                        entry.native,
+                        0,
+                        LocalRegionAuthority::Writer,
+                        &mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated coordinator-writer metadata");
                     active.push(LinuxActiveRegionOwner::Writer {
                         spec,
                         owner: Box::new(LinuxActiveWriteMapping {
@@ -2252,9 +2330,14 @@ impl LinuxMixedDirectionBatch {
                         .mapping
                         .take()
                         .expect("activation preflight retained the final mapping");
-                    let spec =
-                        native_active_spec(entry.native, 1, LocalRegionAuthority::Reader, &mapping)
-                            .expect("activation preflight validated receiver-writer metadata");
+                    let spec = native_active_spec(
+                        entry.native,
+                        1,
+                        LocalRegionAuthority::Reader,
+                        &mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated receiver-writer metadata");
                     active.push(LinuxActiveRegionOwner::Reader {
                         spec,
                         owner: Box::new(LinuxActiveReadMapping {
@@ -2530,7 +2613,7 @@ impl CoordinatorReaderPrepared {
 
 impl VmMapping {
     fn map(fd: RawFd, len: usize, protection: libc::c_int) -> Result<Self, MemfdError> {
-        Self::map_with_clear(fd, len, protection, false)
+        Self::map_with_clear(fd, len, protection, false, true)
     }
 
     fn map_with_clear(
@@ -2538,8 +2621,9 @@ impl VmMapping {
         len: usize,
         protection: libc::c_int,
         clear_on_drop: bool,
+        guard: bool,
     ) -> Result<Self, MemfdError> {
-        let pending = PendingVmMapping::map(fd, len, protection, clear_on_drop)?;
+        let pending = PendingVmMapping::map(fd, len, protection, clear_on_drop, guard)?;
         for advice in [libc::MADV_DONTDUMP, libc::MADV_DONTFORK] {
             pending.advise(advice)?;
         }
@@ -2547,8 +2631,9 @@ impl VmMapping {
     }
 
     fn unmap(self) -> Result<(), MemfdError> {
-        // SAFETY: this value uniquely owns this exact local mapping.
-        if unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) } != 0 {
+        // SAFETY: this value uniquely owns this exact local reservation, which
+        // covers the interior view and, when guarded, both bands.
+        if unsafe { libc::munmap(self.reservation_base, self.reservation_len) } != 0 {
             return Err(last_native());
         }
         // Successful munmap discharged the destructor's native obligation.
@@ -2563,7 +2648,11 @@ impl PendingVmMapping {
         len: usize,
         protection: libc::c_int,
         clear_on_drop: bool,
+        guard: bool,
     ) -> Result<Self, MemfdError> {
+        if guard && let Some(guarded) = Self::map_guarded(fd, len, protection, clear_on_drop) {
+            return Ok(guarded);
+        }
         // SAFETY: arguments describe a checked shared memfd range.
         let base = unsafe {
             libc::mmap(
@@ -2582,11 +2671,74 @@ impl PendingVmMapping {
             base,
             len,
             clear_on_drop,
+            reservation_base: base,
+            reservation_len: len,
+            guarded: false,
+        })
+    }
+
+    /// Best-effort guarded placement: an inaccessible anonymous reservation of
+    /// one page, the view, and one page, with the shared view carved into the
+    /// middle by `MAP_FIXED`. Any failure returns `None` so the caller falls
+    /// back to the plain unguarded path with its original error semantics.
+    fn map_guarded(
+        fd: RawFd,
+        len: usize,
+        protection: libc::c_int,
+        clear_on_drop: bool,
+    ) -> Option<Self> {
+        let page = native_page_size().ok()?;
+        if len == 0 || !len.is_multiple_of(page) {
+            return None;
+        }
+        let total = len.checked_add(page.checked_mul(2)?)?;
+        if total > isize::MAX as usize {
+            return None;
+        }
+        // SAFETY: a fresh inaccessible anonymous reservation of checked length.
+        let reservation = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                total,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if reservation == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: the carve target lies wholly inside the owned reservation,
+        // one page in from each end, so `MAP_FIXED` replaces only owned pages.
+        let interior = unsafe {
+            libc::mmap(
+                reservation.cast::<u8>().add(page).cast(),
+                len,
+                protection,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if interior == libc::MAP_FAILED {
+            // SAFETY: the failed carve leaves the whole reservation owned here.
+            let _ = unsafe { libc::munmap(reservation, total) };
+            return None;
+        }
+        Some(Self {
+            base: interior,
+            len,
+            clear_on_drop,
+            reservation_base: reservation,
+            reservation_len: total,
+            guarded: true,
         })
     }
 
     fn advise(&self, advice: libc::c_int) -> Result<(), MemfdError> {
-        // SAFETY: this owner retains the complete live mapping for the call.
+        // SAFETY: advice applies to the complete live interior view only,
+        // never to the inaccessible bands around it.
         if unsafe { libc::madvise(self.base, self.len, advice) } != 0 {
             return Err(last_native());
         }
@@ -2601,6 +2753,9 @@ impl PendingVmMapping {
             base,
             len: self.len,
             clear_on_drop: self.clear_on_drop,
+            reservation_base: self.reservation_base,
+            reservation_len: self.reservation_len,
+            guarded: self.guarded,
         };
         forget(self);
         Ok(mapping)
@@ -2616,13 +2771,16 @@ impl Drop for VmMapping {
         if self.clear_on_drop {
             for offset in 0..self.len {
                 // SAFETY: this mapping is writable and uniquely owned by the
-                // pending coordinator typestate until destruction.
+                // pending coordinator typestate until destruction. Clearing
+                // touches only the interior view, never the bands.
                 unsafe { core::ptr::write_volatile(self.base.as_ptr().add(offset), 0) };
             }
             compiler_fence(Ordering::SeqCst);
         }
-        // SAFETY: this value uniquely owns this local mapping.
-        let _ = unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+        // SAFETY: this value uniquely owns this local reservation, which is
+        // exactly the interior view when unguarded and additionally covers
+        // both bands when guarded.
+        let _ = unsafe { libc::munmap(self.reservation_base, self.reservation_len) };
     }
 }
 
@@ -2638,8 +2796,9 @@ impl Drop for PendingVmMapping {
             compiler_fence(Ordering::SeqCst);
         }
         // SAFETY: this owner uniquely retains the successful mmap result,
-        // including the address-zero case.
-        let _ = unsafe { libc::munmap(self.base, self.len) };
+        // including the address-zero case; the reservation covers the interior
+        // view and, when guarded, both bands.
+        let _ = unsafe { libc::munmap(self.reservation_base, self.reservation_len) };
     }
 }
 
@@ -2703,6 +2862,7 @@ fn native_active_spec(
     expected_writer: u32,
     authority: LocalRegionAuthority,
     mapping: &VmMapping,
+    guard_requested: GuardPolicy,
 ) -> Result<LinuxActiveRegionSpec, MemfdError> {
     if native.writer != expected_writer {
         return Err(MemfdError::WrongProvenance);
@@ -2713,6 +2873,7 @@ fn native_active_spec(
         native.logical_len,
         native.mapped_len,
         mapping,
+        guard_requested,
     )
 }
 
@@ -2721,12 +2882,15 @@ fn manifest_active_spec(
     authority: LocalRegionAuthority,
     mapping: &VmMapping,
 ) -> Result<LinuxActiveRegionSpec, MemfdError> {
+    // Imported regions apply best-effort guard placement: the wire manifest
+    // does not carry the creator's requested policy.
     active_region_spec(
         manifest.region_id,
         authority,
         manifest.logical_len,
         manifest.mapped_len,
         mapping,
+        GuardPolicy::BestEffort,
     )
 }
 
@@ -2736,6 +2900,7 @@ fn active_region_spec(
     logical_len: u64,
     mapped_len: u64,
     mapping: &VmMapping,
+    guard_requested: GuardPolicy,
 ) -> Result<LinuxActiveRegionSpec, MemfdError> {
     let id = RegionId::new(region_id).ok_or(MemfdError::WrongProvenance)?;
     let logical_len = usize::try_from(logical_len).map_err(|_| MemfdError::InvalidSize)?;
@@ -2748,6 +2913,7 @@ fn active_region_spec(
         authority,
         logical_len,
         mapped_len,
+        guard_requested,
     })
 }
 
