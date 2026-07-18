@@ -926,6 +926,7 @@ fn map_memory_error(error: WindowsBatchError) -> WindowsPublicSessionError {
         WindowsBatchError::InvalidBatch
         | WindowsBatchError::InvalidSize
         | WindowsBatchError::WrongProvenance => WindowsPublicSessionError::InvalidInput,
+        WindowsBatchError::GuardUnavailable => WindowsPublicSessionError::Native(None),
         WindowsBatchError::WrongObject | WindowsBatchError::WrongAccess => {
             WindowsPublicSessionError::MalformedPeer
         }

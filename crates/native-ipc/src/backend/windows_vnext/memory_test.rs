@@ -1,11 +1,13 @@
 use super::vnext_memory::{
-    WindowsBatchError, WindowsExpectedMixedDirectionBatch, WindowsMixedDirectionBatch,
-    WindowsReceivedHandle, live_handles_for_test, live_views_for_test,
+    WindowsActiveRegionOwner, WindowsBatchError, WindowsExpectedMixedDirectionBatch,
+    WindowsMixedDirectionBatch, WindowsReceivedHandle, live_handles_for_test, live_views_for_test,
 };
 use super::{OwnedHandle, QuiescentRegion, View, duplicate_to};
 use crate::batch::{ExpectedBatch, ExpectedRegion, LocalRegionAuthority, TransferBatch};
 use crate::protocol::{NativeAuthorityProfile, TransferManifest};
-use crate::region::{PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint};
+use crate::region::{
+    GuardPolicy, PrivateRegion, RegionId, RegionOptions, RegionSpec, WriterEndpoint,
+};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 use std::mem::zeroed;
 use std::time::Duration;
@@ -14,8 +16,9 @@ use windows_sys::Win32::Foundation::{
     SetHandleInformation,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
-    PAGE_READWRITE, SEC_RESERVE, VirtualAlloc, VirtualProtect,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RESERVE,
+    MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, SEC_RESERVE, VirtualAlloc,
+    VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -461,5 +464,176 @@ fn imported_views_cannot_gain_write_or_execute() {
                 );
             }
         }
+    }
+}
+
+fn build_batch_with_policy(count: usize, guard: GuardPolicy) -> (TransferBatch, ExpectedBatch) {
+    let mut batch = TransferBatch::new(16, 1 << 20, 16 << 20).unwrap();
+    let mut expected = Vec::with_capacity(count);
+    for index in (0..count).rev() {
+        let id = RegionId::new((index + 1) as u128).unwrap();
+        let writer = if index % 2 == 0 {
+            WriterEndpoint::Coordinator
+        } else {
+            WriterEndpoint::Receiver
+        };
+        let logical_len = 31 + index;
+        let mut region =
+            PrivateRegion::allocate(RegionOptions::fixed(logical_len).with_guard_policy(guard))
+                .unwrap();
+        region.initialize(|bytes| {
+            bytes.fill(0);
+            bytes[0] = (index + 1) as u8;
+        });
+        batch
+            .add(region.prepare(RegionSpec { id, writer }).unwrap())
+            .unwrap();
+        expected.push(ExpectedRegion::new(id, writer, logical_len));
+    }
+    (batch, ExpectedBatch::try_from_regions(expected).unwrap())
+}
+
+fn allocation_granularity() -> usize {
+    let mut information: SYSTEM_INFO = unsafe { zeroed() };
+    // SAFETY: output pointer is valid.
+    unsafe { GetSystemInfo(&mut information) };
+    information.dwAllocationGranularity as usize
+}
+
+/// A guard band must be a reserved, uncommitted range covering `address`.
+fn assert_band_reserved(address: usize) {
+    let mut information: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+    // SAFETY: the queried address and output structure are valid.
+    let queried = unsafe {
+        VirtualQuery(
+            address as *const core::ffi::c_void,
+            &mut information,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    assert_eq!(
+        queried,
+        size_of::<MEMORY_BASIC_INFORMATION>(),
+        "guard band at {address:#x} could not be queried"
+    );
+    let start = information.BaseAddress as usize;
+    let end = start + information.RegionSize;
+    assert!(
+        (start..end).contains(&address),
+        "guard band at {address:#x} is outside its queried range"
+    );
+    assert_eq!(
+        information.State, MEM_RESERVE,
+        "guard band at {address:#x} is not a reserved placeholder"
+    );
+}
+
+fn assert_owner_view_guarded(owner: &WindowsActiveRegionOwner, band: usize, installed: bool) {
+    // The owner must stay alive across every probe: dropping it unmaps the
+    // view and releases its band placeholders.
+    let (base, len, reported) = match owner {
+        WindowsActiveRegionOwner::Reader { owner, .. } => (
+            owner.as_ptr() as usize,
+            owner.len(),
+            owner.guard_installed(),
+        ),
+        WindowsActiveRegionOwner::Writer { owner, .. } => (
+            owner.as_ptr() as usize,
+            owner.len(),
+            owner.guard_installed(),
+        ),
+    };
+    assert_eq!(reported, installed, "owner guard reporting is dishonest");
+    if installed {
+        assert_band_reserved(base - band);
+        assert_band_reserved(base + len);
+        let mut information: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        // SAFETY: the live interior base and output structure are valid.
+        let queried = unsafe {
+            VirtualQuery(
+                base as *const core::ffi::c_void,
+                &mut information,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert_eq!(queried, size_of::<MEMORY_BASIC_INFORMATION>());
+        assert_eq!(information.State, MEM_COMMIT, "interior view lost access");
+    }
+}
+
+#[test]
+fn mixed_active_owners_install_guard_bands_on_both_endpoints() {
+    let (batch, expected) = build_batch(2);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let transfer = manifest(prepared.manifest_entries());
+    let handles = prepared.copied_capabilities_for_test().unwrap();
+    let expected =
+        WindowsExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+            .unwrap();
+    let imported = expected.import(&transfer, handles).unwrap();
+    let band = allocation_granularity();
+    for spec in prepared.activation_specs().unwrap() {
+        assert_eq!(spec.guard_requested, GuardPolicy::BestEffort);
+    }
+    for owner in prepared.into_active_region_owners() {
+        assert_owner_view_guarded(&owner, band, true);
+    }
+    for spec in imported.activation_specs(deadline()).unwrap() {
+        assert_eq!(spec.guard_requested, GuardPolicy::BestEffort);
+    }
+    for owner in imported.into_active_region_owners() {
+        assert_owner_view_guarded(&owner, band, true);
+    }
+}
+
+#[test]
+fn required_guard_policy_commits_with_installed_bands() {
+    let (batch, _) = build_batch_with_policy(2, GuardPolicy::Require);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let band = allocation_granularity();
+    for spec in prepared.activation_specs().unwrap() {
+        assert_eq!(spec.guard_requested, GuardPolicy::Require);
+    }
+    for owner in prepared.into_active_region_owners() {
+        assert_owner_view_guarded(&owner, band, true);
+    }
+}
+
+#[test]
+fn disabled_guard_policy_keeps_creator_views_unguarded_and_honest() {
+    let (batch, expected) = build_batch_with_policy(2, GuardPolicy::Disable);
+    let prepared = WindowsMixedDirectionBatch::prepare(
+        batch,
+        NativeAuthorityProfile::WindowsSectionsV1,
+        deadline(),
+    )
+    .unwrap();
+    let transfer = manifest(prepared.manifest_entries());
+    let handles = prepared.copied_capabilities_for_test().unwrap();
+    let expected =
+        WindowsExpectedMixedDirectionBatch::new(expected, SessionLimits::default(), deadline())
+            .unwrap();
+    let imported = expected.import(&transfer, handles).unwrap();
+    let band = allocation_granularity();
+    for spec in prepared.activation_specs().unwrap() {
+        assert_eq!(spec.guard_requested, GuardPolicy::Disable);
+    }
+    for owner in prepared.into_active_region_owners() {
+        assert_owner_view_guarded(&owner, band, false);
+    }
+    // The importing endpoint cannot see the creator's policy and still
+    // applies best-effort placement to its own views.
+    for owner in imported.into_active_region_owners() {
+        assert_owner_view_guarded(&owner, band, true);
     }
 }

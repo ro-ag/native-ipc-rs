@@ -32,7 +32,7 @@ use crate::batch::{ExpectedBatch, LocalRegionAuthority, TransferBatch};
 use crate::protocol::{
     ManifestEntry, NativeAuthorityProfile, NativeRegionSpec, PeerAccess, TransferManifest,
 };
-use crate::region::{RegionId, WriterEndpoint};
+use crate::region::{GuardPolicy, RegionId, WriterEndpoint};
 use crate::session::{AbsoluteDeadline, SessionLimits};
 
 const OBJECT_NAME_INFORMATION: i32 = 1;
@@ -48,6 +48,7 @@ pub(crate) enum WindowsBatchError {
     WrongProvenance,
     WrongObject,
     WrongAccess,
+    GuardUnavailable,
     Native(super::WindowsError),
 }
 
@@ -63,6 +64,7 @@ pub(crate) struct WindowsActiveRegionSpec {
     pub(crate) logical_len: usize,
     pub(crate) mapped_len: usize,
     pub(crate) authority: LocalRegionAuthority,
+    pub(crate) guard_requested: GuardPolicy,
 }
 
 pub(crate) enum WindowsActiveRegionOwner {
@@ -151,6 +153,10 @@ impl SectionView {
     fn len(&self) -> usize {
         self.0.as_ref().expect("live section view").len
     }
+
+    fn guarded(&self) -> bool {
+        self.0.as_ref().expect("live section view").guard.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +219,10 @@ unsafe impl ActiveReadOwner for ActiveReadMapping {
     fn page_size(&self) -> usize {
         self.page_size
     }
+
+    fn guard_installed(&self) -> bool {
+        self.view.guarded()
+    }
 }
 
 // SAFETY: this wrapper uniquely owns the endpoint's writable local view. The
@@ -233,18 +243,24 @@ unsafe impl ActiveWriteOwner for ActiveWriteMapping {
     fn page_size(&self) -> usize {
         self.page_size
     }
+
+    fn guard_installed(&self) -> bool {
+        self.view.guarded()
+    }
 }
 
 struct CoordinatorWriterEntry {
     native: NativeRegionSpec,
     section: SectionHandle,
     mapping: SectionView,
+    guard_requested: GuardPolicy,
 }
 
 struct ReceiverWriterEntry {
     native: NativeRegionSpec,
     section: SectionHandle,
     mapping: SectionView,
+    guard_requested: GuardPolicy,
 }
 
 enum PreparedEntry {
@@ -302,7 +318,7 @@ impl WindowsMixedDirectionBatch {
         let mut entries = Vec::with_capacity(pending.regions.len());
         for (ordinal, region) in pending.regions.into_iter().enumerate() {
             check_deadline(deadline)?;
-            let (request, spec, _) = region.into_windows_transfer_parts();
+            let (request, spec, guard) = region.into_windows_transfer_parts();
             let native = request
                 .native_spec(spec.id.get())
                 .ok_or(WindowsBatchError::InvalidBatch)?;
@@ -316,20 +332,45 @@ impl WindowsMixedDirectionBatch {
             let section = SectionHandle::new(section);
             let entry = match spec.writer {
                 WriterEndpoint::Coordinator => {
+                    // The coordinator's own active writable view honors the
+                    // region's requested guard policy: replace the quiescent
+                    // view with a guarded view of the same section where
+                    // placement succeeds, keep the original otherwise.
+                    let mapping = if guard.requested != GuardPolicy::Disable
+                        && let Some(guarded) =
+                            View::map_guarded(section.raw(), mapped_len, FILE_MAP_WRITE)
+                    {
+                        drop(view);
+                        SectionView::new(guarded)
+                    } else {
+                        SectionView::new(view)
+                    };
+                    if guard.requested == GuardPolicy::Require && !mapping.guarded() {
+                        return Err(WindowsBatchError::GuardUnavailable);
+                    }
                     PreparedEntry::CoordinatorWriter(CoordinatorWriterEntry {
                         native,
                         section,
-                        mapping: SectionView::new(view),
+                        mapping,
+                        guard_requested: guard.requested,
                     })
                 }
                 WriterEndpoint::Receiver => {
                     drop(view);
-                    let mapping =
-                        SectionView::new(View::map(section.raw(), mapped_len, FILE_MAP_READ)?);
+                    let mapping = SectionView::new(View::map_with_guard(
+                        section.raw(),
+                        mapped_len,
+                        FILE_MAP_READ,
+                        guard.requested != GuardPolicy::Disable,
+                    )?);
+                    if guard.requested == GuardPolicy::Require && !mapping.guarded() {
+                        return Err(WindowsBatchError::GuardUnavailable);
+                    }
                     PreparedEntry::ReceiverWriter(ReceiverWriterEntry {
                         native,
                         section,
                         mapping,
+                        guard_requested: guard.requested,
                     })
                 }
             };
@@ -391,12 +432,18 @@ impl WindowsMixedDirectionBatch {
             .entries
             .iter()
             .map(|entry| match entry {
-                PreparedEntry::CoordinatorWriter(entry) => {
-                    active_spec(entry.native, LocalRegionAuthority::Writer, &entry.mapping)
-                }
-                PreparedEntry::ReceiverWriter(entry) => {
-                    active_spec(entry.native, LocalRegionAuthority::Reader, &entry.mapping)
-                }
+                PreparedEntry::CoordinatorWriter(entry) => active_spec(
+                    entry.native,
+                    LocalRegionAuthority::Writer,
+                    &entry.mapping,
+                    entry.guard_requested,
+                ),
+                PreparedEntry::ReceiverWriter(entry) => active_spec(
+                    entry.native,
+                    LocalRegionAuthority::Reader,
+                    &entry.mapping,
+                    entry.guard_requested,
+                ),
             })
             .collect::<Result<Vec<_>, _>>()?;
         validate_active_specs(&specs)?;
@@ -409,9 +456,13 @@ impl WindowsMixedDirectionBatch {
             .into_iter()
             .map(|entry| match entry {
                 PreparedEntry::CoordinatorWriter(entry) => {
-                    let spec =
-                        active_spec(entry.native, LocalRegionAuthority::Writer, &entry.mapping)
-                            .expect("activation preflight validated writer mapping");
+                    let spec = active_spec(
+                        entry.native,
+                        LocalRegionAuthority::Writer,
+                        &entry.mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated writer mapping");
                     drop(entry.section);
                     WindowsActiveRegionOwner::Writer {
                         spec,
@@ -423,9 +474,13 @@ impl WindowsMixedDirectionBatch {
                     }
                 }
                 PreparedEntry::ReceiverWriter(entry) => {
-                    let spec =
-                        active_spec(entry.native, LocalRegionAuthority::Reader, &entry.mapping)
-                            .expect("activation preflight validated reader mapping");
+                    let spec = active_spec(
+                        entry.native,
+                        LocalRegionAuthority::Reader,
+                        &entry.mapping,
+                        entry.guard_requested,
+                    )
+                    .expect("activation preflight validated reader mapping");
                     drop(entry.section);
                     WindowsActiveRegionOwner::Reader {
                         spec,
@@ -917,6 +972,7 @@ fn map_exact_unnamed_section(
     let view = SectionView::new(View {
         base,
         len: mapped_len,
+        guard: None,
     });
     let expected_protection = if access == FILE_MAP_READ {
         PAGE_READONLY
@@ -973,6 +1029,33 @@ fn map_exact_unnamed_section(
         || information.AllocationProtect != expected_protection
     {
         return Err(WindowsBatchError::WrongObject);
+    }
+    // Imported views always take best-effort guard placement: the validated
+    // full-extent view is replaced by an exactly sized guarded view of the
+    // same section where placement succeeds and passes the same checks.
+    if let Some(guarded) = View::map_guarded(handle, mapped_len, access) {
+        let guarded = SectionView::new(guarded);
+        let guarded_base = guarded.base();
+        let mut information: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        // SAFETY: the guarded mapped base and output structure are valid.
+        let queried = unsafe {
+            VirtualQuery(
+                guarded_base.as_ptr().cast_const().cast(),
+                &mut information,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } == size_of::<MEMORY_BASIC_INFORMATION>();
+        if queried
+            && information.BaseAddress == guarded_base.as_ptr().cast()
+            && information.AllocationBase == guarded_base.as_ptr().cast()
+            && information.RegionSize == mapped_len
+            && information.State == MEM_COMMIT
+            && information.Type == MEM_MAPPED
+            && information.Protect == expected_protection
+        {
+            drop(view);
+            return Ok(guarded);
+        }
     }
     Ok(view)
 }
@@ -1092,6 +1175,7 @@ fn active_spec(
     native: NativeRegionSpec,
     authority: LocalRegionAuthority,
     mapping: &SectionView,
+    guard_requested: GuardPolicy,
 ) -> Result<WindowsActiveRegionSpec, WindowsBatchError> {
     let id = RegionId::new(native.region_id).ok_or(WindowsBatchError::WrongProvenance)?;
     let logical_len =
@@ -1106,6 +1190,7 @@ fn active_spec(
         logical_len,
         mapped_len,
         authority,
+        guard_requested,
     })
 }
 
@@ -1122,7 +1207,9 @@ fn active_spec_from_manifest(
         usize::try_from(manifest.mapped_len).map_err(|_| WindowsBatchError::InvalidSize)?,
     )
     .ok_or(WindowsBatchError::WrongProvenance)?;
-    active_spec(native, authority, mapping)
+    // Imported regions apply best-effort guard placement: the wire manifest
+    // does not carry the creator's requested policy.
+    active_spec(native, authority, mapping, GuardPolicy::BestEffort)
 }
 
 fn validate_imported_manifest(

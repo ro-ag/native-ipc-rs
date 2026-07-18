@@ -39,8 +39,10 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
+    UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -1308,43 +1310,224 @@ impl Drop for OwnedHandle {
     }
 }
 
+/// Reserved-placeholder bookkeeping for one guarded view: an inaccessible
+/// reserved band placeholder sits immediately before and after the interior
+/// placeholder the view was mapped into.
+struct ViewGuardBands {
+    lead: *mut core::ffi::c_void,
+    interior: *mut core::ffi::c_void,
+    tail: *mut core::ffi::c_void,
+}
+
 struct View {
     base: NonNull<u8>,
     len: usize,
+    guard: Option<ViewGuardBands>,
 }
 impl View {
     fn map(section: HANDLE, len: usize, access: u32) -> Result<Self, WindowsError> {
         // SAFETY: section handle is live; access/offset/length are checked.
         let address = unsafe { MapViewOfFile(section, access, 0, 0, len) };
         let base = NonNull::new(address.Value.cast()).ok_or_else(|| last_os("MapViewOfFile"))?;
-        Ok(Self { base, len })
+        Ok(Self {
+            base,
+            len,
+            guard: None,
+        })
+    }
+
+    /// Maps the view guarded where placeholder placement succeeds, otherwise
+    /// falls back to the plain map with its original error semantics.
+    fn map_with_guard(
+        section: HANDLE,
+        len: usize,
+        access: u32,
+        guard: bool,
+    ) -> Result<Self, WindowsError> {
+        if guard && let Some(view) = Self::map_guarded(section, len, access) {
+            return Ok(view);
+        }
+        Self::map(section, len, access)
+    }
+
+    /// Best-effort guarded placement: one reserved placeholder of band, view,
+    /// and band length is split into three placeholders, and the view replaces
+    /// the middle one. The outer placeholders stay reserved and inaccessible.
+    /// Any failure releases every placeholder and returns `None`.
+    fn map_guarded(section: HANDLE, len: usize, access: u32) -> Option<Self> {
+        let band = allocation_granularity()?;
+        if len == 0 || !len.is_multiple_of(page_unit()?) {
+            return None;
+        }
+        let total = len.checked_add(band.checked_mul(2)?)?;
+        if total > isize::MAX as usize {
+            return None;
+        }
+        // SAFETY: a fresh inaccessible reservation of checked length in the
+        // current process; no extended constraints are supplied.
+        let lead = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                total,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if lead.is_null() {
+            return None;
+        }
+        // SAFETY: the split target is the base of the owned placeholder.
+        if unsafe { VirtualFree(lead, band, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            // SAFETY: releasing the whole still-unsplit owned placeholder.
+            let _ = unsafe { VirtualFree(lead, 0, MEM_RELEASE) };
+            return None;
+        }
+        // SAFETY: `lead` is a live owned placeholder of exactly `band` bytes.
+        let interior = unsafe { lead.cast::<u8>().add(band).cast::<core::ffi::c_void>() };
+        // SAFETY: the split target is the base of the owned second placeholder.
+        if unsafe { VirtualFree(interior, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+            // SAFETY: releasing both owned placeholders exactly once each.
+            let _ = unsafe { VirtualFree(lead, 0, MEM_RELEASE) };
+            let _ = unsafe { VirtualFree(interior, 0, MEM_RELEASE) };
+            return None;
+        }
+        // SAFETY: `interior` is a live owned placeholder of exactly `len`.
+        let tail = unsafe { interior.cast::<u8>().add(len).cast::<core::ffi::c_void>() };
+        let protection = if access == FILE_MAP_READ {
+            PAGE_READONLY
+        } else {
+            PAGE_READWRITE
+        };
+        // SAFETY: the live section maps into the exactly sized owned interior
+        // placeholder of the current process; no extended constraints.
+        let address = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                interior,
+                0,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                protection,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let Some(base) = NonNull::new(address.Value.cast::<u8>()) else {
+            // SAFETY: releasing all three owned placeholders exactly once.
+            unsafe {
+                let _ = VirtualFree(lead, 0, MEM_RELEASE);
+                let _ = VirtualFree(interior, 0, MEM_RELEASE);
+                let _ = VirtualFree(tail, 0, MEM_RELEASE);
+            }
+            return None;
+        };
+        if base.as_ptr() != interior.cast::<u8>() {
+            // A replaced placeholder maps exactly at its base; anything else
+            // forfeits the guarded placement.
+            // SAFETY: the unexpected view and all placeholders remain owned.
+            unsafe {
+                let _ = UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: base.as_ptr().cast(),
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                );
+                let _ = VirtualFree(lead, 0, MEM_RELEASE);
+                let _ = VirtualFree(interior, 0, MEM_RELEASE);
+                let _ = VirtualFree(tail, 0, MEM_RELEASE);
+            }
+            return None;
+        }
+        Some(Self {
+            base,
+            len,
+            guard: Some(ViewGuardBands {
+                lead,
+                interior,
+                tail,
+            }),
+        })
+    }
+
+    fn release_native(&mut self) -> Result<(), WindowsError> {
+        let Some(guard) = self.guard.take() else {
+            // SAFETY: this object uniquely owns the mapped plain view.
+            if unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.base.as_ptr().cast(),
+                })
+            } == 0
+            {
+                return Err(last_os("UnmapViewOfFile"));
+            }
+            return Ok(());
+        };
+        // Unmap the interior view first so it becomes a placeholder again,
+        // then release each of the three placeholders exactly once.
+        // SAFETY: this object uniquely owns the guarded view and placeholders.
+        let unmapped = unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.base.as_ptr().cast(),
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+        let mut first_error = if unmapped == 0 {
+            Some(last_os("UnmapViewOfFile2"))
+        } else {
+            None
+        };
+        for placeholder in [guard.lead, guard.interior, guard.tail] {
+            // SAFETY: each placeholder base is owned and released exactly once.
+            if unsafe { VirtualFree(placeholder, 0, MEM_RELEASE) } == 0 && first_error.is_none() {
+                first_error = Some(last_os("VirtualFree"));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn unmap(self) -> Result<(), WindowsError> {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: ManuallyDrop suppresses the destructor, so this is the one
-        // unmap attempt for the uniquely owned complete view.
-        if unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: this.base.as_ptr().cast(),
-            })
-        } == 0
-        {
-            Err(last_os("UnmapViewOfFile"))
-        } else {
-            Ok(())
-        }
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // ManuallyDrop suppresses the destructor, so this is the one native
+        // release attempt for the uniquely owned complete view.
+        this.release_native()
     }
 }
 impl Drop for View {
     fn drop(&mut self) {
-        // SAFETY: this object uniquely owns the mapped view.
-        let _ = unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.base.as_ptr().cast(),
-            })
-        };
+        let _ = self.release_native();
     }
+}
+
+/// System allocation granularity: the guard band unit that also satisfies the
+/// fixed-address alignment rule for mapped section views.
+fn allocation_granularity() -> Option<usize> {
+    let mut information: SYSTEM_INFO = unsafe { zeroed() };
+    // SAFETY: output pointer is valid.
+    unsafe { GetSystemInfo(&mut information) };
+    let granularity = information.dwAllocationGranularity as usize;
+    let page = information.dwPageSize as usize;
+    (granularity.is_power_of_two() && page.is_power_of_two() && granularity >= page)
+        .then_some(granularity)
+}
+
+/// System page size for placeholder split alignment checks.
+fn page_unit() -> Option<usize> {
+    let mut information: SYSTEM_INFO = unsafe { zeroed() };
+    // SAFETY: output pointer is valid.
+    unsafe { GetSystemInfo(&mut information) };
+    let page = information.dwPageSize as usize;
+    page.is_power_of_two().then_some(page)
 }
 
 fn duplicate_to(source: HANDLE, target: HANDLE, access: u32) -> Result<RemoteHandle, WindowsError> {
