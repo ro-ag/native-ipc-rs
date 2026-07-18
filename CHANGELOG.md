@@ -5,8 +5,21 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Added
+
+- `core::mapping::ReaderRegion::copy_payload_into` copies one observed hostile
+  payload into caller-owned storage with the same observe → volatile copy →
+  metadata recheck discipline as `copy_payload`, performing no allocation, for
+  consumers that cannot allocate on their read path. Short destinations report
+  the new `BindingError::DestinationTooSmall` without touching shared bytes.
+- `core::mapping::{ReaderRegion, WriterRegion}::into_mapping` release a
+  binding and return the owned mapping witness.
+
 ### Changed
 
+- `core::mapping::{ReaderRegion, WriterRegion}::new` return the rejected
+  mapping witness alongside the binding error, so callers recover the
+  consumed witness instead of losing it.
 - Unify the cross-platform public-API failure semantics recorded as known
   limitations in 0.5.0. Every target now rejects the same reserved bootstrap
   environment union before any backend work; an expired coordinator

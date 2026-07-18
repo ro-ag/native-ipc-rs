@@ -344,11 +344,10 @@ impl QuiescentRegion {
             unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
         let capability_len = self.len();
         let region = self.into_local_writer(capability_len)?;
-        Ok(WriterRegion::new(
-            MacWriterMapping { region },
-            layout,
-            topology,
-        )?)
+        Ok(
+            WriterRegion::new(MacWriterMapping { region }, layout, topology)
+                .map_err(|(_, error)| error)?,
+        )
     }
 
     /// Validates the complete padded capability, then downgrades it to read-only.
@@ -362,11 +361,10 @@ impl QuiescentRegion {
             unsafe { ValidatedRegionLayout::validate(self.as_bytes(), expected, &topology) }?;
         let capability_len = self.len();
         let region = self.into_remote_writer(capability_len)?;
-        Ok(ReaderRegion::new(
-            MacReaderMapping { region },
-            layout,
-            topology,
-        )?)
+        Ok(
+            ReaderRegion::new(MacReaderMapping { region }, layout, topology)
+                .map_err(|(_, error)| error)?,
+        )
     }
 
     /// Validates, transfers a read-only entry, and commits the local writer.
@@ -397,8 +395,8 @@ impl QuiescentRegion {
                 peer_entry,
                 len: _,
             } = region;
-            let runtime =
-                WriterRegion::new(TransferredWriterMapping { mapping }, layout, topology)?;
+            let runtime = WriterRegion::new(TransferredWriterMapping { mapping }, layout, topology)
+                .map_err(|(_, error)| error)?;
             channel.send(peer_entry.name, native, PeerAccess::ReadOnly)?;
             drop(peer_entry);
             Ok(PendingTransferredWriter {
@@ -438,8 +436,8 @@ impl QuiescentRegion {
                 peer_entry,
                 len: _,
             } = region;
-            let runtime =
-                ReaderRegion::new(TransferredReaderMapping { mapping }, layout, topology)?;
+            let runtime = ReaderRegion::new(TransferredReaderMapping { mapping }, layout, topology)
+                .map_err(|(_, error)| error)?;
             channel.send(peer_entry.name, native, PeerAccess::SoleWriter)?;
             drop(peer_entry);
             Ok(PendingTransferredReader {
@@ -559,7 +557,8 @@ impl bootstrap::ChildChannel {
             let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
             drop(right);
             Ok(PendingImportedReader {
-                runtime: ReaderRegion::new(ImportedReaderMapping { mapping }, layout, topology)?,
+                runtime: ReaderRegion::new(ImportedReaderMapping { mapping }, layout, topology)
+                    .map_err(|(_, error)| error)?,
                 provenance: self.pending_provenance(),
             })
         })();
@@ -595,7 +594,8 @@ impl bootstrap::ChildChannel {
             let layout = unsafe { ValidatedRegionLayout::validate(bytes, expected, &topology) }?;
             drop(right);
             Ok(PendingImportedWriter {
-                runtime: WriterRegion::new(ImportedWriterMapping { mapping }, layout, topology)?,
+                runtime: WriterRegion::new(ImportedWriterMapping { mapping }, layout, topology)
+                    .map_err(|(_, error)| error)?,
                 provenance: self.pending_provenance(),
             })
         })();
