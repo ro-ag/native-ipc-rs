@@ -18,7 +18,7 @@ Supported targets are Linux and Windows on ARM64 or AMD64, and macOS on ARM64:
 instead of selecting an unaudited fallback.
 
 The consumer declarations are identical for a fixed feature set on all five
-targets. The published-0.4 versus unreleased-vNext boundary and complete module
+targets. The stable-core versus experimental-vNext boundary and complete module
 inventory are documented in the repository's
 [public API surface](https://github.com/ro-ag/native-ipc-rs/blob/main/docs/public-api.md).
 

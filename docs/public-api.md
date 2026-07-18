@@ -1,7 +1,8 @@
 # Public Rust API surface
 
 This document records the consumer-facing Rust surface at the current vNext
-source head and separates already-published 0.4 API from unreleased vNext API.
+source head and separates the long-stable core API (published since 0.4) from
+the experimental vNext API first released in 0.5.
 It is an API inventory, not a 1.0 compatibility promise.
 
 ## Cross-target invariant

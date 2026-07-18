@@ -5,6 +5,8 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-17
+
 ### Security
 
 - Bind two-sided ACCEPT/REJECT ordering to a fresh nonzero 128-bit coordinator
@@ -265,6 +267,16 @@ Versioning once a stable API is released.
   packaged-release evidence is claimed, and descendant cleanup stays
   `FreshGroupUnverified`.
 
+### Known limitations
+
+- The post-enable cross-platform parity review recorded a set of Windows/Linux
+  public-API diagnostic divergences (failure-state shapes, poison timing,
+  spawn-error tuples, and one fabricated Windows `Exited(127)` cleanup fact
+  reported without querying the real exit code). These do not affect memory
+  safety or protocol security and are tracked for a dedicated cross-platform
+  parity pass. The library remains experimental per the vNext specification
+  §16; public API shapes may still change between 0.x releases.
+
 ## [0.4.0] - 2026-07-11
 
 ### Changed
@@ -364,7 +376,9 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ro-ag/native-ipc-rs/releases/tag/v0.1.0

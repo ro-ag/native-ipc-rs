@@ -118,10 +118,11 @@ the honest residuals, and the per-platform mechanism.
 The consumer type surface is intended to be identical on every supported
 platform; only the underlying kernel mechanism differs (see
 [supported targets](#supported-targets)). The shared-memory allocation core
-ships on all platforms. The unreleased vNext session composition is public on
+ships on all platforms. The vNext session composition is public on
 Linux, macOS Arm64, and Windows (macOS enabled 2026-07-16 after the shared
-public session conformance corpus ran green there). The exact module
-inventory, cross-target enforcement, and published-0.4 versus
+public session conformance corpus ran green there) and ships in the `0.5`
+release line as an experimental API. The exact module inventory,
+cross-target enforcement, and stable-core versus
 experimental-vNext boundary are recorded in
 [`docs/public-api.md`](docs/public-api.md).
 Consumers can inspect this through the common const
@@ -280,8 +281,8 @@ The dependency-ordered implementation phases are recorded in
 
 ## Current status
 
-The unreleased vNext branch composes the safe public session API on Linux,
-macOS Arm64, and Windows:
+The vNext line, released in `0.5.0` as an experimental API, composes the safe
+public session API on Linux, macOS Arm64, and Windows:
 one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
 lease-aware close/abort, and bounded failure/cleanup diagnostics. The public
@@ -306,11 +307,12 @@ no-default workspace suites on physical Apple Silicon at its recorded head and
 on native Windows AMD64 at the recorded Windows checkpoint. Windows
 public sessions bind held executable identity, PID-authenticated message
 transport, exact process/whole-Job lifecycle, full-manifest
-IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation. Exact-release reruns,
-native Windows Arm64 runtime evidence, physical Linux Arm64 evidence, the installed/signed macOS helper
-(launcher) architecture, and release authorization remain outstanding.
+IMPORTED/SEALED/READY/COMMIT, and post-COMMIT activation. The exact-release
+rerun is enforced by the tag-gated release workflow. Physical (non-virtualized)
+Linux Arm64 evidence, non-macOS packaged-crate conformance, and the
+installed/signed macOS helper (launcher) architecture remain outstanding.
 
-Implemented in the current source tree (`0.4.0` plus unreleased vNext work):
+Implemented in the current source tree (`0.5.0`):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -355,12 +357,13 @@ stack-use-after-return detection are enabled, and the standard library is
 rebuilt with instrumentation so the check covers allocation boundaries beyond
 this workspace's crates.
 
-Still intentionally outside the published `0.4` release line are the unreleased
-vNext session/supervisor API, payload authenticity or encryption, automatic
-guard-page policy, and a stable `1.0` compatibility promise. The published
-crates remain low-level building blocks for applications that explicitly own
-protocol negotiation, resource budgets, compatibility policy, and guard-page
-decisions.
+The `0.5` release line ships the vNext session API as an experimental surface;
+per the vNext specification §16 its shapes may still change between 0.x
+releases. Still intentionally outside the published line are payload
+authenticity or encryption, automatic guard-page policy, and a stable `1.0`
+compatibility promise. The published crates remain low-level building blocks
+for applications that explicitly own protocol negotiation, resource budgets,
+compatibility policy, and guard-page decisions.
 
 ## Toolchain and validation
 
