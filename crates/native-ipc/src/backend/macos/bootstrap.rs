@@ -267,8 +267,11 @@ pub enum BootstrapError {
         /// PID from the kernel audit trailer.
         actual: u32,
     },
-    /// Spawn environment was missing or malformed.
+    /// Spawn environment was present but malformed.
     InvalidEnvironment,
+    /// The bootstrap designation is absent: this process was not spawned as
+    /// a receiver, so no peer exists and nothing was negotiated.
+    MissingEnvironment,
     /// The caller-derived absolute deadline expired.
     DeadlineExpired,
     /// A send completed at the deadline boundary with ambiguous peer state.
@@ -1100,7 +1103,8 @@ fn mac_child_cleanup_facts(
             | SessionTransportError::MalformedRecord
             | SessionTransportError::RecordTooLarge
             | SessionTransportError::IdentityMismatch
-            | SessionTransportError::Ambiguous,
+            | SessionTransportError::Ambiguous
+            | SessionTransportError::Poisoned,
         ) => ChildCleanupFacts::new(None, descendants, None),
     }
 }
@@ -1441,10 +1445,10 @@ impl ChildChannel {
         deadline: Option<AbsoluteDeadline>,
     ) -> Result<Self, BootstrapError> {
         let nonce = parse_nonce(
-            &std::env::var(ENV_NONCE).map_err(|_| BootstrapError::InvalidEnvironment)?,
+            &std::env::var(ENV_NONCE).map_err(|_| BootstrapError::MissingEnvironment)?,
         )?;
         let parent_pid = std::env::var(ENV_PARENT_PID)
-            .map_err(|_| BootstrapError::InvalidEnvironment)?
+            .map_err(|_| BootstrapError::MissingEnvironment)?
             .parse()
             .map_err(|_| BootstrapError::InvalidEnvironment)?;
         // Scrub the inherited bootstrap identity so descendants of this receiver
@@ -2295,6 +2299,7 @@ fn bootstrap_lifecycle_error(error: SessionTransportError) -> BootstrapError {
         | SessionTransportError::MalformedRecord
         | SessionTransportError::RecordTooLarge
         | SessionTransportError::Ambiguous
+        | SessionTransportError::Poisoned
         | SessionTransportError::Native(None) => BootstrapError::InvalidMessage,
     }
 }
@@ -2310,9 +2315,9 @@ fn bootstrap_lifecycle_transport_error(error: BootstrapError) -> SessionTranspor
         BootstrapError::ExactAuthorityUnavailable { native_error } => {
             SessionTransportError::Native(native_error)
         }
-        BootstrapError::InvalidMessage | BootstrapError::InvalidEnvironment => {
-            SessionTransportError::MalformedRecord
-        }
+        BootstrapError::InvalidMessage
+        | BootstrapError::InvalidEnvironment
+        | BootstrapError::MissingEnvironment => SessionTransportError::MalformedRecord,
     }
 }
 
@@ -2745,6 +2750,7 @@ const fn bootstrap_native_error(error: &BootstrapError) -> Option<c_int> {
         BootstrapError::InvalidMessage
         | BootstrapError::WrongPeer { .. }
         | BootstrapError::InvalidEnvironment
+        | BootstrapError::MissingEnvironment
         | BootstrapError::DeadlineExpired
         | BootstrapError::Ambiguous => None,
     }

@@ -41,7 +41,7 @@ use crate::session::{
 use super::memory::{LinuxMixedDirectionBatch, MemfdError};
 use super::process::{
     DescendantCleanup, ExactChildCleanup, ExactChildExit, ExactChildLifecycle, HeldExecutable,
-    PreparedExactChildLifecycle,
+    PreparedExactChildLifecycle, SpawnPolicyError,
 };
 use super::{
     MAX_ZERO_RIGHTS_PACKET_BYTES, PacketCredentials, PacketError, SeqPacketEndpoint,
@@ -1377,6 +1377,7 @@ fn map_public_transport_error(error: SessionTransportError) -> LinuxPublicSessio
         }
         SessionTransportError::IdentityMismatch => LinuxPublicSessionError::IdentityMismatch,
         SessionTransportError::Ambiguous => LinuxPublicSessionError::Ambiguous,
+        SessionTransportError::Poisoned => LinuxPublicSessionError::Poisoned,
         SessionTransportError::Native(code) => LinuxPublicSessionError::Native(code),
     }
 }
@@ -1426,7 +1427,7 @@ impl AuthenticatedZeroRightsTransport for CoordinatorLinuxControlTransport {
 
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
         if self.poisoned {
-            return Err(SessionTransportError::Native(None));
+            return Err(SessionTransportError::Poisoned);
         }
         let pidfd = self
             .lifecycle
@@ -1611,7 +1612,7 @@ impl AuthenticatedZeroRightsTransport for ReceiverLinuxControlTransport {
 
     fn try_poll_peer(&mut self) -> Result<PeerState, SessionTransportError> {
         if self.poisoned {
-            return Err(SessionTransportError::Native(None));
+            return Err(SessionTransportError::Poisoned);
         }
         observe_accepted_control_peer(self.endpoint.fd.as_raw_fd(), None)
     }
@@ -1650,7 +1651,7 @@ impl ReceiverLinuxControlTransport {
         deadline: AbsoluteDeadline,
     ) -> Result<PeerState, SessionTransportError> {
         if self.poisoned {
-            return Err(SessionTransportError::Native(None));
+            return Err(SessionTransportError::Poisoned);
         }
         loop {
             let remaining = deadline.remaining();
@@ -2144,8 +2145,15 @@ fn spawn_unauthenticated_diagnostic(
             },
         ));
     }
-    let held = HeldExecutable::open(executable)
-        .map_err(|_| LinuxCoordinatorSpawnFailure::before_child(LinuxSpawnError::InvalidInput))?;
+    let held = HeldExecutable::open(executable).map_err(|error| {
+        // Parity with macOS/Windows: a native open failure (for example a
+        // nonexistent path) reports the kernel error; policy rejections of
+        // the caller's path stay invalid input.
+        LinuxCoordinatorSpawnFailure::before_child(match error {
+            SpawnPolicyError::Native(code) => LinuxSpawnError::Native(code),
+            _ => LinuxSpawnError::InvalidInput,
+        })
+    })?;
     reject_credential_changing_mode(&held).map_err(LinuxCoordinatorSpawnFailure::before_child)?;
     spawn_held_with_fault_diagnostic(held, arguments, environment, fault, deadline)
 }

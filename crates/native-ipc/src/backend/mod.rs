@@ -243,6 +243,7 @@ pub(crate) enum SessionTransportError {
     RecordTooLarge,
     IdentityMismatch,
     Ambiguous,
+    Poisoned,
     Native(Option<i32>),
 }
 

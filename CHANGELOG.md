@@ -5,6 +5,20 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+### Changed
+
+- Unify the cross-platform public-API failure semantics recorded as known
+  limitations in 0.5.0. Every target now rejects the same reserved bootstrap
+  environment union before any backend work; an expired coordinator
+  `wait_for_exit` deadline with a live child no longer poisons the Windows
+  session; a nonexistent executable path reports the kernel error on every
+  target; an absent receiver bootstrap designation reports invalid input at
+  `NotEstablished` instead of claiming a malformed peer; waiting on a
+  poisoned session reports `Poisoned` uniformly; and Windows termination
+  facts carry the exact exit code the kernel recorded instead of a fabricated
+  `Exited(127)`. Native evidence: full suites green on macOS Arm64, Linux
+  ARM64, and Windows ARM64.
+
 ## [0.5.0] - 2026-07-17
 
 ### Security

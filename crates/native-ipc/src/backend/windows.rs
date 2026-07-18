@@ -82,6 +82,9 @@ pub enum WindowsError {
     Binding(BindingError),
     /// Bootstrap environment or authenticated handshake was malformed.
     InvalidBootstrap,
+    /// The bootstrap designation is absent: this process was not spawned as
+    /// a receiver, so no peer exists and nothing was negotiated.
+    MissingBootstrap,
     /// A sole-writer capability was already duplicated from this preparation.
     CapabilityAlreadyTransferred,
     /// A bounded bootstrap or lifecycle operation reached its deadline.
@@ -921,14 +924,23 @@ impl ChildSession {
         Ok((writer.runtime, reader.runtime))
     }
 
-    fn abort_child(&mut self) {
+    fn abort_child(&mut self) -> Option<u32> {
         if !self.reaped {
             // SAFETY: this session owns the exact authenticated child handle.
             let _ = unsafe { TerminateProcess(self.process.0, 127) };
             // SAFETY: same held process; bounded wait completes cleanup.
-            let _ = unsafe { WaitForSingleObject(self.process.0, WAIT_MS) };
+            let waited = unsafe { WaitForSingleObject(self.process.0, WAIT_MS) };
             self.reaped = true;
+            if waited != WAIT_OBJECT_0 {
+                return None;
+            }
         }
+        let mut code = 0;
+        // SAFETY: the exact held process has exited and the output is writable.
+        if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
+            return None;
+        }
+        Some(code)
     }
     /// Waits for a normal helper exit after protocol completion.
     pub fn wait(mut self) -> Result<(), WindowsError> {
@@ -977,15 +989,18 @@ unsafe impl Send for ChildSession {}
 pub(crate) fn connect_spawned_helper_until(
     deadline: AbsoluteDeadline,
 ) -> Result<ChildChannel, WindowsError> {
-    let name = std::env::var_os(PIPE_ENV).ok_or(WindowsError::InvalidBootstrap)?;
+    let name = std::env::var_os(PIPE_ENV).ok_or(WindowsError::MissingBootstrap)?;
     let nonce =
-        parse_nonce(&std::env::var(NONCE_ENV).map_err(|_| WindowsError::InvalidBootstrap)?)?;
+        parse_nonce(&std::env::var(NONCE_ENV).map_err(|_| WindowsError::MissingBootstrap)?)?;
     let parent_pid = std::env::var(PARENT_ENV)
-        .map_err(|_| WindowsError::InvalidBootstrap)?
+        .map_err(|_| WindowsError::MissingBootstrap)?
         .parse::<u32>()
         .map_err(|_| WindowsError::InvalidBootstrap)?;
     if std::env::var(PUBLIC_BOOTSTRAP_ENV).as_deref() != Ok("1") {
-        return Err(WindowsError::InvalidBootstrap);
+        return Err(match std::env::var(PUBLIC_BOOTSTRAP_ENV) {
+            Err(_) => WindowsError::MissingBootstrap,
+            Ok(_) => WindowsError::InvalidBootstrap,
+        });
     }
     // SAFETY: bootstrap environment is process-local startup state. Scrubbing
     // it before application-controlled process creation prevents delegation.
