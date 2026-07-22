@@ -23,8 +23,10 @@ this one wins.
    this rides the platform's own primitives (pidfd + owned cleanup; suspended
    spawn + kill-on-close Job). On macOS the public session path spawns the
    configured executable directly, authenticates it through the audit-token/
-   nonce Mach bootstrap, verifies the spawned image, and owns exact
-   direct-child termination and reaping. The additional hardened launcher —
+   nonce Mach channel inherited through a dedicated task registered port,
+   leaves the child's ordinary launchd bootstrap service intact, verifies the
+   spawned image, and owns exact direct-child termination and reaping. The
+   additional hardened launcher —
    cooperative `ptrace` exec-trap, clean-exec signature gate, inherited
    SBPL/`RLIMIT_NPROC` containment — is backend-private machinery for
    deployer-built helper artifacts and is not part of the public constructor

@@ -72,10 +72,11 @@ bounded cleanup diagnostics.
 
 macOS Arm64 publicly composes the same Negotiating/Ready typestate surface:
 public spawn opens and holds the configured executable, spawns it directly,
-authenticates the exact child over the audit-token/nonce Mach bootstrap,
-re-verifies the spawned image, and owns exact direct-child termination,
-reaping, and bounded cleanup facts. Separately, its backend-private trusted
-launcher
+authenticates the exact child over an audit-token/nonce Mach channel inherited
+through a dedicated task registered port, preserves the child's ordinary
+launchd bootstrap port, re-verifies the spawned image, and owns exact
+direct-child termination, reaping, and bounded cleanup facts. Separately, its
+backend-private trusted launcher
 authenticates the broker, enters cooperative `ptrace`, proves the relationship
 with a stopped handshake, installs hard `RLIMIT_NPROC=1`, and execs through the
 kernel's pre-first-instruction trap. Exact stopped `PT_KILL`, tracer-death kill,
