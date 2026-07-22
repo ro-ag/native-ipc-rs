@@ -44,6 +44,8 @@ const MACH_RCV_TIMED_OUT: c_int = 0x1000_4003;
 const MACH_SEND_INTERRUPTED: c_int = 0x1000_0007;
 const MACH_RCV_INTERRUPTED: c_int = 0x1000_4005;
 const TASK_BOOTSTRAP_PORT: c_int = 4;
+const TASK_PORT_REGISTER_MAX: usize = 3;
+const ENOSYS: c_int = 78;
 const MESSAGE_ID: c_int = 0x4e49_5043;
 const VNEXT_MESSAGE_ID: c_int = 0x4e49_5044;
 const MESSAGE_MAGIC: [u8; 8] = *b"NIPCMACH";
@@ -91,6 +93,14 @@ unsafe extern "C" {
     ) -> c_int;
     fn mach_port_mod_refs(task: MachPort, name: MachPort, right: c_int, delta: c_int) -> c_int;
     fn mach_port_type(task: MachPort, name: MachPort, port_type: *mut u32) -> c_int;
+    fn mach_ports_register(target_task: MachPort, ports: *const MachPort, port_count: u32)
+    -> c_int;
+    fn mach_ports_lookup(
+        target_task: MachPort,
+        ports: *mut *mut MachPort,
+        port_count: *mut u32,
+    ) -> c_int;
+    fn vm_deallocate(target_task: MachPort, address: usize, size: usize) -> c_int;
     fn mach_msg(
         message: *mut MachMsgHeader,
         option: u32,
@@ -112,12 +122,8 @@ unsafe extern "C" {
     fn task_set_special_port(task: MachPort, which: c_int, port: MachPort) -> c_int;
     fn posix_spawnattr_init(attributes: *mut PosixSpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(attributes: *mut PosixSpawnAttr) -> c_int;
-    fn posix_spawnattr_setspecialport_np(
-        attributes: *mut PosixSpawnAttr,
-        port: MachPort,
-        which: c_int,
-    ) -> c_int;
     fn posix_spawnattr_setflags(attributes: *mut PosixSpawnAttr, flags: i16) -> c_int;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn posix_spawn(
         pid: *mut Pid,
         path: *const c_char,
@@ -317,6 +323,115 @@ impl Drop for SendRight {
         #[cfg(test)]
         super::observe_vnext_drop_for_test("send-right");
     }
+}
+
+struct RegisteredPortLookup {
+    ports: *mut MachPort,
+    count: usize,
+}
+
+impl RegisteredPortLookup {
+    fn take(&mut self, index: usize) -> Option<SendRight> {
+        if self.ports.is_null() || index >= self.count {
+            return None;
+        }
+        // SAFETY: `mach_ports_lookup` returned an array containing `count`
+        // initialized port names and this bounds check selects one live slot.
+        let slot = unsafe { self.ports.add(index) };
+        // SAFETY: `slot` points into that initialized array.
+        let port = unsafe { *slot };
+        if port == MACH_PORT_NULL {
+            return None;
+        }
+        // SAFETY: replacing the transferred name with null prevents Drop from
+        // releasing the send-right reference now owned by the return value.
+        unsafe { *slot = MACH_PORT_NULL };
+        Some(SendRight(port))
+    }
+}
+
+impl Drop for RegisteredPortLookup {
+    fn drop(&mut self) {
+        if self.ports.is_null() {
+            return;
+        }
+        for index in 0..self.count {
+            // SAFETY: the kernel supplied `count` initialized names in this
+            // out-of-line array. Null marks a right already transferred out.
+            let port = unsafe { *self.ports.add(index) };
+            if port != MACH_PORT_NULL {
+                deallocate_port(current_task(), port);
+            }
+        }
+        if let Some(bytes) = self.count.checked_mul(size_of::<MachPort>())
+            && bytes != 0
+        {
+            // SAFETY: MIG allocated this exact out-of-line array in the current
+            // task. vm_deallocate rounds the nonzero byte range as required.
+            let _ = unsafe { vm_deallocate(current_task(), self.ports as usize, bytes) };
+        }
+    }
+}
+
+fn take_registered_bootstrap_port() -> Result<SendRight, BootstrapError> {
+    let mut ports = std::ptr::null_mut();
+    let mut count = 0;
+    // SAFETY: both output pointers are valid; on success MIG returns an owned
+    // out-of-line array whose send rights and storage this function releases.
+    mach("mach_ports_lookup", unsafe {
+        mach_ports_lookup(current_task(), &mut ports, &mut count)
+    })?;
+    let mut lookup = RegisteredPortLookup {
+        ports,
+        // MIG reports the size of the returned out-of-line allocation. Retain
+        // that exact count so cleanup matches the allocation even when the ABI
+        // validation below rejects it.
+        count: count as usize,
+    };
+
+    // Remove the task-owned stash before any later exec. The looked-up send
+    // reference remains independently owned by `lookup`.
+    mach("mach_ports_register(clear)", unsafe {
+        mach_ports_register(current_task(), std::ptr::null(), 0)
+    })?;
+    if count as usize != TASK_PORT_REGISTER_MAX {
+        return Err(BootstrapError::InvalidEnvironment);
+    }
+    let parent = lookup.take(0).ok_or(BootstrapError::InvalidEnvironment)?;
+    if lookup.take(1).is_some() || lookup.take(2).is_some() {
+        return Err(BootstrapError::InvalidEnvironment);
+    }
+    Ok(parent)
+}
+
+fn set_spawn_registered_ports(attributes: &mut PosixSpawnAttr, ports: &mut [MachPort]) -> c_int {
+    type SetRegisteredPorts = unsafe extern "C" fn(
+        attributes: *mut PosixSpawnAttr,
+        ports: *mut MachPort,
+        port_count: u32,
+    ) -> c_int;
+
+    // This Darwin spawn action is exported by libSystem but absent from the
+    // public SDK header. Resolve it lazily so an older runtime fails this spawn
+    // with ENOSYS instead of failing to load the entire native-ipc consumer.
+    let default_scope = (-2_isize) as *mut c_void;
+    // SAFETY: RTLD_DEFAULT and the static NUL-terminated symbol name satisfy
+    // dlsym's contract. A null result is handled without calling through it.
+    let symbol = unsafe {
+        dlsym(
+            default_scope,
+            c"posix_spawnattr_set_registered_ports_np".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        return ENOSYS;
+    }
+    // SAFETY: the resolved libSystem symbol has the exact ABI transcribed from
+    // Darwin's posix_spawn implementation. The caller supplies its live args.
+    let function = unsafe { std::mem::transmute::<*mut c_void, SetRegisteredPorts>(symbol) };
+    // SAFETY: the spawn attribute is initialized and the live mutable slice
+    // remains valid for this non-retaining call.
+    unsafe { function(attributes, ports.as_mut_ptr(), ports.len() as u32) }
 }
 
 #[cfg(test)]
@@ -585,10 +700,14 @@ impl SpawnedHelper {
             }
         }
         let mut guard = AttributeGuard(attributes);
-        // SAFETY: attributes are initialized and receive port has a live send right.
-        spawn_result(unsafe {
-            posix_spawnattr_setspecialport_np(&mut guard.0, receive.0, TASK_BOOTSTRAP_PORT)
-        })?;
+        let mut registered_ports = [receive.0];
+        // SAFETY: attributes are initialized and the one-element array holds a
+        // live send right for the duration of the call. Darwin copies that
+        // right into the new task's registered-port stash during spawn.
+        spawn_result(set_spawn_registered_ports(
+            &mut guard.0,
+            &mut registered_ports,
+        ))?;
         if fresh_session {
             // SAFETY: attributes are initialized and the flag is defined by
             // the macOS SDK to create a fresh session for the spawned child.
@@ -638,7 +757,8 @@ impl SpawnedHelper {
             )
         };
         // Drop the parent's extra send reference on every outcome before the
-        // launch result is inspected; the receive right remains owned.
+        // launch result is inspected; the receive right and the spawned
+        // task's registered send reference remain independently owned.
         deallocate_port(current_task(), receive.0);
         spawn_result(result)?;
         if let Some(owner) = &lifecycle {
@@ -1416,7 +1536,7 @@ impl ParentChannel {
     }
 }
 
-/// Child side obtained from its injected special bootstrap port.
+/// Child side obtained from its injected registered bootstrap port.
 pub struct ChildChannel {
     _parent_send: SendRight,
     receive: ReceiveRight,
@@ -1430,7 +1550,7 @@ pub struct ChildChannel {
 }
 
 impl ChildChannel {
-    /// Connects using the injected special port and authenticated environment.
+    /// Connects using the injected registered port and authenticated environment.
     pub fn connect_from_environment() -> Result<Self, BootstrapError> {
         Self::connect_from_environment_inner(None)
     }
@@ -1460,17 +1580,10 @@ impl ChildChannel {
             std::env::remove_var(ENV_NONCE);
             std::env::remove_var(ENV_PARENT_PID);
         }
-        let mut parent = MACH_PORT_NULL;
-        // SAFETY: output pointer is valid for the current task.
-        mach("task_get_special_port", unsafe {
-            task_get_special_port(current_task(), TASK_BOOTSTRAP_PORT, &mut parent)
-        })?;
-        if parent == MACH_PORT_NULL {
-            return Err(BootstrapError::InvalidEnvironment);
-        }
+        let parent = take_registered_bootstrap_port()?;
         let receive = ReceiveRight::allocate()?;
         send_port(
-            parent,
+            parent.0,
             receive.0,
             MACH_MSG_TYPE_MAKE_SEND,
             &nonce,
@@ -1478,7 +1591,7 @@ impl ChildChannel {
             deadline,
         )?;
         Ok(Self {
-            _parent_send: SendRight(parent),
+            _parent_send: parent,
             receive,
             nonce,
             parent_pid,

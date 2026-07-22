@@ -287,7 +287,9 @@ one-shot `receiver_main!` bootstrap, bilateral `Session<Ready>` negotiation,
 bounded opaque control, atomic mixed-direction batches, checked active mappings,
 lease-aware close/abort, and bounded failure/cleanup diagnostics. The public
 macOS path spawns the configured executable directly, authenticates it over
-the audit-token/nonce Mach bootstrap, and owns exact direct-child cleanup.
+an audit-token/nonce Mach channel inherited through a dedicated task registered
+port, preserves the child's ordinary launchd bootstrap port, and owns exact
+direct-child cleanup.
 Separately, the backend-private same-user launcher authenticates its broker,
 enters cooperative `ptrace`, proves the relationship with an initial stop,
 installs the inherited SBPL/`RLIMIT_NPROC=1` profile, and crosses `exec` through
@@ -312,7 +314,7 @@ rerun is enforced by the tag-gated release workflow. Physical (non-virtualized)
 Linux Arm64 evidence, non-macOS packaged-crate conformance, and the
 installed/signed macOS helper (launcher) architecture remain outstanding.
 
-Implemented in the current source tree (`0.6.0`):
+Implemented in the current source tree (`0.6.1`):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;

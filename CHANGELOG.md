@@ -5,6 +5,18 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-22
+
+### Fixed
+
+- macOS session spawn now inherits the private audit-token/nonce handshake
+  through Darwin's task registered-port stash instead of replacing the child's
+  `TASK_BOOTSTRAP_PORT`. CoreFoundation, AppKit, and CoreAudio-linked helpers can
+  complete their pre-main launchd lookups without being classified as malformed
+  peers, while the dedicated handshake port retains the existing strict frame
+  validation. The receiver clears the registered-port stash immediately after
+  taking its send right so the capability cannot survive a later `exec`.
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
@@ -444,7 +456,8 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.3.0...v0.4.0
