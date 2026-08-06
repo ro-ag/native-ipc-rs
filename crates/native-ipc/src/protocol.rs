@@ -33,6 +33,11 @@ const SEALED_MAGIC: [u8; 8] = *b"NIPCSEA1";
 const READY_MAGIC: [u8; 8] = *b"NIPCRDY1";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const COMMIT_MAGIC: [u8; 8] = *b"NIPCCMT1";
+const FRAME_MAGIC_OFFSET: usize = 0;
+const FRAME_MAGIC_LEN: usize = 8;
+const FRAME_KIND_OFFSET: usize = 64;
+const FRAME_KIND_LEN: usize = 4;
+const FRAME_KIND_MAGIC_OFFSET: usize = FRAME_MAGIC_LEN - FRAME_KIND_LEN;
 const MANIFEST_FLAG_CANONICAL: u32 = 1;
 const ENTRY_FLAG_LIBRARY_VIEW_NO_EXECUTE: u16 = 1;
 const ENTRY_FLAG_SIZE_FROZEN: u16 = 2;
@@ -264,10 +269,8 @@ impl CapabilityFrame {
     }
 
     fn capacity_frame(&self, magic: [u8; 8]) -> CapacityFrame {
-        let (_, manifest) = Self::decode(&self.bytes)
-            .expect("capability frames are constructed from canonical manifests");
         CapacityFrame {
-            bytes: manifest.encode(magic),
+            bytes: self.phase_frame_bytes(magic),
         }
     }
 
@@ -296,10 +299,8 @@ impl CapabilityFrame {
     }
 
     pub(crate) fn preparation_frame(&self, kind: PreparationFrameKind) -> PreparationFrame {
-        let (_, manifest) = Self::decode(&self.bytes)
-            .expect("capability frames are constructed from canonical manifests");
         PreparationFrame {
-            bytes: manifest.encode(match kind {
+            bytes: self.phase_frame_bytes(match kind {
                 PreparationFrameKind::Imported => IMPORTED_MAGIC,
                 PreparationFrameKind::Sealed => SEALED_MAGIC,
             }),
@@ -308,14 +309,26 @@ impl CapabilityFrame {
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
     pub(crate) fn completion_frame(&self, kind: CompletionFrameKind) -> CompletionFrame {
-        let (_, manifest) = Self::decode(&self.bytes)
-            .expect("capability frames are constructed from canonical manifests");
         CompletionFrame {
-            bytes: manifest.encode(match kind {
+            bytes: self.phase_frame_bytes(match kind {
                 CompletionFrameKind::Ready => READY_MAGIC,
                 CompletionFrameKind::Commit => COMMIT_MAGIC,
             }),
         }
+    }
+
+    /// Derives a phase frame from this already canonical capability frame.
+    ///
+    /// The fixed wire format binds the magic at `0..8` and its last four
+    /// bytes, encoded little-endian at `64..68`, as the frame kind.
+    /// All remaining bytes are the canonical manifest transcript and stay
+    /// byte-for-byte unchanged. Untrusted ingress still uses `decode`.
+    fn phase_frame_bytes(&self, magic: [u8; FRAME_MAGIC_LEN]) -> [u8; CONTROL_FRAME_LEN] {
+        let mut bytes = self.bytes;
+        bytes[FRAME_MAGIC_OFFSET..FRAME_MAGIC_OFFSET + FRAME_MAGIC_LEN].copy_from_slice(&magic);
+        bytes[FRAME_KIND_OFFSET..FRAME_KIND_OFFSET + FRAME_KIND_LEN]
+            .copy_from_slice(&magic[FRAME_KIND_MAGIC_OFFSET..FRAME_MAGIC_LEN]);
+        bytes
     }
 }
 

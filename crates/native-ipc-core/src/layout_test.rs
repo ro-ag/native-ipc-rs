@@ -86,6 +86,73 @@ fn topology() -> RegionSetLayout {
     RegionSetLayout::calculate(SCHEMA, GENERATION, &specs(), &routes(), limits()).unwrap()
 }
 
+#[test]
+#[ignore = "manual release performance benchmark"]
+fn large_topology_route_lookup_benchmark() {
+    use std::time::Instant;
+
+    const SLOTS_PER_REGION: u32 = 2048;
+    const LOOKUPS: usize = 100_000;
+    let specs = [
+        RegionSpec {
+            role: ROLE_A,
+            writer: Endpoint::Initiator,
+            slot_count: SLOTS_PER_REGION,
+            payload_bytes: 1,
+            acknowledgement_count: SLOTS_PER_REGION,
+        },
+        RegionSpec {
+            role: ROLE_B,
+            writer: Endpoint::Responder,
+            slot_count: SLOTS_PER_REGION,
+            payload_bytes: 1,
+            acknowledgement_count: SLOTS_PER_REGION,
+        },
+    ];
+    let mut routes = Vec::with_capacity((SLOTS_PER_REGION * 2) as usize);
+    for slot in 0..SLOTS_PER_REGION {
+        routes.push(AcknowledgementRouteSpec {
+            owner: ROLE_B,
+            target: ROLE_A,
+            slot_index: slot,
+            cell_index: slot,
+        });
+        routes.push(AcknowledgementRouteSpec {
+            owner: ROLE_A,
+            target: ROLE_B,
+            slot_index: slot,
+            cell_index: slot,
+        });
+    }
+    let topology = RegionSetLayout::calculate(
+        SCHEMA,
+        GENERATION,
+        &specs,
+        &routes,
+        LayoutLimits {
+            maximum_mapping_size: 1 << 30,
+            maximum_slot_count: SLOTS_PER_REGION,
+            maximum_acknowledgement_count: SLOTS_PER_REGION,
+            maximum_payload_bytes: 1,
+        },
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    for _ in 0..LOOKUPS {
+        std::hint::black_box(
+            topology
+                .acknowledgement_route(ROLE_B, SLOTS_PER_REGION - 1)
+                .unwrap(),
+        );
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "route-lookup benchmark: {LOOKUPS} lookups over {} routes in {elapsed:?}",
+        routes.len()
+    );
+}
+
 fn expected(role: RoleId, writer: Endpoint, size: u64) -> ValidationExpectations {
     ValidationExpectations {
         schema_id: SCHEMA,

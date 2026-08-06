@@ -181,6 +181,14 @@ const PAYLOAD: &[u8] = b"ping";
 /// Builds the two-role producer/acknowledger topology used by the fixtures
 /// below, mirroring the shape composed inline in the test above.
 fn build_topology(schema_id: [u8; 32], generation: u64) -> RegionSetLayout {
+    build_topology_with_producer_capacity(schema_id, generation, 64)
+}
+
+fn build_topology_with_producer_capacity(
+    schema_id: [u8; 32],
+    generation: u64,
+    producer_payload_bytes: u32,
+) -> RegionSetLayout {
     let producer = RoleId::new(1).unwrap();
     let acknowledger = RoleId::new(2).unwrap();
     let specs = [
@@ -188,7 +196,7 @@ fn build_topology(schema_id: [u8; 32], generation: u64) -> RegionSetLayout {
             role: producer,
             writer: Endpoint::Initiator,
             slot_count: 1,
-            payload_bytes: 64,
+            payload_bytes: producer_payload_bytes,
             acknowledgement_count: 1,
         },
         RegionSpec {
@@ -217,7 +225,7 @@ fn build_topology(schema_id: [u8; 32], generation: u64) -> RegionSetLayout {
         maximum_mapping_size: 4096,
         maximum_slot_count: 2,
         maximum_acknowledgement_count: 2,
-        maximum_payload_bytes: 64,
+        maximum_payload_bytes: producer_payload_bytes.max(64),
     };
     RegionSetLayout::calculate(schema_id, generation, &specs, &route_specs, limits).unwrap()
 }
@@ -231,8 +239,17 @@ struct ProducerFixture {
 }
 
 fn build_producer_fixture(schema_id: [u8; 32], generation: u64, payload: &[u8]) -> ProducerFixture {
+    build_producer_fixture_with_capacity(schema_id, generation, 64, payload)
+}
+
+fn build_producer_fixture_with_capacity(
+    schema_id: [u8; 32],
+    generation: u64,
+    producer_payload_bytes: u32,
+    payload: &[u8],
+) -> ProducerFixture {
     let producer = RoleId::new(1).unwrap();
-    let set = build_topology(schema_id, generation);
+    let set = build_topology_with_producer_capacity(schema_id, generation, producer_payload_bytes);
     let producer_layout = set.region(producer).unwrap();
     let mut producer_memory = Allocation::new(producer_layout.total_size() as usize);
     producer_layout
@@ -393,6 +410,37 @@ fn writer_region_new_returns_witness_on_rejected_bind() {
     // The rejected bind returns the witness intact; rebinding with the
     // correct topology and binding the producer slot proves it is still
     // usable.
+    let mut rebound =
+        WriterRegion::new(witness, fixture.layout.clone(), fixture.topology.clone()).unwrap();
+    let _ = rebound.slot(SLOT).unwrap();
+}
+
+#[test]
+fn writer_region_new_returns_usable_witness_on_mapping_size_mismatch() {
+    let mut fixture = build_producer_fixture([7; 32], 9, PAYLOAD);
+    let larger_fixture = build_producer_fixture_with_capacity([7; 32], 9, 128, PAYLOAD);
+    let actual = fixture.layout.mapping_size();
+    let expected = larger_fixture.layout.mapping_size();
+    assert_ne!(actual, expected);
+
+    let (witness, error) = match WriterRegion::new(
+        WriterWitness(&mut fixture.memory),
+        larger_fixture.layout,
+        larger_fixture.topology,
+    ) {
+        Ok(_) => panic!("expected the differently sized layout bind to be rejected"),
+        Err(pair) => pair,
+    };
+    assert!(matches!(
+        error,
+        BindingError::MappingSizeMismatch {
+            expected: error_expected,
+            actual: error_actual,
+        } if error_expected == expected && error_actual == actual
+    ));
+
+    // The returned witness still owns the original mapping: rebinding it to
+    // that mapping's layout and binding its producer slot proves it is usable.
     let mut rebound =
         WriterRegion::new(witness, fixture.layout.clone(), fixture.topology.clone()).unwrap();
     let _ = rebound.slot(SLOT).unwrap();

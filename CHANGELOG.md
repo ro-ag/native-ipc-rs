@@ -5,6 +5,37 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-05
+
+### Added
+
+- Reproducible optimized-build performance workloads and named-machine evidence
+  for active shared-memory access and large acknowledgement-route topologies,
+  plus native Parallels validation on Ubuntu 24.04 ARM64 and Windows 11 ARM64.
+
+### Changed
+
+- Index acknowledgement routes once during validated topology construction.
+  A 4,096-route worst-position workload improved from 113.358 ms to 2.50–2.91
+  ms per 100,000 lookups across the recorded macOS, Linux, and Windows runs,
+  while preserving public route order and explicit allocation failure.
+- Eliminate redundant work in session setup and framing: borrow outbound HELLO
+  payloads, transfer retained peer payload ownership without cloning, clear only
+  canonical reserved bytes, derive fixed capability phases by copy-and-patch,
+  and reserve the negotiated batch capacity up front.
+- Receive Linux sequence packets and Windows named-pipe messages into bounded
+  spare `Vec` capacity, exposing only the prefix initialized by a successful OS
+  read and avoiding negotiated-maximum zero-fill for small records.
+
+### Fixed
+
+- Release a successfully returned stray Mach mapping before abandoning guarded
+  placement when the kernel violates the requested fixed-address contract.
+- Lock writer-witness recovery after a mapping-size mismatch and the bound
+  writer's non-`Sync` contract with regression and compile-fail coverage.
+- Describe active-view protection consistently as inaccessible guard bands
+  verified through native VM introspection rather than promising page faults.
+
 ## [0.6.1] - 2026-07-22
 
 ### Fixed
@@ -456,7 +487,8 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.4.0...v0.5.0

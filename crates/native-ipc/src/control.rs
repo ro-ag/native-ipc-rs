@@ -109,7 +109,10 @@ impl ControlState {
         if destination.len() < required {
             return Err(ControlError::DestinationTooSmall);
         }
-        destination[..required].fill(0);
+        // The transport preallocates the exact wire length, but this encoder also
+        // accepts reused caller buffers. Every byte is written below except the
+        // canonical reserved field, which must therefore be explicitly cleared.
+        destination[28..32].fill(0);
         destination[..8].copy_from_slice(&MAGIC);
         put_u16(destination, 8, VERSION_MAJOR);
         put_u16(destination, 10, VERSION_MINOR);

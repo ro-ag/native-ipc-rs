@@ -46,6 +46,24 @@ fn bounded_opaque_duplex_records_are_exact_and_sequenced() {
 }
 
 #[test]
+fn encoding_overwrites_nonzero_destinations_with_canonical_wire_bytes() {
+    for payload in [b"".as_slice(), b"payload".as_slice()] {
+        let frame = frame(payload);
+
+        let mut canonical_state = ControlState::new(NONCE, 16).unwrap();
+        let canonical = encode(&mut canonical_state, &frame);
+
+        let mut state = ControlState::new(NONCE, 16).unwrap();
+        let mut destination = vec![0xa5; canonical.len()];
+        let len = state.encode_into(&frame, &mut destination).unwrap();
+
+        assert_eq!(len, canonical.len());
+        assert_eq!(destination, canonical, "payload {payload:?}");
+        assert_eq!(&destination[28..32], &[0; 4], "payload {payload:?}");
+    }
+}
+
+#[test]
 fn every_truncation_mutation_and_replay_poisons_receive_state() {
     let mut sender = ControlState::new(NONCE, 16).unwrap();
     let bytes = encode(&mut sender, &frame(b"payload"));

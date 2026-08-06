@@ -327,10 +327,10 @@ impl SeqPacketEndpoint {
         if capacity == 0 || capacity > MAX_ZERO_RIGHTS_PACKET_BYTES {
             return Err(PacketError::InvalidInput);
         }
-        let mut bytes = vec![0_u8; capacity];
+        let mut bytes = Vec::<u8>::with_capacity(capacity);
         let mut iovec = libc::iovec {
-            iov_base: bytes.as_mut_ptr().cast(),
-            iov_len: bytes.len(),
+            iov_base: bytes.spare_capacity_mut().as_mut_ptr().cast(),
+            iov_len: capacity,
         };
         // Separate aligned space is reserved for one credentials record and
         // the maximum rights record. Every installed fd that fits is adopted.
@@ -384,7 +384,9 @@ impl SeqPacketEndpoint {
             return Err(PacketError::Truncated);
         }
         let (descriptors, credentials) = ancillary.validate(expected_peer, expected_descriptors)?;
-        bytes.truncate(received as usize);
+        // SAFETY: successful recvmsg initialized exactly the returned prefix;
+        // truncation flags and the positive bounded length were checked above.
+        unsafe { bytes.set_len(received as usize) };
         Ok(ReceivedPacket {
             bytes,
             descriptors,

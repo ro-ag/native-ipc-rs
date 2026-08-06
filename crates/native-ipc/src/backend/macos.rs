@@ -874,7 +874,16 @@ impl Mapping {
                 VM_INHERIT_NONE,
             )
         };
-        if result != KERN_SUCCESS || interior != interior_target {
+        if result != KERN_SUCCESS {
+            deallocate_mapping(task, reservation, total);
+            return None;
+        }
+        if interior != interior_target {
+            // A successful map transfers ownership of the returned view even
+            // when the kernel violates the fixed-address contract. Release
+            // that stray view separately; the reservation still owns the
+            // requested range and is deallocated exactly once below.
+            deallocate_mapping(task, interior, mapped_len);
             deallocate_mapping(task, reservation, total);
             return None;
         }

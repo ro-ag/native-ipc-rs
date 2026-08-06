@@ -207,6 +207,32 @@ fn capacity_preflight_distinguishes_limits_preparation_and_both_roles() {
         capability.coordinator_capacity_frame(CoordinatorCapacityStatus::PreparationFailed);
     let receiver_ready = capability.receiver_capacity_frame(true);
     let receiver_limit = capability.receiver_capacity_frame(false);
+    for (frame, magic) in [
+        (
+            coordinator_ready.as_bytes(),
+            COORDINATOR_CAPACITY_READY_MAGIC,
+        ),
+        (
+            coordinator_limit.as_bytes(),
+            COORDINATOR_CAPACITY_REJECT_MAGIC,
+        ),
+        (
+            coordinator_preparation.as_bytes(),
+            COORDINATOR_PREPARATION_FAILED_MAGIC,
+        ),
+        (receiver_ready.as_bytes(), RECEIVER_CAPACITY_READY_MAGIC),
+        (receiver_limit.as_bytes(), RECEIVER_CAPACITY_REJECT_MAGIC),
+    ] {
+        assert_eq!(frame, &manifest.encode(magic));
+        assert_eq!(
+            &frame[FRAME_MAGIC_OFFSET..FRAME_MAGIC_OFFSET + FRAME_MAGIC_LEN],
+            &magic
+        );
+        assert_eq!(
+            &frame[FRAME_KIND_OFFSET..FRAME_KIND_OFFSET + FRAME_KIND_LEN],
+            &u32::from_le_bytes(magic[4..8].try_into().unwrap()).to_le_bytes()
+        );
+    }
     let frames = [
         coordinator_ready.as_bytes(),
         coordinator_limit.as_bytes(),
@@ -250,6 +276,8 @@ fn preparation_frames_are_disjoint_exact_full_manifest_receipts() {
     let capability = CapabilityFrame::from_manifest(&manifest);
     let imported = capability.preparation_frame(PreparationFrameKind::Imported);
     let sealed = capability.preparation_frame(PreparationFrameKind::Sealed);
+    assert_eq!(imported.as_bytes(), &manifest.encode(IMPORTED_MAGIC));
+    assert_eq!(sealed.as_bytes(), &manifest.encode(SEALED_MAGIC));
     assert_ne!(capability.as_bytes(), imported.as_bytes());
     assert_ne!(capability.as_bytes(), sealed.as_bytes());
     assert_ne!(imported.as_bytes(), sealed.as_bytes());
@@ -292,6 +320,8 @@ fn completion_frames_are_disjoint_exact_full_manifest_barriers() {
     let sealed = capability.preparation_frame(PreparationFrameKind::Sealed);
     let ready = capability.completion_frame(CompletionFrameKind::Ready);
     let commit = capability.completion_frame(CompletionFrameKind::Commit);
+    assert_eq!(ready.as_bytes(), &manifest.encode(READY_MAGIC));
+    assert_eq!(commit.as_bytes(), &manifest.encode(COMMIT_MAGIC));
 
     assert_ne!(capability.as_bytes(), ready.as_bytes());
     assert_ne!(capability.as_bytes(), commit.as_bytes());

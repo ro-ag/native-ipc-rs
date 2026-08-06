@@ -543,16 +543,18 @@ fn read_message_inner(
     }
     let maximum = maximum.min(MAX_VNEXT_RECORD_BYTES);
     let capacity = u32::try_from(maximum).map_err(|_| SessionTransportError::RecordTooLarge)?;
-    let mut bytes = vec![0_u8; maximum];
+    let mut bytes = Vec::<u8>::with_capacity(maximum);
     loop {
         check_deadline(deadline)?;
         let mut read = 0_u32;
-        // SAFETY: the pipe and output range remain live; message mode returns
-        // one record or ERROR_MORE_DATA without allocating from peer length.
+        // SAFETY: the pipe and uninitialized spare-capacity range remain live;
+        // message mode returns one record or ERROR_MORE_DATA without allocating
+        // from peer length. No byte is read until the successful prefix length
+        // is committed below.
         if unsafe {
             ReadFile(
                 pipe,
-                bytes.as_mut_ptr(),
+                bytes.spare_capacity_mut().as_mut_ptr().cast(),
                 capacity,
                 &mut read,
                 core::ptr::null_mut(),
@@ -562,7 +564,9 @@ fn read_message_inner(
             if read == 0 {
                 return Err(SessionTransportError::MalformedRecord);
             }
-            bytes.truncate(read as usize);
+            // SAFETY: successful ReadFile initialized exactly `read` bytes,
+            // which is bounded by the supplied spare-capacity length.
+            unsafe { bytes.set_len(read as usize) };
             if postcheck {
                 check_deadline_after_io(deadline)?;
             }

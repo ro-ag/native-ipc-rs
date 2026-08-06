@@ -128,6 +128,48 @@ fn hello_is_fixed_little_endian_bounded_and_round_trips_opaque_payload() {
 }
 
 #[test]
+fn borrowed_hello_encoding_matches_the_owned_frame_wire_exactly() {
+    for payload in [b"".as_slice(), b"opaque".as_slice(), &[0xa5; 4096]] {
+        let NegotiationFrame::Hello(frame) = hello(payload) else {
+            unreachable!();
+        };
+        let expected = encoded(&NegotiationFrame::Hello(duplicate_hello(&frame)));
+        let mut actual = vec![0xa5; hello_encoded_len(&frame).unwrap()];
+
+        let length = encode_hello_into(&frame, &mut actual).unwrap();
+
+        assert_eq!(length, expected.len());
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn transcript_returns_the_selected_peer_payload_without_a_copy() {
+    for (peer_role, expected) in [
+        (SenderRole::Coordinator, b"coordinator".as_slice()),
+        (SenderRole::Receiver, b"receiver".as_slice()),
+    ] {
+        let NegotiationFrame::Hello(mut coordinator) = hello(b"coordinator") else {
+            unreachable!();
+        };
+        coordinator.required_features = FeatureBits::default();
+        let mut receiver = duplicate_hello(&coordinator);
+        receiver.role = SenderRole::Receiver;
+        receiver.application_payload = b"receiver".to_vec();
+
+        let (transcript, peer_payload) = NegotiatedTranscript::from_hellos_with_peer_payload(
+            HelloPair::new(coordinator, receiver),
+            AtomicCapabilities::from_verified_native(4096, 128, true, true).unwrap(),
+            peer_role,
+        )
+        .unwrap();
+
+        assert_eq!(peer_payload, expected);
+        assert_ne!(transcript.hello_digest, [0; 32]);
+    }
+}
+
+#[test]
 fn accept_and_reject_are_payload_free_exact_decisions() {
     let accept = NegotiationFrame::Accept(AcceptFrame {
         role: SenderRole::Receiver,

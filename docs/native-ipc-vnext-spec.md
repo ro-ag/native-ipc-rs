@@ -289,9 +289,9 @@ distinct. Page padding MUST be zero before transfer and inaccessible through
 safe runtime APIs.
 
 `RegionOptions` includes `GuardPolicy::{BestEffort, Require, Disable}`. Where
-native placement permits reliable guard pages, inaccessible pages surround the
-payload mapping. `Require` fails closed when unavailable; `BestEffort` reports
-the installed result through region capabilities.
+native placement permits reliable guard-band installation, inaccessible address
+ranges surround the payload mapping. `Require` fails closed when unavailable;
+`BestEffort` reports the installed result through region capabilities.
 
 Growth exists only before preparation. Clearing is best-effort local clearing;
 documentation MUST NOT imply erasure of kernel copies or peer mappings.
@@ -933,8 +933,9 @@ only when active mappings drop.
 For every platform/direction, subprocess tests prove reader read, reader store
 failure, designated writer success,
 opposite endpoint denial, post-prepare resize denial, wrong object rejection,
-zero padding, safe padding inaccessibility, guard-page faults when required,
-and accurate best-effort guard capability reporting.
+zero padding, safe padding inaccessibility, required guard-band installation,
+guard-band inaccessibility through native VM introspection, and accurate
+best-effort guard capability reporting.
 
 Linux additionally tests each missing seal and `SCM_RIGHTS` with 0/1/2/N fds,
 multiple messages, wrong level/type, invalid cmsg lengths/alignment,
