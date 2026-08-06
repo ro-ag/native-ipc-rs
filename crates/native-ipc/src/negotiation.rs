@@ -339,6 +339,64 @@ impl NegotiationFrame {
     }
 }
 
+/// Returns the exact bounded wire length for a borrowed HELLO frame.
+///
+/// Session owners retain HELLOs until transcript construction, so this avoids
+/// cloning an application payload merely to encode the outbound record.
+pub(crate) fn hello_encoded_len(frame: &HelloFrame) -> Result<usize, NegotiationWireError> {
+    frame.validate()?;
+    HEADER_LEN
+        .checked_add(frame.application_payload.len())
+        .ok_or(NegotiationWireError::LengthOverflow)
+}
+
+/// Encodes a borrowed HELLO frame with the same canonical wire representation
+/// as [`NegotiationFrame::encode_into`].
+pub(crate) fn encode_hello_into(
+    frame: &HelloFrame,
+    destination: &mut [u8],
+) -> Result<usize, NegotiationWireError> {
+    let required = hello_encoded_len(frame)?;
+    if destination.len() < required {
+        return Err(NegotiationWireError::DestinationTooSmall);
+    }
+    // Every HELLO field and payload byte is overwritten below. Clear only the
+    // canonical reserved ranges so reused caller buffers remain valid without
+    // paying for a second full payload-sized memset after zero allocation.
+    destination[15] = 0;
+    destination[28..32].fill(0);
+    destination[98..100].fill(0);
+    destination[166..HEADER_LEN].fill(0);
+    destination[..8].copy_from_slice(&MAGIC);
+    put_u16(destination, 8, WIRE_MAJOR);
+    put_u16(destination, 10, WIRE_MINOR);
+    put_u16(destination, 12, KIND_HELLO);
+    destination[14] = frame.role as u8;
+    put_u32(destination, 16, HEADER_LEN as u32);
+    put_u32(
+        destination,
+        20,
+        u32::try_from(required).map_err(|_| NegotiationWireError::LengthOverflow)?,
+    );
+    put_u32(
+        destination,
+        24,
+        u32::try_from(frame.application_payload.len())
+            .map_err(|_| NegotiationWireError::LengthOverflow)?,
+    );
+    encode_common(
+        destination,
+        frame.nonce,
+        frame.supported_features,
+        frame.required_features,
+        frame.limits,
+        frame.atomics,
+        frame.target,
+    );
+    destination[HEADER_LEN..required].copy_from_slice(&frame.application_payload);
+    Ok(required)
+}
+
 impl NegotiatedTranscript {
     pub(crate) fn take_accepted_facts(
         &mut self,
@@ -368,10 +426,28 @@ impl NegotiatedTranscript {
         hellos: HelloPair,
         verified_local_atomics: AtomicCapabilities,
     ) -> Result<Self, NegotiationWireError> {
-        let HelloPair {
-            coordinator,
-            receiver,
-        } = hellos;
+        Self::from_hello_pair(&hellos, verified_local_atomics)
+    }
+
+    pub(crate) fn from_hellos_with_peer_payload(
+        mut hellos: HelloPair,
+        verified_local_atomics: AtomicCapabilities,
+        peer_role: SenderRole,
+    ) -> Result<(Self, Vec<u8>), NegotiationWireError> {
+        let transcript = Self::from_hello_pair(&hellos, verified_local_atomics)?;
+        let peer_payload = match peer_role {
+            SenderRole::Coordinator => core::mem::take(&mut hellos.coordinator.application_payload),
+            SenderRole::Receiver => core::mem::take(&mut hellos.receiver.application_payload),
+        };
+        Ok((transcript, peer_payload))
+    }
+
+    fn from_hello_pair(
+        hellos: &HelloPair,
+        verified_local_atomics: AtomicCapabilities,
+    ) -> Result<Self, NegotiationWireError> {
+        let coordinator = &hellos.coordinator;
+        let receiver = &hellos.receiver;
         coordinator.validate()?;
         receiver.validate()?;
         if coordinator.role != SenderRole::Coordinator || receiver.role != SenderRole::Receiver {
@@ -428,7 +504,7 @@ impl NegotiatedTranscript {
             target,
             wire_major: WIRE_MAJOR,
             wire_minor: WIRE_MINOR,
-            hello_digest: canonical_hello_digest(&coordinator, &receiver),
+            hello_digest: canonical_hello_digest(coordinator, receiver),
             decision_challenge: None,
             accepted_roles: 0,
         })

@@ -27,7 +27,7 @@ use crate::liveness::ResourceError;
 use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
-    decode_frame,
+    decode_frame, encode_hello_into, hello_encoded_len,
 };
 use crate::protocol::{
     CONTROL_FRAME_LEN, CapabilityFrame, CoordinatorCapacityStatus, NativeAuthorityProfile,
@@ -2192,10 +2192,13 @@ fn exchange_coordinator_hello_diagnostic(
                 return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
             }
         };
-        let peer_application_payload = receiver.application_payload.clone();
-        let transcript =
-            NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
-                .map_err(LinuxSpawnError::Negotiation)?;
+        let (transcript, peer_application_payload) =
+            NegotiatedTranscript::from_hellos_with_peer_payload(
+                HelloPair::new(coordinator, receiver),
+                atomics,
+                SenderRole::Receiver,
+            )
+            .map_err(LinuxSpawnError::Negotiation)?;
         Ok((transcript, peer_application_payload))
     })();
     let (transcript, peer_application_payload) = match result {
@@ -2253,10 +2256,13 @@ fn exchange_coordinator_hello(
                 return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
             }
         };
-        let peer_application_payload = receiver.application_payload.clone();
-        let transcript =
-            NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
-                .map_err(LinuxSpawnError::Negotiation)?;
+        let (transcript, peer_application_payload) =
+            NegotiatedTranscript::from_hellos_with_peer_payload(
+                HelloPair::new(coordinator, receiver),
+                atomics,
+                SenderRole::Receiver,
+            )
+            .map_err(LinuxSpawnError::Negotiation)?;
         Ok((transcript, peer_application_payload))
     })();
     let (transcript, peer_application_payload) = match result {
@@ -2330,13 +2336,16 @@ fn receive_inherited_hello_owned(
             return Err(LinuxSpawnError::Negotiation(NegotiationWireError::BadKind));
         }
     };
-    let peer_application_payload = coordinator.application_payload.clone();
     let receiver = make_hello(SenderRole::Receiver, nonce, offer, atomics)?;
     let encoded = encode_hello(&receiver)?;
     send_socket_before(&mut endpoint, &encoded, deadline)?;
-    let transcript =
-        NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
-            .map_err(LinuxSpawnError::Negotiation)?;
+    let (transcript, peer_application_payload) =
+        NegotiatedTranscript::from_hellos_with_peer_payload(
+            HelloPair::new(coordinator, receiver),
+            atomics,
+            SenderRole::Coordinator,
+        )
+        .map_err(LinuxSpawnError::Negotiation)?;
     Ok(ReceiverNegotiatingState {
         endpoint,
         transcript,
@@ -2727,24 +2736,12 @@ fn make_hello(
 }
 
 fn encode_hello(hello: &HelloFrame) -> Result<Vec<u8>, LinuxSpawnError> {
-    let frame = NegotiationFrame::Hello(HelloFrame {
-        role: hello.role,
-        nonce: hello.nonce,
-        supported_features: hello.supported_features,
-        required_features: hello.required_features,
-        limits: hello.limits,
-        atomics: hello.atomics,
-        target: hello.target,
-        application_payload: hello.application_payload.clone(),
-    });
-    let length = frame.encoded_len().map_err(LinuxSpawnError::Negotiation)?;
+    let length = hello_encoded_len(hello).map_err(LinuxSpawnError::Negotiation)?;
     if length > MAX_ZERO_RIGHTS_PACKET_BYTES {
         return Err(LinuxSpawnError::InvalidInput);
     }
     let mut encoded = vec![0; length];
-    frame
-        .encode_into(&mut encoded)
-        .map_err(LinuxSpawnError::Negotiation)?;
+    encode_hello_into(hello, &mut encoded).map_err(LinuxSpawnError::Negotiation)?;
     Ok(encoded)
 }
 

@@ -140,6 +140,7 @@ pub struct LayoutLimits {
 pub struct RegionSetLayout {
     regions: Vec<RegionLayout>,
     routes: Vec<AcknowledgementRoute>,
+    route_lookup: Vec<usize>,
 }
 
 impl RegionSetLayout {
@@ -170,7 +171,12 @@ impl RegionSetLayout {
             )?);
         }
         let routes = validate_routes(&regions, route_specs)?;
-        Ok(Self { regions, routes })
+        let route_lookup = build_route_lookup(&routes)?;
+        Ok(Self {
+            regions,
+            routes,
+            route_lookup,
+        })
     }
 
     /// Returns all independent layouts.
@@ -189,10 +195,14 @@ impl RegionSetLayout {
         target: RoleId,
         slot_index: u32,
     ) -> Option<AcknowledgementRoute> {
-        self.routes
-            .iter()
-            .copied()
-            .find(|route| route.target == target && route.slot_index == slot_index)
+        let key = (target.get(), slot_index);
+        self.route_lookup
+            .binary_search_by_key(&key, |index| {
+                let route = self.routes[*index];
+                (route.target.get(), route.slot_index)
+            })
+            .ok()
+            .map(|position| self.routes[self.route_lookup[position]])
     }
 
     /// Returns all exact acknowledgement routes.
@@ -783,6 +793,19 @@ fn validate_routes(
         ));
     }
     Ok(routes)
+}
+
+fn build_route_lookup(routes: &[AcknowledgementRoute]) -> Result<Vec<usize>, LayoutError> {
+    let mut lookup = Vec::new();
+    lookup
+        .try_reserve_exact(routes.len())
+        .map_err(|_| LayoutError::AllocationFailed)?;
+    lookup.extend(0..routes.len());
+    lookup.sort_unstable_by_key(|index| {
+        let route = routes[*index];
+        (route.target.get(), route.slot_index)
+    });
+    Ok(lookup)
 }
 
 fn validate_header(

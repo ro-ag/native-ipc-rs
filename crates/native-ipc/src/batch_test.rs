@@ -214,6 +214,14 @@ fn zero_and_seventeen_region_batches_fail_closed() {
 }
 
 #[test]
+fn transaction_reserves_the_negotiated_region_limit() {
+    for max_regions in [1, 16] {
+        let batch = TransferBatch::new(max_regions, 1, 1).unwrap();
+        assert!(batch.regions.capacity() >= usize::from(max_regions));
+    }
+}
+
+#[test]
 fn committed_set_requires_exact_ids_and_directions_and_preserves_wrong_take() {
     let writer_id = RegionId::new(1).unwrap();
     let reader_id = RegionId::new(2).unwrap();

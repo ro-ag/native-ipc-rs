@@ -27,7 +27,7 @@ use crate::liveness::ResourceError;
 use crate::negotiation::{
     AtomicOffer, DecisionChallenge, FeatureBits, HEADER_LEN, HelloFrame, HelloPair,
     NegotiatedTranscript, NegotiationFrame, NegotiationWireError, SenderRole, TargetFacts,
-    decode_frame,
+    decode_frame, encode_hello_into, hello_encoded_len,
 };
 use crate::protocol::{CoordinatorCapacityStatus, NativeAuthorityProfile};
 use crate::session::{
@@ -194,14 +194,12 @@ impl WindowsCoordinatorNegotiatingSession {
             })?;
         write_message(
             session.pipe.0,
-            &encode_frame(&NegotiationFrame::Hello(clone_hello(&coordinator))).map_err(
-                |error| {
-                    WindowsCoordinatorSessionFailure::after_child(
-                        error,
-                        WindowsCoordinatorFailureState::Negotiating,
-                    )
-                },
-            )?,
+            &encode_hello(&coordinator).map_err(|error| {
+                WindowsCoordinatorSessionFailure::after_child(
+                    error,
+                    WindowsCoordinatorFailureState::Negotiating,
+                )
+            })?,
             options.deadline(),
             Some(session.process.0),
         )
@@ -243,15 +241,18 @@ impl WindowsCoordinatorNegotiatingSession {
                 ));
             }
         };
-        let peer_application_payload = receiver.application_payload.clone();
-        let transcript =
-            NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
-                .map_err(|error| {
-                    WindowsCoordinatorSessionFailure::after_child(
-                        map_negotiation_error(error),
-                        WindowsCoordinatorFailureState::Negotiating,
-                    )
-                })?;
+        let (transcript, peer_application_payload) =
+            NegotiatedTranscript::from_hellos_with_peer_payload(
+                HelloPair::new(coordinator, receiver),
+                atomics,
+                SenderRole::Receiver,
+            )
+            .map_err(|error| {
+                WindowsCoordinatorSessionFailure::after_child(
+                    map_negotiation_error(error),
+                    WindowsCoordinatorFailureState::Negotiating,
+                )
+            })?;
         Ok(Self {
             session: Some(session),
             transcript,
@@ -484,18 +485,21 @@ impl WindowsReceiverNegotiatingSession {
                 return Err(WindowsPublicSessionError::MalformedPeer);
             }
         };
-        let peer_application_payload = coordinator.application_payload.clone();
         let receiver = make_hello(SenderRole::Receiver, nonce, offer, atomics)?;
         write_message(
             channel.pipe.0,
-            &encode_frame(&NegotiationFrame::Hello(clone_hello(&receiver)))?,
+            &encode_hello(&receiver)?,
             options.deadline(),
             None,
         )
         .map_err(map_transport_error)?;
-        let transcript =
-            NegotiatedTranscript::from_hellos(HelloPair::new(coordinator, receiver), atomics)
-                .map_err(map_negotiation_error)?;
+        let (transcript, peer_application_payload) =
+            NegotiatedTranscript::from_hellos_with_peer_payload(
+                HelloPair::new(coordinator, receiver),
+                atomics,
+                SenderRole::Coordinator,
+            )
+            .map_err(map_negotiation_error)?;
         Ok(Self {
             channel,
             transcript,
@@ -831,17 +835,14 @@ fn make_hello(
     })
 }
 
-fn clone_hello(hello: &HelloFrame) -> HelloFrame {
-    HelloFrame {
-        role: hello.role,
-        nonce: hello.nonce,
-        supported_features: hello.supported_features,
-        required_features: hello.required_features,
-        limits: hello.limits,
-        atomics: hello.atomics,
-        target: hello.target,
-        application_payload: hello.application_payload.clone(),
+fn encode_hello(hello: &HelloFrame) -> Result<Vec<u8>, WindowsPublicSessionError> {
+    let len = hello_encoded_len(hello).map_err(map_negotiation_error)?;
+    if len > MAX_VNEXT_RECORD_BYTES {
+        return Err(WindowsPublicSessionError::InvalidInput);
     }
+    let mut bytes = vec![0; len];
+    encode_hello_into(hello, &mut bytes).map_err(map_negotiation_error)?;
+    Ok(bytes)
 }
 
 fn encode_frame(frame: &NegotiationFrame) -> Result<Vec<u8>, WindowsPublicSessionError> {

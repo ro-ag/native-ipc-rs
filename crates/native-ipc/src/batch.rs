@@ -150,7 +150,7 @@ impl TransferBatch {
             return Err(BatchError::InvalidLimits);
         }
         Ok(Self {
-            regions: Vec::new(),
+            regions: Vec::with_capacity(max_regions),
             max_regions,
             max_region_bytes,
             max_batch_bytes,

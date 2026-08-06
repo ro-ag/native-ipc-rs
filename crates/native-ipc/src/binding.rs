@@ -91,6 +91,16 @@ unsafe impl ReadOnlyMapping for BoundReadMapping {
 }
 
 /// Sole-writer witness that owns its consumed active mapping.
+///
+/// Like the [`ActiveWriter`] it owns, a bound writer may move between threads
+/// but cannot be shared between them:
+///
+/// ```compile_fail
+/// use native_ipc::binding::BoundWriteMapping;
+/// use native_ipc::core::mapping::WriterRegion;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<WriterRegion<BoundWriteMapping>>();
+/// ```
 pub struct BoundWriteMapping {
     writer: ActiveWriter,
     base: NonNull<u8>,

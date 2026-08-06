@@ -314,7 +314,7 @@ rerun is enforced by the tag-gated release workflow. Physical (non-virtualized)
 Linux Arm64 evidence, non-macOS packaged-crate conformance, and the
 installed/signed macOS helper (launcher) architecture remain outstanding.
 
-Implemented in the current source tree (`0.6.1`):
+Implemented in the current source tree (`0.6.2`):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
@@ -327,6 +327,9 @@ Implemented in the current source tree (`0.6.1`):
   clear-and-destroy;
 - canonical, manifest-bound `CAPABILITY -> READY -> COMMIT` transactions that
   keep runtime mappings unavailable until both peers finish validation;
+- bounded indexed acknowledgement-route lookup plus clone-free HELLO exchange,
+  exact reserved-byte framing, and native receive buffers that expose only the
+  successful kernel-written prefix;
 - macOS Mach VM quiescent/local-writer/remote-writer typestates, including live
   permission probes, authenticated bootstrap, memory-entry transfer/import,
   READY/COMMIT exchange, and a bidirectional helper-process fixture;
