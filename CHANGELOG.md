@@ -5,6 +5,14 @@ Versioning once a stable API is released.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-06
+
+### Fixed
+
+- Restore docs.rs builds for all five supported targets by omitting the native
+  C helper compilation only while rustdoc runs in the docs.rs environment;
+  normal crate builds continue to compile and link the audited helper.
+
 ## [0.6.2] - 2026-08-05
 
 ### Added
@@ -487,7 +495,8 @@ Versioning once a stable API is released.
   common-core binding lifecycle test.
 - Coverage-guided envelope/layout fuzz targets run for bounded time in CI.
 
-[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ro-ag/native-ipc-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ro-ag/native-ipc-rs/compare/v0.5.0...v0.6.0
