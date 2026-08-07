@@ -314,7 +314,7 @@ rerun is enforced by the tag-gated release workflow. Physical (non-virtualized)
 Linux Arm64 evidence, non-macOS packaged-crate conformance, and the
 installed/signed macOS helper (launcher) architecture remain outstanding.
 
-Implemented in the current source tree (`0.6.2`):
+Implemented in the current source tree (`0.6.3`):
 
 - generic message envelopes and explicit codec traits with allocation/record
   limits;
