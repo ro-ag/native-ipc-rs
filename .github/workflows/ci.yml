@@ -32,7 +32,7 @@ jobs:
           toolchain: 1.97.0
           components: clippy,rustfmt
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: quality-rust-1.97
       - name: Check formatting
@@ -129,7 +129,7 @@ jobs:
         shell: bash
         run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
       - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: tests-rust-1.97-${{ matrix.target }}
       - name: Run workspace and native permission tests
