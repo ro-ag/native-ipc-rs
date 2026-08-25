@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**']
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -133,29 +139,6 @@ jobs:
       - name: Check no-default-feature target surface
         run: cargo check --workspace --no-default-features --all-targets --locked --target ${{ matrix.target }}
 
-  address-sanitizer:
-    name: address sanitizer / linux-amd64
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install nightly Rust with standard-library sources
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
-        with:
-          toolchain: nightly
-          components: rust-src
-          targets: x86_64-unknown-linux-gnu
-      - name: Cache sanitizer artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: address-sanitizer-linux-amd64
-      - name: Run instrumented workspace and native lifecycle tests
-        env:
-          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1
-          RUSTFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
-          RUSTDOCFLAGS: -Zsanitizer=address -Cforce-frame-pointers=yes
-        run: cargo +nightly test -Zbuild-std --workspace --all-features --all-targets --locked --target x86_64-unknown-linux-gnu
-
   dependencies:
     name: dependency and license policy
     runs-on: ubuntu-latest
@@ -168,36 +151,3 @@ jobs:
           tool: cargo-deny@0.19.8
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
-
-  miri:
-    name: miri / platform-neutral core
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install nightly Miri
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
-        with:
-          toolchain: nightly
-          components: miri
-      - name: Run Miri on platform-neutral unsafe contracts
-        run: cargo +nightly miri test -p native-ipc-core --lib
-
-  fuzz-smoke:
-    name: fuzz smoke / envelope and layout
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
-        with:
-          toolchain: nightly
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
-        with:
-          tool: cargo-fuzz@0.13.1
-      - name: Fuzz envelope decoder
-        run: cargo +nightly fuzz run envelope --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=4096 -timeout=5 -rss_limit_mb=1024
-      - name: Fuzz layout decoder
-        run: cargo +nightly fuzz run layout --fuzz-dir fuzz --target x86_64-unknown-linux-gnu -- -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=1024

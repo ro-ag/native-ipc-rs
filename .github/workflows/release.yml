@@ -37,12 +37,6 @@ jobs:
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: 1.97.0
-          components: clippy,rustfmt
-
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
-        with:
-          tool: cargo-deny@0.19.8
 
       - name: Validate tag and workspace version
         id: release
@@ -111,17 +105,6 @@ jobs:
           done
           echo "timed out waiting for full CI on $commit" >&2
           exit 1
-
-      - name: Run release quality and security gates
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
-          cargo test --workspace --all-features --all-targets --locked
-          cargo test --workspace --no-default-features --all-targets --locked
-          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-          cargo deny check
-          git diff --check
 
   publish:
     name: publish crates and GitHub release
