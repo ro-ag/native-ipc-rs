@@ -8,6 +8,9 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use native_ipc_core::layout::{RegionSetLayout, ValidatedRegionLayout, ValidationExpectations};
 use native_ipc_core::mapping::{
     BindingError, ReadOnlyMapping, ReaderRegion, SoleWriterMapping, WriterRegion,
@@ -34,10 +37,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
@@ -62,7 +67,8 @@ use crate::protocol::{
     TransferProvenance, mint_channel_id,
 };
 use crate::session::{
-    AbsoluteDeadline, ChildCleanupFacts, ChildExitStatus, DescendantCleanupStatus,
+    AbsoluteDeadline, ChildCleanupFacts, ChildExitStatus, ChildProcessLimits,
+    DescendantCleanupStatus,
 };
 
 /// Windows section, bootstrap, lifecycle, or binding failure.
@@ -361,14 +367,47 @@ pub struct PendingImportedWriter {
 
 /// Kill-on-last-handle Job Object used to contain an exact spawned helper tree.
 pub struct ChildJob(OwnedHandle);
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_JOB_ASSIGNMENT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_job_assignment_for_test() {
+    FAIL_NEXT_JOB_ASSIGNMENT.with(|fail| fail.set(true));
+}
+
 impl ChildJob {
     /// Creates an unnamed non-inheritable kill-on-close job.
     pub fn new() -> Result<Self, WindowsError> {
+        Self::with_limits(ChildProcessLimits::default())
+    }
+
+    fn with_limits(limits: ChildProcessLimits) -> Result<Self, WindowsError> {
+        if limits.open_descriptor_limit.is_some() {
+            return Err(WindowsError::InvalidBootstrap);
+        }
         // SAFETY: null security/name create an unnamed non-inheritable job.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         let handle = OwnedHandle::new(handle)?;
         let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = limits.per_process_commit_memory_bytes {
+            information.ProcessMemoryLimit =
+                usize::try_from(bytes).map_err(|_| WindowsError::InvalidBootstrap)?;
+            information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
+        if let Some(cpu_time) = limits.per_process_user_cpu_time {
+            let ticks = cpu_time.as_nanos() / 100;
+            information.BasicLimitInformation.PerProcessUserTimeLimit =
+                i64::try_from(ticks).map_err(|_| WindowsError::InvalidBootstrap)?;
+            information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+        }
+        if let Some(processes) = limits.active_process_limit {
+            information.BasicLimitInformation.ActiveProcessLimit = processes;
+            information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        }
         // SAFETY: buffer type/size match the requested information class.
         if unsafe {
             SetInformationJobObject(
@@ -389,6 +428,10 @@ impl ChildJob {
     ///
     /// `process` must be the live suspended child handle returned by CreateProcess.
     pub unsafe fn assign_suspended(&self, process: HANDLE) -> Result<(), WindowsError> {
+        #[cfg(test)]
+        if FAIL_NEXT_JOB_ASSIGNMENT.with(Cell::take) {
+            return Err(WindowsError::InvalidBootstrap);
+        }
         // SAFETY: caller proves process handle/lifecycle; job handle is live.
         if unsafe { AssignProcessToJobObject(self.0.0, process) } == 0 {
             Err(last_os("AssignProcessToJobObject"))
@@ -591,6 +634,7 @@ impl fmt::Debug for ChildSession {
 pub(crate) struct ChildSpawnFailure {
     pub(crate) error: WindowsError,
     pub(crate) cleanup: Option<ChildCleanupFacts>,
+    pub(crate) limits_applied: bool,
 }
 
 impl ChildSpawnFailure {
@@ -598,6 +642,7 @@ impl ChildSpawnFailure {
         Self {
             error,
             cleanup: None,
+            limits_applied: false,
         }
     }
 
@@ -605,6 +650,7 @@ impl ChildSpawnFailure {
         Self {
             error,
             cleanup: Some(session.cleanup_after_failure()),
+            limits_applied: true,
         }
     }
 
@@ -612,6 +658,7 @@ impl ChildSpawnFailure {
         Self {
             error,
             cleanup: Some(cleanup_suspended_child(process)),
+            limits_applied: false,
         }
     }
 }
@@ -706,7 +753,14 @@ impl ChildSession {
         let arguments = std::iter::once(path.as_os_str().to_owned())
             .chain(arguments.iter().cloned())
             .collect::<Vec<_>>();
-        Self::spawn_until(path, &arguments, &[], deadline).map_err(|failure| failure.error)
+        Self::spawn_until(
+            path,
+            &arguments,
+            &[],
+            deadline,
+            ChildProcessLimits::default(),
+        )
+        .map_err(|failure| failure.error)
     }
 
     /// Creates a public-session child under one caller-owned absolute deadline
@@ -716,6 +770,7 @@ impl ChildSession {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
         deadline: AbsoluteDeadline,
+        child_process_limits: ChildProcessLimits,
     ) -> Result<Self, ChildSpawnFailure> {
         if deadline.is_expired() || arguments.is_empty() || !path.is_absolute() {
             return Err(ChildSpawnFailure::before_child(WindowsError::TimedOut(
@@ -745,7 +800,8 @@ impl ChildSession {
             )
         };
         let pipe = OwnedHandle::new(pipe).map_err(ChildSpawnFailure::before_child)?;
-        let job = ChildJob::new().map_err(ChildSpawnFailure::before_child)?;
+        let job =
+            ChildJob::with_limits(child_process_limits).map_err(ChildSpawnFailure::before_child)?;
 
         let application = wide_null(path.as_os_str());
         let mut command = command_line_exact(arguments);
@@ -850,6 +906,7 @@ impl ChildSession {
     pub const fn process_handle(&self) -> HANDLE {
         self.process.0
     }
+
     /// Kernel-created child process ID authenticated on the private pipe.
     pub const fn pid(&self) -> u32 {
         self.pid
