@@ -87,10 +87,24 @@ impl WindowsCoordinatorSessionFailure {
     fn after_child(
         error: WindowsPublicSessionError,
         state: WindowsCoordinatorFailureState,
+        session: &mut ChildSession,
     ) -> Self {
         Self {
             error,
-            cleanup: Some(incomplete_cleanup()),
+            cleanup: Some(session.cleanup_after_failure()),
+            state,
+            poisoned: true,
+        }
+    }
+
+    fn after_cleanup(
+        error: WindowsPublicSessionError,
+        state: WindowsCoordinatorFailureState,
+        cleanup: ChildCleanupFacts,
+    ) -> Self {
+        Self {
+            error,
+            cleanup: Some(cleanup),
             state,
             poisoned: true,
         }
@@ -167,7 +181,7 @@ impl WindowsCoordinatorNegotiatingSession {
             public_offer(options).map_err(WindowsCoordinatorSessionFailure::before_child)?;
         let atomics = discover_atomic_capabilities()
             .map_err(WindowsCoordinatorSessionFailure::before_child)?;
-        let session = ChildSession::spawn_until(
+        let mut session = ChildSession::spawn_until(
             command.executable(),
             command.arguments(),
             command.environment(),
@@ -175,10 +189,11 @@ impl WindowsCoordinatorNegotiatingSession {
         )
         .map_err(|failure: ChildSpawnFailure| {
             let error = map_windows_error(failure.error);
-            if failure.child_was_created {
-                WindowsCoordinatorSessionFailure::after_child(
+            if let Some(cleanup) = failure.cleanup {
+                WindowsCoordinatorSessionFailure::after_cleanup(
                     error,
                     WindowsCoordinatorFailureState::Spawned,
+                    cleanup,
                 )
             } else {
                 WindowsCoordinatorSessionFailure::before_child(error)
@@ -190,6 +205,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     error,
                     WindowsCoordinatorFailureState::Spawned,
+                    &mut session,
                 )
             })?;
         write_message(
@@ -198,6 +214,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     error,
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?,
             options.deadline(),
@@ -207,6 +224,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_transport_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         let bytes = read_message(
@@ -219,6 +237,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_transport_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         let receiver = match decode_frame(
@@ -231,6 +250,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_negotiation_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })? {
             NegotiationFrame::Hello(frame) => frame,
@@ -238,6 +258,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 return Err(WindowsCoordinatorSessionFailure::after_child(
                     WindowsPublicSessionError::MalformedPeer,
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 ));
             }
         };
@@ -251,6 +272,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     map_negotiation_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?;
         Ok(Self {
@@ -282,6 +304,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 error,
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         if let Some(reason) = rejection {
@@ -292,6 +315,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsCoordinatorSessionFailure::after_child(
                         map_negotiation_error(error),
                         WindowsCoordinatorFailureState::Negotiating,
+                        &mut session,
                     )
                 })?;
             write_message(
@@ -300,6 +324,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsCoordinatorSessionFailure::after_child(
                         error,
                         WindowsCoordinatorFailureState::Negotiating,
+                        &mut session,
                     )
                 })?,
                 self.deadline,
@@ -309,13 +334,14 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     map_transport_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?;
-            let exit_code = session.abort_child();
+            let cleanup = session.cleanup_after_failure();
             return Ok(WindowsNegotiationOutcome::Rejected {
                 by: WindowsNegotiationRole::Coordinator,
                 reason,
-                cleanup: Some(terminated_cleanup(exit_code)),
+                cleanup: Some(cleanup),
             });
         }
         let accept = self
@@ -325,6 +351,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     map_negotiation_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?;
         self.transcript
@@ -333,6 +360,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     map_negotiation_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?;
         write_message(
@@ -341,6 +369,7 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     error,
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?,
             self.deadline,
@@ -350,6 +379,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_transport_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         let bytes = read_message(
@@ -362,6 +392,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_transport_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         match decode_frame(
@@ -374,6 +405,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_negotiation_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })? {
             NegotiationFrame::Accept(peer) => self
@@ -383,6 +415,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsCoordinatorSessionFailure::after_child(
                         map_negotiation_error(error),
                         WindowsCoordinatorFailureState::Negotiating,
+                        &mut session,
                     )
                 })?,
             NegotiationFrame::Reject(peer) => {
@@ -393,19 +426,21 @@ impl WindowsCoordinatorNegotiatingSession {
                         WindowsCoordinatorSessionFailure::after_child(
                             map_negotiation_error(error),
                             WindowsCoordinatorFailureState::Negotiating,
+                            &mut session,
                         )
                     })?;
-                let exit_code = session.abort_child();
+                let cleanup = session.cleanup_after_failure();
                 return Ok(WindowsNegotiationOutcome::Rejected {
                     by: WindowsNegotiationRole::Receiver,
                     reason,
-                    cleanup: Some(terminated_cleanup(exit_code)),
+                    cleanup: Some(cleanup),
                 });
             }
             NegotiationFrame::Hello(_) => {
                 return Err(WindowsCoordinatorSessionFailure::after_child(
                     WindowsPublicSessionError::MalformedPeer,
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 ));
             }
         }
@@ -413,6 +448,7 @@ impl WindowsCoordinatorNegotiatingSession {
             WindowsCoordinatorSessionFailure::after_child(
                 map_negotiation_error(error),
                 WindowsCoordinatorFailureState::Negotiating,
+                &mut session,
             )
         })?;
         let facts =
@@ -421,6 +457,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsCoordinatorSessionFailure::after_child(
                         WindowsPublicSessionError::IdentityMismatch,
                         WindowsCoordinatorFailureState::Negotiating,
+                        &mut session,
                     )
                 })?;
         // SAFETY: ChildSession owns the PID-authenticated pipe, exact process,
@@ -434,22 +471,32 @@ impl WindowsCoordinatorNegotiatingSession {
                 WindowsCoordinatorSessionFailure::after_child(
                     map_transport_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
+                    &mut session,
                 )
             })?;
         let parameters = evidence.session_parameters(NativeAuthorityProfile::WindowsSectionsV1);
-        let transport = CoordinatorWindowsControlTransport::from_accepted(session, evidence)
-            .map_err(|error| {
-                WindowsCoordinatorSessionFailure::after_child(
+        let transport = match CoordinatorWindowsControlTransport::from_accepted(session, evidence) {
+            Ok(transport) => transport,
+            Err(failure) => {
+                let (error, mut session) = *failure;
+                return Err(WindowsCoordinatorSessionFailure::after_child(
                     map_transport_error(error),
                     WindowsCoordinatorFailureState::Negotiating,
-                )
-            })?;
-        let dispatcher = AcceptedControlDispatcher::new(transport, parameters).map_err(|_| {
-            WindowsCoordinatorSessionFailure::after_child(
-                WindowsPublicSessionError::InvalidInput,
-                WindowsCoordinatorFailureState::Negotiating,
-            )
-        })?;
+                    &mut session,
+                ));
+            }
+        };
+        let dispatcher = match AcceptedControlDispatcher::new(transport, parameters) {
+            Ok(dispatcher) => dispatcher,
+            Err(mut transport) => {
+                let cleanup = transport.cleanup_after_failure();
+                return Err(WindowsCoordinatorSessionFailure::after_cleanup(
+                    WindowsPublicSessionError::InvalidInput,
+                    WindowsCoordinatorFailureState::Negotiating,
+                    cleanup,
+                ));
+            }
+        };
         Ok(WindowsNegotiationOutcome::Accepted(
             WindowsCoordinatorReadySession { dispatcher },
         ))

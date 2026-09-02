@@ -304,7 +304,7 @@ fn accepted_evidence_must_match_exact_pipe_and_process() {
             session,
             coordinator_evidence(parent, child, wrong_nonce)
         ),
-        Err(SessionTransportError::IdentityMismatch)
+        Err(error) if error.0 == SessionTransportError::IdentityMismatch
     ));
 
     let session = spawn_helper("backend::windows::vnext_transport_test::stalled_record_helper");
@@ -315,7 +315,7 @@ fn accepted_evidence_must_match_exact_pipe_and_process() {
             session,
             coordinator_evidence(parent.wrapping_add(1), child, nonce)
         ),
-        Err(SessionTransportError::IdentityMismatch)
+        Err(error) if error.0 == SessionTransportError::IdentityMismatch
     ));
 
     let session = spawn_helper("backend::windows::vnext_transport_test::stalled_record_helper");
@@ -326,7 +326,7 @@ fn accepted_evidence_must_match_exact_pipe_and_process() {
             session,
             coordinator_evidence(parent, child.wrapping_add(1), nonce)
         ),
-        Err(SessionTransportError::IdentityMismatch)
+        Err(error) if error.0 == SessionTransportError::IdentityMismatch
     ));
 
     spawn_helper("backend::windows::vnext_transport_test::receiver_parent_pid_mismatch_helper")
