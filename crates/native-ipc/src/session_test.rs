@@ -518,6 +518,242 @@ fn public_receiver_helper() {
     assert!(matches!(ready.try_close(), ReceiverCloseOutcome::Closed));
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_DESCENDANT_PID_ENV: &str = "NATIVE_IPC_TEST_DESCENDANT_PID_FILE";
+#[cfg(target_os = "windows")]
+const WINDOWS_DESCENDANT_ACK_ENV: &str = "NATIVE_IPC_TEST_DESCENDANT_ACK_FILE";
+
+#[cfg(target_os = "windows")]
+struct WindowsDescendantProbe {
+    path: std::path::PathBuf,
+    acknowledgement: std::path::PathBuf,
+    observer: std::thread::JoinHandle<usize>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsDescendantProbe {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let path = std::env::temp_dir().join(format!(
+            "native-ipc-descendant-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let acknowledgement = path.with_extension("ack");
+        let observed_path = path.clone();
+        let observed_acknowledgement = acknowledgement.clone();
+        let observer = std::thread::spawn(move || {
+            use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&observed_path)
+                    && let Ok(pid) = value.parse::<u32>()
+                {
+                    // SAFETY: the PID is supplied by the test's exact helper;
+                    // the returned handle is retained to defeat PID reuse.
+                    let handle = unsafe {
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid)
+                    };
+                    if !handle.is_null() {
+                        std::fs::write(&observed_acknowledgement, b"held").unwrap();
+                        return handle as usize;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant PID was not observed"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Self {
+            path,
+            acknowledgement,
+            observer,
+        }
+    }
+
+    fn command(&self, helper: &str) -> SessionCommand {
+        SessionCommand::new(std::env::current_exe().unwrap())
+            .arg0("native-ipc-windows-cleanup-helper")
+            .arg("--exact")
+            .arg(helper)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(WINDOWS_DESCENDANT_PID_ENV, &self.path)
+            .env(WINDOWS_DESCENDANT_ACK_ENV, &self.acknowledgement)
+    }
+
+    fn assert_terminated(self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let descendant = self.observer.join().unwrap() as HANDLE;
+        // SAFETY: the observer retained this exact descendant handle.
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant, 20_000) },
+            WAIT_OBJECT_0
+        );
+        // SAFETY: the exact retained handle is closed once after observation.
+        assert_ne!(unsafe { CloseHandle(descendant) }, 0);
+        let _ = std::fs::remove_file(self.path);
+        let _ = std::fs::remove_file(self.acknowledgement);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cleanup_options() -> SessionOptions {
+    SessionOptions::new(
+        AbsoluteDeadline::after(Duration::from_secs(120)).unwrap(),
+        ExecutableIdentityPolicy::ExactOpenedFile,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn assert_windows_tree_cleanup(cleanup: ChildCleanupFacts, expected_code: i32) {
+    assert_eq!(
+        cleanup.direct_child(),
+        Some(ChildExitStatus::Exited(expected_code))
+    );
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::ContainedProcessTreeComplete
+    );
+    assert_eq!(cleanup.native_error(), None);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_pre_hello_exit_reaps_the_complete_job() {
+    let probe = WindowsDescendantProbe::new();
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        probe.command("session::tests::windows_pre_hello_exit_helper"),
+        windows_cleanup_options(),
+    )
+    .err()
+    .unwrap();
+    assert_windows_tree_cleanup(failure.cleanup().unwrap(), 23);
+    probe.assert_terminated();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_pre_ready_exit_reaps_the_complete_job() {
+    let probe = WindowsDescendantProbe::new();
+    let negotiating = CoordinatorSession::<Negotiating>::spawn(
+        probe.command("session::tests::windows_pre_ready_exit_helper"),
+        windows_cleanup_options(),
+    )
+    .unwrap();
+    let failure = negotiating
+        .decide(NegotiationDecision::Accept)
+        .err()
+        .unwrap();
+    assert_windows_tree_cleanup(failure.cleanup().unwrap(), 23);
+    probe.assert_terminated();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_receiver_rejection_reaps_the_complete_job() {
+    let probe = WindowsDescendantProbe::new();
+    let negotiating = CoordinatorSession::<Negotiating>::spawn(
+        probe.command("session::tests::windows_receiver_rejection_helper"),
+        windows_cleanup_options(),
+    )
+    .unwrap();
+    let cleanup = match negotiating.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Rejected {
+            by: SessionEndpoint::Receiver,
+            reason: RejectionReason::APPLICATION_DECLINED,
+            cleanup: Some(cleanup),
+        } => cleanup,
+        _ => panic!("receiver did not return the expected rejection"),
+    };
+    assert_windows_tree_cleanup(cleanup, 127);
+    probe.assert_terminated();
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::zombie_processes)]
+fn spawn_windows_job_descendant() {
+    let descendant = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "session::tests::windows_job_descendant_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        std::env::var_os(WINDOWS_DESCENDANT_PID_ENV).unwrap(),
+        descendant.id().to_string(),
+    )
+    .unwrap();
+    let acknowledgement = std::env::var_os(WINDOWS_DESCENDANT_ACK_ENV).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !std::path::Path::new(&acknowledgement).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "coordinator did not acknowledge the descendant handle"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the pre-Hello cleanup regression"]
+fn windows_pre_hello_exit_helper() {
+    let _bootstrap = __take_receiver_bootstrap().unwrap();
+    spawn_windows_job_descendant();
+    std::process::exit(23);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the pre-Ready cleanup regression"]
+fn windows_pre_ready_exit_helper() {
+    let bootstrap = __take_receiver_bootstrap().unwrap();
+    let _negotiating =
+        ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, windows_cleanup_options())
+            .unwrap();
+    spawn_windows_job_descendant();
+    std::process::exit(23);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the rejection cleanup regression"]
+fn windows_receiver_rejection_helper() {
+    let bootstrap = __take_receiver_bootstrap().unwrap();
+    let negotiating =
+        ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, windows_cleanup_options())
+            .unwrap();
+    spawn_windows_job_descendant();
+    let outcome = negotiating
+        .decide_after_coordinator(|_| {
+            NegotiationDecision::Reject(RejectionReason::APPLICATION_DECLINED)
+        })
+        .unwrap();
+    assert!(matches!(outcome, NegotiationOutcome::Rejected { .. }));
+    std::thread::sleep(Duration::from_secs(300));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only as a Windows cleanup descendant"]
+fn windows_job_descendant_helper() {
+    std::thread::sleep(Duration::from_secs(300));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn parallel_public_macos_sessions_negotiate_control_and_exit_independently() {

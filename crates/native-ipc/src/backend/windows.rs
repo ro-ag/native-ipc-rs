@@ -15,8 +15,8 @@ use native_ipc_core::mapping::{
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA,
     ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -35,8 +35,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
@@ -60,7 +61,9 @@ use crate::protocol::{
     CONTROL_FRAME_LEN, ManifestEntry, NativeRegionSpec, PeerAccess, TransferManifest,
     TransferProvenance, mint_channel_id,
 };
-use crate::session::AbsoluteDeadline;
+use crate::session::{
+    AbsoluteDeadline, ChildCleanupFacts, ChildExitStatus, DescendantCleanupStatus,
+};
 
 /// Windows section, bootstrap, lifecycle, or binding failure.
 #[derive(Debug)]
@@ -575,23 +578,40 @@ pub struct ChildSession {
     _executable: Option<HeldExecutable>,
 }
 
+impl fmt::Debug for ChildSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildSession")
+            .field("pid", &self.pid)
+            .field("reaped", &self.reaped)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) struct ChildSpawnFailure {
     pub(crate) error: WindowsError,
-    pub(crate) child_was_created: bool,
+    pub(crate) cleanup: Option<ChildCleanupFacts>,
 }
 
 impl ChildSpawnFailure {
     fn before_child(error: WindowsError) -> Self {
         Self {
             error,
-            child_was_created: false,
+            cleanup: None,
         }
     }
 
-    fn after_child(error: WindowsError) -> Self {
+    fn after_child(error: WindowsError, session: &mut ChildSession) -> Self {
         Self {
             error,
-            child_was_created: true,
+            cleanup: Some(session.cleanup_after_failure()),
+        }
+    }
+
+    fn after_suspended_child(error: WindowsError, process: HANDLE) -> Self {
+        Self {
+            error,
+            cleanup: Some(cleanup_suspended_child(process)),
         }
     }
 }
@@ -761,57 +781,16 @@ impl ChildSession {
         {
             return Err(ChildSpawnFailure::before_child(last_os("CreateProcessW")));
         }
-        let process =
-            OwnedHandle::new(information.hProcess).map_err(ChildSpawnFailure::after_child)?;
-        let thread =
-            OwnedHandle::new(information.hThread).map_err(ChildSpawnFailure::after_child)?;
+        let process = OwnedHandle::new(information.hProcess).map_err(|error| {
+            ChildSpawnFailure::after_suspended_child(error, information.hProcess)
+        })?;
+        let thread = OwnedHandle::new(information.hThread)
+            .map_err(|error| ChildSpawnFailure::after_suspended_child(error, process.0))?;
         // SAFETY: CreateProcessW returned this exact child still suspended.
         if let Err(error) = unsafe { job.assign_suspended(process.0) } {
-            // SAFETY: exact held child is still suspended.
-            let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(ChildSpawnFailure::after_child(error));
+            return Err(ChildSpawnFailure::after_suspended_child(error, process.0));
         }
-        if let Err(error) = executable.verify_process_image(process.0) {
-            // SAFETY: exact held child is still suspended and contained by the Job.
-            let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(ChildSpawnFailure::after_child(error));
-        }
-        // SAFETY: thread is the exact suspended primary thread.
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            let error = last_os("ResumeThread");
-            let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(ChildSpawnFailure::after_child(error));
-        }
-        drop(thread);
-        let bootstrap_deadline = Instant::now() + deadline.remaining();
-        connect_authenticated_pipe(
-            pipe.0,
-            process.0,
-            information.dwProcessId,
-            bootstrap_deadline,
-        )
-        .map_err(ChildSpawnFailure::after_child)?;
-        let hello = BootstrapFrame {
-            magic: BOOTSTRAP_MAGIC,
-            nonce,
-            parent_pid,
-            child_pid: information.dwProcessId,
-        };
-        write_frame_until(pipe.0, &hello, bootstrap_deadline)
-            .map_err(ChildSpawnFailure::after_child)?;
-        let ready =
-            read_frame_until(pipe.0, bootstrap_deadline).map_err(ChildSpawnFailure::after_child)?;
-        if ready.magic != AUTH_MAGIC
-            || ready.nonce != nonce
-            || ready.parent_pid != parent_pid
-            || ready.child_pid != information.dwProcessId
-        {
-            let _ = unsafe { TerminateProcess(process.0, 127) };
-            return Err(ChildSpawnFailure::after_child(
-                WindowsError::InvalidBootstrap,
-            ));
-        }
-        Ok(Self {
+        let mut session = Self {
             pipe,
             process,
             _job: job,
@@ -821,7 +800,50 @@ impl ChildSession {
             next_transfer_id: 1,
             pending_manifest: None,
             _executable: Some(executable),
-        })
+        };
+        if let Err(error) = session
+            ._executable
+            .as_ref()
+            .expect("spawn retains executable identity")
+            .verify_process_image(session.process.0)
+        {
+            return Err(ChildSpawnFailure::after_child(error, &mut session));
+        }
+        // SAFETY: thread is the exact suspended primary thread.
+        if unsafe { ResumeThread(thread.0) } == u32::MAX {
+            let error = last_os("ResumeThread");
+            return Err(ChildSpawnFailure::after_child(error, &mut session));
+        }
+        drop(thread);
+        let bootstrap_deadline = Instant::now() + deadline.remaining();
+        connect_authenticated_pipe(
+            session.pipe.0,
+            session.process.0,
+            information.dwProcessId,
+            bootstrap_deadline,
+        )
+        .map_err(|error| ChildSpawnFailure::after_child(error, &mut session))?;
+        let hello = BootstrapFrame {
+            magic: BOOTSTRAP_MAGIC,
+            nonce,
+            parent_pid,
+            child_pid: information.dwProcessId,
+        };
+        write_frame_until(session.pipe.0, &hello, bootstrap_deadline)
+            .map_err(|error| ChildSpawnFailure::after_child(error, &mut session))?;
+        let ready = read_frame_until(session.pipe.0, bootstrap_deadline)
+            .map_err(|error| ChildSpawnFailure::after_child(error, &mut session))?;
+        if ready.magic != AUTH_MAGIC
+            || ready.nonce != nonce
+            || ready.parent_pid != parent_pid
+            || ready.child_pid != information.dwProcessId
+        {
+            return Err(ChildSpawnFailure::after_child(
+                WindowsError::InvalidBootstrap,
+                &mut session,
+            ));
+        }
+        Ok(session)
     }
 
     /// Exact live process handle used only for attenuated handle duplication.
@@ -888,7 +910,7 @@ impl ChildSession {
     > {
         let result = self.commit_transfers_inner(writer, reader);
         if result.is_err() {
-            self.abort_child();
+            let _ = self.cleanup_after_failure();
         }
         result
     }
@@ -928,23 +950,95 @@ impl ChildSession {
         Ok((writer.runtime, reader.runtime))
     }
 
-    fn abort_child(&mut self) -> Option<u32> {
-        if !self.reaped {
-            // SAFETY: this session owns the exact authenticated child handle.
-            let _ = unsafe { TerminateProcess(self.process.0, 127) };
-            // SAFETY: same held process; bounded wait completes cleanup.
-            let waited = unsafe { WaitForSingleObject(self.process.0, WAIT_MS) };
-            self.reaped = true;
-            if waited != WAIT_OBJECT_0 {
-                return None;
-            }
+    /// Terminates the complete held Job and returns the exact direct-child exit
+    /// code only after the kernel reports that the Job has no active process.
+    pub(crate) fn terminate_and_reap_code(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<u32, WindowsError> {
+        if self.reaped {
+            return self.reaped_exit_code();
         }
+        if self.job_is_empty()? && self.process_exited()? {
+            self.reaped = true;
+            return self.reaped_exit_code();
+        }
+        // SAFETY: this session uniquely retains the kill-on-close Job containing
+        // the exact child and every descendant.
+        if unsafe { TerminateJobObject(self._job.0.0, 127) } == 0 {
+            return Err(last_os("TerminateJobObject"));
+        }
+        loop {
+            if self.job_is_empty()? && self.process_exited()? {
+                self.reaped = true;
+                return self.reaped_exit_code();
+            }
+            if deadline.is_expired() {
+                return Err(WindowsError::TimedOut("child cleanup"));
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline.remaining()));
+        }
+    }
+
+    pub(crate) fn wait_for_exit_code(
+        &mut self,
+        deadline: AbsoluteDeadline,
+    ) -> Result<u32, WindowsError> {
+        loop {
+            if self.job_is_empty()? && self.process_exited()? {
+                self.reaped = true;
+                return self.reaped_exit_code();
+            }
+            if deadline.is_expired() {
+                return Err(WindowsError::TimedOut("child exit"));
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline.remaining()));
+        }
+    }
+
+    pub(crate) fn cleanup_after_failure(&mut self) -> ChildCleanupFacts {
+        let deadline = AbsoluteDeadline::after(Duration::from_millis(WAIT_MS.into()));
+        match deadline {
+            Ok(deadline) => cleanup_facts(self.terminate_and_reap_code(deadline)),
+            Err(_) => incomplete_cleanup(None),
+        }
+    }
+
+    fn reaped_exit_code(&self) -> Result<u32, WindowsError> {
         let mut code = 0;
         // SAFETY: the exact held process has exited and the output is writable.
         if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
-            return None;
+            return Err(last_os("GetExitCodeProcess"));
         }
-        Some(code)
+        Ok(code)
+    }
+
+    fn job_is_empty(&self) -> Result<bool, WindowsError> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the held Job is live and the fixed output structure is writable.
+        if unsafe {
+            QueryInformationJobObject(
+                self._job.0.0,
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            Err(last_os("QueryInformationJobObject"))
+        } else {
+            Ok(accounting.ActiveProcesses == 0)
+        }
+    }
+
+    fn process_exited(&self) -> Result<bool, WindowsError> {
+        // SAFETY: the exact held process handle remains live.
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(last_os("WaitForSingleObject")),
+        }
     }
     /// Waits for a normal helper exit after protocol completion.
     pub fn wait(mut self) -> Result<(), WindowsError> {
@@ -971,11 +1065,56 @@ impl ChildSession {
 impl Drop for ChildSession {
     fn drop(&mut self) {
         if !self.reaped {
-            // SAFETY: exact held child; job close remains the backstop for descendants.
-            let _ = unsafe { TerminateProcess(self.process.0, 127) };
-            let _ = unsafe { WaitForSingleObject(self.process.0, WAIT_MS) };
+            let _ = self.cleanup_after_failure();
         }
     }
+}
+
+fn cleanup_suspended_child(process: HANDLE) -> ChildCleanupFacts {
+    // SAFETY: CreateProcessW returned this exact child suspended, so it cannot
+    // have created descendants before this bounded direct-child cleanup.
+    if unsafe { TerminateProcess(process, 127) } == 0 {
+        return incomplete_cleanup(i32::try_from(unsafe { GetLastError() }).ok());
+    }
+    // SAFETY: the exact process handle remains live for this bounded wait.
+    match unsafe { WaitForSingleObject(process, WAIT_MS) } {
+        WAIT_OBJECT_0 => {}
+        WAIT_TIMEOUT => return incomplete_cleanup(None),
+        WAIT_FAILED => {
+            return incomplete_cleanup(i32::try_from(unsafe { GetLastError() }).ok());
+        }
+        _ => return incomplete_cleanup(None),
+    }
+    let mut code = 0;
+    // SAFETY: the exact process is signaled and the output is writable.
+    if unsafe { GetExitCodeProcess(process, &mut code) } == 0 {
+        return incomplete_cleanup(i32::try_from(unsafe { GetLastError() }).ok());
+    }
+    complete_cleanup(code)
+}
+
+fn cleanup_facts(result: Result<u32, WindowsError>) -> ChildCleanupFacts {
+    match result {
+        Ok(code) => complete_cleanup(code),
+        Err(WindowsError::Os { code, .. }) => incomplete_cleanup(i32::try_from(code).ok()),
+        Err(_) => incomplete_cleanup(None),
+    }
+}
+
+fn complete_cleanup(code: u32) -> ChildCleanupFacts {
+    ChildCleanupFacts::new(
+        Some(ChildExitStatus::Exited(code as i32)),
+        DescendantCleanupStatus::ContainedProcessTreeComplete,
+        None,
+    )
+}
+
+fn incomplete_cleanup(native_error: Option<i32>) -> ChildCleanupFacts {
+    ChildCleanupFacts::new(
+        None,
+        DescendantCleanupStatus::OwnedContainmentUnverified,
+        native_error,
+    )
 }
 
 /// Connects a spawned helper from its authenticated bootstrap environment.

@@ -9,12 +9,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::JobObjects::{
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-    QueryInformationJobObject, TerminateJobObject,
-};
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, WaitForSingleObject};
 
 use super::vnext_memory::{WindowsMixedDirectionBatch, WindowsReceivedHandle};
@@ -25,12 +20,11 @@ use crate::backend::{
     SessionTransportError, sealed,
 };
 use crate::protocol::{CONTROL_FRAME_LEN, CapabilityFrame, NativeAuthorityProfile};
-use crate::session::AbsoluteDeadline;
+use crate::session::{AbsoluteDeadline, ChildCleanupFacts};
 
 const MAX_CAPABILITY_COUNT: usize = 16;
 const MAX_CAPABILITY_RECORD_BYTES: usize =
     CONTROL_FRAME_LEN + MAX_CAPABILITY_COUNT * size_of::<u64>();
-const TERMINATION_EXIT_CODE: u32 = 127;
 
 #[cfg(test)]
 thread_local! {
@@ -85,13 +79,13 @@ impl CoordinatorWindowsControlTransport {
     pub(crate) fn from_accepted(
         session: ChildSession,
         evidence: CoordinatorAcceptedEvidence,
-    ) -> Result<Self, SessionTransportError> {
+    ) -> Result<Self, Box<(SessionTransportError, ChildSession)>> {
         let facts = evidence.facts();
         if facts.parent_pid() != unsafe { GetCurrentProcessId() }
             || facts.child_pid() != session.pid()
             || facts.nonce() != session.vnext_nonce()
         {
-            return Err(SessionTransportError::IdentityMismatch);
+            return Err(Box::new((SessionTransportError::IdentityMismatch, session)));
         }
         Ok(Self {
             session,
@@ -111,6 +105,12 @@ impl CoordinatorWindowsControlTransport {
         self.remote_ledger.clear();
     }
 
+    pub(crate) fn cleanup_after_failure(&mut self) -> ChildCleanupFacts {
+        self.poisoned = true;
+        self.remote_ledger.clear();
+        self.session.cleanup_after_failure()
+    }
+
     #[cfg(test)]
     pub(crate) fn remote_capability_count_for_test(&self) -> usize {
         self.remote_ledger.len()
@@ -120,22 +120,14 @@ impl CoordinatorWindowsControlTransport {
         &mut self,
         deadline: AbsoluteDeadline,
     ) -> Result<u32, SessionTransportError> {
-        loop {
-            if poll_process(self.session.process.0)? == PeerState::Running
-                || !job_is_empty(self.session._job.0.0)?
-            {
-                wait_retry(deadline)?;
-                continue;
-            }
-            let mut code = 0;
-            // SAFETY: the exact held process is signaled and the output is writable.
-            if unsafe { GetExitCodeProcess(self.session.process.0, &mut code) } == 0 {
-                return Err(native_error(unsafe { GetLastError() }));
-            }
-            self.session.reaped = true;
+        let result = self
+            .session
+            .wait_for_exit_code(deadline)
+            .map_err(map_windows_error);
+        if result.is_ok() {
             self.remote_ledger.clear();
-            return Ok(code);
         }
+        result
     }
 
     #[cfg(test)]
@@ -338,7 +330,9 @@ impl CoordinatorCapabilityTransport for CoordinatorWindowsControlTransport {
             })();
             self.remote_ledger = ledger.into_handles();
             if operation.is_err() {
-                terminate_session(&mut self.session, deadline)?;
+                self.session
+                    .terminate_and_reap_code(deadline)
+                    .map_err(map_windows_error)?;
                 self.remote_ledger.clear();
             }
             operation
@@ -383,7 +377,10 @@ impl CoordinatorWindowsControlTransport {
         deadline: AbsoluteDeadline,
     ) -> Result<u32, SessionTransportError> {
         self.poisoned = true;
-        let result = terminate_session(&mut self.session, deadline);
+        let result = self
+            .session
+            .terminate_and_reap_code(deadline)
+            .map_err(map_windows_error);
         if result.is_ok() {
             self.remote_ledger.clear();
         }
@@ -614,66 +611,6 @@ fn poll_pipe(pipe: HANDLE) -> Result<PeerState, SessionTransportError> {
         Ok(PeerState::ExitedUnknown)
     } else {
         Err(native_error(code))
-    }
-}
-
-fn terminate_session(
-    session: &mut ChildSession,
-    deadline: AbsoluteDeadline,
-) -> Result<u32, SessionTransportError> {
-    if session.reaped {
-        return reaped_exit_code(session);
-    }
-    if job_is_empty(session._job.0.0)?
-        && poll_process(session.process.0)? == PeerState::ExitedUnknown
-    {
-        session.reaped = true;
-        return reaped_exit_code(session);
-    }
-    // SAFETY: this session uniquely retains the kill-on-close Job containing
-    // the exact still-live child and every descendant.
-    if unsafe { TerminateJobObject(session._job.0.0, TERMINATION_EXIT_CODE) } == 0 {
-        return Err(native_error(unsafe { GetLastError() }));
-    }
-    loop {
-        if job_is_empty(session._job.0.0)?
-            && poll_process(session.process.0)? == PeerState::ExitedUnknown
-        {
-            session.reaped = true;
-            return reaped_exit_code(session);
-        }
-        wait_retry(deadline)?;
-    }
-}
-
-/// Reads the exact exit code the kernel recorded for the reaped child, so
-/// termination facts report the real code instead of assuming the
-/// termination constant landed first.
-fn reaped_exit_code(session: &ChildSession) -> Result<u32, SessionTransportError> {
-    let mut code = 0;
-    // SAFETY: the exact held process has exited and the output is writable.
-    if unsafe { GetExitCodeProcess(session.process.0, &mut code) } == 0 {
-        return Err(native_error(unsafe { GetLastError() }));
-    }
-    Ok(code)
-}
-
-fn job_is_empty(job: HANDLE) -> Result<bool, SessionTransportError> {
-    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-    // SAFETY: the held Job is live and the fixed output structure is writable.
-    if unsafe {
-        QueryInformationJobObject(
-            job,
-            JobObjectBasicAccountingInformation,
-            (&raw mut accounting).cast(),
-            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-            core::ptr::null_mut(),
-        )
-    } == 0
-    {
-        Err(native_error(unsafe { GetLastError() }))
-    } else {
-        Ok(accounting.ActiveProcesses == 0)
     }
 }
 
