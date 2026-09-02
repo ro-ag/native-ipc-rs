@@ -20,13 +20,13 @@ use native_ipc::region::{
 };
 use native_ipc::session::{
     AbsoluteDeadline, ActiveLeaseFacts, AtomicCapabilities, BackendStatus, ChildCleanupFacts,
-    ChildExitStatus, Coordinator, CoordinatorAbortOutcome, CoordinatorCloseOutcome,
-    CoordinatorSession, DescendantCleanupStatus, ExecutableIdentityPolicy, HARD_MAX_ACTIVE_BYTES,
-    HARD_MAX_ACTIVE_REGIONS, HARD_MAX_BATCH_BYTES, HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES,
-    HARD_MAX_CONTROL_PAYLOAD_BYTES, HARD_MAX_REGION_BYTES, HARD_MAX_REGIONS_PER_BATCH,
-    HARD_MAX_TRANSACTIONS, LeaseFactsConsistency, Negotiating, NegotiationDecision,
-    NegotiationError, NegotiationOutcome, PeerStatus, ProtocolVersion, Ready, Receiver,
-    ReceiverBootstrap, ReceiverCloseOutcome, ReceiverSession, RejectionReason, Session,
+    ChildExitStatus, ChildProcessLimitFacts, ChildProcessLimits, Coordinator,
+    CoordinatorAbortOutcome, CoordinatorCloseOutcome, CoordinatorSession, DescendantCleanupStatus,
+    ExecutableIdentityPolicy, HARD_MAX_ACTIVE_BYTES, HARD_MAX_ACTIVE_REGIONS, HARD_MAX_BATCH_BYTES,
+    HARD_MAX_BOOTSTRAP_PAYLOAD_BYTES, HARD_MAX_CONTROL_PAYLOAD_BYTES, HARD_MAX_REGION_BYTES,
+    HARD_MAX_REGIONS_PER_BATCH, HARD_MAX_TRANSACTIONS, LeaseFactsConsistency, Negotiating,
+    NegotiationDecision, NegotiationError, NegotiationOutcome, PeerStatus, ProtocolVersion, Ready,
+    Receiver, ReceiverBootstrap, ReceiverCloseOutcome, ReceiverSession, RejectionReason, Session,
     SessionCommand, SessionEndpoint, SessionError, SessionFailure, SessionLimits, SessionOperation,
     SessionOptions, SessionState, SessionTransactionState, backend_status,
 };
@@ -80,6 +80,8 @@ fn consumer_type_surface_is_available_on_every_supported_target() {
     assert_public_type::<BackendStatus>();
     assert_public_type::<ChildCleanupFacts>();
     assert_public_type::<ChildExitStatus>();
+    assert_public_type::<ChildProcessLimitFacts>();
+    assert_public_type::<ChildProcessLimits>();
     assert_public_type::<Coordinator>();
     assert_public_type::<CoordinatorAbortOutcome>();
     assert_public_type::<CoordinatorCloseOutcome>();
@@ -125,6 +127,12 @@ fn consumer_type_surface_is_available_on_every_supported_target() {
 
     let _: fn() -> NativeMemoryCapabilities = native_memory_capabilities;
     let _: fn() -> BackendStatus = backend_status;
+    let options = SessionOptions::new(
+        AbsoluteDeadline::after(std::time::Duration::from_secs(1)).unwrap(),
+        ExecutableIdentityPolicy::ExactOpenedFile,
+    )
+    .with_child_process_limits(ChildProcessLimits::default());
+    drop(options);
     let _ = (
         APPLICATION_CONTROL_KIND_MIN,
         HARD_MAX_REGIONS_PER_BATCH,

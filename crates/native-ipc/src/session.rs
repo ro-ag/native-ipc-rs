@@ -459,6 +459,7 @@ impl CoordinatorAbortOutcome {
 /// shareable between threads; every control transition requires `&mut self`.
 pub struct Session<Role, State> {
     inner: SessionInner,
+    child_process_limit_facts: ChildProcessLimitFacts,
     role: PhantomData<Role>,
     state: PhantomData<State>,
     not_sync: PhantomData<Cell<()>>,
@@ -716,11 +717,159 @@ impl SessionCommand {
     }
 }
 
+/// Optional kernel-enforced limits for one spawned child process tree.
+///
+/// Every field is opt-in. A target must either apply an exact requested field
+/// before untrusted child code runs or reject construction explicitly; limits
+/// are never silently weakened. Windows enforces commit memory, user CPU time,
+/// and active-process count through the child Job. Descriptor limits are not
+/// supported there. Linux and macOS expose this same type but reject every
+/// requested field; callers may install authenticated runner-side limits
+/// separately on those targets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChildProcessLimits {
+    /// Maximum committed virtual memory charged to each process, in bytes.
+    pub per_process_commit_memory_bytes: Option<u64>,
+    /// Maximum user-mode CPU time charged to each process.
+    pub per_process_user_cpu_time: Option<Duration>,
+    /// Maximum number of processes simultaneously active in the contained tree.
+    pub active_process_limit: Option<u32>,
+    /// Maximum number of open file descriptors or handles per process.
+    pub open_descriptor_limit: Option<u64>,
+}
+
+impl ChildProcessLimits {
+    /// Whether no child-process limit is requested.
+    pub const fn is_empty(self) -> bool {
+        self.per_process_commit_memory_bytes.is_none()
+            && self.per_process_user_cpu_time.is_none()
+            && self.active_process_limit.is_none()
+            && self.open_descriptor_limit.is_none()
+    }
+
+    fn has_zero(self) -> bool {
+        self.per_process_commit_memory_bytes == Some(0)
+            || self
+                .per_process_user_cpu_time
+                .is_some_and(|duration| duration.is_zero())
+            || self.active_process_limit == Some(0)
+            || self.open_descriptor_limit == Some(0)
+    }
+}
+
+/// Exact requested, applied, and target-unsupported child-process limit facts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChildProcessLimitFacts {
+    memory_bytes: u64,
+    user_cpu_time: Duration,
+    active_processes: u32,
+    open_descriptors: u64,
+    requested_mask: u8,
+    applied_mask: u8,
+    unsupported_mask: u8,
+}
+
+impl ChildProcessLimitFacts {
+    const MEMORY: u8 = 1 << 0;
+    const CPU: u8 = 1 << 1;
+    const PROCESSES: u8 = 1 << 2;
+    const DESCRIPTORS: u8 = 1 << 3;
+
+    pub(crate) const fn new(
+        requested: ChildProcessLimits,
+        applied: ChildProcessLimits,
+        unsupported: ChildProcessLimits,
+    ) -> Self {
+        Self {
+            memory_bytes: match requested.per_process_commit_memory_bytes {
+                Some(value) => value,
+                None => 0,
+            },
+            user_cpu_time: match requested.per_process_user_cpu_time {
+                Some(value) => value,
+                None => Duration::ZERO,
+            },
+            active_processes: match requested.active_process_limit {
+                Some(value) => value,
+                None => 0,
+            },
+            open_descriptors: match requested.open_descriptor_limit {
+                Some(value) => value,
+                None => 0,
+            },
+            requested_mask: Self::mask(requested),
+            applied_mask: Self::mask(applied),
+            unsupported_mask: Self::mask(unsupported),
+        }
+    }
+
+    const fn mask(limits: ChildProcessLimits) -> u8 {
+        (if limits.per_process_commit_memory_bytes.is_some() {
+            Self::MEMORY
+        } else {
+            0
+        }) | (if limits.per_process_user_cpu_time.is_some() {
+            Self::CPU
+        } else {
+            0
+        }) | (if limits.active_process_limit.is_some() {
+            Self::PROCESSES
+        } else {
+            0
+        }) | (if limits.open_descriptor_limit.is_some() {
+            Self::DESCRIPTORS
+        } else {
+            0
+        })
+    }
+
+    const fn limits_for_mask(self, mask: u8) -> ChildProcessLimits {
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: if mask & Self::MEMORY != 0 {
+                Some(self.memory_bytes)
+            } else {
+                None
+            },
+            per_process_user_cpu_time: if mask & Self::CPU != 0 {
+                Some(self.user_cpu_time)
+            } else {
+                None
+            },
+            active_process_limit: if mask & Self::PROCESSES != 0 {
+                Some(self.active_processes)
+            } else {
+                None
+            },
+            open_descriptor_limit: if mask & Self::DESCRIPTORS != 0 {
+                Some(self.open_descriptors)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Exact values supplied by the caller.
+    pub const fn requested(self) -> ChildProcessLimits {
+        self.limits_for_mask(self.requested_mask)
+    }
+
+    /// Exact values installed by the kernel before the child was resumed.
+    pub const fn applied(self) -> ChildProcessLimits {
+        self.limits_for_mask(self.applied_mask)
+    }
+
+    /// Exact requested fields that the selected target cannot enforce here.
+    pub const fn unsupported(self) -> ChildProcessLimits {
+        self.limits_for_mask(self.unsupported_mask)
+    }
+}
+
 /// Finite negotiation inputs retained under one caller-derived deadline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionOptions {
     deadline: AbsoluteDeadline,
     limits: SessionLimits,
+    child_process_limits: ChildProcessLimits,
     application_payload: Vec<u8>,
     executable_identity: ExecutableIdentityPolicy,
     require_atomic_u32: bool,
@@ -733,6 +882,7 @@ impl SessionOptions {
         Self {
             deadline,
             limits: SessionLimits::default(),
+            child_process_limits: ChildProcessLimits::default(),
             application_payload: Vec::new(),
             executable_identity,
             require_atomic_u32: false,
@@ -743,6 +893,18 @@ impl SessionOptions {
     /// Replaces the finite local limit offer.
     pub fn with_limits(mut self, limits: SessionLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Requests limits for the spawned child process and its contained tree.
+    ///
+    /// Construction fails before the child runs if any requested field is not
+    /// supported by the selected target. Omitting this call preserves the
+    /// existing unrestricted child-process behavior. Every requested scalar
+    /// must be nonzero. Windows CPU durations must be an exact multiple of 100
+    /// nanoseconds and fit the native signed Job time representation.
+    pub fn with_child_process_limits(mut self, limits: ChildProcessLimits) -> Self {
+        self.child_process_limits = limits;
         self
     }
 
@@ -767,6 +929,11 @@ impl SessionOptions {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) const fn limits(&self) -> SessionLimits {
         self.limits
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) const fn child_process_limits(&self) -> ChildProcessLimits {
+        self.child_process_limits
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -875,6 +1042,8 @@ pub enum SessionError {
     BackendUnavailable,
     /// Local command, environment, payload, or option input is invalid.
     InvalidInput,
+    /// One or more requested child-process limits are not enforceable here.
+    UnsupportedChildProcessLimits,
     /// The one caller-derived absolute deadline expired.
     DeadlineExpired,
     /// The authenticated control endpoint closed before the operation completed.
@@ -970,6 +1139,7 @@ pub struct SessionFailure {
     poisoned: bool,
     peer: Option<PeerStatus>,
     cleanup: Option<ChildCleanupFacts>,
+    child_process_limit_facts: Option<ChildProcessLimitFacts>,
 }
 
 impl SessionFailure {
@@ -990,11 +1160,17 @@ impl SessionFailure {
                 None
             },
             cleanup: None,
+            child_process_limit_facts: None,
         }
     }
 
     const fn with_cleanup(mut self, cleanup: ChildCleanupFacts) -> Self {
         self.cleanup = Some(cleanup);
+        self
+    }
+
+    const fn with_child_process_limit_facts(mut self, facts: ChildProcessLimitFacts) -> Self {
+        self.child_process_limit_facts = Some(facts);
         self
     }
 
@@ -1047,6 +1223,11 @@ impl SessionFailure {
     /// Coordinator-owned cleanup facts, when this operation consumed child authority.
     pub const fn cleanup(self) -> Option<ChildCleanupFacts> {
         self.cleanup
+    }
+
+    /// Exact child-process limit facts retained by this failed construction.
+    pub const fn child_process_limit_facts(self) -> Option<ChildProcessLimitFacts> {
+        self.child_process_limit_facts
     }
 }
 
@@ -1309,9 +1490,10 @@ impl AbsoluteDeadline {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl<Role, State> Session<Role, State> {
-    fn from_inner(inner: SessionInner) -> Self {
+    fn from_inner(inner: SessionInner, child_process_limit_facts: ChildProcessLimitFacts) -> Self {
         Self {
             inner,
+            child_process_limit_facts,
             role: PhantomData,
             state: PhantomData,
             not_sync: PhantomData,
@@ -1329,7 +1511,19 @@ impl Session<Coordinator, Negotiating> {
                 SessionTransactionState::NotEstablished,
                 reason,
             )
+            .with_child_process_limit_facts(child_process_limit_invalid_facts(
+                options.child_process_limits,
+            ))
         })?;
+        let limit_facts = child_process_limit_preflight(options.child_process_limits);
+        if !limit_facts.unsupported().is_empty() {
+            return Err(SessionFailure::new(
+                SessionOperation::Spawn,
+                SessionTransactionState::NotEstablished,
+                SessionError::UnsupportedChildProcessLimits,
+            )
+            .with_child_process_limit_facts(limit_facts));
+        }
         if command.has_reserved_environment() {
             return Err(SessionFailure::new(
                 SessionOperation::Spawn,
@@ -1365,9 +1559,10 @@ impl Session<Coordinator, Negotiating> {
                     .with_poisoned(failure.poisoned)
                     .with_optional_cleanup(failure.cleanup)
                 })?;
-            Ok(Self::from_inner(SessionInner::CoordinatorNegotiating(
-                inner,
-            )))
+            Ok(Self::from_inner(
+                SessionInner::CoordinatorNegotiating(inner),
+                limit_facts,
+            ))
         }
         #[cfg(target_os = "macos")]
         {
@@ -1395,9 +1590,10 @@ impl Session<Coordinator, Negotiating> {
                     )
                     .with_optional_cleanup(failure.cleanup)
                 })?;
-            Ok(Self::from_inner(SessionInner::CoordinatorNegotiating(
-                inner,
-            )))
+            Ok(Self::from_inner(
+                SessionInner::CoordinatorNegotiating(inner),
+                limit_facts,
+            ))
         }
         #[cfg(target_os = "windows")]
         {
@@ -1411,17 +1607,28 @@ impl Session<Coordinator, Negotiating> {
                     crate::backend::windows::vnext_session::WindowsCoordinatorFailureState::Spawned => SessionTransactionState::Spawned,
                     crate::backend::windows::vnext_session::WindowsCoordinatorFailureState::Negotiating => SessionTransactionState::Negotiating,
                 };
-                windows_session_failure(
+                let mapped = windows_session_failure(
                     SessionOperation::Spawn,
                     transaction_state,
                     failure.error,
                     failure.poisoned,
                 )
-                .with_optional_cleanup(failure.cleanup)
+                .with_optional_cleanup(failure.cleanup);
+                if !limit_facts.requested().is_empty() {
+                    let facts = if failure.limits_applied {
+                        limit_facts
+                    } else {
+                        child_process_limit_invalid_facts(limit_facts.requested())
+                    };
+                    mapped.with_child_process_limit_facts(facts)
+                } else {
+                    mapped
+                }
             })?;
-            Ok(Self::from_inner(SessionInner::CoordinatorNegotiating(
-                Box::new(inner),
-            )))
+            Ok(Self::from_inner(
+                SessionInner::CoordinatorNegotiating(Box::new(inner)),
+                limit_facts,
+            ))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -1456,11 +1663,17 @@ impl Session<Coordinator, Negotiating> {
         }
     }
 
+    /// Exact child-process limits installed before this child was resumed.
+    pub const fn child_process_limit_facts(&self) -> ChildProcessLimitFacts {
+        self.child_process_limit_facts
+    }
+
     /// Makes the explicit coordinator decision and awaits the receiver decision.
     pub fn decide(
         self,
         decision: NegotiationDecision,
     ) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
+        let child_process_limit_facts = self.child_process_limit_facts;
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         let _ = decision;
         match self.inner {
@@ -1478,8 +1691,9 @@ impl Session<Coordinator, Negotiating> {
                         .with_native_code(native_code)
                         .with_poisoned(failure.poisoned)
                         .with_optional_cleanup(failure.cleanup)
+                        .with_child_process_limit_facts(child_process_limit_facts)
                     })?;
-                map_linux_coordinator_outcome(outcome)
+                map_linux_coordinator_outcome(outcome, child_process_limit_facts)
             }
             #[cfg(target_os = "macos")]
             SessionInner::CoordinatorNegotiating(inner) => {
@@ -1493,8 +1707,9 @@ impl Session<Coordinator, Negotiating> {
                             failure.poisoned,
                         )
                         .with_optional_cleanup(failure.cleanup)
+                        .with_child_process_limit_facts(child_process_limit_facts)
                     })?;
-                map_mac_coordinator_outcome(outcome)
+                map_mac_coordinator_outcome(outcome, child_process_limit_facts)
             }
             #[cfg(target_os = "windows")]
             SessionInner::CoordinatorNegotiating(inner) => {
@@ -1508,8 +1723,9 @@ impl Session<Coordinator, Negotiating> {
                             failure.poisoned,
                         )
                         .with_optional_cleanup(failure.cleanup)
+                        .with_child_process_limit_facts(child_process_limit_facts)
                     })?;
-                map_windows_coordinator_outcome(outcome)
+                map_windows_coordinator_outcome(outcome, child_process_limit_facts)
             }
             #[cfg(target_os = "linux")]
             _ => unreachable!("coordinator negotiating typestate owns its exact backend state"),
@@ -1538,6 +1754,18 @@ impl Session<Receiver, Negotiating> {
                 reason,
             )
         })?;
+        if !options.child_process_limits.is_empty() {
+            return Err(SessionFailure::new(
+                SessionOperation::Bootstrap,
+                SessionTransactionState::NotEstablished,
+                SessionError::UnsupportedChildProcessLimits,
+            )
+            .with_child_process_limit_facts(ChildProcessLimitFacts::new(
+                options.child_process_limits,
+                ChildProcessLimits::default(),
+                options.child_process_limits,
+            )));
+        }
         #[cfg(target_os = "linux")]
         {
             let inner = crate::backend::linux_vnext::spawn::LinuxReceiverNegotiatingSession::from_inherited_bootstrap(
@@ -1557,7 +1785,10 @@ impl Session<Receiver, Negotiating> {
                 .with_native_code(linux_public_native_code(error))
                 .with_poisoned(true)
             })?;
-            Ok(Self::from_inner(SessionInner::ReceiverNegotiating(inner)))
+            Ok(Self::from_inner(
+                SessionInner::ReceiverNegotiating(inner),
+                ChildProcessLimitFacts::default(),
+            ))
         }
         #[cfg(target_os = "macos")]
         {
@@ -1590,7 +1821,10 @@ impl Session<Receiver, Negotiating> {
                         !invalid_input,
                     )
                 })?;
-            Ok(Self::from_inner(SessionInner::ReceiverNegotiating(inner)))
+            Ok(Self::from_inner(
+                SessionInner::ReceiverNegotiating(inner),
+                ChildProcessLimitFacts::default(),
+            ))
         }
         #[cfg(target_os = "windows")]
         {
@@ -1616,9 +1850,10 @@ impl Session<Receiver, Negotiating> {
                     !invalid_input,
                 )
             })?;
-            Ok(Self::from_inner(SessionInner::ReceiverNegotiating(
-                Box::new(inner),
-            )))
+            Ok(Self::from_inner(
+                SessionInner::ReceiverNegotiating(Box::new(inner)),
+                ChildProcessLimitFacts::default(),
+            ))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
@@ -1741,6 +1976,11 @@ impl Session<Coordinator, Ready> {
                 unreachable!("unavailable backend cannot construct a session")
             }
         }
+    }
+
+    /// Exact child-process limits installed before this child was resumed.
+    pub const fn child_process_limit_facts(&self) -> ChildProcessLimitFacts {
+        self.child_process_limit_facts
     }
 
     /// Effective lock-free atomic and layout alignment facts bound into ACCEPT.
@@ -2498,11 +2738,88 @@ fn validate_public_options(options: &SessionOptions) -> Result<(), SessionError>
     match options.executable_identity {
         ExecutableIdentityPolicy::ExactOpenedFile => {}
     }
+    if options.child_process_limits.has_zero() {
+        return Err(SessionError::InvalidInput);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(cpu_time) = options.child_process_limits.per_process_user_cpu_time {
+        let ticks = cpu_time.as_nanos();
+        if !ticks.is_multiple_of(100) || ticks / 100 > i64::MAX as u128 {
+            return Err(SessionError::InvalidInput);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if options
+        .child_process_limits
+        .per_process_commit_memory_bytes
+        .is_some_and(|bytes| usize::try_from(bytes).is_err())
+    {
+        return Err(SessionError::InvalidInput);
+    }
     options
         .limits
         .validate()
         .map(|_| ())
         .map_err(SessionError::NativeNegotiation)
+}
+
+const fn child_process_limit_invalid_facts(
+    requested: ChildProcessLimits,
+) -> ChildProcessLimitFacts {
+    ChildProcessLimitFacts::new(
+        requested,
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: None,
+            per_process_user_cpu_time: None,
+            active_process_limit: None,
+            open_descriptor_limit: None,
+        },
+        child_process_limit_unsupported(requested),
+    )
+}
+
+const fn child_process_limit_preflight(requested: ChildProcessLimits) -> ChildProcessLimitFacts {
+    let unsupported = child_process_limit_unsupported(requested);
+    #[cfg(target_os = "windows")]
+    let applied = if unsupported.is_empty() {
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: requested.per_process_commit_memory_bytes,
+            per_process_user_cpu_time: requested.per_process_user_cpu_time,
+            active_process_limit: requested.active_process_limit,
+            open_descriptor_limit: None,
+        }
+    } else {
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: None,
+            per_process_user_cpu_time: None,
+            active_process_limit: None,
+            open_descriptor_limit: None,
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let applied = ChildProcessLimits {
+        per_process_commit_memory_bytes: None,
+        per_process_user_cpu_time: None,
+        active_process_limit: None,
+        open_descriptor_limit: None,
+    };
+    ChildProcessLimitFacts::new(requested, applied, unsupported)
+}
+
+const fn child_process_limit_unsupported(requested: ChildProcessLimits) -> ChildProcessLimits {
+    #[cfg(target_os = "windows")]
+    {
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: None,
+            per_process_user_cpu_time: None,
+            active_process_limit: None,
+            open_descriptor_limit: requested.open_descriptor_limit,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        requested
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2530,11 +2847,13 @@ fn map_mac_coordinator_outcome(
     outcome: crate::backend::macos::vnext_session::MacNegotiationOutcome<
         crate::backend::macos::vnext_session::MacCoordinatorReadySession,
     >,
+    child_process_limit_facts: ChildProcessLimitFacts,
 ) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
     match outcome {
         crate::backend::macos::vnext_session::MacNegotiationOutcome::Accepted(inner) => {
             Ok(NegotiationOutcome::Accepted(Session::from_inner(
                 SessionInner::CoordinatorReady(inner),
+                child_process_limit_facts,
             )))
         }
         crate::backend::macos::vnext_session::MacNegotiationOutcome::Rejected {
@@ -2547,7 +2866,8 @@ fn map_mac_coordinator_outcome(
                     SessionOperation::Negotiate,
                     SessionTransactionState::Poisoned,
                     SessionError::MalformedPeer,
-                );
+                )
+                .with_child_process_limit_facts(child_process_limit_facts);
                 cleanup.map_or(failure, |facts| failure.with_cleanup(facts))
             })?;
             Ok(NegotiationOutcome::Rejected {
@@ -2566,9 +2886,12 @@ fn map_mac_receiver_outcome(
     >,
 ) -> Result<NegotiationOutcome<Session<Receiver, Ready>>, SessionFailure> {
     match outcome {
-        crate::backend::macos::vnext_session::MacNegotiationOutcome::Accepted(inner) => Ok(
-            NegotiationOutcome::Accepted(Session::from_inner(SessionInner::ReceiverReady(inner))),
-        ),
+        crate::backend::macos::vnext_session::MacNegotiationOutcome::Accepted(inner) => {
+            Ok(NegotiationOutcome::Accepted(Session::from_inner(
+                SessionInner::ReceiverReady(inner),
+                ChildProcessLimitFacts::default(),
+            )))
+        }
         crate::backend::macos::vnext_session::MacNegotiationOutcome::Rejected {
             by,
             reason,
@@ -2609,11 +2932,13 @@ fn map_windows_coordinator_outcome(
     outcome: crate::backend::windows::vnext_session::WindowsNegotiationOutcome<
         crate::backend::windows::vnext_session::WindowsCoordinatorReadySession,
     >,
+    child_process_limit_facts: ChildProcessLimitFacts,
 ) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
     match outcome {
         crate::backend::windows::vnext_session::WindowsNegotiationOutcome::Accepted(inner) => {
             Ok(NegotiationOutcome::Accepted(Session::from_inner(
                 SessionInner::CoordinatorReady(Box::new(inner)),
+                child_process_limit_facts,
             )))
         }
         crate::backend::windows::vnext_session::WindowsNegotiationOutcome::Rejected {
@@ -2626,7 +2951,8 @@ fn map_windows_coordinator_outcome(
                     SessionOperation::Negotiate,
                     SessionTransactionState::Poisoned,
                     SessionError::MalformedPeer,
-                );
+                )
+                .with_child_process_limit_facts(child_process_limit_facts);
                 cleanup.map_or(failure, |facts| failure.with_cleanup(facts))
             })?;
             Ok(NegotiationOutcome::Rejected {
@@ -2648,6 +2974,7 @@ fn map_windows_receiver_outcome(
         crate::backend::windows::vnext_session::WindowsNegotiationOutcome::Accepted(inner) => {
             Ok(NegotiationOutcome::Accepted(Session::from_inner(
                 SessionInner::ReceiverReady(Box::new(inner)),
+                ChildProcessLimitFacts::default(),
             )))
         }
         crate::backend::windows::vnext_session::WindowsNegotiationOutcome::Rejected {
@@ -2690,11 +3017,13 @@ fn map_linux_coordinator_outcome(
     outcome: crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome<
         crate::backend::linux_vnext::spawn::LinuxCoordinatorReadySession,
     >,
+    child_process_limit_facts: ChildProcessLimitFacts,
 ) -> Result<NegotiationOutcome<Session<Coordinator, Ready>>, SessionFailure> {
     match outcome {
         crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome::Accepted(inner) => {
             Ok(NegotiationOutcome::Accepted(Session::from_inner(
                 SessionInner::CoordinatorReady(inner),
+                child_process_limit_facts,
             )))
         }
         crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome::Rejected {
@@ -2707,7 +3036,8 @@ fn map_linux_coordinator_outcome(
                     SessionOperation::Negotiate,
                     SessionTransactionState::Poisoned,
                     SessionError::MalformedPeer,
-                );
+                )
+                .with_child_process_limit_facts(child_process_limit_facts);
                 cleanup.map_or(failure, |facts| failure.with_cleanup(facts))
             })?;
             Ok(NegotiationOutcome::Rejected {
@@ -2726,9 +3056,12 @@ fn map_linux_receiver_outcome(
     >,
 ) -> Result<NegotiationOutcome<Session<Receiver, Ready>>, SessionFailure> {
     match outcome {
-        crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome::Accepted(inner) => Ok(
-            NegotiationOutcome::Accepted(Session::from_inner(SessionInner::ReceiverReady(inner))),
-        ),
+        crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome::Accepted(inner) => {
+            Ok(NegotiationOutcome::Accepted(Session::from_inner(
+                SessionInner::ReceiverReady(inner),
+                ChildProcessLimitFacts::default(),
+            )))
+        }
         crate::backend::linux_vnext::spawn::LinuxNegotiationOutcome::Rejected {
             by,
             reason,

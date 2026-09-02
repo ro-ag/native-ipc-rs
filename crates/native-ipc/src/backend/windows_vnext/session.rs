@@ -72,6 +72,7 @@ pub(crate) struct WindowsCoordinatorSessionFailure {
     pub(crate) cleanup: Option<ChildCleanupFacts>,
     pub(crate) state: WindowsCoordinatorFailureState,
     pub(crate) poisoned: bool,
+    pub(crate) limits_applied: bool,
 }
 
 impl WindowsCoordinatorSessionFailure {
@@ -81,6 +82,7 @@ impl WindowsCoordinatorSessionFailure {
             cleanup: None,
             state: WindowsCoordinatorFailureState::NotEstablished,
             poisoned: false,
+            limits_applied: false,
         }
     }
 
@@ -94,6 +96,7 @@ impl WindowsCoordinatorSessionFailure {
             cleanup: Some(session.cleanup_after_failure()),
             state,
             poisoned: true,
+            limits_applied: true,
         }
     }
 
@@ -101,12 +104,14 @@ impl WindowsCoordinatorSessionFailure {
         error: WindowsPublicSessionError,
         state: WindowsCoordinatorFailureState,
         cleanup: ChildCleanupFacts,
+        limits_applied: bool,
     ) -> Self {
         Self {
             error,
             cleanup: Some(cleanup),
             state,
             poisoned: true,
+            limits_applied,
         }
     }
 }
@@ -186,6 +191,7 @@ impl WindowsCoordinatorNegotiatingSession {
             command.arguments(),
             command.environment(),
             options.deadline(),
+            options.child_process_limits(),
         )
         .map_err(|failure: ChildSpawnFailure| {
             let error = map_windows_error(failure.error);
@@ -194,6 +200,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     error,
                     WindowsCoordinatorFailureState::Spawned,
                     cleanup,
+                    failure.limits_applied,
                 )
             } else {
                 WindowsCoordinatorSessionFailure::before_child(error)
@@ -494,6 +501,7 @@ impl WindowsCoordinatorNegotiatingSession {
                     WindowsPublicSessionError::InvalidInput,
                     WindowsCoordinatorFailureState::Negotiating,
                     cleanup,
+                    true,
                 ));
             }
         };

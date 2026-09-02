@@ -110,6 +110,150 @@ fn public_session_inputs_are_explicit_bounded_and_role_typed() {
     }
 }
 
+#[test]
+fn child_process_limit_facts_are_target_exact_and_default_is_no_op() {
+    let empty = ChildProcessLimits::default();
+    assert!(empty.is_empty());
+    assert_eq!(
+        child_process_limit_preflight(empty),
+        ChildProcessLimitFacts::default()
+    );
+
+    let requested = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(64 * 1024 * 1024),
+        per_process_user_cpu_time: Some(Duration::from_millis(250)),
+        active_process_limit: Some(2),
+        open_descriptor_limit: Some(64),
+    };
+    let facts = child_process_limit_preflight(requested);
+    assert_eq!(facts.requested(), requested);
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(facts.applied(), ChildProcessLimits::default());
+        assert_eq!(
+            facts.unsupported(),
+            ChildProcessLimits {
+                open_descriptor_limit: Some(64),
+                ..ChildProcessLimits::default()
+            }
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(facts.applied(), ChildProcessLimits::default());
+        assert_eq!(facts.unsupported(), requested);
+    }
+
+    let memory_only = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(64 * 1024 * 1024),
+        ..ChildProcessLimits::default()
+    };
+    let memory_facts = child_process_limit_preflight(memory_only);
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(memory_facts.applied(), memory_only);
+        assert_eq!(memory_facts.unsupported(), ChildProcessLimits::default());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(memory_facts.applied(), ChildProcessLimits::default());
+        assert_eq!(memory_facts.unsupported(), memory_only);
+    }
+
+    let replacement = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(8 * 1024 * 1024),
+        ..ChildProcessLimits::default()
+    };
+    let options = SessionOptions::new(
+        AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+        ExecutableIdentityPolicy::ExactOpenedFile,
+    )
+    .with_child_process_limits(requested)
+    .with_child_process_limits(replacement);
+    assert_eq!(options.child_process_limits, replacement);
+}
+
+#[test]
+fn zero_child_process_limits_fail_before_spawn_with_exact_request_facts() {
+    let zero_rows = [
+        ChildProcessLimits {
+            per_process_commit_memory_bytes: Some(0),
+            ..ChildProcessLimits::default()
+        },
+        ChildProcessLimits {
+            per_process_user_cpu_time: Some(Duration::ZERO),
+            ..ChildProcessLimits::default()
+        },
+        ChildProcessLimits {
+            active_process_limit: Some(0),
+            ..ChildProcessLimits::default()
+        },
+        ChildProcessLimits {
+            open_descriptor_limit: Some(0),
+            ..ChildProcessLimits::default()
+        },
+    ];
+    for requested in zero_rows {
+        let failure = CoordinatorSession::<Negotiating>::spawn(
+            SessionCommand::new(std::env::current_exe().unwrap()),
+            SessionOptions::new(
+                AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+                ExecutableIdentityPolicy::ExactOpenedFile,
+            )
+            .with_child_process_limits(requested),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.reason(), SessionError::InvalidInput);
+        assert_eq!(
+            failure.transaction_state(),
+            SessionTransactionState::NotEstablished
+        );
+        let facts = failure.child_process_limit_facts().unwrap();
+        assert_eq!(facts.requested(), requested);
+        assert_eq!(facts.applied(), ChildProcessLimits::default());
+    }
+}
+
+#[test]
+fn unsupported_child_process_limits_fail_before_spawn_without_degradation() {
+    #[cfg(target_os = "windows")]
+    let requested = ChildProcessLimits {
+        open_descriptor_limit: Some(64),
+        ..ChildProcessLimits::default()
+    };
+    #[cfg(not(target_os = "windows"))]
+    let requested = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(64 * 1024 * 1024),
+        per_process_user_cpu_time: Some(Duration::from_millis(250)),
+        active_process_limit: Some(2),
+        open_descriptor_limit: Some(64),
+    };
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        SessionCommand::new(std::env::current_exe().unwrap()),
+        SessionOptions::new(
+            AbsoluteDeadline::after(Duration::from_secs(1)).unwrap(),
+            ExecutableIdentityPolicy::ExactOpenedFile,
+        )
+        .with_child_process_limits(requested),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        failure.reason(),
+        SessionError::UnsupportedChildProcessLimits
+    );
+    assert_eq!(
+        failure.transaction_state(),
+        SessionTransactionState::NotEstablished
+    );
+    assert!(failure.cleanup().is_none());
+    let facts = failure.child_process_limit_facts().unwrap();
+    assert_eq!(facts.requested(), requested);
+    assert_eq!(facts.applied(), ChildProcessLimits::default());
+    assert_eq!(facts.unsupported(), requested);
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn public_spawn_rejects_the_reserved_environment_union_identically() {
@@ -626,6 +770,245 @@ fn assert_windows_tree_cleanup(cleanup: ChildCleanupFacts, expected_code: i32) {
         DescendantCleanupStatus::ContainedProcessTreeComplete
     );
     assert_eq!(cleanup.native_error(), None);
+}
+
+#[cfg(target_os = "windows")]
+fn windows_limit_command(helper: &str) -> SessionCommand {
+    SessionCommand::new(std::env::current_exe().unwrap())
+        .arg0("native-ipc-windows-limit-helper")
+        .arg("--exact")
+        .arg(helper)
+        .arg("--ignored")
+        .arg("--nocapture")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_limit_options(limits: ChildProcessLimits) -> SessionOptions {
+    windows_cleanup_options().with_child_process_limits(limits)
+}
+
+#[cfg(target_os = "windows")]
+fn reject_windows_limit_helper(negotiating: CoordinatorSession<Negotiating>) -> ChildCleanupFacts {
+    match negotiating
+        .decide(NegotiationDecision::Reject(
+            RejectionReason::APPLICATION_POLICY,
+        ))
+        .unwrap()
+    {
+        NegotiationOutcome::Rejected {
+            by: SessionEndpoint::Coordinator,
+            reason: RejectionReason::APPLICATION_POLICY,
+            cleanup: Some(cleanup),
+        } => cleanup,
+        _ => panic!("limit helper did not observe the coordinator rejection"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_job_denies_commit_over_the_per_process_limit_before_untrusted_code() {
+    let limits = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(64 * 1024 * 1024),
+        ..ChildProcessLimits::default()
+    };
+    let negotiating = CoordinatorSession::<Negotiating>::spawn(
+        windows_limit_command("session::tests::windows_memory_limit_helper"),
+        windows_limit_options(limits),
+    )
+    .unwrap();
+    assert_eq!(
+        negotiating.child_process_limit_facts(),
+        ChildProcessLimitFacts::new(limits, limits, ChildProcessLimits::default())
+    );
+    let cleanup = reject_windows_limit_helper(negotiating);
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::ContainedProcessTreeComplete
+    );
+    assert!(cleanup.direct_child_complete());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_failed_job_assignment_never_reports_limits_as_applied() {
+    let limits = ChildProcessLimits {
+        per_process_commit_memory_bytes: Some(64 * 1024 * 1024),
+        ..ChildProcessLimits::default()
+    };
+    crate::backend::windows::fail_next_job_assignment_for_test();
+    let failure = CoordinatorSession::<Negotiating>::spawn(
+        windows_limit_command("session::tests::windows_memory_limit_helper"),
+        windows_limit_options(limits),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        failure.transaction_state(),
+        SessionTransactionState::Spawned
+    );
+    assert!(failure.cleanup().unwrap().direct_child_complete());
+    let facts = failure.child_process_limit_facts().unwrap();
+    assert_eq!(facts.requested(), limits);
+    assert_eq!(facts.applied(), ChildProcessLimits::default());
+    assert_eq!(facts.unsupported(), ChildProcessLimits::default());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_malformed_rejection_failure_retains_applied_limit_facts() {
+    let limits = ChildProcessLimits {
+        active_process_limit: Some(1),
+        ..ChildProcessLimits::default()
+    };
+    let limit_facts = ChildProcessLimitFacts::new(limits, limits, ChildProcessLimits::default());
+    let cleanup = ChildCleanupFacts::new(
+        Some(ChildExitStatus::Exited(127)),
+        DescendantCleanupStatus::ContainedProcessTreeComplete,
+        None,
+    );
+    let failure = map_windows_coordinator_outcome(
+        crate::backend::windows::vnext_session::WindowsNegotiationOutcome::Rejected {
+            by: crate::backend::windows::vnext_session::WindowsNegotiationRole::Receiver,
+            reason: NonZeroU32::new(4).unwrap(),
+            cleanup: Some(cleanup),
+        },
+        limit_facts,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(failure.reason(), SessionError::MalformedPeer);
+    assert_eq!(failure.cleanup(), Some(cleanup));
+    assert_eq!(failure.child_process_limit_facts(), Some(limit_facts));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_job_denies_create_process_at_the_active_process_limit() {
+    let limits = ChildProcessLimits {
+        active_process_limit: Some(1),
+        ..ChildProcessLimits::default()
+    };
+    let negotiating = CoordinatorSession::<Negotiating>::spawn(
+        windows_limit_command("session::tests::windows_process_limit_helper"),
+        windows_limit_options(limits),
+    )
+    .unwrap();
+    assert_eq!(negotiating.child_process_limit_facts().applied(), limits);
+    let cleanup = reject_windows_limit_helper(negotiating);
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::ContainedProcessTreeComplete
+    );
+    assert!(cleanup.direct_child_complete());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_job_terminates_cpu_bound_child_at_the_per_process_user_time_limit() {
+    let limits = ChildProcessLimits {
+        per_process_user_cpu_time: Some(Duration::from_secs(1)),
+        ..ChildProcessLimits::default()
+    };
+    let negotiating = CoordinatorSession::<Negotiating>::spawn(
+        windows_limit_command("session::tests::windows_cpu_limit_helper"),
+        windows_limit_options(limits),
+    )
+    .unwrap();
+    assert_eq!(negotiating.child_process_limit_facts().applied(), limits);
+    let mut ready = match negotiating.decide(NegotiationDecision::Accept).unwrap() {
+        NegotiationOutcome::Accepted(ready) => ready,
+        _ => panic!("CPU helper rejected negotiation"),
+    };
+    assert_eq!(ready.child_process_limit_facts().applied(), limits);
+    let cleanup = ready.wait_for_exit(AbsoluteDeadline::after(Duration::from_secs(30)).unwrap());
+    assert!(matches!(
+        cleanup.direct_child(),
+        Some(ChildExitStatus::Exited(code)) if code != 0
+    ));
+    assert_eq!(
+        cleanup.descendants(),
+        DescendantCleanupStatus::ContainedProcessTreeComplete
+    );
+    assert_eq!(cleanup.native_error(), None);
+}
+
+#[cfg(target_os = "windows")]
+fn enter_windows_limit_negotiation(bootstrap: ReceiverBootstrap) {
+    let negotiating =
+        ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, windows_cleanup_options())
+            .unwrap();
+    let outcome = negotiating
+        .decide_after_coordinator(|_| NegotiationDecision::Accept)
+        .unwrap();
+    assert!(matches!(outcome, NegotiationOutcome::Rejected { .. }));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the Windows commit-memory Job limit regression"]
+fn windows_memory_limit_helper() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    let bootstrap = __take_receiver_bootstrap().unwrap();
+    // SAFETY: this is a private test allocation; a surprising success is
+    // released before failing the helper.
+    let allocation = unsafe {
+        VirtualAlloc(
+            core::ptr::null(),
+            256 * 1024 * 1024,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    if !allocation.is_null() {
+        // SAFETY: VirtualAlloc returned this exact reservation.
+        assert_ne!(unsafe { VirtualFree(allocation, 0, MEM_RELEASE) }, 0);
+        panic!("commit above the per-process Job limit unexpectedly succeeded");
+    }
+    enter_windows_limit_negotiation(bootstrap);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the Windows active-process Job limit regression"]
+fn windows_process_limit_helper() {
+    let bootstrap = __take_receiver_bootstrap().unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "session::tests::windows_job_descendant_helper",
+            "--ignored",
+        ])
+        .spawn();
+    assert!(
+        result.is_err(),
+        "CreateProcess escaped the active-process limit"
+    );
+    enter_windows_limit_negotiation(bootstrap);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "spawned only by the Windows user-CPU Job limit regression"]
+fn windows_cpu_limit_helper() {
+    let bootstrap = __take_receiver_bootstrap().unwrap();
+    let negotiating =
+        ReceiverSession::<Negotiating>::from_bootstrap(bootstrap, windows_cleanup_options())
+            .unwrap();
+    let ready = match negotiating
+        .decide_after_coordinator(|_| NegotiationDecision::Accept)
+        .unwrap()
+    {
+        NegotiationOutcome::Accepted(ready) => ready,
+        _ => panic!("coordinator rejected CPU helper"),
+    };
+    std::hint::black_box(&ready);
+    let mut value = 1_u64;
+    loop {
+        value = std::hint::black_box(value.wrapping_mul(6364136223846793005).wrapping_add(1));
+    }
 }
 
 #[cfg(target_os = "windows")]
