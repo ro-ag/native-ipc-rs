@@ -34,7 +34,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install release toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.97.0
 
@@ -120,7 +120,7 @@ jobs:
           ref: ${{ needs.gate.outputs.tag }}
 
       - name: Install release toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: 1.97.0
 
